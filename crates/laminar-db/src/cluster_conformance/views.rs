@@ -12,7 +12,10 @@ use arrow::array::RecordBatch;
 use super::cluster::{Cluster, Startup};
 use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
-use super::tests::{events, events_in, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
+use super::tests::{
+    events, events_in, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN, JOINED,
+    WINDOWS_OVER_JOINED, WINDOWS_OVER_JOINED_TRUTH,
+};
 use super::{embedded_db, Verdict, DEADLINE, NODES, VNODES};
 use crate::subscription::{
     ClusterSubscriptionFrameMetadata, PortalFrame, SubscribeStart, SubscriptionPortal,
@@ -491,6 +494,23 @@ async fn interval_join_view_keeps_an_interval_on_its_time_column() {
              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
              WHERE o.ts >= CAST(1319000 AS TIMESTAMP(6))",
         )],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A window view over an interval join stream appends its closed windows; every node reads all of
+/// them at the committed cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_view_over_interval_join_matches_batch_sql_in_cluster() {
+    let case = ViewCase {
+        name: "window_view_over_interval_join",
+        sources: vec![events("orders", 0), events("payments", 3)],
+        views: vec![
+            JOINED.to_owned(),
+            format!("CREATE MATERIALIZED VIEW windows {WINDOWS_OVER_JOINED}"),
+        ],
+        reads: vec![("SELECT * FROM windows", WINDOWS_OVER_JOINED_TRUTH)],
         same_cycle_invariants: vec![],
     };
     assert_eq!(verdict(case).await, Verdict::Equal);

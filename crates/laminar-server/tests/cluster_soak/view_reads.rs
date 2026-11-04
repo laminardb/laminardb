@@ -8,6 +8,9 @@
 //! - `soak_view_counts`, its rows without the key (placed by the full row);
 //! - `soak_view_rows`, an append-only view.
 //!
+//! A fifth, `soak_view_join_windows`, is the join-window canary's window over the join matrix's
+//! interval join stage. Every node must read its one closed window once the matrix completes.
+//!
 //! A reader queries all four in one pgwire statement at the committed level, rotating across the
 //! nodes through every `kill -9` and paused-leader round. Each read must equal the views computed
 //! from the input prefix its own progress rows describe, the prefix must never shrink, the same
@@ -34,11 +37,14 @@ use std::time::{Duration, Instant};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    connect_cluster_subscription_gateway, subscription_websocket_error_is_retryable, wait_for,
-    AcknowledgedIds, Node, ProducedPrefix, ZipfSampler, BASE_PORT, NODES, SOAK_CONSOLE_TOKEN,
+    connect_cluster_subscription_gateway, core_window_canary_query,
+    subscription_websocket_error_is_retryable, wait_for, AcknowledgedIds, Node, ProducedPrefix,
+    ZipfSampler, BASE_PORT, JOIN_WINDOW_CANARY, JOIN_WINDOW_ID_SUM, JOIN_WINDOW_ROWS, NODES,
+    SOAK_CONSOLE_TOKEN,
 };
 
 const PGWIRE_PORT_OFFSET: u16 = 200;
+const JOIN_WINDOW_VIEW: &str = "soak_view_join_windows";
 const KEYED_VIEW: &str = "soak_view_keys";
 const APPEND_EVERY: u64 = 16;
 const READS_PER_SESSION: u32 = 3;
@@ -94,8 +100,11 @@ CREATE MATERIALIZED VIEW soak_view_counts AS SELECT n, max_id FROM {KEYED_VIEW};
 CREATE MATERIALIZED VIEW soak_view_rows AS
 SELECT id, join_key, event_time FROM join_left WHERE join_key >= 0 AND id % {APPEND_EVERY} = 0
 WITH (retention = '1 hour');
+CREATE MATERIALIZED VIEW {JOIN_WINDOW_VIEW} AS
+{join_windows};
 """
-"#
+"#,
+        join_windows = core_window_canary_query(&JOIN_WINDOW_CANARY),
     )
 }
 
@@ -1188,6 +1197,7 @@ impl ViewSoak {
         let complete = oracle.expected(&oracle.produced(produced.count));
         assert_final_pgwire_reads(nodes, epoch, &complete);
         assert_final_http_reads(nodes, epoch, &complete);
+        assert_final_join_window_reads(nodes, epoch, window);
 
         let shared: Vec<u64> = subscription
             .progress
@@ -1358,6 +1368,84 @@ fn assert_final_pgwire_read(
         node.id,
         first_difference(&rows, complete)
     );
+}
+
+/// The window closes once the matrix's closing sentinel passes the join's frontier, which the cut
+/// that holds the sentinel may not have reached yet, so each node waits up to `window` for it.
+fn assert_final_join_window_reads(nodes: &[Node], epoch: u64, window: Duration) {
+    let expected = vec![(
+        JOIN_WINDOW_CANARY.kind.to_owned(),
+        JOIN_WINDOW_ROWS,
+        JOIN_WINDOW_ID_SUM,
+    )];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("final join window read runtime");
+    for node in nodes {
+        let deadline = Instant::now() + window;
+        loop {
+            let read = runtime.block_on(async {
+                let client = connect(node.id, "committed").await?;
+                client
+                    .batch_execute(&format!("SET laminar.min_epoch = {epoch}"))
+                    .await?;
+                let sql = format!("SELECT window_kind, row_count, id_sum FROM {JOIN_WINDOW_VIEW}");
+                let rows = tokio::time::timeout(READ_TIMEOUT, client.simple_query(&sql))
+                    .await
+                    .map_err(|_| ReadFailure::Retryable("read timeout".to_owned()))??;
+                join_window_rows(&rows).map_err(ReadFailure::Fatal)
+            });
+            let reason = match read {
+                Ok(rows) if rows == expected => break,
+                Ok(rows) => {
+                    assert!(
+                        rows.iter().all(|row| expected.contains(row)) && rows.len() <= 1,
+                        "node{} read join windows {rows:?}, expected {expected:?}",
+                        node.id
+                    );
+                    "the window has not closed".to_owned()
+                }
+                Err(ReadFailure::Retryable(reason)) => reason,
+                Err(ReadFailure::Fatal(reason)) => {
+                    panic!("node{} final join window read failed: {reason}", node.id)
+                }
+            };
+            assert!(
+                Instant::now() < deadline,
+                "node{} did not read the closed join window within {window:?}: {reason}",
+                node.id
+            );
+            std::thread::sleep(READ_INTERVAL);
+        }
+    }
+}
+
+fn join_window_rows(
+    messages: &[tokio_postgres::SimpleQueryMessage],
+) -> Result<Vec<(String, u64, i64)>, String> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .map(|row| {
+            let field = |index: usize| {
+                row.get(index)
+                    .ok_or_else(|| format!("join window row has a null column {index}"))
+            };
+            Ok((
+                field(0)?.to_owned(),
+                field(1)?
+                    .parse()
+                    .map_err(|error| format!("row_count: {error}"))?,
+                field(2)?
+                    .parse()
+                    .map_err(|error| format!("id_sum: {error}"))?,
+            ))
+        })
+        .collect()
 }
 
 fn assert_final_http_reads(nodes: &[Node], epoch: u64, complete: &ViewRows) {
