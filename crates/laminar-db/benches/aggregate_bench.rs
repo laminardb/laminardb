@@ -2,6 +2,8 @@
 //!
 //! `keyed`: 1,024 distinct `BIGINT` groups with COUNT/SUM/AVG; `keyed_16_groups` and
 //! `keyed_4096_groups` cover both ends of the distinct-key range of a 4,096-row batch.
+//! `keyed_two_columns`: the same 1,024 groups under a two-column key, which is row-encoded per
+//! row rather than grouped on a single fixed-width column's values.
 //! `global`: the same aggregates without GROUP BY (singleton vnode).
 //! `cluster_one_node`: the keyed `EMIT CHANGES` aggregate operator on a one-node cluster
 //! assignment, repartitioning every batch or applying it whole on a colocated input.
@@ -70,6 +72,11 @@ fn bench_update(c: &mut Criterion) {
     group.throughput(Throughput::Elements(ROWS as u64));
     for (name, sql) in [
         ("keyed", KEYED_SQL),
+        (
+            "keyed_two_columns",
+            "SELECT k, k % 7 AS r, COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a \
+             FROM events GROUP BY k, k % 7",
+        ),
         (
             "global",
             "SELECT COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events",
