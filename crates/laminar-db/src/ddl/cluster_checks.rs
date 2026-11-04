@@ -8,7 +8,6 @@ use arrow::datatypes::{DataType, Schema};
 
 use crate::db::{exact_table_reference, LaminarDB};
 use crate::error::DbError;
-use crate::exchange_plan::EventTimeOrigin;
 
 use super::stream::{
     contains_builtin_join_without_cluster_lifecycle, logical_aggregate_stage_count,
@@ -456,22 +455,15 @@ impl LaminarDB {
                     "managed CoreWindow execution requires one input, an unqualified event-time column, and no nested or row-expanding query shape",
                 )
             })?;
-        let event_time = self
+        if self
             .input_event_time(&input)
             .await?
-            .filter(|event_time| {
-                event_time.column == window.time_column && event_time.max_out_of_orderness.is_some()
+            .is_none_or(|event_time| {
+                event_time.column != window.time_column || event_time.max_out_of_orderness.is_none()
             })
-            .ok_or_else(|| {
-                reject(
-                    "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that carries it",
-                )
-            })?;
-        // Across a fault, a cluster window fed by an interval join stage can close a window
-        // before the join emits its rows.
-        if matches!(event_time.origin, EventTimeOrigin::IntervalJoin(_)) {
+        {
             return Err(reject(
-                "a window over an interval join stream is not certified through cluster recovery; run it embedded or single-node",
+                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that carries it",
             ));
         }
         let managed = crate::core_window_state::CoreWindowState::try_from_sql(
