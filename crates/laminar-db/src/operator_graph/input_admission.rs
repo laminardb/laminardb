@@ -379,6 +379,20 @@ impl OperatorGraph {
                         | ManagedStateContract::TemporalJoinV1
                 )
             );
+        // A managed stage's idle output can revive below the frontier its peers merged to: an
+        // interval join matches a stored row against a revived input. A cluster window or interval
+        // join that merges that output across nodes must wait for it rather than exclude it.
+        #[cfg(feature = "cluster")]
+        let stage_output_never_idle = self.cluster_shuffle.is_some()
+            && matches!(
+                managed_state,
+                Some(
+                    ManagedStateContract::CoreWindowV1
+                        | ManagedStateContract::BoundedIntervalJoinV3
+                )
+            );
+        #[cfg(not(feature = "cluster"))]
+        let stage_output_never_idle = false;
         #[cfg(feature = "cluster")]
         let capped_source_frontiers = match managed_state {
             Some(ManagedStateContract::TemporalJoinV1) => Some(&self.temporal_source_frontiers),
@@ -407,7 +421,9 @@ impl OperatorGraph {
                     InputFrontier {
                         watermark: (self.output_watermarks[upstream] != i64::MIN)
                             .then_some(self.output_watermarks[upstream]),
-                        idle: self.output_idle[upstream] && !self.node_has_buffered_input(upstream),
+                        idle: !stage_output_never_idle
+                            && self.output_idle[upstream]
+                            && !self.node_has_buffered_input(upstream),
                     }
                 } else {
                     InputFrontier::from_watermark(current_watermark)
