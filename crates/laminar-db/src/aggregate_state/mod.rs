@@ -58,7 +58,7 @@ pub(crate) use concrete::{AggregateInput, ConcreteAggregateState, ConcreteInputM
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
 use group_map::{GroupKey, GroupMap};
-use grouping::BatchGroups;
+use grouping::{BatchGroups, EncodedKeys, FixedWidthKeyGrouper};
 pub(crate) use keys::global_aggregate_key;
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
@@ -640,6 +640,7 @@ pub(crate) struct IncrementalAggState {
     aggregate_templates: Vec<ConcreteAggregateState>,
     vnode_states: AggregateVnodeSlots,
     row_converter: Arc<arrow::row::RowConverter>,
+    fixed_key_grouper: Option<FixedWidthKeyGrouper>,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -1308,6 +1309,7 @@ impl IncrementalAggState {
             arrow::row::RowConverter::new(sort_fields)
                 .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?,
         );
+        let fixed_key_grouper = FixedWidthKeyGrouper::for_key(&group_types);
         let vnode_states = AggregateVnodeSlots::try_new(key_group_count)?;
         let vnode_count = usize::from(key_group_count.get());
         let checkpoint_dirty_vnodes = vec![false; vnode_count].into_boxed_slice();
@@ -1331,6 +1333,7 @@ impl IncrementalAggState {
             aggregate_templates,
             vnode_states,
             row_converter,
+            fixed_key_grouper,
             output_schema,
             compiled_projection,
             cached_pre_agg_physical,
@@ -1492,38 +1495,39 @@ impl IncrementalAggState {
             return self.process_batch_no_groups(batch, watermark_ms);
         }
 
-        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-            .map(|i| Arc::clone(batch.column(i)))
-            .collect();
-
-        let rows = self
-            .row_converter
-            .convert_columns(&group_cols)
-            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-
+        let keys = self.encode_group_keys(batch)?;
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
         let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
         self.apply_keyed_groups(
-            &rows,
-            input_weights,
+            &BatchGroups::try_new(&keys, input_weights)?,
             |accs, indices| Self::update_concrete_accumulators(accs, &inputs, indices),
             watermark_ms,
             uniform_vnode,
         )
     }
 
-    /// Group `rows` by key, preflight the group limit, then fold each group's rows into its
+    /// Row-encode the batch's leading group columns: once per group for a single fixed-width
+    /// key, once per row otherwise.
+    fn encode_group_keys(&self, batch: &RecordBatch) -> Result<EncodedKeys, DbError> {
+        if let Some(grouper) = &self.fixed_key_grouper {
+            return grouper.encode(batch.column(0), &self.row_converter);
+        }
+        self.row_converter
+            .convert_columns(&batch.columns()[..self.num_group_cols])
+            .map(EncodedKeys::PerRow)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))
+    }
+
+    /// Preflight the group limit for `batch_groups`, then fold each group's rows into its
     /// accumulators with `update`.
     fn apply_keyed_groups(
         &mut self,
-        rows: &arrow::row::Rows,
-        input_weights: Option<&arrow::array::Int64Array>,
+        batch_groups: &BatchGroups<'_>,
         update: impl Fn(&mut [ConcreteAggregateState], &[u32]) -> Result<(), DbError>,
         watermark_ms: i64,
         uniform_vnode: Option<u32>,
     ) -> Result<(), DbError> {
         let vnode_count = self.routing_vnode_count();
-        let batch_groups = BatchGroups::try_new(rows, input_weights)?;
 
         // Reject the whole batch before touching an accumulator if its new keys would exceed the
         // cardinality bound. Partial application is not retry-safe: an existing group updated
