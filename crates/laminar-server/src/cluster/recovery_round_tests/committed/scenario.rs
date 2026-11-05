@@ -308,14 +308,17 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     Ok(())
 }
 
-pub(super) const VIEWS: [&str; 3] = [
+pub(super) const VIEWS: [&str; 5] = [
     "SELECT account, total, n FROM recovery_totals",
     "SELECT total FROM recovery_amounts",
     "SELECT account, amount FROM recovery_rows",
+    "SELECT account, total, n FROM recovery_chain_totals",
+    "SELECT account, left_amount, right_amount FROM recovery_chain_rows",
 ];
 
 /// The sorted rows of each of [`VIEWS`] once each partition delivered `prefix` records;
-/// partition `p` delivers account `keys[1 - p]` with amounts `10 * i + p`.
+/// partition `p` delivers account `keys[1 - p]` with amounts `10 * i + p`, record `i` 1 ms after
+/// record `i - 1`.
 pub(super) fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
     let mut totals = Vec::new();
     let mut rows = Vec::new();
@@ -331,7 +334,32 @@ pub(super) fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> 
     for view in [&mut totals, &mut amounts, &mut rows] {
         view.sort_unstable();
     }
-    vec![totals, amounts, rows]
+    let [chain_totals, chain_rows] = chain_views(keys, prefix);
+    vec![totals, amounts, rows, chain_totals, chain_rows]
+}
+
+/// The sorted rows of the chain views in [`VIEWS`]: each record joins itself and the next two
+/// records of its account, which are within 2 ms of it.
+pub(super) fn chain_views(keys: [i64; 2], prefix: i64) -> [Vec<Vec<i64>>; 2] {
+    let mut totals = Vec::new();
+    let mut rows = Vec::new();
+    for (partition, account) in [(0, keys[1]), (1, keys[0])] {
+        let amounts = (1..=prefix).map(|i| 10 * i + partition).collect::<Vec<_>>();
+        let pairs = (0..amounts.len())
+            .flat_map(|left| (left..amounts.len().min(left + 3)).map(move |right| (left, right)))
+            .map(|(left, right)| vec![account, amounts[left], amounts[right]])
+            .collect::<Vec<_>>();
+        let matched = i64::try_from(pairs.len()).unwrap();
+        totals.push(vec![
+            account,
+            pairs.iter().map(|pair| pair[1]).sum(),
+            matched,
+        ]);
+        rows.extend(pairs);
+    }
+    totals.sort_unstable();
+    rows.sort_unstable();
+    [totals, rows]
 }
 
 pub(super) async fn leader(processes: &mut [Process; 2]) -> Result<usize> {

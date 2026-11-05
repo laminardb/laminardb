@@ -75,10 +75,15 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
 }
 
 /// The columns of each view that [`VIEWS`] reads.
-const SUBSCRIBED: [(&str, &[&str]); 3] = [
+const SUBSCRIBED: [(&str, &[&str]); 5] = [
     ("recovery_totals", &["account", "total", "n"]),
     ("recovery_amounts", &["total"]),
     ("recovery_rows", &["account", "amount"]),
+    ("recovery_chain_totals", &["account", "total", "n"]),
+    (
+        "recovery_chain_rows",
+        &["account", "left_amount", "right_amount"],
+    ),
 ];
 
 async fn subscribe(process: &mut Process) -> Result<()> {

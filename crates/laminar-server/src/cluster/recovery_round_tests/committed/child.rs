@@ -385,7 +385,7 @@ impl DatabasePeer {
                     return Ok(Response::Done);
                 }
                 let ddl = [
-                    "CREATE SOURCE recovery_input (account BIGINT, amount BIGINT, ts TIMESTAMP, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"recovery-cut-probe\" ('fixture' = 'bounded-replay-v1')".into(),
+                    "CREATE SOURCE recovery_input (account BIGINT, amount BIGINT, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"recovery-cut-probe\" ('fixture' = 'bounded-replay-v1')".into(),
                     // Split into a stage and an owner, so both take over the lost vnodes.
                     "CREATE STREAM recovery_output AS SELECT account, SUM(total) AS total FROM (SELECT account, SUM(amount) AS total FROM recovery_input GROUP BY account) per_account GROUP BY account".into(),
                     "CREATE SINK recovery_probe FROM recovery_output INTO \"recovery-output-probe\" ('fixture' = 'bounded-replay-v1')".into(),
@@ -394,6 +394,13 @@ impl DatabasePeer {
                     "CREATE MATERIALIZED VIEW recovery_totals AS SELECT account, SUM(amount) AS total, COUNT(*) AS n FROM recovery_input GROUP BY account".into(),
                     "CREATE MATERIALIZED VIEW recovery_amounts AS SELECT total FROM recovery_totals".into(),
                     "CREATE MATERIALIZED VIEW recovery_rows AS SELECT account, amount, ts FROM recovery_input WITH (retention = '1 hour')".into(),
+                    "CREATE STREAM chain_mid AS SELECT account, amount, ts FROM recovery_input".into(),
+                    "CREATE STREAM chain_right AS SELECT account, amount, ts FROM recovery_input".into(),
+                    // Two join stages and an aggregate over them, repartitioned by account, then
+                    // amount, then account.
+                    "CREATE MATERIALIZED VIEW recovery_chain_totals AS SELECT c.account AS account, SUM(a.amount) AS total, COUNT(*) AS n FROM recovery_input a JOIN chain_mid b ON a.account = b.account AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '2' MILLISECOND JOIN chain_right c ON b.amount = c.amount AND c.ts BETWEEN a.ts AND a.ts + INTERVAL '2' MILLISECOND GROUP BY c.account".into(),
+                    // One join stage; the owner runs the last join, reading chain_right directly.
+                    "CREATE MATERIALIZED VIEW recovery_chain_rows AS SELECT a.account AS account, a.amount AS left_amount, c.amount AS right_amount FROM recovery_input a JOIN chain_mid b ON a.account = b.account AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '2' MILLISECOND JOIN chain_right c ON b.amount = c.amount AND c.ts BETWEEN a.ts AND a.ts + INTERVAL '2' MILLISECOND WITH (retention = '1000 rows')".into(),
                 ];
                 self.db()?.execute_cluster_bootstrap_batch(&ddl).await?;
             }
