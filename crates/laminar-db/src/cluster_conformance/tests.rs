@@ -819,7 +819,7 @@ fn chain_sources(batches: i64) -> Vec<FixtureSource> {
 }
 
 /// A three-way interval join splits into a join stage and the owner's join over it.
-const THREE_WAY_JOIN: &str = "SELECT o.k AS k, p.v AS pv, r.v AS rv FROM orders o \
+pub(super) const THREE_WAY_JOIN: &str = "SELECT o.k AS k, p.v AS pv, r.v AS rv FROM orders o \
      INNER JOIN payments p ON o.k = p.k \
      AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
      INNER JOIN refunds r ON o.k = r.k \

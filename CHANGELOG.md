@@ -16,9 +16,19 @@
   stream, on the event-time column the input carries.
 - An append-only view over an interval join keeps an interval on the join's event-time column, so
   it no longer has to declare `retention = '<n> rows'`.
+- A chain of interval joins over three or more named inputs (`a JOIN b ON .. JOIN c ON ..`, each
+  `ON` with a `BETWEEN` bound) runs in every mode, in a stream or a materialized view. It is split
+  into one internal stage per join, each admitted as a two-way join over the stage before it, so
+  each later join must bound its time by the event-time column the earlier joins carry; `CREATE`
+  names the column otherwise. In cluster mode the chain counts toward the three-exchange depth
+  limit like named stages.
 
 ### Changed
 
+- A multi-way join that is not a chain of interval joins over named inputs (with a lookup or
+  temporal table, `USING`, a subquery input, or no interval bound) is still rejected, with a
+  message that says which multi-way joins split. Cluster mode reports a window over a join that
+  cannot be split with the one-input window message instead of the windowed-join message.
 - `CREATE` rejects a window over a window stream that groups by any column other than the one the
   upstream carries (for example its start when it projects its end), and a window over a session
   window or over a window that projects no boundary. Such a window could close before the
