@@ -1,6 +1,6 @@
 //! A draining database hands its vnodes over live: the other database takes the keyed and
-//! row-placed views' slices and adopts the append view's log, and reads every view at its next
-//! checkpoint. The drained database takes part in no later checkpoint and reads them too.
+//! row-placed views' slices and the join chains' state, adopts the append views' logs, and reads
+//! every view at its next checkpoint. The drained database takes part in no later checkpoint and reads them too.
 //! Subscribers on both databases, attached before the drain, fold to the same rows: the moved
 //! slices and the adopted log are not changes.
 
@@ -75,10 +75,15 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
 }
 
 /// The columns of each view that [`VIEWS`] reads.
-const SUBSCRIBED: [(&str, &[&str]); 3] = [
+const SUBSCRIBED: [(&str, &[&str]); 5] = [
     ("recovery_totals", &["account", "total", "n"]),
     ("recovery_amounts", &["total"]),
     ("recovery_rows", &["account", "amount"]),
+    ("recovery_chain_totals", &["account", "total", "n"]),
+    (
+        "recovery_chain_rows",
+        &["account", "left_amount", "right_amount"],
+    ),
 ];
 
 async fn subscribe(process: &mut Process) -> Result<()> {

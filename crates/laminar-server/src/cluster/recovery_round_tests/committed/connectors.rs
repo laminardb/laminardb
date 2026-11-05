@@ -48,7 +48,7 @@ fn source_schema() -> SchemaRef {
         Field::new(
             "ts",
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-            true,
+            false,
         ),
     ]))
 }

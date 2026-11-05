@@ -1,31 +1,38 @@
 //! Two databases migrate their topology. The migration adds views over the kept keyed view,
 //! which each database seeds from the slices it restored at the migration's cut, and drops the
-//! view placed by its full row.
+//! view placed by its full row. It keeps the chain view whose owner runs the last join, and
+//! drops the one that aggregates over its join stages.
 
-use super::scenario::{checkpoint, leader, read_views, start_pair, wait_totals, Process};
+use super::scenario::{
+    chain_views, checkpoint, leader, read_views, start_pair, wait_totals, Process,
+};
 use super::*;
 
 const OPERATION: u128 = 0x5d00_0001;
 
-const STATEMENTS: [&str; 3] = [
+const STATEMENTS: [&str; 4] = [
     // Placed by its full row, so each database routes its seed to the rows' owners.
     "CREATE MATERIALIZED VIEW migrated_totals AS SELECT total, n FROM recovery_totals",
     // Regroups both accounts onto one owner.
     "CREATE MATERIALIZED VIEW migrated_counts AS SELECT n, COUNT(*) AS accounts FROM recovery_totals GROUP BY n",
     "DROP MATERIALIZED VIEW recovery_amounts",
+    "DROP MATERIALIZED VIEW recovery_chain_totals",
 ];
 
-const VIEWS: [&str; 2] = [
+const VIEWS: [&str; 3] = [
     "SELECT total, n FROM migrated_totals",
     "SELECT n, accounts FROM migrated_counts",
+    "SELECT account, left_amount, right_amount FROM recovery_chain_rows",
 ];
 
 /// The sorted rows of each of [`VIEWS`] once each partition delivered `prefix` records.
-fn expected_views(prefix: i64) -> Vec<Vec<Vec<i64>>> {
+fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
     let total = 5 * prefix * (prefix + 1);
+    let [_, chain_rows] = chain_views(keys, prefix);
     vec![
         vec![vec![total, prefix], vec![total + prefix, prefix]],
         vec![vec![prefix, 2]],
+        chain_rows,
     ]
 }
 
@@ -50,7 +57,7 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     for process in &mut *processes {
         assert_eq!(
             read_views(process, &VIEWS, Some(epoch)).await?,
-            expected_views(2)
+            expected_views(keys, 2)
         );
     }
     for process in &mut *processes {
@@ -61,7 +68,7 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     for process in &mut *processes {
         assert_eq!(
             read_views(process, &VIEWS, Some(epoch)).await?,
-            expected_views(3)
+            expected_views(keys, 3)
         );
     }
     Ok(())

@@ -1229,7 +1229,10 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
             "CREATE MATERIALIZED VIEW sizes AS SELECT n, COUNT(*) AS ids FROM \
              (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) GROUP BY n"
                 .into(),
-        ],
+        ]
+        .into_iter()
+        .chain(join_chain("chain"))
+        .collect(),
     ))
     .await;
     let probe = enable_runtime(&fixture);
@@ -1296,6 +1299,11 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
         committed_pairs(&fixture.db, sizes, parent.epoch).await,
         [(1, 1), (2, 1)]
     );
+    let chain = &chain_counts("chain");
+    assert_eq!(
+        committed_pairs(&fixture.db, chain, parent.epoch).await,
+        [(1, 1), (2, 5)]
+    );
     let parent_identity = latest_index(&fixture).await.pipeline_identity;
 
     let request = request(1302, independent_pipeline());
@@ -1335,7 +1343,33 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
         committed_pairs(&fixture.db, sizes, target.epoch).await,
         [(2, 1), (4, 1)]
     );
+    // Key 1's later rows match its first row only through the join state restored at the cut.
+    assert_eq!(
+        committed_pairs(&fixture.db, chain, target.epoch).await,
+        [(1, 37), (2, 5)]
+    );
     fixture.db.shutdown().await.unwrap();
+}
+
+/// Two inputs over `trades` and a three-way interval join view over the three of them. It splits
+/// into a join stage, and the owner runs the last join, reading `chain_right` directly.
+fn join_chain(view: &str) -> [String; 3] {
+    [
+        "CREATE STREAM chain_mid AS SELECT id, ts, value FROM trades".into(),
+        "CREATE STREAM chain_right AS SELECT id, ts, value FROM trades".into(),
+        format!(
+            "CREATE MATERIALIZED VIEW {view} AS SELECT a.id AS id, c.value AS value FROM trades a \
+             JOIN chain_mid b ON a.id = b.id AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '1' SECOND \
+             JOIN chain_right c ON a.id = c.id AND c.ts BETWEEN a.ts AND a.ts + INTERVAL '1' SECOND \
+             WITH (retention = '1000 rows')"
+        ),
+    ]
+}
+
+/// Each key's row count in a [`join_chain`] view: the sum, over the key's rows, of the squared
+/// number of its rows at or after that row's time.
+fn chain_counts(view: &str) -> String {
+    format!("SELECT id, COUNT(*) AS n FROM {view} GROUP BY id")
 }
 
 async fn committed_pairs(db: &LaminarDB, sql: &str, epoch: u64) -> Vec<(i64, i64)> {
@@ -1433,7 +1467,10 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
             "CREATE STREAM doomed_nested AS SELECT id, SUM(n) AS n FROM \
              (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) per_id GROUP BY id"
                 .into(),
-        ],
+        ]
+        .into_iter()
+        .chain(join_chain("doomed_chain"))
+        .collect(),
     ))
     .await;
     let probe = enable_runtime(&fixture);
@@ -1521,6 +1558,11 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
         "{recreate}"
     );
 
+    assert!(fixture
+        .db
+        .catalog_namespace
+        .lock()
+        .contains_key("doomed_chain$stage1"));
     let request = request(
         1303,
         vec![
@@ -1528,6 +1570,7 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
             "DROP MATERIALIZED VIEW doomed_seen".into(),
             "DROP MATERIALIZED VIEW doomed_spread".into(),
             "DROP STREAM doomed_nested".into(),
+            "DROP MATERIALIZED VIEW doomed_chain".into(),
             "CREATE MATERIALIZED VIEW added_counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
                 .into(),
             "CREATE MATERIALIZED VIEW added_seen AS SELECT id, value FROM trades WITH (retention = '100 rows')"
@@ -1573,7 +1616,7 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
             ),
         }
     }
-    for dropped in ["doomed", "doomed_seen", "doomed_spread"] {
+    for dropped in ["doomed", "doomed_seen", "doomed_spread", "doomed_chain"] {
         assert!(
             Box::pin(fixture.db.query_committed(
                 &format!("SELECT * FROM {dropped}"),
@@ -1593,6 +1636,7 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
     let namespace = fixture.db.catalog_namespace.lock().clone();
     assert!(!namespace.contains_key("doomed_spread$stage1"));
     assert!(!namespace.contains_key("doomed_nested$stage1"));
+    assert!(!namespace.contains_key("doomed_chain$stage1"));
     fixture.db.shutdown().await.unwrap();
 }
 
