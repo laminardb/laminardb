@@ -95,7 +95,7 @@ impl ViewCase {
         super::wait_until(DEADLINE, || delivered() >= total)
             .await
             .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
-        let checkpoint = self.cluster_checkpoint(cluster).await?;
+        let checkpoint = self.settled_checkpoint(cluster).await?;
         for (truth, portal) in &mut subscriptions {
             self.check_subscription(portal, truth, checkpoint.epoch)
                 .await?;
@@ -176,6 +176,36 @@ impl ViewCase {
             }
         }
         Ok(())
+    }
+
+    /// The first cut after delivery whose committed reads on the leader hold every view's rows,
+    /// or the last cut taken before the deadline, which the checks then report. A window closes
+    /// only once its input's frontier has crossed each exchange, which a checkpoint taken right
+    /// after delivery need not include.
+    async fn settled_checkpoint(
+        &self,
+        cluster: &Cluster,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, String> {
+        let mut expected = Vec::with_capacity(self.reads.len());
+        for (_, truth) in &self.reads {
+            expected.push(oracle::ground_truth(&self.sources, truth).await?);
+        }
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let checkpoint = self.cluster_checkpoint(cluster).await?;
+            let mut settled = true;
+            for ((read, _), expected) in self.reads.iter().zip(&expected) {
+                let committed = cluster.dbs[0]
+                    .query_committed(read, CommittedRead::Exact(checkpoint.epoch))
+                    .await
+                    .map_err(|e| format!("{}: committed `{read}`: {e}", self.name))?;
+                settled &= oracle::consolidate(&committed.batches, OutputForm::Rows)? == *expected;
+            }
+            if settled || tokio::time::Instant::now() >= deadline {
+                return Ok(checkpoint);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn cluster_checkpoint(

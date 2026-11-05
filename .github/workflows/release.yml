@@ -141,9 +141,9 @@ jobs:
 
       - name: Set swap space (Linux)
         if: runner.os == 'Linux'
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross

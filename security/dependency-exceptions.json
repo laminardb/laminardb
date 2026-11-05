@@ -116,9 +116,27 @@
       "crate": "zstd-safe",
       "version": "7.3.0",
       "reason": "Not reached: requires a multithreaded context, which needs the zstdmt feature that no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0440",
+      "crate": "astral-tokio-tar",
+      "version": "0.6.2",
+      "reason": "Unmaintained since 2026-11-03 with no maintained release. Reached only through testcontainers 0.27.2 (the latest, 0.28.0, still requires ^0.6.1), a dev-dependency of laminar-connectors that starts Docker containers for integration tests; no shipped build compiles it."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0441",
+      "crate": "pin-utils",
+      "version": "0.1.0",
+      "reason": "Unmaintained since its repository was archived on 2026-10-01. hyper and the AWS smithy crates are updated off it; the only remaining dependent is wasm-timer 0.2.5 under reqwest-retry 0.7.0 (deltalake-catalog-unity 0.16.1), declared for cfg(target_arch = \"wasm32\") only, which no build target compiles."
     }
   ],
   "packages": [
+    {
+      "name": "astral-tokio-tar",
+      "version": "0.6.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "cb50a7aae84a03bf55b067832bc376f4961b790c97e64d3eacee97d389b90277"
+    },
     {
       "name": "instant",
       "version": "0.1.13",
@@ -130,6 +148,12 @@
       "version": "1.0.15",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+    },
+    {
+      "name": "pin-utils",
+      "version": "0.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
     },
     {
       "name": "proc-macro-error2",
