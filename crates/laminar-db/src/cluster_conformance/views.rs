@@ -13,8 +13,8 @@ use super::cluster::{Cluster, Startup};
 use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
 use super::tests::{
-    events, events_in, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN, JOINED,
-    WINDOWS_OVER_JOINED, WINDOWS_OVER_JOINED_TRUTH,
+    events, events_in, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN, JOINED, THREE_WAY_JOIN,
+    THREE_WAY_TOTALS, WINDOWS_OVER_JOINED, WINDOWS_OVER_JOINED_TRUTH,
 };
 use super::{embedded_db, Verdict, DEADLINE, NODES, VNODES};
 use crate::subscription::{
@@ -543,6 +543,33 @@ async fn window_view_over_interval_join_matches_batch_sql_in_cluster() {
             format!("CREATE MATERIALIZED VIEW windows {WINDOWS_OVER_JOINED}"),
         ],
         reads: vec![("SELECT * FROM windows", WINDOWS_OVER_JOINED_TRUTH)],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Views over a three-way join: an append view that runs the last join over the first join's
+/// stage, and an aggregate view over both join stages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_way_join_views_match_batch_sql_in_cluster() {
+    let case = ViewCase {
+        name: "three_way_join_views",
+        sources: vec![
+            events("orders", 0),
+            events("payments", 3),
+            events("refunds", 5),
+        ],
+        views: vec![
+            format!(
+                "CREATE MATERIALIZED VIEW joined AS {THREE_WAY_JOIN} \
+                 WITH (retention = '100000 rows')"
+            ),
+            format!("CREATE MATERIALIZED VIEW totals AS {THREE_WAY_TOTALS}"),
+        ],
+        reads: vec![
+            ("SELECT * FROM joined", THREE_WAY_JOIN),
+            ("SELECT * FROM totals", THREE_WAY_TOTALS),
+        ],
         same_cycle_invariants: vec![],
     };
     assert_eq!(verdict(case).await, Verdict::Equal);

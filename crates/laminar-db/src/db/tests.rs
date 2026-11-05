@@ -6485,7 +6485,7 @@ async fn multiway_incremental_mv_is_rejected_without_partial_registration() {
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("multi-way streaming joins require explicitly named two-way stages"));
+        .contains("write other multi-way joins as explicitly named two-way stages"));
     assert!(db.mv_registry.lock().get("abc").is_none());
     assert!(!db.ctx.table_exist("abc").unwrap());
     assert!(db.connector_manager.lock().get_ddl("abc").is_none());

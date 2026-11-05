@@ -51,7 +51,7 @@ pub(crate) fn has_join_clause(sql: &str) -> bool {
     join_clause_count(sql) > 0
 }
 
-pub(crate) fn join_clause_count(sql: &str) -> usize {
+fn join_clause_count(sql: &str) -> usize {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return 0;
     };

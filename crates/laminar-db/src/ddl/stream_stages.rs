@@ -567,6 +567,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explain_lists_a_join_chain_stage_by_stage() {
+        let db = db(&[
+            "CREATE SOURCE refunds (k BIGINT NOT NULL, v BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND)",
+        ])
+        .await;
+        let explained = metadata(
+            db.execute(
+                "EXPLAIN CREATE STREAM out AS SELECT r.k AS k, COUNT(*) AS n FROM orders o \
+                 JOIN payments p ON o.k = p.k \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+                 JOIN refunds r ON p.v = r.v \
+                 AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND \
+                 GROUP BY r.k EMIT CHANGES",
+            )
+            .await
+            .unwrap(),
+        );
+        let exchanges: Vec<_> = explained
+            .iter()
+            .filter(|(key, _)| key.starts_with("stage.") && key.contains(".exchange."))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        // The first stage carries `o.ts`, which the second join bounds by, and each join and
+        // the aggregate repartition on their own key: three remote exchanges.
+        assert_eq!(
+            exchanges,
+            [
+                (
+                    "stage.out$stage1.exchange.input.left:orders",
+                    "repartition on (k Int64) from arbitrary, append-only, event time ts"
+                ),
+                (
+                    "stage.out$stage1.exchange.input.right:payments",
+                    "repartition on (k Int64) from arbitrary, append-only, event time ts"
+                ),
+                (
+                    "stage.out$stage1.exchange.output",
+                    "arbitrary, append-only, event time o_ts"
+                ),
+                (
+                    "stage.out$stage2.exchange.input.left:out$stage1",
+                    "repartition on (p_v Int64) from arbitrary, append-only, event time o_ts"
+                ),
+                (
+                    "stage.out$stage2.exchange.input.right:refunds",
+                    "repartition on (v Int64) from arbitrary, append-only, event time ts"
+                ),
+                ("stage.out$stage2.exchange.output", "arbitrary, append-only"),
+                (
+                    "stage.out.exchange.input.out$stage2",
+                    "repartition on (r_k Int64) from arbitrary, append-only"
+                ),
+                (
+                    "stage.out.exchange.output",
+                    "hash(k Int64), weighted changelog"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn explain_lists_each_stage_with_its_exchanges() {
         let db = db(&[]).await;
         let explained = metadata(db.execute(&format!("EXPLAIN {FUSED}")).await.unwrap());
