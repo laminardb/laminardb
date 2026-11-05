@@ -809,13 +809,18 @@ async fn interval_join_over_interval_join_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-fn chain_sources(batches: i64) -> Vec<FixtureSource> {
-    vec![
-        events_with("orders", 0, batches),
-        events_with("payments", 3, batches),
-        events_with("refunds", 5, batches),
-        events_with("shipments", 7, batches),
+/// The first `inputs` of `orders`, `payments`, `refunds` and `shipments`.
+fn chain_sources(inputs: usize, batches: i64) -> Vec<FixtureSource> {
+    [
+        ("orders", 0),
+        ("payments", 3),
+        ("refunds", 5),
+        ("shipments", 7),
     ]
+    .into_iter()
+    .take(inputs)
+    .map(|(name, seed)| events_with(name, seed, batches))
+    .collect()
 }
 
 /// A three-way interval join splits into a join stage and the owner's join over it.
@@ -834,9 +839,9 @@ pub(super) const THREE_WAY_TOTALS: &str =
      AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND \
      GROUP BY r.k";
 
-fn chain_case(name: &'static str, stream: String, form: OutputForm) -> Case {
+fn chain_case(name: &'static str, inputs: usize, stream: String, form: OutputForm) -> Case {
     Case {
-        sources: chain_sources(BATCHES_PER_PARTITION),
+        sources: chain_sources(inputs, BATCHES_PER_PARTITION),
         ..join_case(name, vec![stream], form)
     }
 }
@@ -847,6 +852,7 @@ async fn three_way_interval_join_is_equal() {
         ground_truth: Some(THREE_WAY_JOIN),
         ..chain_case(
             "three_way_interval_join",
+            3,
             format!("CREATE STREAM out AS {THREE_WAY_JOIN}"),
             OutputForm::Rows,
         )
@@ -859,6 +865,7 @@ fn three_way_totals_case(name: &'static str) -> Case {
         ground_truth: Some(THREE_WAY_TOTALS),
         ..chain_case(
             name,
+            3,
             format!("CREATE STREAM out AS {THREE_WAY_TOTALS} EMIT CHANGES"),
             OutputForm::Changelog,
         )
@@ -875,7 +882,7 @@ async fn three_way_join_aggregate_is_equal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loaded_three_way_join_aggregate_checkpoints_are_equal() {
     let case = Case {
-        sources: chain_sources(200),
+        sources: chain_sources(3, 200),
         checkpoint_under_load: true,
         ..three_way_totals_case("loaded_three_way_join_aggregate")
     };
@@ -887,6 +894,7 @@ async fn loaded_three_way_join_aggregate_checkpoints_are_equal() {
 async fn four_way_join_aggregate_is_rejected_in_cluster() {
     let case = chain_case(
         "four_way_join_aggregate",
+        4,
         "CREATE STREAM out AS SELECT s.v AS v, COUNT(*) AS n FROM orders o \
          INNER JOIN payments p ON o.k = p.k \
          AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
@@ -907,6 +915,7 @@ async fn four_way_join_aggregate_is_rejected_in_cluster() {
 async fn join_chain_on_a_time_its_stage_does_not_carry_is_rejected() {
     let case = chain_case(
         "join_chain_on_uncarried_time",
+        3,
         "CREATE STREAM out AS SELECT o.k AS k, o.ts AS ots, r.v AS rv FROM orders o \
          INNER JOIN payments p ON o.k = p.k \
          AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \

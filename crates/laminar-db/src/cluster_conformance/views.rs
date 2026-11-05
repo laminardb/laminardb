@@ -83,17 +83,19 @@ impl ViewCase {
             .await
             .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
         let partial = self.cluster_checkpoint(cluster).await?;
-        cluster.allowance.store(u64::MAX, Ordering::Release);
-        super::wait_until(DEADLINE, || delivered() >= total)
-            .await
-            .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
-        let checkpoint = self.cluster_checkpoint(cluster).await?;
+        // Cleanup may retire a cut once a newer one commits and no read holds it, so the
+        // subscription that starts at this cut attaches while it is the newest.
         subscriptions.extend(
             self.subscribe(cluster, SubscribeStart::AsOfEpoch(partial.epoch))
                 .await?
                 .into_iter()
                 .take(1),
         );
+        cluster.allowance.store(u64::MAX, Ordering::Release);
+        super::wait_until(DEADLINE, || delivered() >= total)
+            .await
+            .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
+        let checkpoint = self.cluster_checkpoint(cluster).await?;
         for (truth, portal) in &mut subscriptions {
             self.check_subscription(portal, truth, checkpoint.epoch)
                 .await?;
