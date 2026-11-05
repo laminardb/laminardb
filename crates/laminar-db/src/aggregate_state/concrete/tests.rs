@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use super::*;
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float64Array,
+    Int32Array, Int64Array, IntervalYearMonthArray, StringArray, StructArray,
 };
-use arrow::datatypes::Int64Type;
-use datafusion_expr::{AggregateUDF, AggregateUDFImpl};
+use arrow::datatypes::{Field, Int32Type, Int64Type, TimeUnit};
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion_expr::{Accumulator, AggregateUDF, AggregateUDFImpl};
 
 /// Every row of a value array and, in weighted mode, a weight array.
 fn whole(values: &[ArrayRef]) -> (AggregateInput<'_>, Vec<u32>) {
@@ -62,7 +64,7 @@ fn cloned_append_sum_is_an_exact_cut() {
         .unwrap();
 
     assert_eq!(
-        captured.checkpoint_state().unwrap(),
+        captured.checkpoint_state(),
         vec![ScalarValue::Int64(Some(6))]
     );
     assert_eq!(live.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
@@ -70,7 +72,7 @@ fn cloned_append_sum_is_an_exact_cut() {
     let mut restored =
         ConcreteAggregateState::try_new(&spec, ConcreteInputMode::AppendOnly).unwrap();
     restored
-        .merge_checkpoint_state(&captured.checkpoint_state().unwrap())
+        .merge_checkpoint_state(&captured.checkpoint_state())
         .unwrap();
     assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(6)));
 }
@@ -89,7 +91,7 @@ fn decimal_avg_widens_running_sum_and_preserves_scale() {
         .unwrap();
     state.update_all(&[Arc::new(values)]).unwrap();
 
-    let checkpoint = state.checkpoint_state().unwrap();
+    let checkpoint = state.checkpoint_state();
     assert_eq!(
         checkpoint,
         vec![
@@ -123,7 +125,7 @@ fn weighted_arithmetic_uses_existing_checkpoint_shapes() {
     ])
     .unwrap();
     assert_eq!(
-        sum.checkpoint_state().unwrap(),
+        sum.checkpoint_state(),
         vec![
             ScalarValue::Decimal128(Some(50), 38, 0),
             ScalarValue::Int64(Some(2)),
@@ -144,7 +146,7 @@ fn weighted_arithmetic_uses_existing_checkpoint_shapes() {
     ])
     .unwrap();
     assert_eq!(
-        avg.checkpoint_state().unwrap(),
+        avg.checkpoint_state(),
         vec![
             ScalarValue::Float64(Some(50.0)),
             ScalarValue::Int64(Some(2)),
@@ -260,7 +262,7 @@ fn extrema_are_append_only_and_use_datafusion_ordering() {
     ]))])
     .unwrap();
     assert_eq!(
-        min.checkpoint_state().unwrap(),
+        min.checkpoint_state(),
         vec![ScalarValue::Utf8(Some("apple".into()))]
     );
     assert!(min.nested_retained_bytes() >= "apple".len());
@@ -268,6 +270,197 @@ fn extrema_are_append_only_and_use_datafusion_ordering() {
     let error =
         ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::Weighted).unwrap_err();
     assert!(error.to_string().contains("append-only"));
+}
+
+/// A column of each type MIN and MAX compare in place, and three types whose rows they copy, all
+/// with NULLs. The floats hold both zeros, NaNs of both signs and both infinities.
+fn extremum_columns() -> Vec<ArrayRef> {
+    const ROWS: i64 = 40;
+    let signed: ArrayRef = Arc::new(Int64Array::from_iter(
+        (0..ROWS).map(|i| (i % 7 != 3).then_some((i * 37) % 101 - 50)),
+    ));
+    let unsigned: ArrayRef = Arc::new(Int64Array::from_iter(
+        (0..ROWS).map(|i| (i % 7 != 3).then_some((i * 37) % 101)),
+    ));
+    let special = [
+        0.0,
+        -0.0,
+        f64::NAN,
+        -f64::NAN,
+        f64::from_bits(0x7ff8_0000_0000_0001),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1.5,
+        -2.5,
+    ];
+    let floats: ArrayRef = Arc::new(Float64Array::from_iter((0..ROWS).map(|i| {
+        (i % 7 != 3).then(|| special[usize::try_from(i * 5).unwrap() % special.len()])
+    })));
+    let strings: ArrayRef = Arc::new(StringArray::from_iter(
+        (0..ROWS).map(|i| (i % 5 != 2).then(|| format!("v{}", (i * 13) % 17))),
+    ));
+    let cast = |array: &ArrayRef, to: DataType| arrow::compute::cast(array, &to).unwrap();
+    let signed32 = cast(&signed, DataType::Int32);
+
+    let mut columns = vec![
+        Arc::clone(&signed),
+        Arc::clone(&floats),
+        Arc::clone(&strings),
+        Arc::new(BooleanArray::from_iter(
+            (0..ROWS).map(|i| (i % 6 != 1).then_some(i % 3 == 0)),
+        )) as ArrayRef,
+    ];
+    columns.extend(
+        [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Decimal32(9, 2),
+            DataType::Decimal64(18, 2),
+            DataType::Decimal128(20, 2),
+            DataType::Decimal256(40, 2),
+            DataType::Date64,
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+01:00".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Duration(TimeUnit::Second),
+            DataType::Duration(TimeUnit::Millisecond),
+            DataType::Duration(TimeUnit::Microsecond),
+            DataType::Duration(TimeUnit::Nanosecond),
+        ]
+        .map(|to| cast(&signed, to)),
+    );
+    columns.extend(
+        [
+            DataType::Date32,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+        ]
+        .map(|to| cast(&signed32, to)),
+    );
+    columns.extend(
+        [
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ]
+        .map(|to| cast(&unsigned, to)),
+    );
+    columns.extend([DataType::Float16, DataType::Float32].map(|to| cast(&floats, to)));
+    columns.extend(
+        [
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ]
+        .map(|to| cast(&strings, to)),
+    );
+    columns.push(Arc::new(IntervalYearMonthArray::from_iter(
+        signed32.as_primitive::<Int32Type>().iter(),
+    )));
+    columns.push(Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            (0..ROWS).map(|i| (i % 4 != 0).then(|| [u8::try_from(i % 5).unwrap(), 9])),
+            2,
+        )
+        .unwrap(),
+    ));
+    columns.push(Arc::new(StructArray::from(vec![(
+        Arc::new(Field::new("a", DataType::Int64, true)),
+        signed,
+    )])));
+    columns
+}
+
+fn datafusion_extremum(spec: &AggFuncSpec) -> Box<dyn Accumulator> {
+    if spec.udf.name() == "min" {
+        Box::new(MinAccumulator::try_new(&spec.return_type).unwrap())
+    } else {
+        Box::new(MaxAccumulator::try_new(&spec.return_type).unwrap())
+    }
+}
+
+#[test]
+fn extrema_update_and_merge_like_datafusion_on_every_type() {
+    for values in extremum_columns() {
+        for implementation in [
+            Arc::new(Min::new()) as Arc<dyn AggregateUDFImpl>,
+            Arc::new(Max::new()),
+        ] {
+            let data_type = values.data_type().clone();
+            let spec = AggFuncSpec {
+                udf: Arc::new(AggregateUDF::new_from_shared_impl(implementation)),
+                input_types: vec![data_type.clone()],
+                input_col_indices: vec![0],
+                output_name: "value".into(),
+                return_type: data_type.clone(),
+                is_count_star: false,
+                filter_col_index: None,
+            };
+            let name = format!("{} {data_type}", spec.udf.name());
+            let mut updated =
+                ConcreteAggregateState::try_new(&spec, ConcreteInputMode::AppendOnly).unwrap();
+            let mut merged = updated.clone();
+            let mut expected = datafusion_extremum(&spec);
+            for (offset, length) in [(0, 15), (15, 13), (28, 12)] {
+                let batch = values.slice(offset, length);
+                let filter = BooleanArray::from_iter(
+                    (0..length).map(|i| (i % 6 != 0).then_some(i % 6 != 5)),
+                );
+                let rows: Vec<u32> = (0..u32::try_from(length).unwrap())
+                    .filter(|row| row % 4 != 1)
+                    .collect();
+                let input = AggregateInput::new(&batch, Some(&filter), None);
+                let admitted = input.take_selected(&rows).unwrap();
+                updated.update_rows(&input, &rows).unwrap();
+                expected.update_batch(&[Arc::clone(&admitted)]).unwrap();
+                let mut delta = datafusion_extremum(&spec);
+                delta.update_batch(&[admitted]).unwrap();
+                merged
+                    .merge_checkpoint_state(&delta.state().unwrap())
+                    .unwrap();
+
+                let expected_state = expected.state().unwrap();
+                assert_eq!(updated.checkpoint_state(), expected_state, "{name}");
+                assert_eq!(merged.checkpoint_state(), expected_state, "{name} merged");
+                assert_eq!(
+                    updated.nested_retained_bytes(),
+                    expected.size() - std::mem::size_of::<ScalarValue>(),
+                    "{name} retained bytes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extremum_rejects_another_type_without_mutating() {
+    let spec = spec(Min::new(), DataType::Int64, DataType::Int64, false);
+    let mut min = ConcreteAggregateState::try_new(&spec, ConcreteInputMode::AppendOnly).unwrap();
+    let text = [ScalarValue::Utf8(Some("1".into()))];
+    assert!(min.merge_checkpoint_state(&text).is_err());
+
+    min.update_all(&[Arc::new(Int64Array::from(vec![4]))])
+        .unwrap();
+    assert!(min.merge_checkpoint_state(&text).is_err());
+    assert!(min
+        .merge_checkpoint_state(&[ScalarValue::Int32(Some(1))])
+        .is_err());
+    assert!(min
+        .update_all(&[Arc::new(Int32Array::from(vec![1]))])
+        .is_err());
+    assert_eq!(min.checkpoint_state(), vec![ScalarValue::Int64(Some(4))]);
+}
+
+#[test]
+fn extremum_state_does_not_widen_concrete_state() {
+    assert!(std::mem::size_of::<ExtremumState>() <= std::mem::size_of::<SumState>());
 }
 
 #[cfg(feature = "cluster")]
@@ -357,6 +550,14 @@ fn batch_delta_merges_like_update_rows() {
             AppendOnly,
             vec![vec![ints(&[Some(2), None])], vec![ints(&[None])]],
         ),
+        (
+            spec(Min::new(), DataType::Utf8, DataType::Utf8, false),
+            AppendOnly,
+            vec![
+                vec![Arc::new(StringArray::from(vec![Some("pear"), None])) as ArrayRef],
+                vec![Arc::new(StringArray::from(vec![Some("fig"), Some("plum")]))],
+            ],
+        ),
     ];
     for (spec, mode, batches) in cases {
         let template = ConcreteAggregateState::try_new(&spec, mode).unwrap();
@@ -369,8 +570,8 @@ fn batch_delta_merges_like_update_rows() {
                 .unwrap();
         }
         assert_eq!(
-            merged.checkpoint_state().unwrap(),
-            updated.checkpoint_state().unwrap(),
+            merged.checkpoint_state(),
+            updated.checkpoint_state(),
             "{} {mode:?}",
             spec.udf.name()
         );
@@ -435,8 +636,8 @@ fn row_updates_read_only_admitted_rows_in_place() {
         };
         copied.update_all(&copied_values).unwrap();
         assert_eq!(
-            in_place.checkpoint_state().unwrap(),
-            copied.checkpoint_state().unwrap(),
+            in_place.checkpoint_state(),
+            copied.checkpoint_state(),
             "{} weighted={weighted}",
             spec.udf.name()
         );

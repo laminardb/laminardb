@@ -64,7 +64,7 @@ impl IncrementalAggState {
             .get(..self.num_group_cols)
             .filter(|fields| !fields.is_empty())
             .ok_or_else(|| partial_shape_error("pre-aggregate schema lacks the group columns"))?;
-        let state = self.global_partial_schema()?;
+        let state = self.global_partial_schema();
         let fields = group_fields
             .iter()
             .chain(state.fields().iter())
@@ -73,8 +73,8 @@ impl IncrementalAggState {
         let arities = self
             .aggregate_templates
             .iter()
-            .map(|template| template.checkpoint_state().map(|state| state.len()))
-            .collect::<Result<_, _>>()?;
+            .map(|template| template.checkpoint_state().len())
+            .collect();
         Ok(KeyedPartialLayout {
             schema: Arc::new(Schema::new(fields)),
             arities,
