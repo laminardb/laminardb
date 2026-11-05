@@ -575,33 +575,43 @@ async fn interval_join_over_append_only_streams_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-const WINDOW_OVER_JOIN: [&str; 2] = [
-    "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
-     INNER JOIN payments p ON o.k = p.k \
-     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
-    "CREATE STREAM out AS SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, \
-     COUNT(*) AS n, SUM(pv) AS s FROM joined \
-     GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND) EMIT ON WINDOW CLOSE",
-];
+/// An interval join stream that carries its left time column, `ots`.
+pub(super) const JOINED: &str = "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS ots, p.v AS pv \
+     FROM orders o INNER JOIN payments p ON o.k = p.k \
+     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND";
 
-/// A window over an interval join stream, on the join's left time column. The join's frontier
-/// trails the sources' final watermark (1.469 s) by its 50 ms bound, so 20 ms windows close only
-/// up to 1.400 s.
+/// 20 ms windows over `joined`, after the statement's name.
+pub(super) const WINDOWS_OVER_JOINED: &str =
+    "AS SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, \
+     COUNT(*) AS n, SUM(pv) AS s FROM joined \
+     GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND) EMIT ON WINDOW CLOSE";
+
+/// The windows over `joined` that close. The join's frontier trails the sources' final watermark
+/// (1.469 s) by its 50 ms bound, so 20 ms windows close only up to 1.400 s.
+pub(super) const WINDOWS_OVER_JOINED_TRUTH: &str =
+    "SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, \
+     SUM(pv) AS s FROM \
+     (SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+      INNER JOIN payments p ON o.k = p.k \
+      AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND) \
+     WHERE ots < CAST(1400000 AS TIMESTAMP(6)) \
+     GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND)";
+
+fn window_over_join() -> Vec<String> {
+    vec![
+        JOINED.to_owned(),
+        format!("CREATE STREAM out {WINDOWS_OVER_JOINED}"),
+    ]
+}
+
+/// A window over an interval join stream, on the join's left time column.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn window_over_interval_join_is_equal() {
     let case = Case {
-        ground_truth: Some(
-            "SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, \
-             SUM(pv) AS s FROM \
-             (SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
-              INNER JOIN payments p ON o.k = p.k \
-              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND) \
-             WHERE ots < CAST(1400000 AS TIMESTAMP(6)) \
-             GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND)",
-        ),
+        ground_truth: Some(WINDOWS_OVER_JOINED_TRUTH),
         ..join_case(
             "window_over_interval_join",
-            WINDOW_OVER_JOIN.map(String::from).into(),
+            window_over_join(),
             OutputForm::Rows,
         )
     };
@@ -620,7 +630,7 @@ async fn loaded_window_over_interval_join_checkpoints_are_equal() {
         checkpoint_under_load: true,
         ..join_case(
             "loaded_window_over_interval_join",
-            WINDOW_OVER_JOIN.map(String::from).into(),
+            window_over_join(),
             OutputForm::Rows,
         )
     };

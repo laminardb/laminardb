@@ -18,10 +18,10 @@
 //! an independent snapshot oracle requires the main frozen output exactly once. All four join legs
 //! phase the matrix across faults and require connector-visible keyed aggregate results that combine
 //! pre-fault retained state with post-fault input. That phased source also closes direct TUMBLE,
-//! HOP, and SESSION state after recovery. After its kills, the three-node exact leg pauses the
-//! leader inside a checkpoint and resumes it once survivors fail over; the stale leader must fence
-//! itself without publishing (`paused_leader`). The local exact leg separately validates
-//! finite-source and retained-state recovery.
+//! HOP, and SESSION state, and a TUMBLE window over an interval join stage, after recovery. After
+//! its kills, the three-node exact leg pauses the leader inside a checkpoint and resumes it once
+//! survivors fail over; the stale leader must fence itself without publishing (`paused_leader`).
+//! The local exact leg separately validates finite-source and retained-state recovery.
 //!
 //! Ignored by default — spawns processes and runs for minutes:
 //!
@@ -828,30 +828,54 @@ const MATRIX_OUTPUT_PIPELINES: [&str; 8] = [
 struct CoreWindowCanary {
     kind: &'static str,
     pipeline: &'static str,
+    input: &'static str,
     expression: &'static str,
     emit: &'static str,
 }
 
+/// An inner interval join of the matrix sources that carries the left time column.
 #[cfg(feature = "kafka")]
-const CORE_WINDOW_CANARIES: [CoreWindowCanary; 3] = [
+const JOIN_WINDOW_INPUT: &str = "soak_window_join_input";
+
+/// A window over `JOIN_WINDOW_INPUT`. Of the canary's left ids, -101, -104 and -105 have an inner
+/// match and -102 has none.
+#[cfg(feature = "kafka")]
+const JOIN_WINDOW_CANARY: CoreWindowCanary = CoreWindowCanary {
+    kind: "join_tumble",
+    pipeline: "soak_window_over_join",
+    input: JOIN_WINDOW_INPUT,
+    expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
+    emit: "EMIT ON WINDOW CLOSE",
+};
+#[cfg(feature = "kafka")]
+const JOIN_WINDOW_ROWS: u64 = 3;
+#[cfg(feature = "kafka")]
+const JOIN_WINDOW_ID_SUM: i64 = -310;
+
+#[cfg(feature = "kafka")]
+const CORE_WINDOW_CANARIES: [CoreWindowCanary; 4] = [
     CoreWindowCanary {
         kind: "tumble",
         pipeline: "soak_window_tumble",
+        input: "soak_matrix_lhs",
         expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
         emit: "EMIT ON WINDOW CLOSE",
     },
     CoreWindowCanary {
         kind: "hop",
         pipeline: "soak_window_hop",
+        input: "soak_matrix_lhs",
         expression: "HOP(event_time, INTERVAL '500' MILLISECOND, INTERVAL '1' SECOND)",
         emit: "EMIT FINAL",
     },
     CoreWindowCanary {
         kind: "session",
         pipeline: "soak_window_session",
+        input: "soak_matrix_lhs",
         expression: "SESSION(event_time, INTERVAL '1' SECOND)",
         emit: "EMIT ON WINDOW CLOSE",
     },
+    JOIN_WINDOW_CANARY,
 ];
 
 #[cfg(feature = "kafka")]
@@ -6459,6 +6483,12 @@ fn expected_core_window_outputs(event_time_ms: u64) -> BTreeMap<CoreWindowOutput
             row_count: 4,
             id_sum: -412,
         },
+        CoreWindowOutput {
+            kind: JOIN_WINDOW_CANARY.kind.to_owned(),
+            window_start_ms: tumble_start,
+            row_count: JOIN_WINDOW_ROWS,
+            id_sum: JOIN_WINDOW_ID_SUM,
+        },
     ]
     .into_iter()
     .fold(BTreeMap::new(), |mut expected, row| {
@@ -10718,30 +10748,55 @@ fn delta_core_window_sink_config(
 }
 
 #[cfg(feature = "kafka")]
+fn core_window_canary_query(canary: &CoreWindowCanary) -> String {
+    format!(
+        "SELECT '{kind}' AS window_kind, {expression} AS window_start,
+       COUNT(*) AS row_count, SUM(id) AS id_sum
+FROM {input}
+WHERE id IN (-101, -102, -104, -105)
+GROUP BY {expression}
+{emit}",
+        kind = canary.kind,
+        input = canary.input,
+        expression = canary.expression,
+        emit = canary.emit,
+    )
+}
+
+#[cfg(feature = "kafka")]
 fn core_window_canary_pipeline_config() -> String {
+    let join_interval_ms = join_interval_ms();
+    let join_input = format!(
+        r#"
+[[pipeline]]
+name = "{JOIN_WINDOW_INPUT}"
+sql = """
+SELECT l.id AS id, l.event_time AS event_time
+FROM soak_matrix_lhs l
+JOIN soak_matrix_rhs r
+  ON l.join_key = r.join_key_2
+ AND l.join_key_2 = r.join_key
+ AND r.event_time BETWEEN l.event_time
+                          AND l.event_time + INTERVAL '{join_interval_ms}' MILLISECOND
+"""
+"#
+    );
     CORE_WINDOW_CANARIES
         .iter()
-        .map(|canary| {
-            format!(
+        .fold(join_input, |mut config, canary| {
+            config.push_str(&format!(
                 r#"
 [[pipeline]]
 name = "{pipeline}"
 sql = """
-SELECT '{kind}' AS window_kind, {expression} AS window_start,
-       COUNT(*) AS row_count, SUM(id) AS id_sum
-FROM soak_matrix_lhs
-WHERE id IN (-101, -102, -104, -105)
-GROUP BY {expression}
-{emit}
+{query}
 """
 "#,
-                kind = canary.kind,
                 pipeline = canary.pipeline,
-                expression = canary.expression,
-                emit = canary.emit,
-            )
+                query = core_window_canary_query(canary),
+            ));
+            config
         })
-        .collect()
 }
 
 #[cfg(feature = "kafka")]
@@ -19472,10 +19527,20 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
     );
     let config = std::fs::read_to_string(path).unwrap();
     let parsed: toml::Table = config.parse().unwrap();
-    assert!(parsed["sql"]
-        .as_str()
+    let views = parsed["sql"].as_str().unwrap();
+    assert!(views.contains("CREATE MATERIALIZED VIEW soak_view_rows"));
+    assert!(
+        views.contains("CREATE MATERIALIZED VIEW soak_view_join_windows AS\nSELECT 'join_tumble'")
+    );
+    let pipelines = parsed["pipeline"]
+        .as_array()
         .unwrap()
-        .contains("CREATE MATERIALIZED VIEW soak_view_rows"));
+        .iter()
+        .map(|pipeline| pipeline["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    for name in [JOIN_WINDOW_INPUT, JOIN_WINDOW_CANARY.pipeline] {
+        assert!(pipelines.contains(&name), "{name}: {pipelines:?}");
+    }
     assert_eq!(
         parsed["server"]["pgwire_bind"].as_str(),
         Some(format!("127.0.0.1:{}", view_reads::pgwire_port(0)).as_str())
@@ -19768,6 +19833,12 @@ fn recovery_canary_event_time_holds_ordered_and_window_cuts_open() {
             id_sum: -412,
         }));
     }
+    assert!(expected.contains_key(&CoreWindowOutput {
+        kind: "join_tumble".to_owned(),
+        window_start_ms: 12_000,
+        row_count: 3,
+        id_sum: -101 - 104 - 105,
+    }));
 }
 
 #[cfg(feature = "kafka")]
