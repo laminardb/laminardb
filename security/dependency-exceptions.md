@@ -1,7 +1,8 @@
 # Temporary dependency exceptions
 
 Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27,
-re-approved 2026-10-31; all expire at 2026-11-30 UTC (CI fails on that date).
+re-approved 2026-10-31, two unmaintained-crate exceptions added 2026-11-05; all expire at
+2026-11-30 UTC (CI fails on that date).
 Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
 The four residual exceptions below were re-reviewed and accepted for this interval under S4.
 Machine-readable versions, sources, checksums and reasons are in `dependency-exceptions.json`.
@@ -12,6 +13,8 @@ Machine-readable versions, sources, checksums and reasons are in `dependency-exc
 | [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | paste 1.0.15 | Unmaintained compile-time dependency through DataFusion/Parquet/tokenizers. |
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | proc-macro-error2 2.0.1 | Unmaintained compile-time dependency through validator_derive in Delta Lake. |
 | [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384.html) | instant 0.1.13 | Unmaintained dependency in the wider lockfile, including reqwest-retry/wasm-timer and old parking_lot. |
+| [RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440.html) | astral-tokio-tar 0.6.2 | Unmaintained since 2026-11-03, no maintained release. Test-only: reached through testcontainers 0.27.2 (0.28.0 still requires it), a laminar-connectors dev-dependency; no shipped build compiles it. |
+| [RUSTSEC-2026-0441](https://rustsec.org/advisories/RUSTSEC-2026-0441.html) | pin-utils 0.1.0 | Unmaintained since 2026-10-01. hyper and the AWS smithy crates were updated off it; it remains in the lockfile only under wasm-timer for reqwest-retry 0.7.0 (Delta Lake's Unity catalog), a `wasm32`-only dependency no build target compiles. |
 
 Thirteen zstd advisories published in October 2026 were excepted on 2026-10-27 ([PR #637](https://github.com/laminardb/laminardb/pull/637)),
 with the same deadline. They are fixed only in zstd 0.14.3 and zstd-safe 8.2.0, but DataFusion
