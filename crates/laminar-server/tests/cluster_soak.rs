@@ -18,10 +18,11 @@
 //! an independent snapshot oracle requires the main frozen output exactly once. All four join legs
 //! phase the matrix across faults and require connector-visible keyed aggregate results that combine
 //! pre-fault retained state with post-fault input. That phased source also closes direct TUMBLE,
-//! HOP, and SESSION state, and a TUMBLE window over an interval join stage, after recovery. After
-//! its kills, the three-node exact leg pauses the leader inside a checkpoint and resumes it once
-//! survivors fail over; the stale leader must fence itself without publishing (`paused_leader`).
-//! The local exact leg separately validates finite-source and retained-state recovery.
+//! HOP, and SESSION state, and TUMBLE windows over an interval join and over a three-way interval
+//! join chain, after recovery. After its kills, the three-node exact leg pauses the leader inside
+//! a checkpoint and resumes it once survivors fail over; the stale leader must fence itself
+//! without publishing (`paused_leader`). The local exact leg separately validates finite-source
+//! and retained-state recovery.
 //!
 //! Ignored by default — spawns processes and runs for minutes:
 //!
@@ -852,8 +853,30 @@ const JOIN_WINDOW_ROWS: u64 = 3;
 #[cfg(feature = "kafka")]
 const JOIN_WINDOW_ID_SUM: i64 = -310;
 
+/// The matrix's right rows as a stream, the third input of `CHAIN_WINDOW_INPUT`.
 #[cfg(feature = "kafka")]
-const CORE_WINDOW_CANARIES: [CoreWindowCanary; 4] = [
+const CHAIN_WINDOW_RIGHT: &str = "soak_window_chain_right";
+
+/// `JOIN_WINDOW_INPUT`'s join, then an interval join with `CHAIN_WINDOW_RIGHT` on the right id. It
+/// splits into a stage for the first join and an owner that runs the second, reading
+/// `CHAIN_WINDOW_RIGHT` directly; the second join repartitions on another key.
+#[cfg(feature = "kafka")]
+const CHAIN_WINDOW_INPUT: &str = "soak_window_chain_input";
+
+/// A window over `CHAIN_WINDOW_INPUT`. Each matched pair meets its right row again in the third
+/// input, so it closes the same window as `JOIN_WINDOW_CANARY`. Left -105 arrives after the faults
+/// and matches -205 in the stage's restored right state, then in the owner's.
+#[cfg(feature = "kafka")]
+const CHAIN_WINDOW_CANARY: CoreWindowCanary = CoreWindowCanary {
+    kind: "chain_tumble",
+    pipeline: "soak_window_over_chain",
+    input: CHAIN_WINDOW_INPUT,
+    expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
+    emit: "EMIT ON WINDOW CLOSE",
+};
+
+#[cfg(feature = "kafka")]
+const CORE_WINDOW_CANARIES: [CoreWindowCanary; 5] = [
     CoreWindowCanary {
         kind: "tumble",
         pipeline: "soak_window_tumble",
@@ -876,6 +899,7 @@ const CORE_WINDOW_CANARIES: [CoreWindowCanary; 4] = [
         emit: "EMIT ON WINDOW CLOSE",
     },
     JOIN_WINDOW_CANARY,
+    CHAIN_WINDOW_CANARY,
 ];
 
 #[cfg(feature = "kafka")]
@@ -6489,6 +6513,12 @@ fn expected_core_window_outputs(event_time_ms: u64) -> BTreeMap<CoreWindowOutput
             row_count: JOIN_WINDOW_ROWS,
             id_sum: JOIN_WINDOW_ID_SUM,
         },
+        CoreWindowOutput {
+            kind: CHAIN_WINDOW_CANARY.kind.to_owned(),
+            window_start_ms: tumble_start,
+            row_count: JOIN_WINDOW_ROWS,
+            id_sum: JOIN_WINDOW_ID_SUM,
+        },
     ]
     .into_iter()
     .fold(BTreeMap::new(), |mut expected, row| {
@@ -10766,24 +10796,43 @@ GROUP BY {expression}
 #[cfg(feature = "kafka")]
 fn core_window_canary_pipeline_config() -> String {
     let join_interval_ms = join_interval_ms();
-    let join_input = format!(
-        r#"
-[[pipeline]]
-name = "{JOIN_WINDOW_INPUT}"
-sql = """
-SELECT l.id AS id, l.event_time AS event_time
+    let join = format!(
+        "SELECT l.id AS id, l.event_time AS event_time
 FROM soak_matrix_lhs l
 JOIN soak_matrix_rhs r
   ON l.join_key = r.join_key_2
  AND l.join_key_2 = r.join_key
  AND r.event_time BETWEEN l.event_time
+                          AND l.event_time + INTERVAL '{join_interval_ms}' MILLISECOND"
+    );
+    let inputs = format!(
+        r#"
+[[pipeline]]
+name = "{JOIN_WINDOW_INPUT}"
+sql = """
+{join}
+"""
+
+[[pipeline]]
+name = "{CHAIN_WINDOW_RIGHT}"
+sql = """
+SELECT id, event_time FROM soak_matrix_rhs
+"""
+
+[[pipeline]]
+name = "{CHAIN_WINDOW_INPUT}"
+sql = """
+{join}
+JOIN {CHAIN_WINDOW_RIGHT} c
+  ON r.id = c.id
+ AND c.event_time BETWEEN l.event_time
                           AND l.event_time + INTERVAL '{join_interval_ms}' MILLISECOND
 """
 "#
     );
     CORE_WINDOW_CANARIES
         .iter()
-        .fold(join_input, |mut config, canary| {
+        .fold(inputs, |mut config, canary| {
             config.push_str(&format!(
                 r#"
 [[pipeline]]
@@ -19532,13 +19581,21 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
     assert!(
         views.contains("CREATE MATERIALIZED VIEW soak_view_join_windows AS\nSELECT 'join_tumble'")
     );
+    assert!(views
+        .contains("CREATE MATERIALIZED VIEW soak_view_chain_windows AS\nSELECT 'chain_tumble'"));
     let pipelines = parsed["pipeline"]
         .as_array()
         .unwrap()
         .iter()
         .map(|pipeline| pipeline["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    for name in [JOIN_WINDOW_INPUT, JOIN_WINDOW_CANARY.pipeline] {
+    for name in [
+        JOIN_WINDOW_INPUT,
+        JOIN_WINDOW_CANARY.pipeline,
+        CHAIN_WINDOW_RIGHT,
+        CHAIN_WINDOW_INPUT,
+        CHAIN_WINDOW_CANARY.pipeline,
+    ] {
         assert!(pipelines.contains(&name), "{name}: {pipelines:?}");
     }
     assert_eq!(
@@ -19833,12 +19890,14 @@ fn recovery_canary_event_time_holds_ordered_and_window_cuts_open() {
             id_sum: -412,
         }));
     }
-    assert!(expected.contains_key(&CoreWindowOutput {
-        kind: "join_tumble".to_owned(),
-        window_start_ms: 12_000,
-        row_count: 3,
-        id_sum: -101 - 104 - 105,
-    }));
+    for kind in ["join_tumble", "chain_tumble"] {
+        assert!(expected.contains_key(&CoreWindowOutput {
+            kind: kind.to_owned(),
+            window_start_ms: 12_000,
+            row_count: 3,
+            id_sum: -101 - 104 - 105,
+        }));
+    }
 }
 
 #[cfg(feature = "kafka")]
