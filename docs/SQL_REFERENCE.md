@@ -279,10 +279,12 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
   projection/filter subqueries are not supported by the flattened pair projection.
 - Outer and anti unmatched rows become final only when the opposite input watermark closes their
   possible match interval.
-- Cross, unbounded, general non-equality, intermediate-input, and multi-way joins fail closed on
-  this bounded stream-stream path. `FOR SYSTEM_TIME AS OF` and `TEMPORAL PROBE JOIN` use the
-  separate managed vnode-keyed temporal path for one direct `INNER` or `LEFT` join in single-node
-  and cluster mode. `ASOF JOIN` is not an alias; use `FOR SYSTEM_TIME AS OF`.
+- Cross, unbounded, general non-equality, and intermediate-input joins fail closed on this bounded
+  stream-stream path, and so does a join of three or more inputs unless it is a chain of interval
+  joins over named inputs, which is split into stages (below). `FOR SYSTEM_TIME AS OF` and
+  `TEMPORAL PROBE JOIN` use the separate managed vnode-keyed temporal path for one direct `INNER`
+  or `LEFT` join in single-node and cluster mode. `ASOF JOIN` is not an alias; use
+  `FOR SYSTEM_TIME AS OF`.
 
 To aggregate rows from any of the eight kinds, name the join output and create a separate keyed
 aggregate stage:
@@ -420,8 +422,22 @@ GROUP BY trade_count;
   `RIGHT SEMI` and `RIGHT ANTI`. A `FULL` join's output carries none. Its watermark trails the
   inputs' by the join bound, so a window or another interval join can read that column without
   late rows.
-- A join of three or more inputs needs named two-way stages, each later join's time condition on
-  the previous stage's event-time column.
+- A chain of interval joins over three or more named inputs (`a JOIN b ON .. JOIN c ON ..`, each
+  `ON` with a `BETWEEN` bound) is split into one stage per join: the first joins `a` and `b`, and
+  each later one joins the stage before it with the next input. Each stage projects the columns
+  read after it as `<qualifier>_<column>`, so every column must carry its input qualifier. Without
+  an aggregate the stream itself runs the last join and `WHERE` filters it; an aggregate or window
+  reads the last join's stage, which `WHERE` filters.
+- Each later join's `BETWEEN` must bound its time by the event-time column of the stage it reads,
+  chosen as for any join output (above) among the columns the stage projects. An inner join's
+  stage carries its left input's time column when anything after the join reads it, otherwise its
+  right input's: a chain whose second join is bounded by `b.ts` in `a JOIN b ON .. b.ts BETWEEN
+  a.ts AND ..` works only if nothing after the first join reads `a.ts`. Otherwise `CREATE` fails
+  and names the column the stage carries.
+- A window over a join or a chain in the same statement reads the last join's stage. In cluster
+  mode it must window on the time column that stage carries.
+- Other joins of three or more inputs, such as one with a lookup or temporal table, `USING`, or a
+  subquery input, need named two-way stages.
 
 ### Spreading a hot key
 
@@ -580,8 +596,9 @@ aggregates. A cluster window reads a source, or an append-only stream that carri
 column: a projection that forwards a source's, an interval join other than `FULL`, or a closed
 `TUMBLE` or `HOP` window. It windows on that column, requires a bounded watermark on it, and needs
 `EMIT ON WINDOW CLOSE` or `EMIT FINAL`. An interval join may read another interval join's
-stream on that stream's event-time column. A join output may feed a keyed aggregate, either as a named stream or in
-one statement that is split into stages; windowed joins remain rejected. A stream may sit at most
+stream on that stream's event-time column. A join output may feed a keyed aggregate or a window,
+either as a named stream or in one statement that is split into stages, and a chain of interval
+joins over three or more inputs is split the same way. A stream may sit at most
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
 which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
@@ -590,8 +607,8 @@ Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admit
 - a keyed or global aggregate view;
 - a projection or filter over such a view, keeping or dropping its key columns;
 - an append-only view: a projection over a source, a closed window, or an interval join;
-- an aggregate over one two-way join or over an aggregating or joining subquery, split into
-  stages as for a stream.
+- a chain of interval joins, an aggregate or window over a join or a chain, or an aggregate over
+  an aggregating or joining subquery, split into stages as for a stream.
 
 Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
 moves them with their vnodes when ownership changes. A view that drops or changes its input's

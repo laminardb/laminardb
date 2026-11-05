@@ -444,11 +444,6 @@ impl LaminarDB {
                 "ALLOW LATENESS is not certified for cluster windows; omit it to close windows at the watermark",
             ));
         }
-        if plan.join_config.is_some() || crate::sql_analysis::has_join_clause(query_sql) {
-            return Err(reject(
-                "a windowed join requires a planner-certified combined join/window vnode lifecycle",
-            ));
-        }
         let input = crate::sql_analysis::managed_core_window_input(query_sql, window)
             .ok_or_else(|| {
                 reject(

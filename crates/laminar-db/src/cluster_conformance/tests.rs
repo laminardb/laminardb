@@ -809,6 +809,138 @@ async fn interval_join_over_interval_join_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+fn chain_sources(batches: i64) -> Vec<FixtureSource> {
+    vec![
+        events_with("orders", 0, batches),
+        events_with("payments", 3, batches),
+        events_with("refunds", 5, batches),
+        events_with("shipments", 7, batches),
+    ]
+}
+
+/// A three-way interval join splits into a join stage and the owner's join over it.
+const THREE_WAY_JOIN: &str = "SELECT o.k AS k, p.v AS pv, r.v AS rv FROM orders o \
+     INNER JOIN payments p ON o.k = p.k \
+     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+     INNER JOIN refunds r ON o.k = r.k \
+     AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND";
+
+/// Three remote exchanges: the joins repartition on `k` and then `v`, the aggregate on `r.k`.
+pub(super) const THREE_WAY_TOTALS: &str =
+    "SELECT r.k AS k, COUNT(*) AS n, SUM(o.v) AS s FROM orders o \
+     INNER JOIN payments p ON o.k = p.k \
+     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+     INNER JOIN refunds r ON p.v = r.v \
+     AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND \
+     GROUP BY r.k";
+
+fn chain_case(name: &'static str, stream: String, form: OutputForm) -> Case {
+    Case {
+        sources: chain_sources(BATCHES_PER_PARTITION),
+        ..join_case(name, vec![stream], form)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_way_interval_join_is_equal() {
+    let case = Case {
+        ground_truth: Some(THREE_WAY_JOIN),
+        ..chain_case(
+            "three_way_interval_join",
+            format!("CREATE STREAM out AS {THREE_WAY_JOIN}"),
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+fn three_way_totals_case(name: &'static str) -> Case {
+    Case {
+        ground_truth: Some(THREE_WAY_TOTALS),
+        ..chain_case(
+            name,
+            format!("CREATE STREAM out AS {THREE_WAY_TOTALS} EMIT CHANGES"),
+            OutputForm::Changelog,
+        )
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_way_join_aggregate_is_equal() {
+    let case = three_way_totals_case("three_way_join_aggregate");
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Checkpoints taken while rows still cross both join stages and the aggregate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loaded_three_way_join_aggregate_checkpoints_are_equal() {
+    let case = Case {
+        sources: chain_sources(200),
+        checkpoint_under_load: true,
+        ..three_way_totals_case("loaded_three_way_join_aggregate")
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A fourth join on another key puts the aggregate four remote exchanges from the sources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_way_join_aggregate_is_rejected_in_cluster() {
+    let case = chain_case(
+        "four_way_join_aggregate",
+        "CREATE STREAM out AS SELECT s.v AS v, COUNT(*) AS n FROM orders o \
+         INNER JOIN payments p ON o.k = p.k \
+         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+         INNER JOIN refunds r ON p.v = r.v \
+         AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND \
+         INNER JOIN shipments s ON r.k = s.k \
+         AND s.ts BETWEEN o.ts AND o.ts + INTERVAL '20' MILLISECOND \
+         GROUP BY s.v EMIT CHANGES"
+            .into(),
+        OutputForm::Changelog,
+    );
+    assert_rejected(verdict(case).await, "crosses 4 remote exchanges");
+}
+
+/// The first join's stage carries its left time, `o.ts`, so a later join bounded by `p.ts` reads
+/// a column whose watermark nothing holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_chain_on_a_time_its_stage_does_not_carry_is_rejected() {
+    let case = chain_case(
+        "join_chain_on_uncarried_time",
+        "CREATE STREAM out AS SELECT o.k AS k, o.ts AS ots, r.v AS rv FROM orders o \
+         INNER JOIN payments p ON o.k = p.k \
+         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+         INNER JOIN refunds r ON o.k = r.k \
+         AND r.ts BETWEEN p.ts AND p.ts + INTERVAL '30' MILLISECOND"
+            .into(),
+        OutputForm::Rows,
+    );
+    assert!(matches!(
+        verdict(case).await,
+        Verdict::UnsupportedEverywhere(reason)
+            if reason.contains("'out$stage1' must carry an event-time watermark on 'p_ts' but carries 'o_ts'")
+    ));
+}
+
+/// A window and a join in one statement split into a join stage and the window over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windowed_join_is_equal() {
+    let case = Case {
+        ground_truth: Some(WINDOWS_OVER_JOINED_TRUTH),
+        ..join_case(
+            "windowed_join",
+            vec!["CREATE STREAM out AS SELECT o.k % 4 AS g, \
+                 tumble(o.ts, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, SUM(p.v) AS s \
+                 FROM orders o INNER JOIN payments p ON o.k = p.k \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+                 GROUP BY o.k % 4, tumble(o.ts, INTERVAL '20' MILLISECOND) EMIT ON WINDOW CLOSE"
+                .into()],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Join kinds whose output distribution differs (null-extended rows are placed by the side that
 /// is present). Differential only: unmatched rows near the final watermark stay open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

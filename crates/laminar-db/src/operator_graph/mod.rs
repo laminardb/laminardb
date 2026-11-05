@@ -27,8 +27,7 @@ use crate::operator::capability::{OperatorCapability, OperatorImplementation, Op
 use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
     apply_topk_filter, detect_stream_join_query, detect_unbounded_join_steps,
-    extract_table_references, has_join_clause, join_clause_count, temporal_projection_sql,
-    StreamJoinDetection,
+    extract_table_references, has_join_clause, temporal_projection_sql, StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -2180,13 +2179,6 @@ impl OperatorGraph {
         incremental: bool,
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
-
-        if join_clause_count(&sql) > 1 {
-            self.build_errors.push(DbError::InvalidOperation(
-                "multi-way streaming joins require explicitly named two-way stages".to_string(),
-            ));
-            return;
-        }
 
         let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
         if ai_calls.len() > 1 {

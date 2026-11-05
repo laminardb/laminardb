@@ -910,7 +910,9 @@ fn validate_streaming_joins(
 ) -> Result<(), PlanningError> {
     if multi.joins.len() != 1 {
         return Err(PlanningError::InvalidQuery(
-            "multi-way streaming joins require explicitly named two-way stages".to_string(),
+            "multi-way streaming joins split into stages only as a chain of interval joins \
+             over named inputs; write other multi-way joins as explicitly named two-way stages"
+                .to_string(),
         ));
     }
     for step in &multi.joins {
