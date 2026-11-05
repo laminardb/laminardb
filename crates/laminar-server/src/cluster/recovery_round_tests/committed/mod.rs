@@ -1,5 +1,5 @@
-//! Independent database processes recover aggregates and process functions through the existing
-//! shared checkpoint, assignment and recovery lifecycle.
+//! Independent database processes recover aggregates, split interval-join chains and process
+//! functions through the existing shared checkpoint, assignment and recovery lifecycle.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
