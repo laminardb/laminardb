@@ -950,6 +950,46 @@ async fn windowed_join_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// A three-way join stream named `joined`: its owner runs the second join, on `p.v`, over the
+/// first join's stage.
+pub(super) const JOINED_CHAIN: &str = "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS ots, \
+     p.v AS pv FROM orders o INNER JOIN payments p ON o.k = p.k \
+     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+     INNER JOIN refunds r ON p.v = r.v \
+     AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND";
+
+/// The windows over `JOINED_CHAIN` that close. Its frontier trails the final watermark by the
+/// first join's 50 ms bound, so the same windows close as over the two-way join.
+pub(super) const WINDOWS_OVER_JOINED_CHAIN_TRUTH: &str =
+    "SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, \
+     SUM(pv) AS s FROM \
+     (SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+      INNER JOIN payments p ON o.k = p.k \
+      AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+      INNER JOIN refunds r ON p.v = r.v \
+      AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND) \
+     WHERE ots < CAST(1400000 AS TIMESTAMP(6)) \
+     GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND)";
+
+/// A window over a three-way join stream, three remote exchanges from the sources: the joins
+/// repartition on `k` and `v`, the window on `k % 4`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_over_three_way_join_is_equal() {
+    let case = Case {
+        sources: chain_sources(3, BATCHES_PER_PARTITION),
+        ground_truth: Some(WINDOWS_OVER_JOINED_CHAIN_TRUTH),
+        ..join_case(
+            "window_over_three_way_join",
+            vec![
+                JOINED_CHAIN.to_owned(),
+                format!("CREATE STREAM out {WINDOWS_OVER_JOINED}"),
+            ],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Join kinds whose output distribution differs (null-extended rows are placed by the side that
 /// is present). Differential only: unmatched rows near the final watermark stay open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
