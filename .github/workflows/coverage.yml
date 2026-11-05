@@ -46,9 +46,9 @@ jobs:
           docker-images: true
           swap-storage: false
       - name: Set swap space
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

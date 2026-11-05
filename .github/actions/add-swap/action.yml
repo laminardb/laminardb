@@ -1,0 +1,21 @@
+name: Add swap
+description: Add a swap file next to the runner's existing swap
+inputs:
+  size-gb:
+    description: Size of the added swap file in GiB
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Runner images may provide swap as a zram device, which an action that replaces the
+      # existing swap file deletes and cannot recreate. Prefer the temporary disk when the
+      # image mounts one, so the file does not take space from builds on the root filesystem.
+      run: |
+        if mountpoint -q /mnt; then swap_file=/mnt/ci-swapfile; else swap_file=/ci-swapfile; fi
+        sudo fallocate -l "${{ inputs.size-gb }}G" "$swap_file"
+        sudo chmod 600 "$swap_file"
+        sudo mkswap "$swap_file"
+        sudo swapon "$swap_file"
+        swapon --show
+        free -h
