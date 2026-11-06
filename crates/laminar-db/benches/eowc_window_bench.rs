@@ -1,11 +1,15 @@
 //! Local `EMIT ON WINDOW CLOSE` window cycle benchmark: compiled pre-aggregation, per-window
 //! accumulators in per-vnode state, and window close and emit.
 //!
-//! Each cycle feeds 4,096 rows over 1,024 `BIGINT` keys with COUNT/SUM/AVG, spread over a fresh
-//! one-second span, and the watermark reaches the span's start. `tumble` (one-second windows)
-//! closes the previous span's window; `hop` (four-second windows every second) assigns each row
-//! to four windows and closes the one that ends at the span's start. Every cycle emits one row per
-//! key, so retained state stays at steady state across iterations.
+//! Each cycle feeds 4,096 rows over 1,024 `BIGINT` keys, spread over a fresh one-second span, and
+//! the watermark reaches the span's start. Every cycle emits one row per key, so retained state
+//! stays at steady state across iterations.
+//! - `tumble` (COUNT/SUM/AVG, one-second windows) closes the previous span's window.
+//! - `tumble_min_max` is `tumble` with MIN of a `BIGINT` and MAX of a `DOUBLE` column.
+//! - `hop` (COUNT/SUM/AVG, four-second windows every second) assigns each row to four windows and
+//!   closes the one that ends at the span's start.
+//! - `session` (COUNT/SUM/AVG, 200 ms gap) spreads the rows over the span's first half, so each
+//!   key's four rows extend one session that closes before the next span.
 //!
 //! Run with: `cargo bench -p laminar-db --features benchmark-internals --bench eowc_window_bench`
 
@@ -38,7 +42,7 @@ fn schema() -> SchemaRef {
     ]))
 }
 
-fn span(base: i64) -> RecordBatch {
+fn span(base: i64, spread_ms: i64) -> RecordBatch {
     RecordBatch::try_new(
         schema(),
         vec![
@@ -53,7 +57,7 @@ fn span(base: i64) -> RecordBatch {
             )),
             Arc::new(TimestampMillisecondArray::from(
                 (0..ROWS as i64)
-                    .map(|i| base + i * SPAN_MS / ROWS as i64)
+                    .map(|i| base + i * spread_ms / ROWS as i64)
                     .collect::<Vec<_>>(),
             )),
         ],
@@ -68,11 +72,19 @@ fn bench_eowc_cycle(c: &mut Criterion) {
         .unwrap();
     let mut group = c.benchmark_group("window/eowc_cycle");
     group.throughput(Throughput::Elements(ROWS as u64));
-    for (name, window, sql) in [
+    for (name, window, spread_ms, sql) in [
         (
             "tumble",
             WindowOperatorConfig::tumbling("ts".into(), Duration::from_secs(1)),
+            SPAN_MS,
             "SELECT k, COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events \
+             GROUP BY k, TUMBLE(ts, INTERVAL '1' SECOND)",
+        ),
+        (
+            "tumble_min_max",
+            WindowOperatorConfig::tumbling("ts".into(), Duration::from_secs(1)),
+            SPAN_MS,
+            "SELECT k, MIN(v) AS lo, MAX(p) AS hi FROM events \
              GROUP BY k, TUMBLE(ts, INTERVAL '1' SECOND)",
         ),
         (
@@ -82,8 +94,16 @@ fn bench_eowc_cycle(c: &mut Criterion) {
                 Duration::from_secs(4),
                 Duration::from_secs(1),
             ),
+            SPAN_MS,
             "SELECT k, COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events \
              GROUP BY k, HOP(ts, INTERVAL '1' SECOND, INTERVAL '4' SECOND)",
+        ),
+        (
+            "session",
+            WindowOperatorConfig::session("ts".into(), Duration::from_millis(200)),
+            SPAN_MS / 2,
+            "SELECT k, COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events \
+             GROUP BY k, SESSION(ts, INTERVAL '200' MILLISECOND)",
         ),
     ] {
         let ctx = laminar_sql::create_session_context();
@@ -95,7 +115,8 @@ fn bench_eowc_cycle(c: &mut Criterion) {
             .unwrap();
         for cycle in 0..WARM_SPANS {
             let base = cycle * SPAN_MS;
-            rt.block_on(window.process(span(base), base)).unwrap();
+            rt.block_on(window.process(span(base, spread_ms), base))
+                .unwrap();
         }
         let mut cycle = WARM_SPANS;
         group.bench_function(name, |b| {
@@ -103,7 +124,7 @@ fn bench_eowc_cycle(c: &mut Criterion) {
                 || {
                     let base = cycle * SPAN_MS;
                     cycle += 1;
-                    (span(base), base)
+                    (span(base, spread_ms), base)
                 },
                 |(batch, watermark)| {
                     let output = rt.block_on(window.process(batch, watermark)).unwrap();

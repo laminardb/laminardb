@@ -511,3 +511,33 @@ async fn outcome_cannot_authorize_a_different_valid_index() {
         .to_string()
         .contains("does not bind the supplied committed checkpoint index"));
 }
+
+/// A cut bound to another pipeline identity, such as one written under an earlier state frame
+/// ABI, fails closed.
+#[tokio::test]
+async fn a_cut_bound_to_another_pipeline_identity_fails_closed() {
+    let fixture = committed_checkpoint().await;
+    let runtime_identity = laminar_core::checkpoint::PipelineIdentity {
+        canonical_version: fixture.manifest.pipeline_identity.canonical_version,
+        sha256: "ab".repeat(32),
+    };
+    assert_ne!(runtime_identity, fixture.committed.pipeline_identity);
+    let manager = RecoveryManager::new(
+        &fixture.store,
+        &runtime_identity,
+        DEPLOYMENT_ID,
+        CheckpointScope::Local,
+    );
+
+    let error = manager
+        .recover_committed(&fixture.outcome, &fixture.committed)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not match runtime identity"),
+        "{error}"
+    );
+}

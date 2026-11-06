@@ -8,13 +8,11 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{Array, ArrayRef};
-use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
-use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::AggregateUDF;
 use laminar_core::state::{KeyGroupCount, PartitionKeyCodecV1};
 
@@ -65,7 +63,7 @@ use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 /// Builds the per-window result batch for one closed window.
 /// Output schema: `[group_cols..., agg_outputs...]`.
 pub(crate) fn emit_window_batch(
-    groups: FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    groups: FxHashMap<arrow::row::OwnedRow, Vec<ConcreteAggregateState>>,
     row_converter: &arrow::row::RowConverter,
     num_group_cols: usize,
     agg_specs: &[AggFuncSpec],
@@ -85,10 +83,7 @@ pub(crate) fn emit_window_batch(
     for (key, mut accs) in groups {
         row_keys.push(key);
         for (i, acc) in accs.iter_mut().enumerate() {
-            let sv = acc
-                .evaluate()
-                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
-            agg_scalars[i].push(sv);
+            agg_scalars[i].push(acc.evaluate()?);
         }
     }
 
@@ -136,48 +131,6 @@ pub(crate) struct AggFuncSpec {
     pub(crate) return_type: DataType,
     pub(crate) is_count_star: bool,
     pub(crate) filter_col_index: Option<usize>,
-}
-
-impl AggFuncSpec {
-    pub(crate) fn create_accumulator(
-        &self,
-    ) -> Result<Box<dyn datafusion_expr::Accumulator>, DbError> {
-        let return_field = Arc::new(Field::new(
-            &self.output_name,
-            self.return_type.clone(),
-            true,
-        ));
-        let schema = Schema::new(
-            self.input_types
-                .iter()
-                .enumerate()
-                .map(|(i, dt)| Field::new(format!("col_{i}"), dt.clone(), true))
-                .collect::<Vec<_>>(),
-        );
-        let expr_fields: Vec<Arc<Field>> = self
-            .input_types
-            .iter()
-            .enumerate()
-            .map(|(i, dt)| Arc::new(Field::new(format!("col_{i}"), dt.clone(), true)))
-            .collect();
-        let args = AccumulatorArgs {
-            return_field,
-            schema: &schema,
-            ignore_nulls: false,
-            order_bys: &[],
-            is_reversed: false,
-            name: self.udf.name(),
-            is_distinct: false,
-            exprs: &[],
-            expr_fields: &expr_fields,
-        };
-        self.udf.accumulator(args).map_err(|e| {
-            DbError::Pipeline(format!(
-                "accumulator creation failed for '{}': {e}",
-                self.udf.name()
-            ))
-        })
-    }
 }
 
 fn decimal_fits_managed_checkpoint_ipc(precision: u8, scale: i8, maximum: u8) -> bool {
@@ -565,7 +518,7 @@ fn decode_columnar_state_scalars(
     Ok(out)
 }
 
-fn build_concrete_states_from_checkpoint(
+pub(crate) fn build_concrete_states_from_checkpoint(
     templates: &[ConcreteAggregateState],
     checkpoint: &[Vec<ScalarValue>],
 ) -> Result<Vec<ConcreteAggregateState>, DbError> {
@@ -1650,7 +1603,7 @@ impl IncrementalAggState {
         Ok(next)
     }
 
-    fn update_concrete_accumulators(
+    pub(crate) fn update_concrete_accumulators(
         states: &mut [ConcreteAggregateState],
         inputs: &[AggregateInput<'_>],
         rows: &[u32],
@@ -1666,119 +1619,6 @@ impl IncrementalAggState {
             .iter_mut()
             .zip(inputs)
             .try_for_each(|(state, input)| state.update_rows(input, rows))
-    }
-
-    /// Temporary adapter for window state until it adopts the concrete vnode representation.
-    pub(crate) fn update_group_accumulators(
-        accs: &mut [Box<dyn datafusion_expr::Accumulator>],
-        batch: &RecordBatch,
-        indices: &[u32],
-        agg_specs: &[AggFuncSpec],
-        weight_col_idx: Option<usize>,
-    ) -> Result<(), DbError> {
-        if accs.len() != agg_specs.len() {
-            return Err(DbError::Pipeline(format!(
-                "window aggregate state arity mismatch: {} accumulators vs {} specifications",
-                accs.len(),
-                agg_specs.len()
-            )));
-        }
-        Self::for_each_aggregate_input(
-            batch,
-            indices,
-            agg_specs,
-            weight_col_idx,
-            |index, values| {
-                accs[index]
-                    .update_batch(values)
-                    .map_err(|error| DbError::Pipeline(format!("accumulator update: {error}")))
-            },
-        )
-    }
-
-    fn for_each_aggregate_input(
-        batch: &RecordBatch,
-        indices: &[u32],
-        agg_specs: &[AggFuncSpec],
-        weight_col_idx: Option<usize>,
-        mut update: impl FnMut(usize, &[ArrayRef]) -> Result<(), DbError>,
-    ) -> Result<(), DbError> {
-        let index_array = arrow::array::UInt32Array::from(indices.to_vec());
-
-        let weight_arr = if let Some(w_idx) = weight_col_idx {
-            let weight = batch.columns().get(w_idx).ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "aggregate weight column {w_idx} is outside a {}-column batch",
-                    batch.num_columns()
-                ))
-            })?;
-            Some(
-                compute::take(weight, &index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("weight take: {e}")))?,
-            )
-        } else {
-            None
-        };
-
-        for (i, spec) in agg_specs.iter().enumerate() {
-            let input_capacity = spec.input_col_indices.len() + usize::from(weight_arr.is_some());
-            let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(input_capacity);
-            for &col_idx in &spec.input_col_indices {
-                let column = batch.columns().get(col_idx).ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "aggregate input column {col_idx} is outside a {}-column batch",
-                        batch.num_columns()
-                    ))
-                })?;
-                let arr = compute::take(column, &index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("array take failed: {e}")))?;
-                input_arrays.push(arr);
-            }
-
-            let filtered_weight = if let Some(filter_idx) = spec.filter_col_index {
-                let filter_column = batch.columns().get(filter_idx).ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "aggregate filter column {filter_idx} is outside a {}-column batch",
-                        batch.num_columns()
-                    ))
-                })?;
-                let filter_arr = compute::take(filter_column, &index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
-                let mask = filter_arr
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                    .ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "aggregate FILTER must be Boolean, got {:?}",
-                            filter_arr.data_type()
-                        ))
-                    })?;
-                let mut filtered = Vec::with_capacity(input_capacity);
-                for arr in &input_arrays {
-                    filtered.push(
-                        compute::filter(arr, mask)
-                            .map_err(|e| DbError::Pipeline(format!("filter apply: {e}")))?,
-                    );
-                }
-                input_arrays = filtered;
-                weight_arr
-                    .as_ref()
-                    .map(|weight| {
-                        compute::filter(weight, mask)
-                            .map_err(|e| DbError::Pipeline(format!("weight filter: {e}")))
-                    })
-                    .transpose()?
-            } else {
-                weight_arr.clone()
-            };
-
-            if let Some(w) = &filtered_weight {
-                input_arrays.push(Arc::clone(w));
-            }
-
-            update(i, &input_arrays)?;
-        }
-        Ok(())
     }
 
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {

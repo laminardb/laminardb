@@ -54,6 +54,13 @@ fn key_groups() -> KeyGroupCount {
     KeyGroupCount::try_from(1_u16).unwrap()
 }
 
+fn concrete_templates(agg_specs: &[AggFuncSpec]) -> Vec<ConcreteAggregateState> {
+    agg_specs
+        .iter()
+        .map(|spec| ConcreteAggregateState::try_new(spec, ConcreteInputMode::AppendOnly).unwrap())
+        .collect()
+}
+
 #[test]
 fn timestamp_extraction_rejects_reserved_and_overflowing_values() {
     fn batch(array: ArrayRef) -> RecordBatch {
@@ -221,6 +228,7 @@ fn make_core_window_state(size_ms: i64) -> CoreWindowState {
         vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
+        aggregate_templates: concrete_templates(&agg_specs),
         agg_specs,
         num_group_cols: 1,
         group_types: Arc::from(vec![DataType::Utf8]),
@@ -301,6 +309,7 @@ fn make_core_window_state_multi_agg(size_ms: i64) -> CoreWindowState {
         vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
+        aggregate_templates: concrete_templates(&agg_specs),
         agg_specs,
         num_group_cols: 1,
         group_types: Arc::from(vec![DataType::Utf8]),
@@ -370,6 +379,7 @@ fn make_hopping_core_window_state(size_ms: i64, slide_ms: i64) -> CoreWindowStat
         vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
+        aggregate_templates: concrete_templates(&agg_specs),
         agg_specs,
         num_group_cols: 1,
         group_types: Arc::from(vec![DataType::Utf8]),
@@ -437,6 +447,7 @@ fn make_session_core_window_state(gap_ms: i64) -> CoreWindowState {
         vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
+        aggregate_templates: concrete_templates(&agg_specs),
         agg_specs,
         num_group_cols: 1,
         group_types: Arc::from(vec![DataType::Utf8]),
@@ -2258,4 +2269,167 @@ async fn global_window_frame_restores_multi_column_state() {
         })
         .collect::<Vec<_>>();
     assert_eq!(windows, [(6, 3.0), (9, 9.0)]);
+}
+
+type KindRow = (
+    &'static str,
+    Option<i64>,
+    Option<f64>,
+    Option<i128>,
+    Option<&'static str>,
+    i64,
+);
+
+fn every_kind_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, true),
+        Field::new("p", DataType::Float64, true),
+        Field::new("d", DataType::Decimal128(10, 2), true),
+        Field::new("s", DataType::Utf8, true),
+        Field::new("ts", DataType::Int64, false),
+    ]))
+}
+
+fn every_kind_batch(rows: &[KindRow], ts_divisor: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        every_kind_schema(),
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.0))),
+            Arc::new(Int64Array::from_iter(rows.iter().map(|row| row.1))),
+            Arc::new(arrow::array::Float64Array::from_iter(
+                rows.iter().map(|row| row.2),
+            )),
+            Arc::new(
+                arrow::array::Decimal128Array::from_iter(rows.iter().map(|row| row.3))
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| row.4))),
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.5 / ts_divisor),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn sorted_by_key(batch: &RecordBatch) -> RecordBatch {
+    let order =
+        arrow::compute::sort_to_indices(batch.column_by_name("k").unwrap(), None, None).unwrap();
+    arrow::compute::take_record_batch(batch, &order).unwrap()
+}
+
+/// Every concrete aggregate kind, updated over two batches, merged across sessions and restored
+/// from a checkpoint, emits what `DataFusion` computes over the same rows.
+#[tokio::test]
+async fn windows_aggregate_every_kind_like_datafusion_through_merge_and_restore() {
+    use std::time::Duration;
+
+    const AGGREGATES: &str = "COUNT(*) AS n, COUNT(v) AS nv, SUM(v) AS sv, SUM(p) AS sp, \
+        SUM(d) AS sd, AVG(p) AS ap, AVG(d) AS ad, MIN(s) AS lo, MAX(s) AS hi, \
+        MAX(v) FILTER (WHERE p > 1) AS fv";
+    // With a one-second gap, each key's first batch opens two sessions and its second-batch row
+    // bridges them, so the session case merges two sessions and a row into one.
+    let first: [KindRow; 5] = [
+        ("a", Some(7), Some(1.25), Some(1_050), Some("pear"), 0),
+        ("a", None, Some(0.5), None, Some("apple"), 100),
+        ("a", Some(-3), None, Some(-275), None, 1_600),
+        ("b", Some(40), Some(2.75), Some(99_999), Some("fig"), 0),
+        (
+            "b",
+            Some(i64::from(i32::MAX)),
+            Some(3.0),
+            Some(1),
+            Some("date"),
+            1_600,
+        ),
+    ];
+    let second: [KindRow; 2] = [
+        ("a", Some(11), Some(4.5), Some(5), Some("zucchini"), 1_050),
+        ("b", None, None, None, None, 900),
+    ];
+
+    let reference = {
+        let ctx = SessionContext::new();
+        let rows = every_kind_batch(&[first.as_slice(), &second].concat(), 1);
+        let table =
+            datafusion::datasource::MemTable::try_new(every_kind_schema(), vec![vec![rows]])
+                .unwrap();
+        ctx.register_table("rows", Arc::new(table)).unwrap();
+        let batches = ctx
+            .sql(&format!(
+                "SELECT k, {AGGREGATES} FROM rows GROUP BY k ORDER BY k"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap()
+    };
+
+    let tumble = WindowOperatorConfig::tumbling("ts".into(), Duration::from_secs(1));
+    let session = WindowOperatorConfig::session("ts".into(), Duration::from_secs(1));
+    for (window, config, ts_divisor, close_at) in [
+        ("TUMBLE(ts, INTERVAL '1' SECOND)", tumble, 10, 1_000),
+        ("SESSION(ts, INTERVAL '1' SECOND)", session, 1, 2_600),
+    ] {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let table =
+            datafusion::datasource::MemTable::try_new(every_kind_schema(), vec![vec![]]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        let sql = format!("SELECT k, {window} AS w, {AGGREGATES} FROM events GROUP BY k, {window}");
+        let build = || async {
+            CoreWindowState::try_from_sql(&ctx, &sql, &config, None, key_groups())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let mut state = build().await;
+        for rows in [first.as_slice(), &second] {
+            let projected = state
+                .compiled_projection()
+                .unwrap()
+                .evaluate(&every_kind_batch(rows, ts_divisor))
+                .unwrap();
+            state.update_batch(&projected).unwrap();
+        }
+        assert_session_deadline_index(&state);
+
+        let mut restored = build().await;
+        restore_all(&mut restored, checkpoint_all(&mut state)).unwrap();
+        for emitted in [
+            state.close_windows(close_at),
+            restored.close_windows(close_at),
+        ] {
+            let emitted = emitted.unwrap();
+            assert_eq!(emitted.len(), 1, "{window}");
+            let emitted = sorted_by_key(&emitted[0]);
+            for field in reference.schema().fields() {
+                assert_eq!(
+                    emitted.column_by_name(field.name()).unwrap().as_ref(),
+                    reference.column_by_name(field.name()).unwrap().as_ref(),
+                    "{window} {}",
+                    field.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn window_sum_overflow_fails_instead_of_wrapping() {
+    let mut state = make_core_window_state(1000);
+    state
+        .update_batch(&make_pre_agg_batch(vec!["A"], vec![i64::MAX], vec![100]))
+        .unwrap();
+
+    let error = state
+        .update_batch(&make_pre_agg_batch(vec!["A"], vec![1], vec![200]))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("SUM state overflow"), "{error}");
+    assert_eq!(sum_total(&state.close_windows(1000).unwrap()[0]), i64::MAX);
 }

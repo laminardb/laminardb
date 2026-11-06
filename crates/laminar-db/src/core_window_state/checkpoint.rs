@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef};
+use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::ScalarValue;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -13,7 +14,8 @@ use super::{
     SessionGroupState,
 };
 use crate::aggregate_state::{
-    encode_accumulator_states, encode_group_keys, global_aggregate_key, EncodeBudget,
+    build_concrete_states_from_checkpoint, encode_accumulator_states, encode_group_keys,
+    global_aggregate_key, ConcreteAggregateState, EncodeBudget,
 };
 use crate::error::DbError;
 
@@ -381,7 +383,7 @@ impl CoreWindowState {
     }
 
     /// Decodes the key and state batches, checking their row counts against the rosters and each
-    /// state batch's columns against a fresh accumulator's state.
+    /// state batch's columns against a fresh aggregate state's checkpoint form.
     fn decode_frame_columns(
         &self,
         checkpoint: &CoreWindowVnodeCheckpoint,
@@ -413,20 +415,13 @@ impl CoreWindowState {
             Some(keys)
         };
         let mut states = Vec::with_capacity(checkpoint.acc_state_ipc.len());
-        for (spec, bytes) in self.agg_specs.iter().zip(&checkpoint.acc_state_ipc) {
+        for (template, bytes) in self
+            .aggregate_templates
+            .iter()
+            .zip(&checkpoint.acc_state_ipc)
+        {
             let batch = decode(bytes, rows.states, "accumulator state")?;
-            let expected = spec
-                .create_accumulator()
-                .and_then(|mut accumulator| {
-                    accumulator
-                        .state()
-                        .map_err(|error| DbError::Checkpoint(error.to_string()))
-                })
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "Core window accumulator schema inspection failed: {error}"
-                    ))
-                })?;
+            let expected = template.checkpoint_state();
             if batch.num_columns() != expected.len()
                 || batch
                     .columns()
@@ -465,28 +460,24 @@ impl CoreWindowState {
         &self,
         columns: &FrameColumns,
         row: usize,
-    ) -> Result<Vec<Box<dyn datafusion_expr::Accumulator>>, DbError> {
-        let mut accumulators = Vec::new();
-        accumulators
-            .try_reserve_exact(self.agg_specs.len())
+    ) -> Result<Vec<ConcreteAggregateState>, DbError> {
+        let checkpoint = columns
+            .states
+            .iter()
+            .map(|batch| {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| ScalarValue::try_from_array(column, row))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
-                DbError::Checkpoint(format!("Core window accumulator reserve failed: {error}"))
+                DbError::Checkpoint(format!("Core window accumulator state decode: {error}"))
             })?;
-        for (spec, batch) in self.agg_specs.iter().zip(&columns.states) {
-            let mut accumulator = spec.create_accumulator().map_err(|error| {
-                DbError::Checkpoint(format!("Core window accumulator creation failed: {error}"))
-            })?;
-            let state: Vec<ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(|column| column.slice(row, 1))
-                .collect();
-            accumulator.merge_batch(&state).map_err(|error| {
-                DbError::Checkpoint(format!("Core window accumulator merge failed: {error}"))
-            })?;
-            accumulators.push(accumulator);
-        }
-        Ok(accumulators)
+        build_concrete_states_from_checkpoint(&self.aggregate_templates, &checkpoint).map_err(
+            |error| DbError::Checkpoint(format!("Core window accumulator merge failed: {error}")),
+        )
     }
 
     fn check_fixed_window_start(
