@@ -235,7 +235,7 @@ impl SqlQueryOperator {
             )));
         };
         if aggregate.num_group_cols() == 0 {
-            return aggregate.global_partial_schema();
+            return Ok(aggregate.global_partial_schema());
         }
         if let Some(projection) = aggregate.compiled_projection() {
             return Ok(Arc::clone(&projection.output_schema));

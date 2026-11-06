@@ -4,6 +4,8 @@
 //! `keyed_4096_groups` cover both ends of the distinct-key range of a 4,096-row batch.
 //! `keyed_two_columns`: the same 1,024 groups under a two-column key, which is row-encoded per
 //! row rather than grouped on a single fixed-width column's values.
+//! `keyed_min_max`: MIN of the `BIGINT` and MAX of the `DOUBLE` column over the same 1,024 groups;
+//! `keyed_min_max_text`: MIN and MAX of a `VARCHAR` column over 1,024 groups of its own batch.
 //! `global`: the same aggregates without GROUP BY (singleton vnode).
 //! `cluster_one_node`: the keyed `EMIT CHANGES` aggregate operator on a one-node cluster
 //! assignment, repartitioning every batch or applying it whole on a colocated input.
@@ -20,7 +22,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use datafusion::datasource::MemTable;
@@ -58,6 +60,27 @@ fn keyed_input(rows: usize, distinct_keys: i64) -> RecordBatch {
     .unwrap()
 }
 
+fn text_input() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                (0..ROWS as i64)
+                    .map(|i| (i * 7919) % DISTINCT_KEYS)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..ROWS).map(|i| format!("item-{:05}", (i * 2_654_435_761) % 100_000)),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
 fn bench_update(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -67,6 +90,9 @@ fn bench_update(c: &mut Criterion) {
     let ctx = laminar_sql::create_session_context();
     let table = MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).unwrap();
     ctx.register_table("events", Arc::new(table)).unwrap();
+    let texts = text_input();
+    let table = MemTable::try_new(texts.schema(), vec![vec![texts.clone()]]).unwrap();
+    ctx.register_table("texts", Arc::new(table)).unwrap();
 
     let mut group = c.benchmark_group("agg/update");
     group.throughput(Throughput::Elements(ROWS as u64));
@@ -81,14 +107,27 @@ fn bench_update(c: &mut Criterion) {
             "global",
             "SELECT COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events",
         ),
+        (
+            "keyed_min_max",
+            "SELECT k, MIN(v) AS lo, MAX(p) AS hi FROM events GROUP BY k",
+        ),
+        (
+            "keyed_min_max_text",
+            "SELECT k, MIN(s) AS lo, MAX(s) AS hi FROM texts GROUP BY k",
+        ),
     ] {
+        let batch = if name == "keyed_min_max_text" {
+            &texts
+        } else {
+            &batch
+        };
         let mut aggregate = rt.block_on(AggregateBenchmark::new(&ctx, sql)).unwrap();
         group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            b.iter(|| aggregate.update(&batch).unwrap());
+            b.iter(|| aggregate.update(batch).unwrap());
         });
         group.bench_function(BenchmarkId::new("with_emit", name), |b| {
             b.iter(|| {
-                aggregate.update(&batch).unwrap();
+                aggregate.update(batch).unwrap();
                 aggregate.emit().unwrap()
             });
         });

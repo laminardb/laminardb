@@ -38,10 +38,10 @@ impl IncrementalAggState {
 
     /// Schema of a partial batch: the net input weight, then each aggregate's state columns.
     #[cfg(feature = "cluster")]
-    pub(crate) fn global_partial_schema(&self) -> Result<SchemaRef, DbError> {
+    pub(crate) fn global_partial_schema(&self) -> SchemaRef {
         let mut fields = vec![Field::new("__input_weight", DataType::Int64, false)];
         for (index, template) in self.aggregate_templates.iter().enumerate() {
-            for (column, scalar) in template.checkpoint_state()?.iter().enumerate() {
+            for (column, scalar) in template.checkpoint_state().iter().enumerate() {
                 fields.push(Field::new(
                     format!("__partial_{index}_{column}"),
                     scalar.data_type(),
@@ -49,7 +49,7 @@ impl IncrementalAggState {
                 ));
             }
         }
-        Ok(Arc::new(Schema::new(fields)))
+        Arc::new(Schema::new(fields))
     }
 
     /// Fold each pre-aggregate batch into one partial row. One row per batch makes merging it on
@@ -59,7 +59,7 @@ impl IncrementalAggState {
         &self,
         batches: &[RecordBatch],
     ) -> Result<RecordBatch, DbError> {
-        let schema = self.global_partial_schema()?;
+        let schema = self.global_partial_schema();
         let mut weights = Vec::with_capacity(batches.len());
         let mut states = vec![Vec::with_capacity(batches.len()); schema.fields().len() - 1];
         for batch in batches {
@@ -99,8 +99,8 @@ impl IncrementalAggState {
         let arities = self
             .aggregate_templates
             .iter()
-            .map(|template| template.checkpoint_state().map(|state| state.len()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|template| template.checkpoint_state().len())
+            .collect::<Vec<_>>();
         if batch.num_columns() != 1 + arities.iter().sum::<usize>() {
             return Err(partial_shape_error(
                 "column count differs from the aggregate state",

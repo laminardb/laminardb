@@ -1,19 +1,20 @@
 use arrow::datatypes::{DataType, Decimal128Type};
 use datafusion::functions_aggregate::average::Avg;
 use datafusion::functions_aggregate::count::Count;
-use datafusion::functions_aggregate::min_max::{Max, MaxAccumulator, Min, MinAccumulator};
+use datafusion::functions_aggregate::min_max::{Max, Min};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion_common::ScalarValue;
-use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 
 use super::AggFuncSpec;
 use crate::error::DbError;
 
 mod input;
+mod min_max;
 mod sum;
 
 pub(crate) use input::AggregateInput;
+use min_max::{Extremum, ExtremumState};
 #[cfg(feature = "cluster")]
 use sum::sum_rows;
 pub(crate) use sum::SumState;
@@ -30,8 +31,8 @@ pub(crate) enum ConcreteAggregateState {
     Count(CountState),
     Sum(SumState),
     Avg(AvgState),
-    Min(MinAccumulator),
-    Max(MaxAccumulator),
+    Min(ExtremumState),
+    Max(ExtremumState),
 }
 
 impl ConcreteAggregateState {
@@ -67,15 +68,11 @@ impl ConcreteAggregateState {
         }
         if implementation.is::<Min>() {
             require_append_only(spec, mode)?;
-            return MinAccumulator::try_new(&spec.return_type)
-                .map(Self::Min)
-                .map_err(|error| aggregate_error("MIN state creation", error));
+            return ExtremumState::try_new(&spec.input_types[0], &spec.return_type).map(Self::Min);
         }
         if implementation.is::<Max>() {
             require_append_only(spec, mode)?;
-            return MaxAccumulator::try_new(&spec.return_type)
-                .map(Self::Max)
-                .map_err(|error| aggregate_error("MAX state creation", error));
+            return ExtremumState::try_new(&spec.input_types[0], &spec.return_type).map(Self::Max);
         }
 
         Err(unsupported(
@@ -94,12 +91,8 @@ impl ConcreteAggregateState {
             Self::Count(state) => state.update_rows(input, rows),
             Self::Sum(state) => state.update_rows(input, rows),
             Self::Avg(state) => state.update_rows(input, rows),
-            Self::Min(state) => state
-                .update_batch(&[input.take_selected(rows)?])
-                .map_err(|error| aggregate_error("MIN update", error)),
-            Self::Max(state) => state
-                .update_batch(&[input.take_selected(rows)?])
-                .map_err(|error| aggregate_error("MAX update", error)),
+            Self::Min(state) => state.update_rows(Extremum::Min, input, rows),
+            Self::Max(state) => state.update_rows(Extremum::Max, input, rows),
         }
     }
 
@@ -120,24 +113,8 @@ impl ConcreteAggregateState {
             ))]),
             Self::Sum(state) => state.batch_delta(input, rows),
             Self::Avg(state) => state.batch_delta(input, rows),
-            Self::Min(_) => {
-                let value = input.take_selected(rows)?;
-                let mut delta = MinAccumulator::try_new(value.data_type())
-                    .map_err(|error| aggregate_error("MIN delta creation", error))?;
-                delta
-                    .update_batch(&[value])
-                    .and_then(|()| delta.state())
-                    .map_err(|error| aggregate_error("MIN delta", error))
-            }
-            Self::Max(_) => {
-                let value = input.take_selected(rows)?;
-                let mut delta = MaxAccumulator::try_new(value.data_type())
-                    .map_err(|error| aggregate_error("MAX delta creation", error))?;
-                delta
-                    .update_batch(&[value])
-                    .and_then(|()| delta.state())
-                    .map_err(|error| aggregate_error("MAX delta", error))
-            }
+            Self::Min(state) => state.batch_delta(Extremum::Min, input, rows),
+            Self::Max(state) => state.batch_delta(Extremum::Max, input, rows),
         }
     }
 
@@ -146,28 +123,16 @@ impl ConcreteAggregateState {
             Self::Count(state) => Ok(ScalarValue::Int64(Some(state.count))),
             Self::Sum(state) => state.evaluate(),
             Self::Avg(state) => state.evaluate(),
-            Self::Min(state) => state
-                .evaluate()
-                .map_err(|error| aggregate_error("MIN evaluation", error)),
-            Self::Max(state) => state
-                .evaluate()
-                .map_err(|error| aggregate_error("MAX evaluation", error)),
+            Self::Min(state) | Self::Max(state) => Ok(state.evaluate()),
         }
     }
 
-    pub(crate) fn checkpoint_state(&self) -> Result<Vec<ScalarValue>, DbError> {
+    pub(crate) fn checkpoint_state(&self) -> Vec<ScalarValue> {
         match self {
-            Self::Count(state) => Ok(vec![ScalarValue::Int64(Some(state.count))]),
-            Self::Sum(state) => Ok(state.checkpoint_state()),
-            Self::Avg(state) => Ok(state.checkpoint_state()),
-            Self::Min(state) => state
-                .clone()
-                .state()
-                .map_err(|error| aggregate_error("MIN checkpoint state", error)),
-            Self::Max(state) => state
-                .clone()
-                .state()
-                .map_err(|error| aggregate_error("MAX checkpoint state", error)),
+            Self::Count(state) => vec![ScalarValue::Int64(Some(state.count))],
+            Self::Sum(state) => state.checkpoint_state(),
+            Self::Avg(state) => state.checkpoint_state(),
+            Self::Min(state) | Self::Max(state) => state.checkpoint_state(),
         }
     }
 
@@ -179,15 +144,14 @@ impl ConcreteAggregateState {
             Self::Count(state) => state.merge_checkpoint_state(checkpoint),
             Self::Sum(state) => state.merge_checkpoint_state(checkpoint),
             Self::Avg(state) => state.merge_checkpoint_state(checkpoint),
-            Self::Min(state) => merge_extremum_checkpoint(state, checkpoint, "MIN"),
-            Self::Max(state) => merge_extremum_checkpoint(state, checkpoint, "MAX"),
+            Self::Min(state) => state.merge_checkpoint_state(Extremum::Min, checkpoint),
+            Self::Max(state) => state.merge_checkpoint_state(Extremum::Max, checkpoint),
         }
     }
 
     pub(crate) fn nested_retained_bytes(&self) -> usize {
         match self {
-            Self::Min(state) => state.size().saturating_sub(std::mem::size_of_val(state)),
-            Self::Max(state) => state.size().saturating_sub(std::mem::size_of_val(state)),
+            Self::Min(state) | Self::Max(state) => state.nested_retained_bytes(),
             Self::Count(_) | Self::Sum(_) | Self::Avg(_) => 0,
         }
     }
@@ -555,24 +519,6 @@ fn append_average(
             sum.data_type()
         ))),
     }
-}
-
-fn merge_extremum_checkpoint<T: Accumulator>(
-    state: &mut T,
-    checkpoint: &[ScalarValue],
-    name: &str,
-) -> Result<(), DbError> {
-    let [value] = checkpoint else {
-        return Err(DbError::Pipeline(format!(
-            "{name} checkpoint state must contain one scalar"
-        )));
-    };
-    let array = value
-        .to_array()
-        .map_err(|error| aggregate_error(&format!("{name} checkpoint scalar"), error))?;
-    state
-        .merge_batch(&[array])
-        .map_err(|error| aggregate_error(&format!("{name} checkpoint merge"), error))
 }
 
 #[cfg(test)]

@@ -985,7 +985,7 @@ async fn global_partials_merge_exactly_like_their_batches() {
     }
     let partial = folder.global_partial_batch(&batches).unwrap();
     assert_eq!(partial.num_rows(), batches.len());
-    assert_eq!(partial.schema(), folder.global_partial_schema().unwrap());
+    assert_eq!(partial.schema(), folder.global_partial_schema());
     merged.merge_global_partials(&partial, 10).unwrap();
 
     assert_eq!(checkpoint_bytes(&mut merged), checkpoint_bytes(&mut direct));

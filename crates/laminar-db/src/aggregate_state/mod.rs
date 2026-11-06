@@ -1192,13 +1192,7 @@ impl IncrementalAggState {
         for (aggregate_index, (spec, template)) in
             agg_specs.iter().zip(&aggregate_templates).enumerate()
         {
-            let checkpoint_state = template.checkpoint_state().map_err(|error| {
-                DbError::Unsupported(format!(
-                    "[{}] managed aggregate checkpoint state {aggregate_index} ('{}') cannot expose its initialization shape: {error}",
-                    laminar_core::error_codes::SQL_UNSUPPORTED,
-                    spec.output_name
-                ))
-            })?;
+            let checkpoint_state = template.checkpoint_state();
             for (state_index, scalar) in checkpoint_state.iter().enumerate() {
                 require_managed_checkpoint_scalar_type(
                     &scalar.data_type(),
@@ -1927,7 +1921,7 @@ impl IncrementalAggState {
             for (key, entry) in &state.groups {
                 let mut accumulator_states = Vec::with_capacity(entry.accs.len());
                 for aggregate in &entry.accs {
-                    accumulator_states.push(aggregate.checkpoint_state()?);
+                    accumulator_states.push(aggregate.checkpoint_state());
                 }
                 let last_emitted = self
                     .emit_changelog
