@@ -8,7 +8,6 @@ use std::sync::Arc;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use arrow::array::ArrayRef;
-use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
@@ -25,7 +24,8 @@ use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
     apply_compiled_having, compile_having_filter, compile_plan_expr, extract_clauses,
-    find_aggregate, query_fingerprint_with_config, AggFuncSpec, CompiledProjection, PreAggBuilder,
+    find_aggregate, query_fingerprint_with_config, AggFuncSpec, AggregateInput, CompiledProjection,
+    ConcreteAggregateState, ConcreteInputMode, IncrementalAggState, PreAggBuilder,
 };
 use crate::error::DbError;
 
@@ -261,7 +261,7 @@ fn substitute_wallclock(
 struct SessionAccState {
     start: i64,
     end: i64,
-    accs: Vec<Box<dyn datafusion_expr::Accumulator>>,
+    accs: Vec<ConcreteAggregateState>,
 }
 
 struct SessionGroupState {
@@ -296,8 +296,7 @@ impl SessionDeadline {
     }
 }
 
-type FixedWindowGroups =
-    FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>;
+type FixedWindowGroups = FxHashMap<arrow::row::OwnedRow, Vec<ConcreteAggregateState>>;
 type FixedWindows = BTreeMap<i64, FixedWindowGroups>;
 type SessionGroups = FxHashMap<SessionGroupKey, SessionGroupState>;
 
@@ -382,6 +381,7 @@ pub(crate) struct CoreWindowState {
     session_group_count: usize,
     row_converter: Arc<arrow::row::RowConverter>,
     agg_specs: Vec<AggFuncSpec>,
+    aggregate_templates: Vec<ConcreteAggregateState>,
     num_group_cols: usize,
     group_types: Arc<[DataType]>,
     query_sql: String,
@@ -672,12 +672,10 @@ impl CoreWindowState {
                 laminar_core::error_codes::SQL_UNSUPPORTED
             )));
         }
-        for spec in &agg_specs {
-            crate::aggregate_state::ConcreteAggregateState::try_new(
-                spec,
-                crate::aggregate_state::ConcreteInputMode::AppendOnly,
-            )?;
-        }
+        let aggregate_templates = agg_specs
+            .iter()
+            .map(|spec| ConcreteAggregateState::try_new(spec, ConcreteInputMode::AppendOnly))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
@@ -854,6 +852,7 @@ impl CoreWindowState {
             session_group_count: 0,
             row_converter,
             agg_specs,
+            aggregate_templates,
             num_group_cols,
             group_types: Arc::from(group_types),
             query_sql: sql.to_string(),
@@ -884,14 +883,12 @@ impl CoreWindowState {
         }))
     }
 
-    fn accumulator_vector_bytes(
-        accumulators: &Vec<Box<dyn datafusion_expr::Accumulator>>,
-    ) -> usize {
+    fn accumulator_vector_bytes(accumulators: &Vec<ConcreteAggregateState>) -> usize {
         accumulators
             .capacity()
-            .saturating_mul(std::mem::size_of::<Box<dyn datafusion_expr::Accumulator>>())
+            .saturating_mul(std::mem::size_of::<ConcreteAggregateState>())
             .saturating_add(accumulators.iter().fold(0_usize, |bytes, accumulator| {
-                bytes.saturating_add(accumulator.size())
+                bytes.saturating_add(accumulator.nested_retained_bytes())
             }))
     }
 
@@ -900,7 +897,7 @@ impl CoreWindowState {
             .capacity()
             .saturating_mul(std::mem::size_of::<(
                 arrow::row::OwnedRow,
-                Vec<Box<dyn datafusion_expr::Accumulator>>,
+                Vec<ConcreteAggregateState>,
             )>())
             .saturating_add(groups.iter().fold(0_usize, |bytes, (key, accumulators)| {
                 bytes
@@ -1078,7 +1075,7 @@ impl CoreWindowState {
         vnode: u32,
         window_start: i64,
         key: arrow::row::OwnedRow,
-        accumulators: Vec<Box<dyn datafusion_expr::Accumulator>>,
+        accumulators: Vec<ConcreteAggregateState>,
     ) {
         let key_bytes = key.as_ref().len();
         let accumulator_bytes = Self::accumulator_vector_bytes(&accumulators);
@@ -1095,7 +1092,7 @@ impl CoreWindowState {
             .saturating_sub(previous_capacity)
             .saturating_mul(std::mem::size_of::<(
                 arrow::row::OwnedRow,
-                Vec<Box<dyn datafusion_expr::Accumulator>>,
+                Vec<ConcreteAggregateState>,
             )>());
         state.accounted_state_bytes = state
             .accounted_state_bytes
@@ -1194,6 +1191,7 @@ impl CoreWindowState {
         ts_array: &[i64],
     ) -> Result<(), DbError> {
         let empty_key = crate::aggregate_state::global_aggregate_key();
+        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
         let mut grouped = std::mem::take(&mut self.scratch_nogroup);
         grouped.clear();
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
@@ -1242,10 +1240,9 @@ impl CoreWindowState {
                 .and_then(|state| state.windows.get(window_start))
                 .is_none_or(|groups| !groups.contains_key(&empty_key));
             if needs_insert {
-                let accs = self.create_fresh_accumulators()?;
+                let accs = self.aggregate_templates.clone();
                 self.insert_fixed_group(0, *window_start, empty_key.clone(), accs);
             }
-            let agg_specs = &self.agg_specs;
             let state = self.vnode_states[0]
                 .as_deref_mut()
                 .expect("global Core window vnode must exist");
@@ -1256,9 +1253,8 @@ impl CoreWindowState {
                     .and_then(|groups| groups.get_mut(&empty_key))
                     .expect("global Core window group must exist");
                 let previous = Self::accumulator_vector_bytes(accs);
-                let update = crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs, batch, indices, agg_specs, None,
-                );
+                let update =
+                    IncrementalAggState::update_concrete_accumulators(accs, &inputs, indices);
                 (previous, update, Self::accumulator_vector_bytes(accs))
             };
             state.accounted_state_bytes = state
@@ -1285,6 +1281,7 @@ impl CoreWindowState {
             .row_converter
             .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
+        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
 
         let mut grouped = std::mem::take(&mut self.scratch_grouped);
         let mut group_keys = std::mem::take(&mut self.scratch_group_keys);
@@ -1363,11 +1360,10 @@ impl CoreWindowState {
                 }
             };
             if needs_insert {
-                let accs = self.create_fresh_accumulators()?;
+                let accs = self.aggregate_templates.clone();
                 self.insert_fixed_group(*vnode, *window_start, row_key.clone(), accs);
             }
 
-            let agg_specs = &self.agg_specs;
             let state = self.vnode_states[*vnode as usize]
                 .as_deref_mut()
                 .expect("Core window vnode must exist");
@@ -1378,9 +1374,8 @@ impl CoreWindowState {
                     .and_then(|groups| groups.get_mut(row_key))
                     .expect("Core window group must exist");
                 let previous = Self::accumulator_vector_bytes(accs);
-                let update = crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs, batch, indices, agg_specs, None,
-                );
+                let update =
+                    IncrementalAggState::update_concrete_accumulators(accs, &inputs, indices);
                 (previous, update, Self::accumulator_vector_bytes(accs))
             };
             state.accounted_state_bytes = state
@@ -1433,21 +1428,15 @@ impl CoreWindowState {
             }
             vnodes.push(vnode);
         }
+        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
         for (row, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
             self.count_applied_rows(vnodes[row], 1);
             #[allow(clippy::cast_possible_truncation)]
-            let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
-            self.update_session_window(
-                vnodes[row],
-                ts_ms,
-                gap_ms,
-                &keys[row],
-                batch,
-                &index_array,
-            )?;
+            let input_row = row as u32;
+            self.update_session_window(vnodes[row], ts_ms, gap_ms, &keys[row], &inputs, input_row)?;
         }
         Ok(())
     }
@@ -1459,8 +1448,8 @@ impl CoreWindowState {
         ts_ms: i64,
         gap_ms: i64,
         key: &arrow::row::OwnedRow,
-        batch: &RecordBatch,
-        index_array: &arrow::array::UInt32Array,
+        inputs: &[AggregateInput<'_>],
+        input_row: u32,
     ) -> Result<(), DbError> {
         let new_start = ts_ms;
         let new_end = ts_ms.checked_add(gap_ms).ok_or_else(|| {
@@ -1520,8 +1509,8 @@ impl CoreWindowState {
 
         match overlapping.len() {
             0 => {
-                let mut accs = self.create_fresh_accumulators()?;
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
+                let mut accs = self.aggregate_templates.clone();
+                IncrementalAggState::update_concrete_accumulators(&mut accs, inputs, &[input_row])?;
                 let accumulator_bytes = Self::accumulator_vector_bytes(&accs);
                 let group_key = self.vnode_states[vnode as usize]
                     .as_ref()
@@ -1641,11 +1630,10 @@ impl CoreWindowState {
                         .get_mut(&sess_key)
                         .expect("invariant: session key sourced from this map");
                     let previous_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
-                    let update = Self::update_accumulators(
+                    let update = IncrementalAggState::update_concrete_accumulators(
                         &mut sess.accs,
-                        &self.agg_specs,
-                        batch,
-                        index_array,
+                        inputs,
+                        &[input_row],
                     );
                     let current_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
                     if update.is_ok() {
@@ -1688,8 +1676,8 @@ impl CoreWindowState {
                     &overlapping,
                     new_start,
                     new_end,
-                    batch,
-                    index_array,
+                    inputs,
+                    input_row,
                 )?;
             }
         }
@@ -1706,14 +1694,14 @@ impl CoreWindowState {
         overlapping: &[i64],
         new_start: i64,
         new_end: i64,
-        batch: &RecordBatch,
-        index_array: &arrow::array::UInt32Array,
+        inputs: &[AggregateInput<'_>],
+        input_row: u32,
     ) -> Result<(), DbError> {
         // Stage the merge into a fresh survivor before mutating the group: fold in
         // every overlapping session's state (a non-destructive read) plus the new
         // row, and only remove + insert once all fallible steps succeed — so a
         // mid-merge failure leaves the existing sessions intact.
-        let mut accs = self.create_fresh_accumulators()?;
+        let mut accs = self.aggregate_templates.clone();
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let group_key = self.vnode_states[vnode as usize]
             .as_ref()
@@ -1722,11 +1710,11 @@ impl CoreWindowState {
             .expect("invariant: key present (overlapping derived from same group)");
         let (merged_start, merged_end, retired_bytes, retired_deadlines) = {
             let state = self.vnode_states[vnode as usize]
-                .as_deref_mut()
+                .as_deref()
                 .expect("session vnode must exist");
             let group = state
                 .session_groups
-                .get_mut(key)
+                .get(key)
                 .expect("invariant: key present (overlapping derived from same group)");
             let mut merged_start = new_start;
             let mut merged_end = new_end;
@@ -1736,7 +1724,7 @@ impl CoreWindowState {
             for &sess_key in overlapping {
                 let sess = group
                     .sessions
-                    .get_mut(&sess_key)
+                    .get(&sess_key)
                     .expect("invariant: overlapping keys are unique BTreeMap entries");
                 retired_bytes = retired_bytes
                     .saturating_add(BTREE_ENTRY_CHARGE)
@@ -1749,20 +1737,8 @@ impl CoreWindowState {
                 ));
                 merged_start = merged_start.min(sess.start);
                 merged_end = merged_end.max(sess.end);
-                for (i, acc) in sess.accs.iter_mut().enumerate() {
-                    let state = acc
-                        .state()
-                        .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
-                    let arrays: Vec<ArrayRef> = state
-                        .iter()
-                        .map(|sv| {
-                            sv.to_array()
-                                .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    accs[i]
-                        .merge_batch(&arrays)
-                        .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
+                for (survivor, merged) in accs.iter_mut().zip(&sess.accs) {
+                    survivor.merge_checkpoint_state(&merged.checkpoint_state())?;
                 }
             }
             (merged_start, merged_end, retired_bytes, retired_deadlines)
@@ -1776,7 +1752,7 @@ impl CoreWindowState {
             &retired_deadlines,
             &replacement_deadline,
         )?;
-        Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
+        IncrementalAggState::update_concrete_accumulators(&mut accs, inputs, &[input_row])?;
 
         let replacement_bytes =
             BTREE_ENTRY_CHARGE.saturating_add(Self::accumulator_vector_bytes(&accs));
@@ -1815,55 +1791,6 @@ impl CoreWindowState {
             .expect("Core session state must cover merged intervals")
             .saturating_add(replacement_bytes);
         Self::commit_session_deadline_replacement(state, &retired_deadlines, replacement_deadline);
-        Ok(())
-    }
-
-    fn create_fresh_accumulators(
-        &self,
-    ) -> Result<Vec<Box<dyn datafusion_expr::Accumulator>>, DbError> {
-        let mut accs = Vec::with_capacity(self.agg_specs.len());
-        for spec in &self.agg_specs {
-            accs.push(spec.create_accumulator()?);
-        }
-        Ok(accs)
-    }
-
-    fn update_accumulators(
-        accs: &mut [Box<dyn datafusion_expr::Accumulator>],
-        agg_specs: &[AggFuncSpec],
-        batch: &RecordBatch,
-        index_array: &arrow::array::UInt32Array,
-    ) -> Result<(), DbError> {
-        for (i, spec) in agg_specs.iter().enumerate() {
-            let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(spec.input_col_indices.len());
-            for &col_idx in &spec.input_col_indices {
-                let arr = compute::take(batch.column(col_idx), index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("array take: {e}")))?;
-                input_arrays.push(arr);
-            }
-
-            if let Some(filter_idx) = spec.filter_col_index {
-                let filter_arr = compute::take(batch.column(filter_idx), index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
-                if let Some(mask) = filter_arr
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                {
-                    let mut filtered = Vec::with_capacity(input_arrays.len());
-                    for arr in &input_arrays {
-                        filtered.push(
-                            compute::filter(arr, mask)
-                                .map_err(|e| DbError::Pipeline(format!("filter apply: {e}")))?,
-                        );
-                    }
-                    input_arrays = filtered;
-                }
-            }
-
-            accs[i]
-                .update_batch(&input_arrays)
-                .map_err(|e| DbError::Pipeline(format!("accumulator update: {e}")))?;
-        }
         Ok(())
     }
 
@@ -2063,13 +1990,7 @@ impl CoreWindowState {
             return Ok(Vec::new());
         }
 
-        #[allow(clippy::type_complexity)]
-        let mut rows: Vec<(
-            i64,
-            i64,
-            SessionGroupKey,
-            Vec<Box<dyn datafusion_expr::Accumulator>>,
-        )> = Vec::new();
+        let mut rows: Vec<(i64, i64, SessionGroupKey, Vec<ConcreteAggregateState>)> = Vec::new();
         rows.try_reserve_exact(due_count).map_err(|error| {
             DbError::Pipeline(format!("Core session close roster reserve failed: {error}"))
         })?;
@@ -2140,15 +2061,9 @@ impl CoreWindowState {
     }
 
     /// Emit closed session rows as a `RecordBatch`.
-    #[allow(clippy::type_complexity)]
     fn emit_session_rows(
         &self,
-        rows: Vec<(
-            i64,
-            i64,
-            SessionGroupKey,
-            Vec<Box<dyn datafusion_expr::Accumulator>>,
-        )>,
+        rows: Vec<(i64, i64, SessionGroupKey, Vec<ConcreteAggregateState>)>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let num_rows = rows.len();
 
@@ -2164,10 +2079,7 @@ impl CoreWindowState {
             window_starts.push(window_start);
             window_ends.push(window_end);
             for (i, acc) in accs.iter_mut().enumerate() {
-                let sv = acc
-                    .evaluate()
-                    .map_err(|e| DbError::Pipeline(format!("session accumulator evaluate: {e}")))?;
-                agg_scalars[i].push(sv);
+                agg_scalars[i].push(acc.evaluate()?);
             }
         }
 
@@ -2300,7 +2212,7 @@ impl CoreWindowState {
         &self,
         window_start: i64,
         window_size_ms: i64,
-        groups: FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+        groups: FixedWindowGroups,
     ) -> Result<Option<RecordBatch>, DbError> {
         let Some(batch) = crate::aggregate_state::emit_window_batch(
             groups,
@@ -2507,7 +2419,7 @@ impl CoreWindowState {
     }
 
     fn capture_full_vnode(
-        &mut self,
+        &self,
         vnode: u32,
         fingerprint: u64,
         group_types: Arc<[DataType]>,
@@ -2554,16 +2466,14 @@ impl CoreWindowState {
         }
 
         fn capture_accumulator_states(
-            accumulators: &mut [Box<dyn datafusion_expr::Accumulator>],
+            accumulators: &[ConcreteAggregateState],
             remaining: &mut usize,
             component: &str,
         ) -> Result<Vec<Vec<ScalarValue>>, DbError> {
             let mut states = Vec::new();
             reserve_roster(&mut states, accumulators.len(), remaining, component)?;
             for accumulator in accumulators {
-                let state = accumulator.state().map_err(|error| {
-                    DbError::Checkpoint(format!("Core window {component} capture failed: {error}"))
-                })?;
+                let state = accumulator.checkpoint_state();
                 let retained = state
                     .capacity()
                     .checked_mul(std::mem::size_of::<ScalarValue>())
@@ -2595,14 +2505,14 @@ impl CoreWindowState {
         )?;
         let mut windows = Vec::new();
         let mut session_state = Vec::new();
-        if let Some(state) = self.vnode_states[vnode as usize].as_deref_mut() {
+        if let Some(state) = self.vnode_states[vnode as usize].as_deref() {
             reserve_roster(
                 &mut windows,
                 state.windows.len(),
                 &mut remaining,
                 "window roster",
             )?;
-            for (&window_start, groups) in &mut state.windows {
+            for (&window_start, groups) in &state.windows {
                 let mut captured_groups = Vec::new();
                 reserve_roster(
                     &mut captured_groups,
@@ -2635,7 +2545,7 @@ impl CoreWindowState {
                 &mut remaining,
                 "session group roster",
             )?;
-            for (key, group) in &mut state.session_groups {
+            for (key, group) in &state.session_groups {
                 charge(
                     &mut remaining,
                     Self::session_group_key_bytes(key),
@@ -2648,9 +2558,9 @@ impl CoreWindowState {
                     &mut remaining,
                     "session roster",
                 )?;
-                for session in group.sessions.values_mut() {
+                for session in group.sessions.values() {
                     let accumulator_states = capture_accumulator_states(
-                        &mut session.accs,
+                        &session.accs,
                         &mut remaining,
                         "session accumulator state",
                     )?;

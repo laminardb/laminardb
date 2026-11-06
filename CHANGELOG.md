@@ -35,6 +35,11 @@
   upstream emitted into it. The check runs whenever the DDL runs, so after upgrading, an embedded
   or single-node pipeline with such a window fails to start until it windows on the carried
   column. Cluster mode never admitted these windows.
+- `TUMBLE`, `HOP` and `SESSION` windows keep their `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` state
+  in the same form as non-windowed aggregates, in every mode. A windowed `SUM` or `AVG` whose
+  state would overflow now fails the operator's cycle with an error, as a non-windowed one does,
+  instead of wrapping. A floating-point `SUM` or `AVG` adds its values in row order, so a result
+  can differ in its last bits from earlier releases.
 
 ### Fixed
 
@@ -60,6 +65,9 @@
 
 - A stream or view whose DDL already carried `ALLOW LATENESS` gets a new pipeline identity, so its
   existing checkpoints fail closed; it restarts from its sources.
+- The state frame ABI is now 9, for the window state change above. Every checkpoint written by an
+  earlier release fails closed at startup, in every pipeline and mode, and the pipeline restarts
+  from its sources.
 
 ## [0.33.0]
 
