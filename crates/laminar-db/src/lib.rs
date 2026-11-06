@@ -138,7 +138,7 @@ pub use table_store::benchmark::ReferenceTableBenchmark;
 
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
-pub use aggregate_state::benchmark::AggregateBenchmark;
+pub use aggregate_state::benchmark::{AggregateBenchmark, AggregateBenchmarkCheckpoint};
 
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]

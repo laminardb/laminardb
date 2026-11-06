@@ -394,16 +394,16 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_owner_drops_the_stages_it_created() {
         let db = db(&[]).await;
-        // The inner stage admits; MIN cannot consume its weighted changelog.
+        // The inner stage admits; STDDEV has no managed state for its weighted changelog.
         for sql in [
-            "CREATE STREAM out AS SELECT MIN(n) AS lo FROM \
+            "CREATE STREAM out AS SELECT STDDEV(n) AS sd FROM \
              (SELECT k, COUNT(*) AS n FROM orders GROUP BY k) EMIT CHANGES",
-            "CREATE MATERIALIZED VIEW out AS SELECT MIN(n) AS lo FROM \
+            "CREATE MATERIALIZED VIEW out AS SELECT STDDEV(n) AS sd FROM \
              (SELECT k, COUNT(*) AS n FROM orders GROUP BY k)",
         ] {
             let error = error(&db, sql).await;
             assert!(
-                error.contains("MIN/MAX require append-only input"),
+                error.contains("only built-in COUNT, SUM, AVG, MIN, and MAX are supported"),
                 "{sql}: {error}"
             );
             assert_eq!(catalog_names(&db), ["orders", "payments"]);

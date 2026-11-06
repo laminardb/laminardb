@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::*;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float64Array,
-    Int32Array, Int64Array, IntervalYearMonthArray, StringArray, StructArray,
+    Int32Array, Int64Array, IntervalYearMonthArray, StringArray, StructArray, UInt32Array,
 };
 use arrow::datatypes::{Field, Int32Type, Int64Type, TimeUnit};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
@@ -13,7 +13,13 @@ use datafusion_expr::{Accumulator, AggregateUDF, AggregateUDFImpl};
 fn whole(values: &[ArrayRef]) -> (AggregateInput<'_>, Vec<u32>) {
     let weights = values.get(1).map(AsArray::as_primitive::<Int64Type>);
     let rows = (0..u32::try_from(values[0].len()).unwrap()).collect();
-    (AggregateInput::new(&values[0], None, weights), rows)
+    let input = AggregateInput::new(&values[0], None, weights);
+    let input = if weights.is_some() {
+        input.with_row_encoding().unwrap()
+    } else {
+        input
+    };
+    (input, rows)
 }
 
 trait WholeArrays {
@@ -251,7 +257,7 @@ fn append_sum_adds_each_batch_sum_to_its_total() {
 }
 
 #[test]
-fn extrema_are_append_only_and_use_datafusion_ordering() {
+fn extrema_choose_their_state_by_input_mode() {
     let min_spec = spec(Min::new(), DataType::Utf8, DataType::Utf8, false);
     let mut min =
         ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::AppendOnly).unwrap();
@@ -267,9 +273,10 @@ fn extrema_are_append_only_and_use_datafusion_ordering() {
     );
     assert!(min.nested_retained_bytes() >= "apple".len());
 
-    let error =
-        ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::Weighted).unwrap_err();
-    assert!(error.to_string().contains("append-only"));
+    assert!(matches!(
+        ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::Weighted).unwrap(),
+        ConcreteAggregateState::RetractableMin(_)
+    ));
 }
 
 /// A column of each type MIN and MAX compare in place, and three types whose rows they copy, all
@@ -642,4 +649,255 @@ fn row_updates_read_only_admitted_rows_in_place() {
             spec.udf.name()
         );
     }
+}
+
+fn extremum_spec(implementation: Arc<dyn AggregateUDFImpl>, data_type: &DataType) -> AggFuncSpec {
+    AggFuncSpec {
+        udf: Arc::new(AggregateUDF::new_from_shared_impl(implementation)),
+        input_types: vec![data_type.clone()],
+        input_col_indices: vec![0],
+        output_name: "value".into(),
+        return_type: data_type.clone(),
+        is_count_star: false,
+        filter_col_index: None,
+    }
+}
+
+/// Each step's weight for row `i`; the net weight of a row never goes below zero.
+fn changelog_steps(rows: usize) -> Vec<Vec<i64>> {
+    let step = |weight: fn(usize) -> i64| (0..rows).map(weight).collect::<Vec<_>>();
+    vec![
+        step(|_| 1),
+        step(|i| if i % 3 == 0 { -1 } else { 0 }),
+        step(|i| match (i % 6, i % 4) {
+            (0, _) => 2,
+            (_, 1) if i % 3 != 0 => -1,
+            _ => 0,
+        }),
+        step(|i| if i % 6 == 0 { -1 } else { 0 }),
+        step(|i| if i % 6 == 0 { -1 } else { 0 }),
+    ]
+}
+
+#[test]
+fn changelog_extrema_match_datafusion_over_net_values_on_every_admitted_type() {
+    for values in extremum_columns() {
+        let data_type = values.data_type().clone();
+        for implementation in [
+            Arc::new(Min::new()) as Arc<dyn AggregateUDFImpl>,
+            Arc::new(Max::new()),
+        ] {
+            let spec = extremum_spec(implementation, &data_type);
+            let name = format!("{} {data_type}", spec.udf.name());
+            let Ok(mut state) = ConcreteAggregateState::try_new(&spec, ConcreteInputMode::Weighted)
+            else {
+                assert!(
+                    matches!(data_type, DataType::Interval(_) | DataType::Struct(_)),
+                    "{name} must be admitted"
+                );
+                continue;
+            };
+            let template = state.clone();
+            let mut net = vec![0_i64; values.len()];
+            for weights in changelog_steps(values.len()) {
+                let weights: ArrayRef = Arc::new(Int64Array::from(weights));
+                let rows: Vec<u32> = (0..u32::try_from(values.len()).unwrap())
+                    .filter(|&row| weights.as_primitive::<Int64Type>().value(row as usize) != 0)
+                    .collect();
+                let input =
+                    AggregateInput::new(&values, None, Some(weights.as_primitive::<Int64Type>()))
+                        .with_row_encoding()
+                        .unwrap();
+                state.update_rows(&input, &rows).unwrap();
+                for (net, weight) in net.iter_mut().zip(weights.as_primitive::<Int64Type>()) {
+                    *net += weight.unwrap();
+                }
+
+                let held = UInt32Array::from_iter_values(
+                    (0..u32::try_from(values.len()).unwrap()).filter(|&row| net[row as usize] > 0),
+                );
+                let mut expected = datafusion_extremum(&spec);
+                expected
+                    .update_batch(&[arrow::compute::take(&values, &held, None).unwrap()])
+                    .unwrap();
+                let expected = expected.evaluate().unwrap();
+                assert_eq!(state.evaluate().unwrap(), expected, "{name}");
+
+                let mut restored = template.clone();
+                restored
+                    .merge_checkpoint_state(&state.checkpoint_state())
+                    .unwrap();
+                assert_eq!(restored.evaluate().unwrap(), expected, "{name} restored");
+                assert_eq!(
+                    restored.checkpoint_state(),
+                    state.checkpoint_state(),
+                    "{name} restored checkpoint"
+                );
+                assert_eq!(
+                    restored.nested_retained_bytes(),
+                    state.nested_retained_bytes(),
+                    "{name} retained bytes"
+                );
+            }
+            let weights = Int64Array::from_iter_values(net.iter().map(|net| -net));
+            let rows: Vec<u32> = (0..u32::try_from(values.len()).unwrap()).collect();
+            state
+                .update_rows(
+                    &AggregateInput::new(&values, None, Some(&weights))
+                        .with_row_encoding()
+                        .unwrap(),
+                    &rows,
+                )
+                .unwrap();
+            assert!(state.evaluate().unwrap().is_null(), "{name} drained");
+            assert_eq!(state.nested_retained_bytes(), 0, "{name} drained bytes");
+        }
+    }
+}
+
+fn weighted_max() -> ConcreteAggregateState {
+    let spec = spec(Max::new(), DataType::Int64, DataType::Int64, false);
+    ConcreteAggregateState::try_new(&spec, ConcreteInputMode::Weighted).unwrap()
+}
+
+fn apply(
+    state: &mut ConcreteAggregateState,
+    values: Vec<i64>,
+    weights: Vec<i64>,
+) -> Result<(), DbError> {
+    state.update_all(&[
+        Arc::new(Int64Array::from(values)),
+        Arc::new(Int64Array::from(weights)),
+    ])
+}
+
+#[test]
+fn changelog_extremum_errors_leave_the_state_as_it_was() {
+    let mut max = weighted_max();
+    apply(&mut max, vec![4, 7, 7], vec![1, 1, 1]).unwrap();
+    let before = max.checkpoint_state();
+
+    let error = apply(&mut max, vec![9, 7, 7, 5], vec![1, -1, -2, -1]).unwrap_err();
+    assert!(error.to_string().contains("negative"), "{error}");
+    assert_eq!(max.checkpoint_state(), before);
+    let error = apply(&mut max, vec![9, 5], vec![1, -1]).unwrap_err();
+    assert!(error.to_string().contains("does not hold"), "{error}");
+    assert_eq!(max.checkpoint_state(), before);
+    let error = apply(&mut max, vec![6, 6, 1], vec![1, -1, -5]).unwrap_err();
+    assert!(error.to_string().contains("does not hold"), "{error}");
+    assert_eq!(max.checkpoint_state(), before);
+    let error = apply(&mut max, vec![1, 4], vec![1, i64::MAX]).unwrap_err();
+    assert!(error.to_string().contains("overflow"), "{error}");
+    assert_eq!(max.checkpoint_state(), before);
+    assert!(max
+        .update_all(&[
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![1])),
+        ])
+        .is_err());
+    assert_eq!(max.evaluate().unwrap(), ScalarValue::Int64(Some(7)));
+
+    apply(&mut max, vec![7, 7], vec![-1, -1]).unwrap();
+    assert_eq!(max.evaluate().unwrap(), ScalarValue::Int64(Some(4)));
+    apply(&mut max, vec![4], vec![-1]).unwrap();
+    assert_eq!(max.evaluate().unwrap(), ScalarValue::Int64(None));
+}
+
+#[test]
+fn changelog_extremum_rejects_malformed_checkpoints_without_mutating() {
+    let mut source = weighted_max();
+    apply(&mut source, vec![2, 5], vec![3, 1]).unwrap();
+    let [ScalarValue::Binary(Some(valid))] = &source.checkpoint_state()[..] else {
+        panic!("a changelog MAX checkpoints one Binary");
+    };
+    // format, count, two weights, buffer count, one 16-byte buffer of the values 2 and 5
+    assert_eq!(valid.len(), 1 + 4 + 16 + 4 + 8 + 16);
+    let swapped = {
+        let mut bytes = valid.clone();
+        bytes[33..41].copy_from_slice(&5_i64.to_le_bytes());
+        bytes[41..49].copy_from_slice(&2_i64.to_le_bytes());
+        bytes
+    };
+    let with = |offset: usize, replacement: &[u8]| {
+        let mut bytes = valid.clone();
+        bytes[offset..offset + replacement.len()].copy_from_slice(replacement);
+        bytes
+    };
+    let mut malformed = vec![
+        with(0, &[2]),
+        with(1, &u32::MAX.to_le_bytes()),
+        with(5, &0_i64.to_le_bytes()),
+        with(13, &(-1_i64).to_le_bytes()),
+        with(21, &2_u32.to_le_bytes()),
+        with(21, &u32::MAX.to_le_bytes()),
+        with(25, &8_u64.to_le_bytes()),
+        swapped,
+        [valid.as_slice(), &[0]].concat(),
+    ];
+    malformed.extend((0..valid.len()).map(|length| valid[..length].to_vec()));
+
+    let mut target = weighted_max();
+    apply(&mut target, vec![2], vec![1]).unwrap();
+    let before = target.checkpoint_state();
+    for bytes in malformed {
+        assert!(
+            target
+                .merge_checkpoint_state(&[ScalarValue::Binary(Some(bytes.clone()))])
+                .is_err(),
+            "{bytes:?}"
+        );
+        assert_eq!(target.checkpoint_state(), before);
+    }
+    for state in [
+        vec![ScalarValue::Binary(None)],
+        vec![ScalarValue::Int64(Some(2))],
+        vec![],
+    ] {
+        assert!(target.merge_checkpoint_state(&state).is_err());
+    }
+    assert_eq!(target.checkpoint_state(), before);
+
+    target
+        .merge_checkpoint_state(&[ScalarValue::Binary(Some(valid.clone()))])
+        .unwrap();
+    assert_eq!(target.evaluate().unwrap(), ScalarValue::Int64(Some(5)));
+    apply(&mut target, vec![5, 2, 2, 2], vec![-1, -1, -1, -1]).unwrap();
+    assert_eq!(target.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
+}
+
+#[test]
+fn changelog_extremum_rejects_a_checkpoint_of_invalid_utf8() {
+    let spec = spec(Max::new(), DataType::Utf8, DataType::Utf8, false);
+    let mut source = ConcreteAggregateState::try_new(&spec, ConcreteInputMode::Weighted).unwrap();
+    source
+        .update_all(&[
+            Arc::new(StringArray::from(vec!["ab"])),
+            Arc::new(Int64Array::from(vec![1])),
+        ])
+        .unwrap();
+    let [ScalarValue::Binary(Some(valid))] = &source.checkpoint_state()[..] else {
+        panic!("a changelog MAX checkpoints one Binary");
+    };
+    let mut invalid = valid.clone();
+    *invalid.last_mut().unwrap() = 0xFF;
+    let mut target = ConcreteAggregateState::try_new(&spec, ConcreteInputMode::Weighted).unwrap();
+    let error = target
+        .merge_checkpoint_state(&[ScalarValue::Binary(Some(invalid))])
+        .unwrap_err();
+    assert!(error.to_string().contains("values are invalid"), "{error}");
+    target
+        .merge_checkpoint_state(&[ScalarValue::Binary(Some(valid.clone()))])
+        .unwrap();
+    assert_eq!(
+        target.evaluate().unwrap(),
+        ScalarValue::Utf8(Some("ab".into()))
+    );
+}
+
+#[test]
+fn changelog_extremum_state_does_not_widen_concrete_state() {
+    assert!(
+        std::mem::size_of::<retractable::RetractableExtremumState>()
+            <= std::mem::size_of::<SumState>()
+    );
 }

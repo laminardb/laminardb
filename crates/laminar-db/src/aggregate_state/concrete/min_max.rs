@@ -37,7 +37,7 @@ impl Extremum {
         )
     }
 
-    const fn name(self) -> &'static str {
+    pub(super) const fn name(self) -> &'static str {
         match self {
             Self::Min => "MIN",
             Self::Max => "MAX",

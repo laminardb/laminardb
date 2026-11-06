@@ -256,9 +256,9 @@ async fn salted_two_stage_count_and_sum_are_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-/// The outer stage sees the salted stage's retractions, which MIN and MAX cannot take back.
+/// The outer stage takes back each salted extreme the inner stage retracts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn salted_two_stage_min_max_is_unsupported_everywhere() {
+async fn salted_two_stage_min_max_is_equal() {
     let case = case(
         "salted_two_stage_min_max",
         &[
@@ -270,10 +270,49 @@ async fn salted_two_stage_min_max_is_unsupported_everywhere() {
         OutputForm::Changelog,
         Some("SELECT k / 20 AS k, MIN(v) AS lo, MAX(v) AS hi FROM events GROUP BY k / 20"),
     );
-    assert!(matches!(
-        verdict(case).await,
-        Verdict::UnsupportedEverywhere(reason) if reason.contains("require append-only input")
-    ));
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+const PER_KEY_CHANGES: &str = "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n, SUM(v) AS s \
+     FROM events GROUP BY k EMIT CHANGES";
+
+/// Each key's update retracts its previous `(n, s)` row, so every group's extreme is retracted
+/// as often as it is replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyed_min_max_over_changelog_stream_is_equal() {
+    let case = case(
+        "keyed_min_max_over_changelog_stream",
+        &[
+            PER_KEY_CHANGES,
+            "CREATE STREAM out AS SELECT n, MIN(s) AS lo, MAX(s) AS hi FROM per_key GROUP BY n \
+             EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        Some(
+            "SELECT n, MIN(s) AS lo, MAX(s) AS hi FROM \
+             (SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k) GROUP BY n",
+        ),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A global aggregate's peers ship one partial row per batch, which cannot carry the values a
+/// retracted extreme falls back to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_min_max_over_changelog_stream_is_rejected_in_cluster() {
+    let case = case(
+        "global_min_max_over_changelog_stream",
+        &[
+            PER_KEY_CHANGES,
+            "CREATE STREAM out AS SELECT MIN(s) AS lo, MAX(s) AS hi FROM per_key EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        Some(
+            "SELECT MIN(s) AS lo, MAX(s) AS hi FROM \
+             (SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k)",
+        ),
+    );
+    assert_rejected(verdict(case).await, "global MIN or MAX over a changelog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
