@@ -11,10 +11,12 @@ use crate::error::DbError;
 
 mod input;
 mod min_max;
+mod retractable;
 mod sum;
 
 pub(crate) use input::AggregateInput;
 use min_max::{Extremum, ExtremumState};
+use retractable::RetractableExtremumState;
 #[cfg(feature = "cluster")]
 use sum::sum_rows;
 pub(crate) use sum::SumState;
@@ -33,6 +35,10 @@ pub(crate) enum ConcreteAggregateState {
     Avg(AvgState),
     Min(ExtremumState),
     Max(ExtremumState),
+    /// MIN over a changelog.
+    RetractableMin(RetractableExtremumState),
+    /// MAX over a changelog.
+    RetractableMax(RetractableExtremumState),
 }
 
 impl ConcreteAggregateState {
@@ -66,13 +72,28 @@ impl ConcreteAggregateState {
                 mode,
             )?));
         }
+        let (input_type, output_type) = (&spec.input_types[0], &spec.return_type);
         if implementation.is::<Min>() {
-            require_append_only(spec, mode)?;
-            return ExtremumState::try_new(&spec.input_types[0], &spec.return_type).map(Self::Min);
+            return match mode {
+                ConcreteInputMode::AppendOnly => {
+                    ExtremumState::try_new(input_type, output_type).map(Self::Min)
+                }
+                ConcreteInputMode::Weighted => {
+                    RetractableExtremumState::try_new(input_type, output_type)
+                        .map(Self::RetractableMin)
+                }
+            };
         }
         if implementation.is::<Max>() {
-            require_append_only(spec, mode)?;
-            return ExtremumState::try_new(&spec.input_types[0], &spec.return_type).map(Self::Max);
+            return match mode {
+                ConcreteInputMode::AppendOnly => {
+                    ExtremumState::try_new(input_type, output_type).map(Self::Max)
+                }
+                ConcreteInputMode::Weighted => {
+                    RetractableExtremumState::try_new(input_type, output_type)
+                        .map(Self::RetractableMax)
+                }
+            };
         }
 
         Err(unsupported(
@@ -93,6 +114,8 @@ impl ConcreteAggregateState {
             Self::Avg(state) => state.update_rows(input, rows),
             Self::Min(state) => state.update_rows(Extremum::Min, input, rows),
             Self::Max(state) => state.update_rows(Extremum::Max, input, rows),
+            Self::RetractableMin(state) => state.update_rows(Extremum::Min, input, rows),
+            Self::RetractableMax(state) => state.update_rows(Extremum::Max, input, rows),
         }
     }
 
@@ -115,6 +138,9 @@ impl ConcreteAggregateState {
             Self::Avg(state) => state.batch_delta(input, rows),
             Self::Min(state) => state.batch_delta(Extremum::Min, input, rows),
             Self::Max(state) => state.batch_delta(Extremum::Max, input, rows),
+            Self::RetractableMin(_) | Self::RetractableMax(_) => Err(DbError::Pipeline(
+                "MIN/MAX over a changelog has no partial form; its rows go to the owner".into(),
+            )),
         }
     }
 
@@ -124,6 +150,8 @@ impl ConcreteAggregateState {
             Self::Sum(state) => state.evaluate(),
             Self::Avg(state) => state.evaluate(),
             Self::Min(state) | Self::Max(state) => Ok(state.evaluate()),
+            Self::RetractableMin(state) => state.evaluate(Extremum::Min),
+            Self::RetractableMax(state) => state.evaluate(Extremum::Max),
         }
     }
 
@@ -133,6 +161,7 @@ impl ConcreteAggregateState {
             Self::Sum(state) => state.checkpoint_state(),
             Self::Avg(state) => state.checkpoint_state(),
             Self::Min(state) | Self::Max(state) => state.checkpoint_state(),
+            Self::RetractableMin(state) | Self::RetractableMax(state) => state.checkpoint_state(),
         }
     }
 
@@ -146,12 +175,17 @@ impl ConcreteAggregateState {
             Self::Avg(state) => state.merge_checkpoint_state(checkpoint),
             Self::Min(state) => state.merge_checkpoint_state(Extremum::Min, checkpoint),
             Self::Max(state) => state.merge_checkpoint_state(Extremum::Max, checkpoint),
+            Self::RetractableMin(state) => state.merge_checkpoint_state(Extremum::Min, checkpoint),
+            Self::RetractableMax(state) => state.merge_checkpoint_state(Extremum::Max, checkpoint),
         }
     }
 
     pub(crate) fn nested_retained_bytes(&self) -> usize {
         match self {
             Self::Min(state) | Self::Max(state) => state.nested_retained_bytes(),
+            Self::RetractableMin(state) | Self::RetractableMax(state) => {
+                state.nested_retained_bytes()
+            }
             Self::Count(_) | Self::Sum(_) | Self::Avg(_) => 0,
         }
     }
@@ -163,13 +197,6 @@ fn unsupported(spec: &AggFuncSpec, reason: &str) -> DbError {
         laminar_core::error_codes::SQL_UNSUPPORTED,
         spec.udf.name(),
     ))
-}
-
-fn require_append_only(spec: &AggFuncSpec, mode: ConcreteInputMode) -> Result<(), DbError> {
-    if mode == ConcreteInputMode::Weighted {
-        return Err(unsupported(spec, "MIN/MAX require append-only input"));
-    }
-    Ok(())
 }
 
 fn aggregate_error(context: &str, error: impl std::fmt::Display) -> DbError {

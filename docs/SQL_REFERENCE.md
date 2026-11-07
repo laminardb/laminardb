@@ -371,10 +371,13 @@ non-`DISTINCT` aggregates:
 | `MIN(col)` / `MAX(col)` | Min/max |
 
 `first_value` and `last_value` are available on supported local window paths, not on the distributed
-named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog inputs remain rejected
-because bounded retractable extrema state is not supported. Mutable bounded-join output can feed
-`COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join output keeps
-the ordinary row stream.
+named-aggregate path. `DISTINCT` aggregates over changelog inputs remain rejected. `MIN` and `MAX`
+over a changelog (an `EMIT CHANGES` aggregate, a changelog view, or a CDC or change-feed source)
+keep each value a group holds with its net weight, so retracting the current extreme falls back
+to the next one; that state counts toward the memory budgets like other retained state. In
+cluster mode a `MIN` or `MAX` over a changelog needs a `GROUP BY`. Mutable bounded-join output
+can feed `COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join
+output keeps the ordinary row stream.
 
 ### Nested aggregates and aggregates over a join
 
@@ -465,7 +468,8 @@ EMIT CHANGES;
   of the key.
 - `COUNT` becomes a `SUM` of counts and `SUM` a `SUM` of sums. For an average, keep both and
   divide when reading, because an aggregate stage cannot compute `SUM(volume) / SUM(trades)`.
-  `MIN` and `MAX` cannot be salted, because the second stage reads changes.
+  `MIN` becomes a `MIN` of minimums and `MAX` a `MAX` of maximums; the second stage keeps every
+  salted group's current extreme so it can take one back.
 - The salted stage is one more remote exchange (a pipeline may have three below its sources) and
   adds one cycle of latency.
 

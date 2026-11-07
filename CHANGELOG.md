@@ -23,6 +23,13 @@
   names the column otherwise. In cluster mode the chain counts toward the three-exchange depth
   limit like named stages.
 
+- `MIN` and `MAX` work over changelog inputs: an `EMIT CHANGES` aggregate, a changelog
+  materialized view, a CDC or change-feed source, and the second stage of a salted aggregate.
+  Each group keeps every value it holds with its net weight, so retracting the current extreme
+  falls back to the next one; the values count toward `managed_state_bytes` and the memory
+  budgets. Embedded and single-node admit them with or without `GROUP BY`. Cluster mode admits
+  them with a `GROUP BY` and still rejects a global (ungrouped) one at `CREATE`.
+
 ### Changed
 
 - A multi-way join that is not a chain of interval joins over named inputs (with a lookup or

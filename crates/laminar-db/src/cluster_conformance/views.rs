@@ -432,6 +432,31 @@ async fn keyed_and_chained_views_match_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// MIN and MAX views over a changelog view take back each extreme the upstream retracts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn min_max_view_over_changelog_view_matches_batch_sql_in_cluster() {
+    let case = ViewCase {
+        name: "min_max_view_over_changelog_view",
+        sources: vec![events_with("events", 0, 40)],
+        views: views(&[
+            "CREATE MATERIALIZED VIEW counts AS \
+             SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k",
+            "CREATE MATERIALIZED VIEW extremes AS \
+             SELECT n, MIN(s) AS lo, MAX(s) AS hi FROM counts GROUP BY n",
+        ]),
+        reads: vec![
+            ("SELECT * FROM counts", KEYED_TRUTH),
+            (
+                "SELECT * FROM extremes",
+                "SELECT n, MIN(s) AS lo, MAX(s) AS hi FROM \
+                 (SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k) GROUP BY n",
+            ),
+        ],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Views that drop their upstream's key are placed by their full row: each node routes a row to
 /// the owner of its vnode, and every node reads all of them at the committed cut. Rows repeat
 /// across keys, so the owners keep multiplicities from several producers.

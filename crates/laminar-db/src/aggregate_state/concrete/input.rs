@@ -4,6 +4,8 @@
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, UInt32Array};
 use arrow::compute;
 use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, Rows, SortField};
+use datafusion::functions_aggregate::min_max::{Max, Min};
 
 use super::aggregate_error;
 use crate::aggregate_state::AggFuncSpec;
@@ -14,6 +16,9 @@ pub(crate) struct AggregateInput<'a> {
     pub(super) value: &'a ArrayRef,
     filter: Option<&'a BooleanArray>,
     weights: Option<&'a Int64Array>,
+    /// The value column's row encoding, for a MIN or MAX over weighted input. Held by value: an
+    /// interior-mutable cache here would make every per-row loop reload the other fields.
+    rows: Option<Rows>,
 }
 
 impl<'a> AggregateInput<'a> {
@@ -26,7 +31,19 @@ impl<'a> AggregateInput<'a> {
             value,
             filter,
             weights,
+            rows: None,
         }
+    }
+
+    /// Encodes the value column into rows that order as the values do.
+    pub(crate) fn with_row_encoding(mut self) -> Result<Self, DbError> {
+        let converter = RowConverter::new(vec![SortField::new(self.value.data_type().clone())])
+            .map_err(|error| aggregate_error("aggregate input row encoding", error))?;
+        let rows = converter
+            .convert_columns(std::slice::from_ref(self.value))
+            .map_err(|error| aggregate_error("aggregate input row encoding", error))?;
+        self.rows = Some(rows);
+        Ok(self)
     }
 
     /// Resolve each aggregate's columns in `batch`. `weights` must already be validated as
@@ -69,7 +86,13 @@ impl<'a> AggregateInput<'a> {
                             })
                     })
                     .transpose()?;
-                Ok(Self::new(column(value_index, "input")?, filter, weights))
+                let input = Self::new(column(value_index, "input")?, filter, weights);
+                let extremum = spec.udf.inner().as_any();
+                if weights.is_some() && (extremum.is::<Min>() || extremum.is::<Max>()) {
+                    input.with_row_encoding()
+                } else {
+                    Ok(input)
+                }
             })
             .collect()
     }
@@ -85,6 +108,12 @@ impl<'a> AggregateInput<'a> {
     pub(super) fn weights(&self) -> Result<&'a Int64Array, DbError> {
         self.weights
             .ok_or_else(|| DbError::Pipeline("weighted aggregate received no input weights".into()))
+    }
+
+    pub(super) fn row_encoding(&self) -> Result<&Rows, DbError> {
+        self.rows
+            .as_ref()
+            .ok_or_else(|| DbError::Pipeline("MIN/MAX input has no row encoding".into()))
     }
 
     /// The admitted rows' values copied into one array, for states that update from arrays.

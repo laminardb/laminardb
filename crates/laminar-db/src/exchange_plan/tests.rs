@@ -153,6 +153,53 @@ async fn global_aggregate_gathers_to_the_global_vnode() {
     );
 }
 
+/// A global MIN or MAX over a changelog gathers raw rows, since one partial row cannot hold the
+/// values a retracted extreme falls back to; other global aggregates over it gather partials.
+#[tokio::test]
+async fn global_min_max_over_a_changelog_gathers_rows() {
+    let db = db(&[
+        EVENTS,
+        "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k EMIT CHANGES",
+    ])
+    .await;
+    for (sql, exchange_form) in [
+        (
+            "CREATE STREAM top AS SELECT MAX(n) AS peak FROM per_key EMIT CHANGES",
+            "gather to vnode 0",
+        ),
+        (
+            "CREATE STREAM range AS SELECT COUNT(*) AS keys, MIN(n) AS low FROM per_key \
+             EMIT CHANGES",
+            "gather to vnode 0",
+        ),
+        (
+            "CREATE STREAM total AS SELECT SUM(n) AS rows FROM per_key EMIT CHANGES",
+            "gather partials to vnode 0",
+        ),
+    ] {
+        assert_eq!(
+            exchange(&db, sql).await,
+            rows(&[
+                (
+                    "exchange.input.per_key",
+                    &format!("{exchange_form} from hash(k Int64), weighted changelog"),
+                ),
+                ("exchange.output", "singleton(vnode 0), weighted changelog"),
+            ]),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        exchange(
+            &db,
+            "CREATE STREAM top AS SELECT MAX(v) AS peak FROM events EMIT CHANGES"
+        )
+        .await[0]
+            .1,
+        "gather partials to vnode 0 from arbitrary, append-only, event time ts"
+    );
+}
+
 #[tokio::test]
 async fn computed_group_key_and_window_markers() {
     let db = db(&[EVENTS]).await;

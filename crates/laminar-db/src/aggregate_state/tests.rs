@@ -2041,32 +2041,83 @@ async fn test_cascaded_agg_retract_batch() {
     }
 }
 
+/// Retracting a group's extreme reveals the next value, and a restored state retracts exactly the
+/// row the original emitted.
 #[tokio::test]
-async fn weighted_min_and_max_are_rejected_at_admission() {
+async fn changelog_min_and_max_retract_to_the_next_extreme_across_a_restore() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
         Field::new("price", DataType::Int64, false),
         Field::new(WEIGHT_COLUMN, DataType::Int64, false),
     ]));
-    let batch = RecordBatch::try_new(
+    let raw = |symbols: &[&str], prices: &[i64], weights: &[i64]| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(symbols.to_vec())),
+                Arc::new(arrow::array::Int64Array::from(prices.to_vec())),
+                Arc::new(arrow::array::Int64Array::from(weights.to_vec())),
+            ],
+        )
+        .unwrap()
+    };
+    let table = datafusion::datasource::MemTable::try_new(
         Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
+        vec![vec![raw(&["X"], &[1], &[1])]],
     )
     .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
+    ctx.register_table("upstream", Arc::new(table)).unwrap();
+    let sql = "SELECT symbol, MIN(price) AS lo, MAX(price) AS hi FROM upstream GROUP BY symbol";
+    let apply = |state: &mut IncrementalAggState, batch: RecordBatch, watermark: i64| {
+        let projected = state
+            .compiled_projection()
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap();
+        state.process_batch(&projected, watermark).unwrap();
+    };
+    let emitted = |state: &mut IncrementalAggState| {
+        let output = arrow::util::pretty::pretty_format_batches(&state.emit().unwrap())
+            .unwrap()
+            .to_string();
+        let mut rows = output
+            .lines()
+            .filter(|line| line.starts_with("| ") && !line.contains("symbol"))
+            .map(|line| line.split_whitespace().collect::<String>())
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
 
-    for sql in [
-        "SELECT symbol, MIN(price) AS value FROM upstream GROUP BY symbol",
-        "SELECT symbol, MAX(price) AS value FROM upstream GROUP BY symbol",
-    ] {
-        assert!(try_from_sql_local(&ctx, sql, false).await.is_err(), "{sql}");
+    let mut original = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
+    let empty = original.accounted_state_bytes();
+    apply(
+        &mut original,
+        raw(&["X", "X", "X", "Y"], &[5, 3, 9, 1], &[1, 1, 1, 1]),
+        10,
+    );
+    assert_eq!(emitted(&mut original), ["|X|3|9|1|", "|Y|1|1|1|"]);
+    let four_values = original.accounted_state_bytes();
+    apply(&mut original, raw(&["X", "X"], &[3, 9], &[-1, -1]), 20);
+    assert!(original.cached_usage_matches_structural_recompute());
+    assert!(empty < original.accounted_state_bytes());
+    assert!(original.accounted_state_bytes() < four_values);
+    let checkpoints = capture_all_vnodes(&mut original).unwrap();
+    let mut restored = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
+    let vnode_count = u32::from(restored.key_group_count().get());
+    for (vnode, checkpoint) in checkpoints {
+        restored
+            .restore_vnode(vnode, vnode_count, checkpoint)
+            .unwrap();
     }
+
+    let next = raw(&["X", "Y", "X"], &[5, 1, 7], &[-1, -1, 1]);
+    apply(&mut original, next.clone(), 30);
+    apply(&mut restored, next, 30);
+    let expected = ["|X|3|9|-1|", "|X|7|7|1|", "|Y|1|1|-1|"];
+    assert_eq!(emitted(&mut original), expected);
+    assert_eq!(emitted(&mut restored), expected);
 }
 
 #[tokio::test]

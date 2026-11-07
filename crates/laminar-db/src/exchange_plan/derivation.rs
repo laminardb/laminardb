@@ -159,12 +159,20 @@ async fn plan_stream(
                 .and_then(|window| {
                     window_event_time(logical, window, input_properties.event_time.as_ref())
                 });
+            // The owner of a MIN or MAX over a changelog needs every value to fall back to.
+            let changelog_extremum = input_properties.changelog == ChangelogKind::Weighted
+                && aggregate.aggr_exprs.iter().any(|expr| {
+                    matches!(
+                        expr.clone().unalias(),
+                        Expr::AggregateFunction(function)
+                            if matches!(function.func.name(), "min" | "max")
+                    )
+                });
             return Ok(keyed_aggregate(
                 logical,
-                &aggregate.group_exprs,
-                &aggregate.schema,
+                (&aggregate.group_exprs, &aggregate.schema),
                 (input, &input_properties.distribution),
-                closes_windows,
+                (closes_windows, !closes_windows && !changelog_extremum),
                 (changelog, event_time),
             ));
         }
@@ -353,16 +361,14 @@ fn forwarding(
 }
 
 /// A managed aggregate routes on its group expressions; a window excludes its boundary markers.
-/// Without a key it gathers to the global vnode, as partials for an aggregate and as raw rows for
-/// a window. A keyed aggregate whose input is already hashed
-/// on exactly that key is colocated; only the aggregate operator honours that, so windows always
-/// repartition.
+/// Without a key it gathers to the global vnode, as partials when `partial` holds and as raw rows
+/// otherwise. A keyed aggregate whose input is already hashed on exactly that key is colocated;
+/// only the aggregate operator honours that, so windows always repartition.
 fn keyed_aggregate(
     logical: &LogicalPlan,
-    group_exprs: &[Expr],
-    schema: &Schema,
+    (group_exprs, schema): (&[Expr], &Schema),
     (input, upstream): (&str, &Distribution),
-    window: bool,
+    (window, partial): (bool, bool),
     (changelog, event_time): (ChangelogKind, Option<EventTime>),
 ) -> StreamPlan {
     let groups: Vec<usize> = (0..group_exprs.len())
@@ -372,7 +378,7 @@ fn keyed_aggregate(
         (
             PortExchange::Gather {
                 vnode: GLOBAL_VNODE,
-                partial: !window,
+                partial,
             },
             Distribution::Singleton {
                 vnode: GLOBAL_VNODE,

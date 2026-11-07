@@ -36,6 +36,17 @@ impl IncrementalAggState {
         self.update_global_group(input_weight_delta, watermark_ms, &GlobalInput::Rows(batch))
     }
 
+    /// Whether a MIN or MAX reads a changelog, so the aggregate has no one-row partial form.
+    pub(crate) fn has_changelog_extremum(&self) -> bool {
+        self.aggregate_templates.iter().any(|template| {
+            matches!(
+                template,
+                ConcreteAggregateState::RetractableMin(_)
+                    | ConcreteAggregateState::RetractableMax(_)
+            )
+        })
+    }
+
     /// Schema of a partial batch: the net input weight, then each aggregate's state columns.
     #[cfg(feature = "cluster")]
     pub(crate) fn global_partial_schema(&self) -> SchemaRef {

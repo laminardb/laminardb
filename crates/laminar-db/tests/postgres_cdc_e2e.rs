@@ -1000,14 +1000,6 @@ async fn changelog_consumers_that_cannot_retract_are_rejected_before_data_moves(
     let changelog = capture.source("orders", CHANGELOG_COLUMNS, ", 'output.mode' = 'changelog'");
     let cases = [
         (
-            vec![
-                changelog.clone(),
-                "CREATE STREAM top AS SELECT label, MAX(qty) AS m FROM orders GROUP BY label"
-                    .to_string(),
-            ],
-            "MIN/MAX",
-        ),
-        (
             vec![capture.source(
                 "orders",
                 CHANGELOG_COLUMNS,
