@@ -40,7 +40,11 @@ impl IncrementalAggState {
     /// Whether other nodes send this aggregate one partial row per batch. A keyed aggregate takes
     /// their rows, and so does a global one with a MIN or MAX over a changelog: its owner needs
     /// every value to fall back to when the extreme is retracted.
+    // PERF: inlined into the two cluster routing callers, it moved the global update kernel to a
+    // placement that ran `agg/update/global` 16% slower with identical instructions. It runs once
+    // per cycle, so the call costs nothing measurable.
     #[cfg(feature = "cluster")]
+    #[inline(never)]
     pub(crate) fn gathers_partials(&self) -> bool {
         self.num_group_cols == 0
             && !self.aggregate_templates.iter().any(|template| {
