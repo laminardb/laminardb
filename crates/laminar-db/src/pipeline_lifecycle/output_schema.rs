@@ -431,7 +431,7 @@ async fn certify_managed_aggregates(
 /// the graph installs, a context of `sql`'s inputs with the graph's schemas. The session
 /// registers a materialized view by its rows, while the graph gives a changelog view's
 /// consumers its trailing weight, so a state built against `ctx` would be append-only.
-async fn graph_input_context(
+pub(crate) async fn graph_input_context(
     ctx: &datafusion::prelude::SessionContext,
     sql: &str,
     schemas: &HashMap<String, arrow_schema::SchemaRef>,
