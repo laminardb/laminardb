@@ -1,8 +1,9 @@
 //! Debug-build check that a derived aggregate or window port routes on exactly the columns the
-//! managed state's shuffle hashes, and gathers partials exactly when the state ships them
-//! wherever the context shows the input's weight. A failure is a derivation bug, never a reason
-//! to loosen the check.
+//! managed state's shuffle hashes, and gathers partials exactly when the state ships them. The
+//! state is built against the input schemas the operator graph installs. A failure is a
+//! derivation bug, never a reason to loosen the check.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -12,9 +13,7 @@ use laminar_sql::parser::EmitClause;
 use rustc_hash::FxHashSet;
 
 use super::{InputPort, KeyColumn, PortExchange, StreamPlan};
-use crate::aggregate_state::{
-    query_reads_weighted_changelog, CompiledProjection, IncrementalAggState,
-};
+use crate::aggregate_state::{CompiledProjection, IncrementalAggState};
 use crate::connector_manager::StreamRegistration;
 use crate::core_window_state::CoreWindowState;
 
@@ -41,7 +40,8 @@ pub(super) async fn assert_runtime_routing(
         return;
     };
     let stream = &registration.name;
-    let Some(runtime) = runtime_routing(ctx, registration).await else {
+    let inputs = graph_inputs(ctx, &registration.query_sql, changelog).await;
+    let Some(runtime) = runtime_routing(&inputs, registration).await else {
         return;
     };
     assert_eq!(
@@ -50,19 +50,11 @@ pub(super) async fn assert_runtime_routing(
         "stream '{stream}': plan routes on {keys:?}, managed state on {} group columns",
         runtime.group_columns
     );
-    // The context registers a view by its rows, while the graph gives its consumers the trailing
-    // weight, so a state rebuilt here over a changelog view cannot show the runtime's input mode.
-    let sql = &registration.query_sql;
-    let weighted = crate::sql_analysis::extract_table_references(sql)
-        .iter()
-        .any(|input| changelog.contains(input));
-    if query_reads_weighted_changelog(ctx, sql).await.ok() == Some(weighted) {
-        assert_eq!(
-            runtime.gathers_partials, partial,
-            "stream '{stream}': plan gathers partials: {partial}, managed state ships them: {}",
-            runtime.gathers_partials
-        );
-    }
+    assert_eq!(
+        runtime.gathers_partials, partial,
+        "stream '{stream}': plan gathers partials: {partial}, managed state ships them: {}",
+        runtime.gathers_partials
+    );
     let Some(schema) = runtime.pre_aggregate else {
         return;
     };
@@ -78,6 +70,33 @@ pub(super) async fn assert_runtime_routing(
             "stream '{stream}': plan key {key} differs from managed pre-aggregate column {field:?}"
         );
     }
+}
+
+/// `sql`'s inputs as the graph installs them: each changelog input with its trailing weight.
+async fn graph_inputs(
+    ctx: &SessionContext,
+    sql: &str,
+    changelog: &FxHashSet<String>,
+) -> SessionContext {
+    let mut schemas = HashMap::new();
+    for input in crate::sql_analysis::extract_table_references(sql) {
+        if !changelog.contains(&input) {
+            continue;
+        }
+        let Ok(provider) = ctx
+            .table_provider(crate::db::exact_table_reference(&input))
+            .await
+        else {
+            continue;
+        };
+        let schema =
+            crate::pipeline_lifecycle::advertise_changelog_schema(&input, &provider.schema())
+                .expect("a changelog input's registered schema admits its trailing weight");
+        schemas.insert(input, schema);
+    }
+    crate::pipeline_lifecycle::graph_input_context(ctx, sql, &schemas)
+        .await
+        .expect("the graph's inputs register in a fresh context")
 }
 
 /// How the state the graph builds routes its input.
