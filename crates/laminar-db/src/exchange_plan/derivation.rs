@@ -51,7 +51,7 @@ pub(crate) async fn derive(
         )
         .await?;
         #[cfg(all(debug_assertions, feature = "cluster"))]
-        super::shadow::assert_runtime_routing(ctx, registration, &stream).await;
+        super::shadow::assert_runtime_routing(ctx, registration, &stream, changelog).await;
         plan.streams.insert(registration.name.clone(), stream);
     }
     Ok(plan)

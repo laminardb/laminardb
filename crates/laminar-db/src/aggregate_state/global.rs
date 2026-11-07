@@ -1,5 +1,6 @@
 //! The global aggregate's single group, updated from raw pre-aggregate rows on its owner or, in
-//! cluster mode, from partial rows other nodes fold from theirs.
+//! cluster mode, from partial rows other nodes fold from theirs when every aggregate has a
+//! one-row partial form.
 
 #[cfg(feature = "cluster")]
 use std::sync::Arc;
@@ -36,15 +37,23 @@ impl IncrementalAggState {
         self.update_global_group(input_weight_delta, watermark_ms, &GlobalInput::Rows(batch))
     }
 
-    /// Whether a MIN or MAX reads a changelog, so the aggregate has no one-row partial form.
-    pub(crate) fn has_changelog_extremum(&self) -> bool {
-        self.aggregate_templates.iter().any(|template| {
-            matches!(
-                template,
-                ConcreteAggregateState::RetractableMin(_)
-                    | ConcreteAggregateState::RetractableMax(_)
-            )
-        })
+    /// Whether other nodes send this aggregate one partial row per batch. A keyed aggregate takes
+    /// their rows, and so does a global one with a MIN or MAX over a changelog: its owner needs
+    /// every value to fall back to when the extreme is retracted.
+    // PERF: inlined into the two cluster routing callers, it moved the global update kernel to a
+    // placement that ran `agg/update/global` 16% slower with identical instructions. It runs once
+    // per cycle, so the call costs nothing measurable.
+    #[cfg(feature = "cluster")]
+    #[inline(never)]
+    pub(crate) fn gathers_partials(&self) -> bool {
+        self.num_group_cols == 0
+            && !self.aggregate_templates.iter().any(|template| {
+                matches!(
+                    template,
+                    ConcreteAggregateState::RetractableMin(_)
+                        | ConcreteAggregateState::RetractableMax(_)
+                )
+            })
     }
 
     /// Schema of a partial batch: the net input weight, then each aggregate's state columns.

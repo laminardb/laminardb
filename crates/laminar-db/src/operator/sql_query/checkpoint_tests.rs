@@ -1287,6 +1287,163 @@ async fn global_aggregate_ships_partials_and_restores_queued_ones() {
 }
 
 #[cfg(feature = "cluster")]
+fn changelog_values(values: &[i64], weight: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(values.to_vec())),
+            Arc::new(Int64Array::from(vec![weight; values.len()])),
+        ],
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "cluster")]
+async fn global_changelog_extremum_operator(
+    scope: &ClusterShuffleConfig,
+    metrics: Option<Arc<EngineMetrics>>,
+) -> SqlQueryOperator {
+    let context = laminar_sql::create_session_context();
+    let table = datafusion::datasource::MemTable::try_new(
+        changelog_values(&[], 1).schema(),
+        vec![Vec::new()],
+    )
+    .unwrap();
+    context.register_table("changes", Arc::new(table)).unwrap();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "extremes",
+        "SELECT COUNT(*) AS n, MIN(value) AS lo, MAX(value) AS hi FROM changes",
+        context,
+        metrics,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    operator
+}
+
+/// A MIN or MAX over a changelog has no one-row partial, so a non-owner ships its rows and the
+/// owner falls back to the next extreme when a peer retracts the current one.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn global_changelog_extremum_ships_rows_and_restores_queued_ones() {
+    let sender_scope = cluster_scope([2, 1, 1, 1, 1, 1, 1, 1]).await;
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    let mut sender =
+        global_changelog_extremum_operator(&sender_scope, Some(Arc::clone(&metrics))).await;
+    let frontier = InputFrontier {
+        watermark: Some(10),
+        idle: false,
+    };
+    let rows = sender
+        .pre_aggregate(&[
+            changelog_values(&[1, 2, 3, 40], 1),
+            changelog_values(&[40], -1),
+        ])
+        .await
+        .unwrap();
+    let plan = sender
+        .plan_cluster_batches(
+            rows.clone(),
+            frontier,
+            &sender_scope,
+            &sender_scope.registry.versioned_snapshot(),
+            &[2],
+        )
+        .unwrap();
+    assert!(plan.local_batches.is_empty());
+    let shipped = plan
+        .outbound
+        .iter()
+        .filter_map(|(peer, message)| match message {
+            ShuffleMessage::Data {
+                routed_vnodes,
+                batch,
+                ..
+            } => {
+                assert_eq!((*peer, routed_vnodes.as_ref()), (2, &[0][..]));
+                Some(batch.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(shipped, rows);
+    let shuffled = |form| {
+        metrics
+            .flow
+            .aggregate_shuffle_rows_total
+            .with_label_values(&["extremes", form])
+            .get()
+    };
+    assert_eq!((shuffled("input"), shuffled("sent")), (5, 5));
+
+    let receiver_scope = cluster_scope([1, 2, 2, 2, 2, 2, 2, 2]).await;
+    let mut receiver = global_changelog_extremum_operator(&receiver_scope, None).await;
+    assert_eq!(
+        receiver.expected_shuffle_schema().unwrap(),
+        rows[0].schema()
+    );
+    let version = receiver_scope.registry.assignment_version();
+    let recovery = receiver_scope.receiver.recovery_gen();
+    for batch in shipped {
+        let staged = crate::operator::RetainedBatch::restored_channel(
+            batch,
+            2,
+            version,
+            recovery,
+            Arc::from([0_u32]),
+        );
+        receiver
+            .stage_checkpointed_shuffle("extremes", staged, i64::MIN)
+            .unwrap();
+    }
+    receiver
+        .stage_checkpointed_shuffle_frontier("extremes", 2, frontier, version, recovery)
+        .unwrap();
+    let capture = receiver
+        .checkpoint_capture(1 << 20)
+        .unwrap()
+        .expect("cluster aggregate always captures its channel cut");
+    let mut staged_bytes = capture.retained_bytes();
+    let encoded = capture.materialize(&mut staged_bytes, 1 << 20).unwrap();
+
+    let mut restored = global_changelog_extremum_operator(&receiver_scope, None).await;
+    restored
+        .restore(OperatorCheckpoint {
+            data: encoded.to_vec(),
+        })
+        .unwrap();
+    assert_eq!(restored.queued_remote_events, 3);
+    let mut outputs = Vec::new();
+    for _ in 0..3 {
+        let output = restored
+            .process_cluster(&[Vec::new()], InputFrontier::default())
+            .await
+            .unwrap();
+        outputs.extend(output.iter().map(|batch| {
+            let column = |index| {
+                arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(
+                    batch.column(index),
+                )
+                .value(0)
+            };
+            (column(0), column(1), column(2))
+        }));
+    }
+    assert_eq!(restored.queued_remote_events, 0);
+    assert_eq!(outputs, [(4, 1, 40), (3, 1, 3)]);
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
     let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
