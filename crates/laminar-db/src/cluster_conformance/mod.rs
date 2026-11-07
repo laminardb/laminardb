@@ -86,7 +86,7 @@ impl Case {
             Startup::Running(cluster) => cluster,
             Startup::Rejected(error) => return Ok(Verdict::Rejected(error.to_string())),
         };
-        let observed = self.observe_cluster(&cluster).await;
+        let observed = self.observe_cluster(&cluster, &embedded).await;
         cluster.shutdown().await;
         let observed = observed?;
         if observed != embedded {
@@ -124,7 +124,11 @@ impl Case {
             .map_err(|e| format!("{}: embedded {e}", self.name))?))
     }
 
-    async fn observe_cluster(&self, cluster: &Cluster) -> Result<Consolidated, String> {
+    async fn observe_cluster(
+        &self,
+        cluster: &Cluster,
+        embedded: &Consolidated,
+    ) -> Result<Consolidated, String> {
         let readers = cluster
             .dbs
             .iter()
@@ -140,7 +144,7 @@ impl Case {
             .zip(readers)
             .map(|(db, reader)| self.portal(db, reader))
             .collect::<Result<Vec<_>, _>>()?;
-        let output = self
+        let mut output = self
             .drain(&cluster.dbs, &mut portals, &cluster.polled)
             .await?;
         if self.checkpoint_under_load && !cluster.dbs.iter().any(|db| flush_crossed_exchange(db)) {
@@ -156,7 +160,34 @@ impl Case {
         {
             return Err(format!("{}: node {} read no input", self.name, idle + 1));
         }
-        oracle::consolidate(&output, self.form).map_err(|e| format!("{}: cluster {e}", self.name))
+        self.settle(&cluster.dbs, &mut portals, &mut output, embedded)
+            .await
+    }
+
+    /// A cluster window closes only once its input's frontier has crossed each exchange, which the
+    /// checkpoint taken right after delivery need not include. Checkpoint until the output equals
+    /// `expected` or the deadline passes, and return the last observation for the caller to
+    /// compare.
+    async fn settle(
+        &self,
+        dbs: &[Arc<LaminarDB>],
+        portals: &mut [SubscriptionPortal],
+        batches: &mut Vec<RecordBatch>,
+        expected: &Consolidated,
+    ) -> Result<Consolidated, String> {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let observed = oracle::consolidate(batches, self.form)
+                .map_err(|e| format!("{}: cluster {e}", self.name))?;
+            if observed == *expected || tokio::time::Instant::now() >= deadline {
+                return Ok(observed);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.checkpoint(dbs).await?;
+            for portal in portals.iter_mut() {
+                read_published(portal, batches).map_err(|e| format!("{}: {e}", self.name))?;
+            }
+        }
     }
 
     /// Owner-local observation of the stream log, attached before start so no output is missed;
