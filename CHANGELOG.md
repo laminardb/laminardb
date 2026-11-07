@@ -50,6 +50,10 @@
 
 ### Fixed
 
+- In every mode, `CREATE` certifies an aggregate over a changelog materialized view in its
+  changelog form, as it already did over an `EMIT CHANGES` stream. One whose changelog state
+  cannot hold its input (for example `MIN` or `MAX` over an `INTERVAL` column) is now rejected at
+  `CREATE`; before, it was admitted and the pipeline failed to start.
 - A window over another window's output no longer drops the upstream's rows. A window stream's
   watermark now trails the watermark its windows close at: by the allowed lateness when it
   projects `tumble_end` or `hop_end`, and by the lateness plus the window size otherwise.
