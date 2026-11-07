@@ -646,12 +646,6 @@ impl LaminarDB {
                     )));
                 }
             };
-            if aggregate.num_group_cols() == 0 && aggregate.has_changelog_extremum() {
-                return Err(reject(
-                    "a global MIN or MAX over a changelog needs every value on the global owner, and \
-                     the global exchange ships one partial row per batch",
-                ));
-            }
             // A stage feeds only its owner and is never subscribed to.
             let certified = if crate::sql_analysis::stage_owner(name).is_some() {
                 plan.subscription_output.is_none()

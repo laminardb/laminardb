@@ -1,5 +1,5 @@
 //! Cluster routing of pre-aggregated input batches: local apply, remote shuffle (as per-batch
-//! partials for a global aggregate), and the frontier frames every peer receives.
+//! partials for a global aggregate that has them), and the frontier frames every peer receives.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -113,8 +113,9 @@ impl SqlQueryOperator {
         })
     }
 
-    /// The owner of the global vnode when it is another node; only then do this node's rows
-    /// travel, folded into partials. The owner applies its own rows directly.
+    /// The owner of the global vnode when it is another node and this aggregate gathers
+    /// partials; only then do this node's rows travel folded. The owner applies its own rows
+    /// directly, and every other aggregate's rows are routed as they are.
     fn remote_global_owner(
         &self,
         aggregate: &IncrementalAggState,
@@ -122,7 +123,7 @@ impl SqlQueryOperator {
         assignment: &VnodeAssignmentSnapshot,
         self_id: NodeId,
     ) -> Result<Option<NodeId>, DbError> {
-        if aggregate.num_group_cols() != 0 || batches.is_empty() {
+        if batches.is_empty() || !aggregate.gathers_partials() {
             return Ok(None);
         }
         let error = match assignment.owners().first() {
@@ -226,7 +227,7 @@ impl SqlQueryOperator {
     }
 
     /// The schema every peer's shuffle batch carries: pre-aggregate rows, or for a global
-    /// aggregate the partial rows each node folds from its own.
+    /// aggregate that gathers partials the partial rows each node folds from its own.
     pub(super) fn expected_shuffle_schema(&self) -> Result<SchemaRef, DbError> {
         let QueryState::Agg(aggregate) = &self.state else {
             return Err(DbError::Checkpoint(format!(
@@ -234,7 +235,7 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         };
-        if aggregate.num_group_cols() == 0 {
+        if aggregate.gathers_partials() {
             return Ok(aggregate.global_partial_schema());
         }
         if let Some(projection) = aggregate.compiled_projection() {
@@ -251,7 +252,8 @@ impl SqlQueryOperator {
         )
     }
 
-    /// Apply batches a peer shuffled here. A global aggregate's peers send partials.
+    /// Apply batches a peer shuffled here: partial rows for an aggregate that gathers them,
+    /// otherwise pre-aggregate rows.
     pub(super) fn apply_remote_aggregate(
         &mut self,
         batches: &[(RecordBatch, Option<u32>)],
@@ -259,7 +261,7 @@ impl SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         self.invalidate_local_aggregate_output_cache();
         match &mut self.state {
-            QueryState::Agg(aggregate) if aggregate.num_group_cols() == 0 => {
+            QueryState::Agg(aggregate) if aggregate.gathers_partials() => {
                 for (batch, _) in batches {
                     aggregate.merge_global_partials(batch, watermark)?;
                 }

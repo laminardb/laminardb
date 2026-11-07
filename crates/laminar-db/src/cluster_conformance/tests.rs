@@ -296,23 +296,24 @@ async fn keyed_min_max_over_changelog_stream_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-/// A global aggregate's peers ship one partial row per batch, which cannot carry the values a
-/// retracted extreme falls back to.
+/// A global MIN or MAX has no one-row partial, so every node sends its rows to the global owner,
+/// which folds the COUNT and SUM beside them from the same rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn global_min_max_over_changelog_stream_is_rejected_in_cluster() {
+async fn global_min_max_over_changelog_stream_is_equal() {
     let case = case(
         "global_min_max_over_changelog_stream",
         &[
             PER_KEY_CHANGES,
-            "CREATE STREAM out AS SELECT MIN(s) AS lo, MAX(s) AS hi FROM per_key EMIT CHANGES",
+            "CREATE STREAM out AS SELECT COUNT(*) AS keys, SUM(s) AS total, MIN(s) AS lo, \
+             MAX(s) AS hi FROM per_key EMIT CHANGES",
         ],
         OutputForm::Changelog,
         Some(
-            "SELECT MIN(s) AS lo, MAX(s) AS hi FROM \
+            "SELECT COUNT(*) AS keys, SUM(s) AS total, MIN(s) AS lo, MAX(s) AS hi FROM \
              (SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k)",
         ),
     );
-    assert_rejected(verdict(case).await, "global MIN or MAX over a changelog");
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -27,8 +27,8 @@
   materialized view, a CDC or change-feed source, and the second stage of a salted aggregate.
   Each group keeps every value it holds with its net weight, so retracting the current extreme
   falls back to the next one; the values count toward `managed_state_bytes` and the memory
-  budgets. Embedded and single-node admit them with or without `GROUP BY`. Cluster mode admits
-  them with a `GROUP BY` and still rejects a global (ungrouped) one at `CREATE`.
+  budgets, in every mode, with or without `GROUP BY`. In cluster mode a global (ungrouped) one
+  has every node send its rows to the owner of vnode 0 (`EXPLAIN` shows `gather to vnode 0`).
 
 ### Changed
 

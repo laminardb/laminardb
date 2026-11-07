@@ -457,6 +457,31 @@ async fn min_max_view_over_changelog_view_matches_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// The global view's owner holds every value of `s`, so it falls back as each key's sum moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_min_max_view_over_changelog_view_matches_batch_sql_in_cluster() {
+    let case = ViewCase {
+        name: "global_min_max_view_over_changelog_view",
+        sources: vec![events_with("events", 0, 40)],
+        views: views(&[
+            "CREATE MATERIALIZED VIEW counts AS \
+             SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k",
+            "CREATE MATERIALIZED VIEW extremes AS \
+             SELECT MIN(s) AS lo, MAX(s) AS hi FROM counts",
+        ]),
+        reads: vec![
+            ("SELECT * FROM counts", KEYED_TRUTH),
+            (
+                "SELECT * FROM extremes",
+                "SELECT MIN(s) AS lo, MAX(s) AS hi FROM \
+                 (SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k)",
+            ),
+        ],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Views that drop their upstream's key are placed by their full row: each node routes a row to
 /// the owner of its vnode, and every node reads all of them at the committed cut. Rows repeat
 /// across keys, so the owners keep multiplicities from several producers.
