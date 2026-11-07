@@ -185,38 +185,6 @@ pub(crate) async fn resolve_stream_output_schemas(
             pending = next;
         }
 
-        for reg in stream_regs.values() {
-            let shape = shapes.get(&reg.name).ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "stream '{}' has no resolved output shape",
-                    reg.name
-                ))
-            })?;
-            if !shape.aggregate && reg.window_config.is_none() {
-                continue;
-            }
-            let certified = crate::ddl::validate_managed_aggregate_admission(
-                ctx,
-                &reg.query_sql,
-                reg.window_config.as_ref(),
-                reg.emit_clause.as_ref(),
-                laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
-            )
-            .await
-            .map_err(|error| {
-                DbError::Pipeline(format!(
-                    "stream '{}' aggregate could not be certified: {error}",
-                    reg.name
-                ))
-            })?;
-            if !certified {
-                return Err(DbError::Pipeline(format!(
-                    "stream '{}' aggregate has no managed execution path",
-                    reg.name
-                )));
-            }
-        }
-
         // Admitted full-changelog sources are changelog roots exactly like mutable join output.
         let mut changelog_carrying: rustc_hash::FxHashSet<String> =
             ordered_interval_joins.keys().chain(changelog_sources).cloned().collect();
@@ -379,6 +347,7 @@ pub(crate) async fn resolve_stream_output_schemas(
             }
         }
         advertise_changelog_outputs(&mut schemas, &changelog_carrying, changelog_sources)?;
+        certify_managed_aggregates(ctx, stream_regs, &shapes, &schemas).await?;
         let exchange_plan = crate::exchange_plan::derive(
             ctx,
             stream_regs,
@@ -414,6 +383,105 @@ pub(super) struct StreamOutputShape {
     aggregate: bool,
     projection_filter: bool,
     planned_functions_immutable: bool,
+}
+
+/// Certify every aggregate and window against the inputs the operator graph installs for it.
+async fn certify_managed_aggregates(
+    ctx: &datafusion::prelude::SessionContext,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    shapes: &HashMap<String, StreamOutputShape>,
+    schemas: &HashMap<String, arrow_schema::SchemaRef>,
+) -> Result<(), DbError> {
+    for reg in stream_regs.values() {
+        let shape = shapes.get(&reg.name).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "stream '{}' has no resolved output shape",
+                reg.name
+            ))
+        })?;
+        if !shape.aggregate && reg.window_config.is_none() {
+            continue;
+        }
+        let inputs = graph_input_context(ctx, &reg.query_sql, schemas).await?;
+        let certified = crate::ddl::validate_managed_aggregate_admission(
+            &inputs,
+            &reg.query_sql,
+            reg.window_config.as_ref(),
+            reg.emit_clause.as_ref(),
+            laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
+        )
+        .await
+        .map_err(|error| {
+            DbError::Pipeline(format!(
+                "stream '{}' aggregate could not be certified: {error}",
+                reg.name
+            ))
+        })?;
+        if !certified {
+            return Err(DbError::Pipeline(format!(
+                "stream '{}' aggregate has no managed execution path",
+                reg.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `ctx`, or, when `sql` reads a stream or view that `ctx` registers with another schema than
+/// the graph installs, a context of `sql`'s inputs with the graph's schemas. The session
+/// registers a materialized view by its rows, while the graph gives a changelog view's
+/// consumers its trailing weight, so a state built against `ctx` would be append-only.
+async fn graph_input_context(
+    ctx: &datafusion::prelude::SessionContext,
+    sql: &str,
+    schemas: &HashMap<String, arrow_schema::SchemaRef>,
+) -> Result<datafusion::prelude::SessionContext, DbError> {
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::execution::session_state::SessionStateBuilder;
+
+    let mut inputs = Vec::new();
+    let mut differs = false;
+    for name in crate::sql_analysis::extract_table_references(sql) {
+        // An unresolved input fails in the admission that plans `sql`.
+        let Ok(provider) = ctx.table_provider(exact_table_reference(&name)).await else {
+            return Ok(ctx.clone());
+        };
+        let provider: Arc<dyn TableProvider> = match schemas.get(&name) {
+            Some(schema) if **schema != *provider.schema() => {
+                differs = true;
+                Arc::new(EmptyTable::new(Arc::clone(schema)))
+            }
+            _ => provider,
+        };
+        inputs.push((name, provider));
+    }
+    if !differs {
+        return Ok(ctx.clone());
+    }
+    let state = ctx.state();
+    let config = state
+        .config()
+        .clone()
+        .with_create_default_catalog_and_schema(true);
+    let context = datafusion::prelude::SessionContext::new_with_state(
+        SessionStateBuilder::new_from_existing(state)
+            .with_config(config)
+            .with_catalog_list(Arc::new(
+                datafusion::catalog::MemoryCatalogProviderList::new(),
+            ))
+            .build(),
+    );
+    for (name, provider) in inputs {
+        context
+            .register_table(exact_table_reference(&name), provider)
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "could not register input '{name}' for aggregate certification: {error}"
+                ))
+            })?;
+    }
+    Ok(context)
 }
 
 /// Reject a reserved weight on streams that carry no changelog, and advertise the trailing weight

@@ -332,3 +332,36 @@ async fn view_quota_halt_remains_terminal_across_public_stop_and_start() {
     assert!(error.requires_pipeline_halt(), "{error}");
     assert_eq!(db.last_fault().as_deref(), Some(reason.as_str()));
 }
+
+/// A changelog view's consumers read its trailing weight at runtime, so CREATE certifies their
+/// aggregates over a changelog, as it does over an `EMIT CHANGES` stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_over_changelog_view_is_certified_over_its_changelog() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE input (k BIGINT, d INTERVAL)")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW latest AS SELECT k, MAX(d) AS d FROM input GROUP BY k")
+        .await
+        .unwrap();
+    for (kind, sql) in [
+        (
+            "view",
+            "CREATE MATERIALIZED VIEW lo AS SELECT k, MIN(d) AS lo FROM latest GROUP BY k",
+        ),
+        (
+            "stream",
+            "CREATE STREAM lo AS SELECT k, MIN(d) AS lo FROM latest GROUP BY k EMIT CHANGES",
+        ),
+    ] {
+        let error = db.execute(sql).await.unwrap_err().to_string();
+        assert!(
+            error.contains("MIN/MAX over a changelog does not support Interval"),
+            "{kind}: {error}"
+        );
+    }
+    db.execute("CREATE MATERIALIZED VIEW lo AS SELECT k, MIN(k) AS lo FROM latest GROUP BY k")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+}
