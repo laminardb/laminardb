@@ -375,9 +375,10 @@ named-aggregate path. `DISTINCT` aggregates over changelog inputs remain rejecte
 over a changelog (an `EMIT CHANGES` aggregate, a changelog view, or a CDC or change-feed source)
 keep each value a group holds with its net weight, so retracting the current extreme falls back
 to the next one; that state counts toward the memory budgets like other retained state. In
-cluster mode a `MIN` or `MAX` over a changelog needs a `GROUP BY`. Mutable bounded-join output
-can feed `COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join
-output keeps the ordinary row stream.
+cluster mode a global (ungrouped) `MIN` or `MAX` over a changelog has every node send its rows to
+the owner of vnode 0, which holds every value, so that one node applies the whole input. Mutable
+bounded-join output can feed `COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink;
+append-only join output keeps the ordinary row stream.
 
 ### Nested aggregates and aggregates over a join
 
@@ -791,7 +792,8 @@ An input is `forward` (rows stay where they are), `repartition on (...)` (rows m
 owner of their key), `colocated on (...)` (an aggregate whose input is already hashed on its
 group key, so no rows move), `gather partials to vnode N` (a global aggregate: in cluster mode
 each other node sends one partial row per input batch instead of its rows), or `gather to vnode N`
-(a window without a group key). Join inputs are named
+(a window without a group key, or a global aggregate with a `MIN` or `MAX` over a changelog: the
+other nodes send their rows). Join inputs are named
 `left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
 (an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry an

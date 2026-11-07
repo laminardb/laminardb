@@ -199,6 +199,11 @@ fn bench_changelog(c: &mut Criterion) {
             "sum",
             "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM changes GROUP BY k",
         ),
+        // Every value in one group, as the global owner holds them in cluster mode.
+        (
+            "global_min_max",
+            "SELECT MIN(v) AS lo, MAX(p) AS hi FROM changes",
+        ),
     ] {
         for (schedule, preload) in [
             ("insert_retract", vec![&held]),
