@@ -4,7 +4,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::ScalarValue;
 #[cfg(feature = "cluster")]
@@ -17,7 +16,10 @@ use rustc_hash::FxHashSet;
 use super::apply_compiled_having;
 #[cfg(feature = "cluster")]
 use super::vnode_state::AggregateVnodeState;
-use super::{build_weighted_batch, ConcreteAggregateState, DbError, GroupKey, IncrementalAggState};
+use super::{
+    build_weighted_batch, ConcreteAggregateState, DbError, GroupKey, IncrementalAggState,
+    OutputColumn,
+};
 #[cfg(feature = "cluster")]
 use crate::subscription::PartitionedOutputBatch;
 
@@ -512,32 +514,20 @@ impl IncrementalAggState {
 
     #[cfg(feature = "cluster")]
     fn build_running_batch(&self, rows: &[PendingChange]) -> Result<RecordBatch, DbError> {
-        let group_arrays = if self.num_group_cols == 0 {
+        let mut arrays = if self.num_group_cols == 0 {
             Vec::new()
         } else {
             self.row_converter
                 .convert_rows(rows.iter().map(|row| row.key.row()))
                 .map_err(|error| DbError::Pipeline(format!("group key array build: {error}")))?
         };
-        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (index, spec) in self.agg_specs.iter().enumerate() {
-            let values = rows.iter().map(|row| row.values[index].clone());
-            let array = ScalarValue::iter_to_array(values)
-                .map_err(|error| DbError::Pipeline(format!("agg result array build: {error}")))?;
-            let array = if array.data_type() == &spec.return_type {
-                array
-            } else {
-                arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "aggregate '{}' result cast failed: {error}",
-                        spec.output_name
-                    ))
-                })?
-            };
-            agg_arrays.push(array);
+            let mut column = OutputColumn::with_capacity(rows.len());
+            for row in rows {
+                column.push(row.values[index].clone())?;
+            }
+            arrays.push(column.finish(spec)?);
         }
-        let mut arrays = group_arrays;
-        arrays.extend(agg_arrays);
         RecordBatch::try_new(Arc::clone(&self.output_schema), arrays)
             .map_err(|error| DbError::Pipeline(format!("result batch build: {error}")))
     }
@@ -669,7 +659,7 @@ impl IncrementalAggState {
             return Ok(Vec::new());
         }
 
-        let group_arrays = if self.num_group_cols > 0 {
+        let mut arrays = if self.num_group_cols > 0 {
             self.row_converter
                 .convert_rows(
                     self.vnode_states
@@ -681,30 +671,21 @@ impl IncrementalAggState {
         } else {
             Vec::new()
         };
-        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
-        for (index, spec) in self.agg_specs.iter().enumerate() {
-            let mut scalars = Vec::with_capacity(num_rows);
-            for (_, state) in self.vnode_states.iter_mut() {
-                for entry in state.groups.values_mut() {
-                    scalars.push(entry.accs[index].evaluate()?);
+        let mut columns: Vec<OutputColumn> = self
+            .agg_specs
+            .iter()
+            .map(|_| OutputColumn::with_capacity(num_rows))
+            .collect();
+        for (_, state) in self.vnode_states.iter_mut() {
+            for entry in state.groups.values_mut() {
+                for (column, acc) in columns.iter_mut().zip(&mut entry.accs) {
+                    column.push(acc.evaluate()?)?;
                 }
             }
-            let array = ScalarValue::iter_to_array(scalars)
-                .map_err(|error| DbError::Pipeline(format!("agg result array build: {error}")))?;
-            let array = if array.data_type() == &spec.return_type {
-                array
-            } else {
-                arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "aggregate '{}' result cast failed: {error}",
-                        spec.output_name
-                    ))
-                })?
-            };
-            agg_arrays.push(array);
         }
-        let mut arrays = group_arrays;
-        arrays.extend(agg_arrays);
+        for (column, spec) in columns.into_iter().zip(&self.agg_specs) {
+            arrays.push(column.finish(spec)?);
+        }
         let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), arrays)
             .map_err(|error| DbError::Pipeline(format!("result batch build: {error}")))?;
         Ok(vec![batch])

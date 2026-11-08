@@ -33,6 +33,7 @@ mod grouping;
 #[cfg(all(feature = "cluster", any(test, feature = "benchmark-internals")))]
 pub(crate) mod keyed_partial;
 mod keys;
+mod output_column;
 #[cfg(feature = "cluster")]
 mod output_sequence;
 #[cfg(feature = "cluster")]
@@ -58,6 +59,7 @@ pub(crate) use emission::PreparedAggregateEmission;
 use group_map::{GroupKey, GroupMap};
 use grouping::{BatchGroups, EncodedKeys, FixedWidthKeyGrouper};
 pub(crate) use keys::global_aggregate_key;
+pub(crate) use output_column::OutputColumn;
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
 /// Builds the per-window result batch for one closed window.
@@ -74,48 +76,28 @@ pub(crate) fn emit_window_batch(
         return Ok(None);
     }
 
-    // Collect keys and evaluate accumulators in a single drain pass.
     let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
-    let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..agg_specs.len())
-        .map(|_| Vec::with_capacity(num_rows))
+    let mut columns: Vec<OutputColumn> = agg_specs
+        .iter()
+        .map(|_| OutputColumn::with_capacity(num_rows))
         .collect();
-
     for (key, mut accs) in groups {
         row_keys.push(key);
-        for (i, acc) in accs.iter_mut().enumerate() {
-            agg_scalars[i].push(acc.evaluate()?);
+        for (column, acc) in columns.iter_mut().zip(&mut accs) {
+            column.push(acc.evaluate()?)?;
         }
     }
 
-    let group_arrays = if num_group_cols == 0 {
+    let mut all_arrays = if num_group_cols == 0 {
         Vec::new()
     } else {
         row_converter
             .convert_rows(row_keys.iter().map(arrow::row::OwnedRow::row))
             .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
     };
-
-    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
-    for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
-        let spec = &agg_specs[agg_idx];
-        let array = ScalarValue::iter_to_array(scalars)
-            .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
-        if array.data_type() == &spec.return_type {
-            agg_arrays.push(array);
-        } else {
-            let casted = arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "window aggregate '{}' result cast failed: {error}",
-                    spec.output_name
-                ))
-            })?;
-            agg_arrays.push(casted);
-        }
+    for (column, spec) in columns.into_iter().zip(agg_specs) {
+        all_arrays.push(column.finish(spec)?);
     }
-
-    let mut all_arrays = Vec::with_capacity(group_arrays.len() + agg_arrays.len());
-    all_arrays.extend(group_arrays);
-    all_arrays.extend(agg_arrays);
 
     let batch = RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
         .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
@@ -845,39 +827,23 @@ fn build_weighted_batch(
     agg_specs: &[AggFuncSpec],
     output_schema: &SchemaRef,
 ) -> Result<RecordBatch, DbError> {
-    let group_arrays = if num_group_cols > 0 {
+    let mut all_arrays = if num_group_cols > 0 {
         row_converter
             .convert_rows(keys.iter().map(arrow::row::OwnedRow::row))
             .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
     } else {
         Vec::new()
     };
-
-    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
     for (agg_idx, spec) in agg_specs.iter().enumerate() {
-        let scalars: Vec<ScalarValue> = vals.iter().map(|v| v[agg_idx].clone()).collect();
-        let array = ScalarValue::iter_to_array(scalars)
-            .map_err(|e| DbError::Pipeline(format!("agg array: {e}")))?;
-        if array.data_type() == &spec.return_type {
-            agg_arrays.push(array);
-        } else {
-            let casted = arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "weighted aggregate '{}' result cast failed: {error}",
-                    spec.output_name
-                ))
-            })?;
-            agg_arrays.push(casted);
+        let mut column = OutputColumn::with_capacity(vals.len());
+        for values in vals {
+            column.push(values[agg_idx].clone())?;
         }
+        all_arrays.push(column.finish(spec)?);
     }
-
-    let weight_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+    all_arrays.push(Arc::new(arrow::array::Int64Array::from_iter_values(
         weights.iter().copied(),
-    ));
-
-    let mut all_arrays = group_arrays;
-    all_arrays.extend(agg_arrays);
-    all_arrays.push(weight_array);
+    )));
 
     RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
         .map_err(|e| DbError::Pipeline(format!("weighted batch: {e}")))
