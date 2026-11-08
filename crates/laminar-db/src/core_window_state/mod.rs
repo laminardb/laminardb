@@ -25,7 +25,7 @@ use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 use crate::aggregate_state::{
     apply_compiled_having, compile_having_filter, compile_plan_expr, extract_clauses,
     find_aggregate, query_fingerprint_with_config, AggFuncSpec, AggregateInput, CompiledProjection,
-    ConcreteAggregateState, ConcreteInputMode, IncrementalAggState, PreAggBuilder,
+    ConcreteAggregateState, ConcreteInputMode, IncrementalAggState, OutputColumn, PreAggBuilder,
 };
 use crate::error::DbError;
 
@@ -2070,16 +2070,17 @@ impl CoreWindowState {
         let mut row_keys: Vec<SessionGroupKey> = Vec::with_capacity(num_rows);
         let mut window_starts = Vec::with_capacity(num_rows);
         let mut window_ends = Vec::with_capacity(num_rows);
-        let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..self.agg_specs.len())
-            .map(|_| Vec::with_capacity(num_rows))
+        let mut columns: Vec<OutputColumn> = self
+            .agg_specs
+            .iter()
+            .map(|_| OutputColumn::with_capacity(num_rows))
             .collect();
-
         for (window_start, window_end, key, mut accs) in rows {
             row_keys.push(key);
             window_starts.push(window_start);
             window_ends.push(window_end);
-            for (i, acc) in accs.iter_mut().enumerate() {
-                agg_scalars[i].push(acc.evaluate()?);
+            for (column, acc) in columns.iter_mut().zip(&mut accs) {
+                column.push(acc.evaluate()?)?;
             }
         }
 
@@ -2091,30 +2092,16 @@ impl CoreWindowState {
         } else {
             Vec::new()
         };
-        let group_arrays = self.output_group_arrays(
+        let mut all_arrays = self.output_group_arrays(
             &key_arrays,
             &WindowBoundaryValues::PerRow {
                 starts: &window_starts,
                 ends: &window_ends,
             },
         )?;
-
-        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
-        for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
-            let array = ScalarValue::iter_to_array(scalars)
-                .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
-            let dt = &self.agg_specs[agg_idx].return_type;
-            if array.data_type() == dt {
-                agg_arrays.push(array);
-            } else {
-                let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
-                agg_arrays.push(casted);
-            }
+        for (column, spec) in columns.into_iter().zip(&self.agg_specs) {
+            all_arrays.push(column.finish(spec)?);
         }
-
-        let mut all_arrays = Vec::with_capacity(group_arrays.len() + agg_arrays.len());
-        all_arrays.extend(group_arrays);
-        all_arrays.extend(agg_arrays);
 
         let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), all_arrays)
             .map_err(|e| DbError::Pipeline(format!("session result batch: {e}")))?;
