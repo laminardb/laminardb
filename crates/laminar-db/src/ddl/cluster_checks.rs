@@ -406,15 +406,44 @@ impl LaminarDB {
             return Ok(true);
         }
         if crate::sql_analysis::extract_table_references(query_sql).len() > 1 {
-            return Err(Self::cluster_state_lifecycle_error(
-                object_kind,
-                name,
-                "ordinary SQL execution requires a single input frontier; multiple sources require a managed join stage",
-            ));
+            self.validate_cluster_union(object_kind, name, query_sql, plan)
+                .await?;
         }
 
         self.validate_cluster_aggregate_shape(object_kind, name, query_sql, plan)
             .await
+    }
+
+    /// A `UNION ALL` runs on each node over that node's rows, and a managed consumer closes on the
+    /// lowest node-local frontier of the sources its branches forward. So every branch must
+    /// forward one source event-time column through stateless projections only.
+    async fn validate_cluster_union(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        use crate::exchange_plan::{ChangelogKind, EventTimeOrigin};
+
+        let resolved = self
+            .resolve_catalog_stream_outputs(Some(plan.candidate_registration(name, query_sql)))
+            .await?;
+        if resolved.exchange_plan.stream(name).is_some_and(|stream| {
+            stream.output.changelog == ChangelogKind::AppendOnly
+                && stream
+                    .output
+                    .event_time
+                    .as_ref()
+                    .is_some_and(|event_time| event_time.origin == EventTimeOrigin::Source)
+        }) {
+            return Ok(());
+        }
+        Err(Self::cluster_state_lifecycle_error(
+            object_kind,
+            name,
+            "a query over several inputs needs a managed join stage, or a UNION ALL whose every branch forwards one source event-time column unchanged through projections and filters",
+        ))
     }
 
     /// Managed `TUMBLE`/`HOP`/`SESSION` window admission. `Some(true)` admits the

@@ -1,5 +1,6 @@
 //! The column whose watermark orders a stream's rows, derived per operator: declared by a source,
-//! forwarded by stateless projections, carried through interval joins and closed windows.
+//! forwarded by stateless projections and `UNION ALL`, carried through interval joins and closed
+//! windows.
 
 use std::time::Duration;
 
@@ -7,7 +8,10 @@ use datafusion_expr::LogicalPlan;
 use laminar_sql::parser::join_parser::JoinType;
 use laminar_sql::translator::{StreamJoinConfig, WindowOperatorConfig, WindowType};
 
-use super::derivation::{interval_join_plan, projected_join_column, window_boundary_column};
+use super::derivation::{
+    interval_join_plan, projected_join_column, stateless_output, window_boundary_column,
+};
+use super::{ChangelogKind, StreamProperties};
 
 /// A stream carries at most one event-time column. For a derived column,
 /// `max_out_of_orderness` is how far the stream's frontier trails its inputs' frontiers; it is
@@ -113,4 +117,64 @@ pub(super) fn window_event_time(
         max_out_of_orderness: input.max_out_of_orderness.map(|_| hold),
         origin: EventTimeOrigin::Window(boundary),
     })
+}
+
+/// A `UNION ALL` carries an event-time column when every branch is a stateless projection that
+/// forwards its append-only input's event-time column unchanged to the same output column, with
+/// one type and one origin. Its frontier is the lowest of its inputs' frontiers, so it trails
+/// them by at most the largest of their bounds.
+pub(super) fn union_event_time(
+    logical: &LogicalPlan,
+    input: &impl Fn(&str) -> StreamProperties,
+) -> Option<EventTime> {
+    let LogicalPlan::Union(union) = logical else {
+        return None;
+    };
+    let mut carried: Option<(usize, EventTime)> = None;
+    for branch in &union.inputs {
+        let (index, event_time) = branch_event_time(branch, input)?;
+        if branch.schema().field(index).data_type() != union.schema.field(index).data_type() {
+            return None;
+        }
+        carried = Some(match carried {
+            None => (index, event_time),
+            Some((known, merged)) if known == index && merged.origin == event_time.origin => (
+                index,
+                EventTime {
+                    max_out_of_orderness: merged
+                        .max_out_of_orderness
+                        .zip(event_time.max_out_of_orderness)
+                        .map(|(merged, branch)| merged.max(branch)),
+                    ..merged
+                },
+            ),
+            Some(_) => return None,
+        });
+    }
+    let (index, event_time) = carried?;
+    Some(EventTime {
+        column: union.schema.field(index).name().clone(),
+        ..event_time
+    })
+}
+
+/// The output position and event time of one branch of a union.
+fn branch_event_time(
+    branch: &LogicalPlan,
+    input: &impl Fn(&str) -> StreamProperties,
+) -> Option<(usize, EventTime)> {
+    let event_time = if matches!(branch, LogicalPlan::Union(_)) {
+        union_event_time(branch, input)?
+    } else {
+        let projection = crate::sql_analysis::extract_projection_filter(branch)?;
+        let properties = input(&projection.input);
+        if properties.changelog != ChangelogKind::AppendOnly {
+            return None;
+        }
+        stateless_output(properties, &projection).1?
+    };
+    let index = branch
+        .schema()
+        .index_of_column_by_name(None, &event_time.column)?;
+    Some((index, event_time))
 }

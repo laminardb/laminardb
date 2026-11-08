@@ -59,6 +59,7 @@ mod routing;
 mod state_accounting;
 #[cfg(feature = "cluster")]
 mod subscription_output;
+mod union_all;
 
 use apply_failure::stateful_apply_outcome_unknown;
 pub(crate) use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
@@ -678,7 +679,7 @@ pub(crate) fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> Operat
         return OperatorCapability::unclassified_sql_query();
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return OperatorCapability::unclassified_sql_query();
+        return union_all::classify_union_all(query, ctx);
     };
 
     let function_registry = ctx.state();
@@ -2643,17 +2644,17 @@ impl GraphOperator for SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         #[cfg(feature = "cluster")]
         if self.cluster_shuffle.is_some() {
-            if frontiers.len() != 1 {
-                return Err(DbError::InvalidOperation(format!(
-                    "aggregate '{}' requires one input frontier",
-                    self.op_name
-                )));
-            }
             if matches!(self.state, QueryState::Uninit) {
                 self.lazy_init().await?;
             }
             if matches!(self.state, QueryState::Agg(_)) {
-                return self.process_cluster(inputs, frontiers[0]).await;
+                let [frontier] = frontiers else {
+                    return Err(DbError::InvalidOperation(format!(
+                        "aggregate '{}' requires one input frontier",
+                        self.op_name
+                    )));
+                };
+                return self.process_cluster(inputs, *frontier).await;
             }
         }
         let watermarks = frontiers
