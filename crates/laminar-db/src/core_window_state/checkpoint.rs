@@ -448,7 +448,7 @@ impl CoreWindowState {
             .keys
             .as_ref()
             .map_or_else(global_aggregate_key, |keys| keys.row(group).owned());
-        if self.vnode_for_group_key(&key) != vnode {
+        if self.vnode_for_group_key(key.as_ref()) != vnode {
             return Err(DbError::Checkpoint(format!(
                 "Core window vnode {vnode} checkpoint contains a key for another vnode"
             )));
