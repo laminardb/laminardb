@@ -806,24 +806,16 @@ async fn zero_admission_send_retries_without_becoming_runnable() {
             idle: false,
         },
     )];
-    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
-    let (visible_tx, visible_rx) = tokio::sync::oneshot::channel();
-    let send = tokio::spawn(async move {
-        let _ = outcome_tx.send((
-            Err(DbError::ShuffleNotReady("injected zero admission".into())),
-            Some(retry_plan),
-        ));
-        let _ = visible_tx.send(());
-    });
     operator.pending_cluster_input = Some(PendingIntervalClusterInput {
         routed: BTreeMap::new(),
         outbound: None,
         local_frontiers: [InputFrontier::default(); 2],
-        send: Some(send),
-        outcome: Some(outcome_rx),
+        send: Some(ShuffleSend::Completed((
+            Err(DbError::ShuffleNotReady("injected zero admission".into())),
+            Some(retry_plan),
+        ))),
         accounted_bytes: 0,
     });
-    visible_rx.await.unwrap();
 
     let output = operator
         .process_cluster(
@@ -839,12 +831,6 @@ async fn zero_admission_send_retries_without_becoming_runnable() {
         .as_ref()
         .unwrap()
         .send
-        .is_some());
-    assert!(operator
-        .pending_cluster_input
-        .as_ref()
-        .unwrap()
-        .outcome
         .is_some());
     assert!(!operator.deferred_work_is_runnable());
     assert!(operator.checkpoint_capture(u64::MAX).is_err());
@@ -892,20 +878,16 @@ async fn pending_send_applies_remote_match_before_local_finalize() {
         effective_frontiers: _,
     } = plan;
     let (release, wait) = tokio::sync::oneshot::channel();
-    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
-    let (visible_tx, visible_rx) = tokio::sync::oneshot::channel();
-    let send = tokio::spawn(async move {
+    let send = ShuffleSend::spawned(async move {
         let _ = wait.await;
         drop(outbound);
-        let _ = outcome_tx.send((Ok(()), None));
-        let _ = visible_tx.send(());
+        (Ok(()), None)
     });
     operator.pending_cluster_input = Some(PendingIntervalClusterInput {
         routed,
         outbound: None,
         local_frontiers,
         send: Some(send),
-        outcome: Some(outcome_rx),
         accounted_bytes,
     });
     let assignment_version = scope.registry.assignment_version();
@@ -949,10 +931,18 @@ async fn pending_send_applies_remote_match_before_local_finalize() {
     assert!(operator.pending_cluster_input.is_some());
 
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), visible_rx)
-        .await
-        .expect("pending interval send outcome was not published")
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !operator
+            .pending_cluster_input
+            .as_ref()
+            .and_then(|pending| pending.send.as_ref())
+            .is_some_and(ShuffleSend::is_finished)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending interval send outcome was not published");
     let output = operator
         .process_cluster(
             &[Vec::new(), Vec::new()],

@@ -46,6 +46,8 @@ use crate::operator_graph::{
 use crate::operator_graph::{GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint};
 
 #[cfg(feature = "cluster")]
+use crate::operator::shuffle_send::ShuffleSend;
+#[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
@@ -714,31 +716,12 @@ struct IntervalClusterInputPlan {
 }
 
 #[cfg(feature = "cluster")]
-type IntervalSendOutcome = (
-    Result<(), DbError>,
-    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
-);
-
-#[cfg(feature = "cluster")]
-type IntervalSendTask = tokio::task::JoinHandle<()>;
-
-#[cfg(feature = "cluster")]
 struct PendingIntervalClusterInput {
     routed: BTreeMap<u32, [Vec<RecordBatch>; 2]>,
     outbound: Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
     local_frontiers: [InputFrontier; 2],
-    send: Option<IntervalSendTask>,
-    outcome: Option<tokio::sync::oneshot::Receiver<IntervalSendOutcome>>,
+    send: Option<ShuffleSend>,
     accounted_bytes: usize,
-}
-
-#[cfg(feature = "cluster")]
-impl Drop for PendingIntervalClusterInput {
-    fn drop(&mut self) {
-        if let Some(send) = &self.send {
-            send.abort();
-        }
-    }
 }
 
 #[cfg(feature = "cluster")]
@@ -3873,66 +3856,49 @@ impl IntervalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn start_pending_cluster_send(
+    /// Starts the pending plan's send unless one is running, and joins its local rows when the
+    /// send finishes in this cycle. `after_replay` marks a cycle that already applied a peer's
+    /// event, which a failure here can no longer undo.
+    async fn send_pending_cluster_input(
         &mut self,
         config: &ClusterShuffleConfig,
-        assignment_version: u64,
-    ) {
+        assignment: &VnodeAssignmentSnapshot,
+        after_replay: bool,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let pending = self
             .pending_cluster_input
             .as_mut()
             .expect("interval send plan must be installed before it starts");
-        debug_assert!(pending.send.is_none());
-        debug_assert!(pending.outcome.is_none());
+        if pending.send.is_some() {
+            return Ok(Vec::new());
+        }
         let outbound = pending
             .outbound
             .take()
             .expect("idle interval send plan must retain its outbound cut");
-        let topology = config.topology;
-        let sender = Arc::clone(&config.sender);
-        let wake = config.receiver.work_ready_notify();
         let context = format!("interval join [{}] shuffle", self.projection.op_name);
-        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
-        pending.outcome = Some(outcome_rx);
-        pending.send = Some(tokio::spawn(async move {
-            let outcome = crate::operator::send_shuffle_plan_retaining(
-                &sender,
-                topology,
-                assignment_version,
-                outbound,
-                &context,
-            )
-            .await;
-            let should_wake = !matches!(&outcome.0, Err(error) if error.is_shuffle_not_ready());
-            if outcome_tx.send(outcome).is_ok() && should_wake {
-                wake.notify_one();
+        pending.send =
+            Some(ShuffleSend::start(config, assignment.version(), outbound, context).await);
+        match self.finish_pending_cluster_input().await {
+            Ok(PendingIntervalCompletion::Applied(output)) => Ok(output),
+            Ok(PendingIntervalCompletion::Waiting | PendingIntervalCompletion::RetryLater) => {
+                Ok(Vec::new())
             }
-        }));
+            Err(error) if after_replay => Err(self.remote_replay_error(error)),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(feature = "cluster")]
     async fn finish_pending_cluster_input(&mut self) -> Result<PendingIntervalCompletion, DbError> {
-        let received = {
-            let Some(pending) = self.pending_cluster_input.as_mut() else {
-                return Ok(PendingIntervalCompletion::Waiting);
-            };
-            match (pending.send.as_ref(), pending.outcome.as_mut()) {
-                (None, None) => return Ok(PendingIntervalCompletion::Waiting),
-                (Some(_), Some(outcome)) => outcome.try_recv().map_err(|error| match error {
-                    tokio::sync::oneshot::error::TryRecvError::Empty => None,
-                    tokio::sync::oneshot::error::TryRecvError::Closed => {
-                        Some("send task ended without a delivery outcome")
-                    }
-                }),
-                _ => Err(Some("send task lost its completion channel")),
-            }
-        };
-        let outcome = match received {
-            Ok(outcome) => outcome,
-            Err(None) => {
-                return Ok(PendingIntervalCompletion::Waiting);
-            }
-            Err(Some(reason)) => {
+        let finished = self
+            .pending_cluster_input
+            .as_mut()
+            .and_then(|pending| ShuffleSend::take_finished(&mut pending.send));
+        let outcome = match finished {
+            None => return Ok(PendingIntervalCompletion::Waiting),
+            Some(Ok(outcome)) => outcome,
+            Some(Err(reason)) => {
                 drop(self.pending_cluster_input.take());
                 return Err(DbError::ShufflePartialSend(format!(
                     "interval join [{}] {reason}",
@@ -3944,11 +3910,6 @@ impl IntervalJoinOperator {
             .pending_cluster_input
             .take()
             .expect("finished interval send plan");
-        pending.send.take().expect("completed interval send task");
-        pending
-            .outcome
-            .take()
-            .expect("completed interval send outcome");
         let (result, outbound) = outcome;
         if let Err(error) = result {
             if error.is_shuffle_not_ready() {
@@ -4160,13 +4121,10 @@ impl IntervalJoinOperator {
                     ))),
                 );
             }
-            if self
-                .pending_cluster_input
-                .as_ref()
-                .is_some_and(|pending| pending.send.is_none())
-            {
-                self.start_pending_cluster_send(&config, assignment.version());
-            }
+            deferred_output.extend(
+                self.send_pending_cluster_input(&config, &assignment, drained_remote)
+                    .await?,
+            );
             return Ok(deferred_output);
         }
         if drained_remote {
@@ -4206,11 +4164,11 @@ impl IntervalJoinOperator {
                 outbound: Some(outbound),
                 local_frontiers,
                 send: None,
-                outcome: None,
                 accounted_bytes,
             });
-            self.start_pending_cluster_send(&config, assignment.version());
-            return Ok(Vec::new());
+            return self
+                .send_pending_cluster_input(&config, &assignment, false)
+                .await;
         }
         let output = self.apply_routed_cluster(plan.routed, plan.effective_frontiers)?;
         let output = self.project_output(output).await?;

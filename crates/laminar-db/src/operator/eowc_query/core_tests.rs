@@ -590,10 +590,9 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
         )]
     ));
     operator.process_cluster(&[Vec::new()], live).await.unwrap();
-    let mut pending = operator.pending_cluster_input.take().unwrap();
+    let pending = operator.pending_cluster_input.take().unwrap();
     assert_eq!(pending.local_frontier, restored);
     assert!(pending.local_batches.is_empty());
-    pending.send.take().unwrap().abort();
 
     // Simulate completion of the bootstrap send. The graph may now release its retained row,
     // and the ordinary node-local frontier is used without being globally frozen.
@@ -610,10 +609,9 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
         .process_cluster(&[vec![buffered]], live)
         .await
         .unwrap();
-    let mut pending = operator.pending_cluster_input.take().unwrap();
+    let pending = operator.pending_cluster_input.take().unwrap();
     assert_eq!(pending.local_frontier, live);
     assert_eq!(pending.local_batches.len(), 1);
-    pending.send.take().unwrap().abort();
 }
 
 #[cfg(feature = "cluster")]
@@ -687,7 +685,7 @@ async fn zero_admission_send_restarts_once_without_becoming_runnable() {
             idle: false,
         },
     )];
-    let send = tokio::spawn(async move {
+    let send = ShuffleSend::spawned(async move {
         (
             Err(DbError::ShuffleNotReady("injected zero admission".into())),
             Some(retry_plan),
@@ -719,10 +717,107 @@ async fn zero_admission_send_restarts_once_without_becoming_runnable() {
         .await
         .unwrap();
     assert!(output.is_empty());
+    // Peer 2 has no address, so the retry fails again while the cycle polls it and the plan waits
+    // for a later cycle without making the operator runnable.
     let pending = operator.pending_cluster_input.as_ref().unwrap();
-    assert!(pending.send.is_some());
-    assert!(pending.outbound.is_none());
+    assert!(pending.send.is_none());
+    assert!(pending.outbound.is_some());
     assert!(!operator.deferred_work_is_runnable());
+}
+
+/// A cycle that only moves the frontier still sends it to every peer. When the transport admits
+/// those frames while the cycle polls the send, the windows the frontier closes are emitted in
+/// that cycle; the first send waits for the peer's connection and finishes in a task.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn admitted_frontier_send_closes_windows_in_the_same_cycle() {
+    use laminar_core::cluster::control::LeaseDeadline;
+    use laminar_core::shuffle::ShuffleReceiver;
+
+    let owners = [1, 2, 1, 1, 1, 1, 1, 1];
+    let scope = cluster_scope(owners).await;
+    let peer = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(2))
+        .await
+        .unwrap();
+    peer.install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
+    peer.install_assignment_fence(
+        &test_assignment_fence(scope.registry.assignment_version(), &owners),
+        &owners,
+    )
+    .unwrap();
+    scope.sender.register_peer(2, peer.local_addr());
+    let mut operator = EowcQueryOperator::new(
+        "managed_window",
+        AGG_SQL,
+        Some(EmitClause::OnWindowClose),
+        Some(test_window_config()),
+        aggregate_context(),
+        key_groups(),
+        None,
+    );
+    operator.initialize_managed_state().await.unwrap();
+    let (symbol, _) = projected_batch_for_vnode(&operator, 0, 8.0);
+    let row = RecordBatch::try_new(
+        test_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![symbol.as_str()])),
+            Arc::new(Float64Array::from(vec![8.0])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+    operator.attach_cluster_scope(scope.clone());
+    let at = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    };
+
+    let output = operator
+        .process_cluster(&[vec![row]], at(100))
+        .await
+        .unwrap();
+    assert!(output.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !operator
+            .pending_cluster_input
+            .as_ref()
+            .and_then(|pending| pending.send.as_ref())
+            .is_some_and(ShuffleSend::is_finished)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first frontier send never finished");
+    assert!(operator
+        .process_cluster(&[Vec::new()], at(100))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(operator.pending_cluster_input.is_none());
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "managed_window",
+            2,
+            at(60_000),
+            scope.registry.assignment_version(),
+            scope.receiver.recovery_gen(),
+        )
+        .unwrap();
+    assert!(operator
+        .process_cluster(&[Vec::new()], at(100))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(operator.queued_remote_events, 0);
+
+    let output = operator
+        .process_cluster(&[Vec::new()], at(60_000))
+        .await
+        .unwrap();
+    assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert!(operator.pending_cluster_input.is_none());
 }
 
 #[cfg(feature = "cluster")]
@@ -772,7 +867,7 @@ async fn pending_cluster_send_drains_remote_data_before_committing_local_cut() {
     } = plan;
     let baseline = operator.managed_state_accounting().unwrap().live;
     let (release, wait) = tokio::sync::oneshot::channel();
-    let send = tokio::spawn(async move {
+    let send = ShuffleSend::spawned(async move {
         let _ = wait.await;
         drop(outbound);
         (Ok(()), None)
