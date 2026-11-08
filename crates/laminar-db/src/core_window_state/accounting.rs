@@ -1,7 +1,7 @@
 //! Total and per-vnode accounting of core window state: the live vnode states plus the
 //! fixed slot table, rosters and reusable scratch every cycle keeps.
 
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxHashMap;
 
 use super::{CoreWindowState, CoreWindowVnodeState};
 use crate::operator_graph::VnodeStateLoad;
@@ -25,16 +25,6 @@ impl CoreWindowState {
             }))
     }
 
-    fn scratch_group_keys_bytes(
-        keys: &indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
-    ) -> usize {
-        keys.capacity()
-            .saturating_mul(std::mem::size_of::<arrow::row::OwnedRow>())
-            .saturating_add(keys.iter().fold(0_usize, |bytes, key| {
-                bytes.saturating_add(key.as_ref().len())
-            }))
-    }
-
     fn window_group_counts_bytes(counts: &FxHashMap<i64, usize>) -> usize {
         counts
             .capacity()
@@ -53,7 +43,7 @@ impl CoreWindowState {
             })
             .saturating_add(Self::scratch_nogroup_bytes(&self.scratch_nogroup))
             .saturating_add(Self::scratch_grouped_bytes(&self.scratch_grouped))
-            .saturating_add(Self::scratch_group_keys_bytes(&self.scratch_group_keys))
+            .saturating_add(self.scratch_key_ids.retained_bytes())
             .saturating_add(Self::window_group_counts_bytes(&self.window_group_counts))
             .saturating_add(
                 self.vnode_states

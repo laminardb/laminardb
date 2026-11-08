@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -25,16 +25,19 @@ use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 use crate::aggregate_state::{
     apply_compiled_having, compile_having_filter, compile_plan_expr, extract_clauses,
     find_aggregate, query_fingerprint_with_config, AggFuncSpec, AggregateInput, CompiledProjection,
-    ConcreteAggregateState, ConcreteInputMode, IncrementalAggState, OutputColumn, PreAggBuilder,
+    ConcreteAggregateState, ConcreteInputMode, FixedWidthKeyGrouper, IncrementalAggState,
+    OutputColumn, PreAggBuilder,
 };
 use crate::error::DbError;
 
 mod accounting;
 mod checkpoint;
 mod frontier;
+mod grouping;
 
 use checkpoint::ArchivedCoreWindowVnodeCheckpoint;
 pub(crate) use checkpoint::CoreWindowVnodeCheckpoint;
+use grouping::BatchKeyIds;
 
 /// Sentinel for null timestamps; callers must skip these rows rather than
 /// assigning them to the epoch-zero window.
@@ -380,6 +383,7 @@ pub(crate) struct CoreWindowState {
     window_group_counts: FxHashMap<i64, usize>,
     session_group_count: usize,
     row_converter: Arc<arrow::row::RowConverter>,
+    key_grouper: Option<FixedWidthKeyGrouper>,
     agg_specs: Vec<AggFuncSpec>,
     aggregate_templates: Vec<ConcreteAggregateState>,
     num_group_cols: usize,
@@ -408,9 +412,9 @@ pub(crate) struct CoreWindowState {
     post_projection: Option<PostProjection>,
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     scratch_nogroup: FxHashMap<i64, Vec<u32>>,
-    // Group ids are dense within a batch and index into scratch_group_keys.
+    // Group ids are dense within a batch and number scratch_key_ids' keys.
     scratch_grouped: FxHashMap<(u32, i64, u32), Vec<u32>>,
-    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
+    scratch_key_ids: BatchKeyIds,
     checkpoint_dirty_vnodes: Box<[bool]>,
     checkpoint_dirty_vnode_roster: Vec<u32>,
     full_vnode_capture_required: bool,
@@ -854,6 +858,7 @@ impl CoreWindowState {
             agg_specs,
             aggregate_templates,
             num_group_cols,
+            key_grouper: FixedWidthKeyGrouper::for_key(&group_types),
             group_types: Arc::from(group_types),
             query_sql: sql.to_string(),
             #[cfg(test)]
@@ -875,7 +880,7 @@ impl CoreWindowState {
             prom: None,
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
-            scratch_group_keys: indexmap::IndexSet::default(),
+            scratch_key_ids: BatchKeyIds::default(),
             checkpoint_dirty_vnodes,
             checkpoint_dirty_vnode_roster,
             full_vnode_capture_required: true,
@@ -1034,11 +1039,11 @@ impl CoreWindowState {
     }
 
     #[inline]
-    fn vnode_for_group_key(&self, key: &arrow::row::OwnedRow) -> u32 {
+    fn vnode_for_group_key(&self, key: &[u8]) -> u32 {
         if self.num_group_cols == 0 || self.key_group_count.get() == 1 {
             0
         } else {
-            PartitionKeyCodecV1::vnode_for_encoded(key.as_ref(), self.routing_vnode_count())
+            PartitionKeyCodecV1::vnode_for_encoded(key, self.routing_vnode_count())
         }
     }
 
@@ -1268,129 +1273,6 @@ impl CoreWindowState {
         Ok(())
     }
 
-    fn update_batch_grouped(
-        &mut self,
-        batch: &RecordBatch,
-        ts_array: &[i64],
-        vnode_hint: Option<u32>,
-    ) -> Result<(), DbError> {
-        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-            .map(|i| Arc::clone(batch.column(i)))
-            .collect();
-        let rows = self
-            .row_converter
-            .convert_columns(&group_cols)
-            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
-
-        let mut grouped = std::mem::take(&mut self.scratch_grouped);
-        let mut group_keys = std::mem::take(&mut self.scratch_group_keys);
-        grouped.clear();
-        group_keys.clear();
-
-        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
-            if ts_ms == NULL_TIMESTAMP {
-                continue;
-            }
-            let row_key = rows.row(row_idx).owned();
-            let vnode = self.vnode_for_group_key(&row_key);
-            if vnode_hint.is_some_and(|hint| hint != vnode) {
-                return Err(DbError::Pipeline(format!(
-                    "Core window batch routed to vnode {} contains a key for vnode {vnode}",
-                    vnode_hint.expect("checked as Some")
-                )));
-            }
-            let (gid, _) = group_keys.insert_full(row_key);
-            #[allow(clippy::cast_possible_truncation)]
-            let (gid, idx) = (gid as u32, row_idx as u32);
-            match &self.assigner {
-                CoreWindowAssigner::Tumbling(a) => {
-                    let ws = a
-                        .try_assign(ts_ms)
-                        .map_err(|error| {
-                            DbError::PipelineTerminal(format!(
-                                "Core tumbling window assignment failed: {error}"
-                            ))
-                        })?
-                        .start;
-                    if self.is_window_closed(ws) {
-                        self.record_late_drop(1);
-                        continue;
-                    }
-                    grouped.entry((vnode, ws, gid)).or_default().push(idx);
-                }
-                CoreWindowAssigner::Hopping(a) => {
-                    let windows = a.try_iter_windows(ts_ms).map_err(|error| {
-                        DbError::PipelineTerminal(format!(
-                            "Core hopping window assignment failed: {error}"
-                        ))
-                    })?;
-                    for wid in windows {
-                        if self.is_window_closed(wid.start) {
-                            self.record_late_drop(1);
-                            continue;
-                        }
-                        grouped
-                            .entry((vnode, wid.start, gid))
-                            .or_default()
-                            .push(idx);
-                    }
-                }
-                CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
-            }
-        }
-
-        for ((vnode, window_start, gid), indices) in &grouped {
-            self.count_applied_rows(*vnode, indices.len());
-            let row_key = group_keys
-                .get_index(*gid as usize)
-                .expect("gid was just produced by insert_full");
-            let needs_insert = {
-                let window_groups = self.vnode_states[*vnode as usize]
-                    .as_ref()
-                    .and_then(|state| state.windows.get(window_start));
-                if window_groups.is_some_and(|groups| groups.contains_key(row_key)) {
-                    false
-                } else {
-                    let groups = self.window_group_counts.get(window_start).copied();
-                    self.admit_group_count(groups.unwrap_or(0).saturating_add(1), || {
-                        format!("window {window_start} record processing")
-                    })?;
-                    true
-                }
-            };
-            if needs_insert {
-                let accs = self.aggregate_templates.clone();
-                self.insert_fixed_group(*vnode, *window_start, row_key.clone(), accs);
-            }
-
-            let state = self.vnode_states[*vnode as usize]
-                .as_deref_mut()
-                .expect("Core window vnode must exist");
-            let (previous_accumulator_bytes, update, current_accumulator_bytes) = {
-                let accs = state
-                    .windows
-                    .get_mut(window_start)
-                    .and_then(|groups| groups.get_mut(row_key))
-                    .expect("Core window group must exist");
-                let previous = Self::accumulator_vector_bytes(accs);
-                let update =
-                    IncrementalAggState::update_concrete_accumulators(accs, &inputs, indices);
-                (previous, update, Self::accumulator_vector_bytes(accs))
-            };
-            state.accounted_state_bytes = state
-                .accounted_state_bytes
-                .saturating_sub(previous_accumulator_bytes)
-                .saturating_add(current_accumulator_bytes);
-            update?;
-            self.mark_checkpoint_vnode_dirty(*vnode);
-        }
-
-        self.scratch_grouped = grouped;
-        self.scratch_group_keys = group_keys;
-        Ok(())
-    }
-
     /// Per-row fallback for session windows (merge depends on insertion order).
     fn update_batch_session(
         &mut self,
@@ -1401,42 +1283,46 @@ impl CoreWindowState {
         let CoreWindowAssigner::Session { gap_ms } = self.assigner else {
             unreachable!("update_batch_session called on non-session assigner");
         };
-        let keys = if self.num_group_cols == 0 {
-            vec![crate::aggregate_state::global_aggregate_key(); batch.num_rows()]
+        let (keys, key_of_row) = if self.num_group_cols == 0 {
+            let key = Arc::new(crate::aggregate_state::global_aggregate_key());
+            (vec![key], vec![(0, 0); batch.num_rows()])
         } else {
-            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-                .map(|index| Arc::clone(batch.column(index)))
+            let encoded = self.encode_group_keys(batch)?;
+            let mut key_ids = BatchKeyIds::default();
+            key_ids.reset(&encoded);
+            let key_of_row = (0..batch.num_rows())
+                .map(|row| key_ids.number(&encoded, row, |key| self.vnode_for_group_key(key)))
                 .collect();
-            let rows = self
-                .row_converter
-                .convert_columns(&group_cols)
-                .map_err(|error| {
-                    DbError::Pipeline(format!("session group key conversion: {error}"))
-                })?;
-            (0..batch.num_rows())
-                .map(|row| rows.row(row).owned())
-                .collect()
+            #[allow(clippy::cast_possible_truncation)]
+            let keys = (0..key_ids.len() as u32)
+                .map(|id| Arc::new(key_ids.key(&encoded, id).owned()))
+                .collect();
+            (keys, key_of_row)
         };
-        let mut vnodes = Vec::with_capacity(batch.num_rows());
-        for (key, &ts_ms) in keys.iter().zip(ts_array) {
-            let vnode = self.vnode_for_group_key(key);
+        for (&(_, vnode), &ts_ms) in key_of_row.iter().zip(ts_array) {
             if ts_ms != NULL_TIMESTAMP && vnode_hint.is_some_and(|hint| hint != vnode) {
                 return Err(DbError::Pipeline(format!(
                     "Core window batch routed to vnode {} contains a key for vnode {vnode}",
                     vnode_hint.expect("checked as Some")
                 )));
             }
-            vnodes.push(vnode);
         }
         let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
-        for (row, &ts_ms) in ts_array.iter().enumerate() {
+        for (row, (&(id, vnode), &ts_ms)) in key_of_row.iter().zip(ts_array).enumerate() {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            self.count_applied_rows(vnodes[row], 1);
+            self.count_applied_rows(vnode, 1);
             #[allow(clippy::cast_possible_truncation)]
             let input_row = row as u32;
-            self.update_session_window(vnodes[row], ts_ms, gap_ms, &keys[row], &inputs, input_row)?;
+            self.update_session_window(
+                vnode,
+                ts_ms,
+                gap_ms,
+                &keys[id as usize],
+                &inputs,
+                input_row,
+            )?;
         }
         Ok(())
     }
@@ -1447,7 +1333,7 @@ impl CoreWindowState {
         vnode: u32,
         ts_ms: i64,
         gap_ms: i64,
-        key: &arrow::row::OwnedRow,
+        key: &SessionGroupKey,
         inputs: &[AggregateInput<'_>],
         input_row: u32,
     ) -> Result<(), DbError> {
@@ -1515,7 +1401,7 @@ impl CoreWindowState {
                 let group_key = self.vnode_states[vnode as usize]
                     .as_ref()
                     .and_then(|state| state.session_groups.get_key_value(key))
-                    .map_or_else(|| Arc::new(key.clone()), |(key, _)| Arc::clone(key));
+                    .map_or_else(|| Arc::clone(key), |(key, _)| Arc::clone(key));
                 let deadline = SessionDeadline::new(
                     Arc::clone(&group_key),
                     new_start,

@@ -57,7 +57,8 @@ pub(crate) use concrete::{AggregateInput, ConcreteAggregateState, ConcreteInputM
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
 use group_map::{GroupKey, GroupMap};
-use grouping::{BatchGroups, EncodedKeys, FixedWidthKeyGrouper};
+use grouping::BatchGroups;
+pub(crate) use grouping::{EncodedKeys, FixedWidthKeyGrouper};
 pub(crate) use keys::global_aggregate_key;
 pub(crate) use output_column::OutputColumn;
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};

@@ -120,7 +120,6 @@ tokio-util = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 async-trait = { workspace = true }
 trait-variant = { workspace = true }
-indexmap = { workspace = true }
 futures = { workspace = true }
 crossfire = { workspace = true }
 

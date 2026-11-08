@@ -14,7 +14,7 @@ use super::group_map::GroupKey;
 use crate::error::DbError;
 
 /// A batch's row-encoded group keys.
-pub(super) enum EncodedKeys {
+pub(crate) enum EncodedKeys {
     /// Every row's key, in batch order.
     PerRow(Rows),
     /// Each group's key once, in first-appearance order, and each row's group.
@@ -24,7 +24,7 @@ pub(super) enum EncodedKeys {
 /// Groups a single fixed-width key column on its values' bits, so each group's key is
 /// row-encoded once. Two rows group together exactly when their row encodings are equal: an
 /// admitted type's row encoding is a bijection on the value's bits, and every null encodes alike.
-pub(super) struct FixedWidthKeyGrouper {
+pub(crate) struct FixedWidthKeyGrouper {
     data_type: DataType,
 }
 
@@ -34,7 +34,7 @@ const MIN_GROUPED_ROWS: usize = 16;
 
 impl FixedWidthKeyGrouper {
     /// A grouper for `group_types`, or `None` unless it is one column of an admitted type.
-    pub(super) fn for_key(group_types: &[DataType]) -> Option<Self> {
+    pub(crate) fn for_key(group_types: &[DataType]) -> Option<Self> {
         match group_types {
             [data_type] if groups_on_values(data_type) => Some(Self {
                 data_type: data_type.clone(),
@@ -43,7 +43,7 @@ impl FixedWidthKeyGrouper {
         }
     }
 
-    pub(super) fn encode(
+    pub(crate) fn encode(
         &self,
         key: &ArrayRef,
         converter: &RowConverter,
