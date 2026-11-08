@@ -102,7 +102,21 @@ impl ConcreteAggregateState {
         ))
     }
 
-    /// Fold the admitted values of `rows`, in row order, into the state.
+    /// Rejects an input column of a type this aggregate's states do not take.
+    fn check_input(&self, input: &AggregateInput<'_>) -> Result<(), DbError> {
+        match self {
+            Self::Count(_) => Ok(()),
+            Self::Sum(state) => state.check_input(input),
+            Self::Avg(state) => state.check_input(input),
+            Self::Min(state) => state.check_input(Extremum::Min, input),
+            Self::Max(state) => state.check_input(Extremum::Max, input),
+            Self::RetractableMin(state) => state.check_input(Extremum::Min, input),
+            Self::RetractableMax(state) => state.check_input(Extremum::Max, input),
+        }
+    }
+
+    /// Fold the admitted values of `rows`, in row order, into the state. `input` must have
+    /// passed this aggregate's `check_input`.
     pub(crate) fn update_rows(
         &mut self,
         input: &AggregateInput<'_>,
@@ -121,7 +135,8 @@ impl ConcreteAggregateState {
 
     /// The contribution of `rows` in `checkpoint_state` form, independent of accumulated values.
     /// `merge_checkpoint_state` applies it with the same checks `update_rows` makes, so a delta
-    /// may be negative where the state it merges into may not.
+    /// may be negative where the state it merges into may not. `input` must have passed
+    /// `check_input`.
     // PERF: SUM and AVG deltas repeat `update_rows` arithmetic; routing their updates through
     // `Vec<ScalarValue>` deltas cost the keyed update benchmark about 4%.
     #[cfg(feature = "cluster")]
@@ -233,7 +248,7 @@ impl CountState {
         } else {
             None
         };
-        let nulls = input.value.nulls();
+        let nulls = input.nulls;
         input
             .selected(rows)
             .filter(|&row| self.count_star || nulls.is_none_or(|nulls| nulls.is_valid(row)))
@@ -314,10 +329,17 @@ impl AvgState {
         })
     }
 
+    fn check_input(&self, input: &AggregateInput<'_>) -> Result<(), DbError> {
+        let name = match self.mode {
+            AvgMode::AppendOnly { .. } => "AVG",
+            AvgMode::Weighted { .. } => "weighted AVG",
+        };
+        require_array_type(input.value, &self.input_type, name)
+    }
+
     fn update_rows(&mut self, input: &AggregateInput<'_>, rows: &[u32]) -> Result<(), DbError> {
         match &mut self.mode {
             AvgMode::AppendOnly { count } => {
-                require_array_type(input.value, &self.input_type, "AVG")?;
                 let next_count = count
                     .checked_add(non_null_rows(input, rows)?)
                     .ok_or_else(|| DbError::Pipeline("AVG count overflow".into()))?;
@@ -326,7 +348,6 @@ impl AvgState {
                 Ok(())
             }
             AvgMode::Weighted { non_null_weight } => {
-                require_array_type(input.value, &self.input_type, "weighted AVG")?;
                 let ScalarValue::Float64(Some(sum)) = &mut self.sum else {
                     return Err(DbError::Pipeline(
                         "weighted AVG has an invalid concrete state shape".into(),
@@ -433,15 +454,11 @@ impl AvgState {
         rows: &[u32],
     ) -> Result<Vec<ScalarValue>, DbError> {
         match self.mode {
-            AvgMode::AppendOnly { .. } => {
-                require_array_type(input.value, &self.input_type, "AVG")?;
-                Ok(vec![
-                    ScalarValue::UInt64(Some(non_null_rows(input, rows)?)),
-                    sum_rows(input, rows, &self.sum.data_type())?,
-                ])
-            }
+            AvgMode::AppendOnly { .. } => Ok(vec![
+                ScalarValue::UInt64(Some(non_null_rows(input, rows)?)),
+                sum_rows(input, rows, &self.sum.data_type())?,
+            ]),
             AvgMode::Weighted { .. } => {
-                require_array_type(input.value, &self.input_type, "weighted AVG")?;
                 let (sum, weight) = weighted_f64_delta(input, rows, "weighted AVG")?;
                 Ok(vec![
                     ScalarValue::Float64(Some(sum)),
@@ -453,7 +470,7 @@ impl AvgState {
 }
 
 fn non_null_rows(input: &AggregateInput<'_>, rows: &[u32]) -> Result<u64, DbError> {
-    let nulls = input.value.nulls();
+    let nulls = input.nulls;
     let count = input
         .selected(rows)
         .filter(|&row| nulls.is_none_or(|nulls| nulls.is_valid(row)))

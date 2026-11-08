@@ -1,19 +1,49 @@
 //! One batch's aggregate inputs, checked once and then read in place for each group's rows, so
-//! a group update copies no column.
+//! a group update copies no column and checks no type.
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Float64Array, Int64Array, UInt32Array,
+    UInt64Array,
+};
+use arrow::buffer::NullBuffer;
 use arrow::compute;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
 use datafusion::functions_aggregate::min_max::{Max, Min};
 
-use super::aggregate_error;
+use super::{aggregate_error, ConcreteAggregateState};
 use crate::aggregate_state::AggFuncSpec;
 use crate::error::DbError;
+
+/// The value column downcast once per batch, for the types with typed kernels.
+#[derive(Clone, Copy)]
+pub(super) enum TypedValues<'a> {
+    Int64(&'a Int64Array),
+    UInt64(&'a UInt64Array),
+    Float64(&'a Float64Array),
+    Decimal128(&'a Decimal128Array),
+    Other,
+}
+
+impl<'a> TypedValues<'a> {
+    fn of(value: &'a ArrayRef) -> Self {
+        match value.data_type() {
+            DataType::Int64 => value.as_primitive_opt().map(Self::Int64),
+            DataType::UInt64 => value.as_primitive_opt().map(Self::UInt64),
+            DataType::Float64 => value.as_primitive_opt().map(Self::Float64),
+            DataType::Decimal128(_, _) => value.as_primitive_opt().map(Self::Decimal128),
+            _ => None,
+        }
+        .unwrap_or(Self::Other)
+    }
+}
 
 /// One aggregate's value column, FILTER mask, and input weights, borrowed from one batch.
 pub(crate) struct AggregateInput<'a> {
     pub(super) value: &'a ArrayRef,
+    pub(super) values: TypedValues<'a>,
+    pub(super) nulls: Option<&'a NullBuffer>,
     filter: Option<&'a BooleanArray>,
     weights: Option<&'a Int64Array>,
     /// The value column's row encoding, for a MIN or MAX over weighted input. Held by value: an
@@ -22,13 +52,15 @@ pub(crate) struct AggregateInput<'a> {
 }
 
 impl<'a> AggregateInput<'a> {
-    pub(crate) const fn new(
+    pub(super) fn new(
         value: &'a ArrayRef,
         filter: Option<&'a BooleanArray>,
         weights: Option<&'a Int64Array>,
     ) -> Self {
         Self {
             value,
+            values: TypedValues::of(value),
+            nulls: value.nulls(),
             filter,
             weights,
             rows: None,
@@ -36,7 +68,7 @@ impl<'a> AggregateInput<'a> {
     }
 
     /// Encodes the value column into rows that order as the values do.
-    pub(crate) fn with_row_encoding(mut self) -> Result<Self, DbError> {
+    pub(super) fn with_row_encoding(mut self) -> Result<Self, DbError> {
         let converter = RowConverter::new(vec![SortField::new(self.value.data_type().clone())])
             .map_err(|error| aggregate_error("aggregate input row encoding", error))?;
         let rows = converter
@@ -46,13 +78,23 @@ impl<'a> AggregateInput<'a> {
         Ok(self)
     }
 
-    /// Resolve each aggregate's columns in `batch`. `weights` must already be validated as
-    /// non-NULL `Int64` of the batch's length.
+    /// Resolve each aggregate's columns in `batch`, checked against `templates`: one state per
+    /// aggregate, its template or any state built from it. Every state of an aggregate takes
+    /// the same input type, so updates read the columns without checking them again.
+    /// `weights` must already be validated as non-NULL `Int64` of the batch's length.
     pub(crate) fn resolve_all(
         batch: &'a RecordBatch,
         agg_specs: &[AggFuncSpec],
+        templates: &[ConcreteAggregateState],
         weights: Option<&'a Int64Array>,
     ) -> Result<Vec<Self>, DbError> {
+        if templates.len() != agg_specs.len() {
+            return Err(DbError::Pipeline(format!(
+                "aggregate template arity mismatch: {} templates vs {} aggregates",
+                templates.len(),
+                agg_specs.len()
+            )));
+        }
         let column = |index: usize, role: &str| {
             batch.columns().get(index).ok_or_else(|| {
                 DbError::Pipeline(format!(
@@ -63,7 +105,8 @@ impl<'a> AggregateInput<'a> {
         };
         agg_specs
             .iter()
-            .map(|spec| {
+            .zip(templates)
+            .map(|(spec, template)| {
                 let [value_index] = spec.input_col_indices[..] else {
                     return Err(DbError::Pipeline(format!(
                         "managed aggregate '{}' expected one input column, got {}",
@@ -87,6 +130,7 @@ impl<'a> AggregateInput<'a> {
                     })
                     .transpose()?;
                 let input = Self::new(column(value_index, "input")?, filter, weights);
+                template.check_input(&input)?;
                 let extremum = spec.udf.inner().as_any();
                 if weights.is_some() && (extremum.is::<Min>() || extremum.is::<Max>()) {
                     input.with_row_encoding()

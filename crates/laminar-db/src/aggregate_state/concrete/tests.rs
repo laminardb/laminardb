@@ -9,7 +9,8 @@ use arrow::datatypes::{Field, Int32Type, Int64Type, TimeUnit};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::{Accumulator, AggregateUDF, AggregateUDFImpl};
 
-/// Every row of a value array and, in weighted mode, a weight array.
+/// Every row of a value array and, in weighted mode, a weight array. Callers check the input
+/// against the state first, as `AggregateInput::resolve_all` does.
 fn whole(values: &[ArrayRef]) -> (AggregateInput<'_>, Vec<u32>) {
     let weights = values.get(1).map(AsArray::as_primitive::<Int64Type>);
     let rows = (0..u32::try_from(values[0].len()).unwrap()).collect();
@@ -31,12 +32,14 @@ trait WholeArrays {
 impl WholeArrays for ConcreteAggregateState {
     fn update_all(&mut self, values: &[ArrayRef]) -> Result<(), DbError> {
         let (input, rows) = whole(values);
+        self.check_input(&input)?;
         self.update_rows(&input, &rows)
     }
 
     #[cfg(feature = "cluster")]
     fn delta_all(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
         let (input, rows) = whole(values);
+        self.check_input(&input)?;
         self.batch_delta(&input, &rows)
     }
 }
@@ -463,6 +466,79 @@ fn extremum_rejects_another_type_without_mutating() {
         .update_all(&[Arc::new(Int32Array::from(vec![1]))])
         .is_err());
     assert_eq!(min.checkpoint_state(), vec![ScalarValue::Int64(Some(4))]);
+}
+
+#[test]
+fn inputs_are_type_checked_once_per_batch_against_each_template() {
+    use arrow::record_batch::RecordBatch;
+    use ConcreteInputMode::{AppendOnly, Weighted};
+
+    let batch =
+        RecordBatch::try_from_iter([("value", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+            .unwrap();
+    let weights = Int64Array::from(vec![1]);
+    let resolve = |spec: &AggFuncSpec, mode| {
+        let template = ConcreteAggregateState::try_new(spec, mode).unwrap();
+        let weights = (mode == Weighted).then_some(&weights);
+        AggregateInput::resolve_all(&batch, std::slice::from_ref(spec), &[template], weights)
+            .map(|_| ())
+    };
+    // COUNT reads only validity, so it takes a column of any type.
+    let count = spec(Count::new(), DataType::Int64, DataType::Int64, false);
+    resolve(&count, AppendOnly).unwrap();
+    let sum = spec(Sum::new(), DataType::Int64, DataType::Int64, false);
+    let avg = spec(Avg::new(), DataType::Float64, DataType::Float64, false);
+    let min = spec(Min::new(), DataType::Int64, DataType::Int64, false);
+    let max = spec(Max::new(), DataType::Int64, DataType::Int64, false);
+    for (spec, mode, message) in [
+        (&sum, AppendOnly, "SUM expected input Int64, got Int32"),
+        (
+            &sum,
+            Weighted,
+            "weighted SUM expected input Int64, got Int32",
+        ),
+        (&avg, AppendOnly, "AVG expected input Float64, got Int32"),
+        (
+            &avg,
+            Weighted,
+            "weighted AVG expected input Float64, got Int32",
+        ),
+        (&min, AppendOnly, "MIN expected input Int64, got Int32"),
+        (&max, Weighted, "MAX expected input Int64, got Int32"),
+    ] {
+        let error = resolve(spec, mode).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+    let error = AggregateInput::resolve_all(&batch, &[sum], &[], None)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(error.to_string().contains("template arity"), "{error}");
+}
+
+#[test]
+fn unchecked_inputs_of_another_type_fail_without_mutating() {
+    use ConcreteInputMode::{AppendOnly, Weighted};
+
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+    let weights = Int64Array::from(vec![1]);
+    let int_sum = spec(Sum::new(), DataType::Int64, DataType::Int64, false);
+    let float_sum = spec(Sum::new(), DataType::Float64, DataType::Float64, false);
+    let avg = spec(Avg::new(), DataType::Float64, DataType::Float64, false);
+    let min = spec(Min::new(), DataType::Int64, DataType::Int64, false);
+    for (spec, mode) in [
+        (&int_sum, AppendOnly),
+        (&int_sum, Weighted),
+        (&float_sum, Weighted),
+        (&avg, AppendOnly),
+        (&avg, Weighted),
+        (&min, AppendOnly),
+    ] {
+        let mut state = ConcreteAggregateState::try_new(spec, mode).unwrap();
+        let before = state.checkpoint_state();
+        let input = AggregateInput::new(&values, None, (mode == Weighted).then_some(&weights));
+        assert!(state.update_rows(&input, &[0]).is_err());
+        assert_eq!(state.checkpoint_state(), before);
+    }
 }
 
 #[test]

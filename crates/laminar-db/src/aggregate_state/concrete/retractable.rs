@@ -52,6 +52,14 @@ impl RetractableExtremumState {
         })
     }
 
+    pub(super) fn check_input(
+        &self,
+        extremum: Extremum,
+        input: &AggregateInput<'_>,
+    ) -> Result<(), DbError> {
+        require_array_type(input.value, &self.value_type, extremum.name())
+    }
+
     /// Applies each admitted non-NULL row's weight. On error the state is as it was.
     pub(super) fn update_rows(
         &mut self,
@@ -59,10 +67,9 @@ impl RetractableExtremumState {
         input: &AggregateInput<'_>,
         rows: &[u32],
     ) -> Result<(), DbError> {
-        require_array_type(input.value, &self.value_type, extremum.name())?;
         let weights = input.weights()?;
         let encoded = input.row_encoding()?;
-        let nulls = input.value.nulls();
+        let nulls = input.nulls;
         let admitted = || {
             input
                 .selected(rows)
