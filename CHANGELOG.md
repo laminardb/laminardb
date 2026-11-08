@@ -56,6 +56,12 @@
   state would overflow now fails the operator's cycle with an error, as a non-windowed one does,
   instead of wrapping. A floating-point `SUM` or `AVG` adds its values in row order, so a result
   can differ in its last bits from earlier releases.
+- Cluster mode: an aggregate, window, interval join or temporal join applies a cycle's local rows,
+  and a window closes, in the cycle that sends its rows and watermark to the other nodes when the
+  shuffle accepts them without waiting. Before, every cycle that advanced the watermark applied
+  its local rows on the following cycle and held new input until then, even when nothing went to
+  another node. A send that has to wait (a new connection, a full send budget) still finishes in
+  the background, and the rows apply on a later cycle as before.
 
 ### Fixed
 

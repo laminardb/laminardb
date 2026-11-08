@@ -144,6 +144,7 @@ pub use aggregate_state::benchmark::{AggregateBenchmark, AggregateBenchmarkCheck
 #[doc(hidden)]
 pub use operator::benchmark::{
     ClusterAggregateBenchmark, EowcWindowBenchmark, IntervalJoinBenchmark,
+    TwoNodeAggregateBenchmark,
 };
 
 #[cfg(feature = "benchmark-internals")]

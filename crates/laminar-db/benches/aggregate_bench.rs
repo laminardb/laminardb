@@ -17,6 +17,12 @@
 //! (`restore`). Throughput counts the distinct values.
 //! `cluster_one_node`: the keyed `EMIT CHANGES` aggregate operator on a one-node cluster
 //! assignment, repartitioning every batch or applying it whole on a colocated input.
+//! `cluster_two_node`: the same operator on node 1 of two nodes that own alternate vnodes, with a
+//! loopback shuffle to node 2. Each iteration runs cycles until node 1 has applied its input and
+//! sent its frontier frames: `frontier_only` moves the frontier with no rows; `owned_held` gives a
+//! colocated input only node 1's rows at an unchanged frontier (no frames); `owned_advancing` moves
+//! the frontier too; `repartition_advancing` sends the other node's half of the batch. Setup prints
+//! the cycles one iteration takes.
 //! `global_partial_merge`: one projected batch of the global aggregate, applied by its owner
 //! (`apply_rows`) or folded into a partial row on another node (`fold`) that the owner merges
 //! (`merge`). Throughput counts the batch's input rows in all three, so `merge` reports the input
@@ -35,7 +41,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use datafusion::datasource::MemTable;
 use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stream};
-use laminar_db::{AggregateBenchmark, ClusterAggregateBenchmark};
+use laminar_db::{AggregateBenchmark, ClusterAggregateBenchmark, TwoNodeAggregateBenchmark};
 
 const ROWS: usize = 4096;
 const DISTINCT_KEYS: i64 = 1024;
@@ -321,6 +327,39 @@ fn bench_cluster_routing(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_cluster_two_node(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let batch = input(DISTINCT_KEYS);
+    let owned = TwoNodeAggregateBenchmark::owned_rows(&batch).unwrap();
+    let mut group = c.benchmark_group("agg/cluster_two_node");
+    for (name, colocated, rows, advance) in [
+        ("frontier_only", true, None, 1),
+        ("owned_held", true, Some(&owned), 0),
+        ("owned_advancing", true, Some(&owned), 1),
+        ("repartition_advancing", false, Some(&batch), 1),
+    ] {
+        let ctx = laminar_sql::create_session_context();
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        let mut aggregate = rt
+            .block_on(TwoNodeAggregateBenchmark::new(ctx, KEYED_SQL, colocated))
+            .unwrap();
+        rt.block_on(aggregate.step(rows, 1)).unwrap();
+        let (_, cycles) = rt.block_on(aggregate.step(rows, advance)).unwrap();
+        println!("agg/cluster_two_node/{name}: {cycles} cycles per iteration");
+        group.throughput(Throughput::Elements(
+            rows.map_or(1, RecordBatch::num_rows) as u64
+        ));
+        group.bench_function(BenchmarkId::from_parameter(name), |b| {
+            b.iter(|| rt.block_on(aggregate.step(rows, advance)).unwrap());
+        });
+    }
+    group.finish();
+}
+
 fn bench_global_partial_merge(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -428,6 +467,7 @@ criterion_group!(
     bench_changelog,
     bench_changelog_restore,
     bench_cluster_routing,
+    bench_cluster_two_node,
     bench_global_partial_merge,
     bench_keyed_partial
 );

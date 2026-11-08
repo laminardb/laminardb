@@ -39,6 +39,8 @@ use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
+use crate::operator::shuffle_send::ShuffleSend;
+#[cfg(feature = "cluster")]
 use crate::operator_graph::{
     merge_input_frontier_iter, ManagedVnodeTransition, ManagedVnodeTransitionMode,
 };
@@ -335,28 +337,12 @@ struct AggClusterInputPlan {
 }
 
 #[cfg(feature = "cluster")]
-type AggSendOutcome = (Result<(), DbError>, Option<Vec<(u64, ShuffleMessage)>>);
-
-#[cfg(feature = "cluster")]
-type AggSendTask = tokio::task::JoinHandle<()>;
-
-#[cfg(feature = "cluster")]
 struct PendingAggClusterInput {
     local_batches: Vec<(RecordBatch, Option<u32>)>,
     outbound: Option<Vec<(u64, ShuffleMessage)>>,
     local_frontier: InputFrontier,
-    send: Option<AggSendTask>,
-    completion: Option<tokio::sync::oneshot::Receiver<AggSendOutcome>>,
+    send: Option<ShuffleSend>,
     accounted_bytes: usize,
-}
-
-#[cfg(feature = "cluster")]
-impl Drop for PendingAggClusterInput {
-    fn drop(&mut self) {
-        if let Some(send) = &self.send {
-            send.abort();
-        }
-    }
 }
 
 #[cfg(feature = "cluster")]
@@ -1946,42 +1932,36 @@ impl SqlQueryOperator {
         Ok(output)
     }
 
+    /// Starts the pending plan's send unless one is running, and applies its local rows when the
+    /// send finishes in this cycle. `after_replay` marks a cycle that already applied a peer's
+    /// event, which a failure here can no longer undo.
     #[cfg(feature = "cluster")]
-    fn start_pending_cluster_send(
+    async fn send_pending_cluster_input(
         &mut self,
         config: &ClusterShuffleConfig,
-        assignment_version: u64,
-    ) {
+        assignment: &VnodeAssignmentSnapshot,
+        after_replay: bool,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let pending = self
             .pending_cluster_input
             .as_mut()
             .expect("aggregate send plan must be installed before it starts");
-        debug_assert!(pending.send.is_none());
-        debug_assert!(pending.completion.is_none());
+        if pending.send.is_some() {
+            return Ok(Vec::new());
+        }
         let outbound = pending
             .outbound
             .take()
             .expect("idle aggregate send plan must retain its outbound cut");
-        let topology = config.topology;
-        let sender = Arc::clone(&config.sender);
-        let wake = config.receiver.work_ready_notify();
         let context = format!("aggregate [{}] shuffle", self.op_name);
-        let (completion_tx, completion) = tokio::sync::oneshot::channel();
-        pending.completion = Some(completion);
-        pending.send = Some(tokio::spawn(async move {
-            let outcome = crate::operator::send_shuffle_plan_retaining(
-                &sender,
-                topology,
-                assignment_version,
-                outbound,
-                &context,
-            )
-            .await;
-            let should_wake = !matches!(&outcome.0, Err(error) if error.is_shuffle_not_ready());
-            if completion_tx.send(outcome).is_ok() && should_wake {
-                wake.notify_one();
-            }
-        }));
+        pending.send =
+            Some(ShuffleSend::start(config, assignment.version(), outbound, context).await);
+        match self.finish_pending_cluster_input() {
+            Ok(PendingAggCompletion::Applied(output)) => Ok(output),
+            Ok(PendingAggCompletion::Waiting | PendingAggCompletion::RetryLater) => Ok(Vec::new()),
+            Err(error) if after_replay => Err(self.remote_replay_error(error)),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -1998,27 +1978,14 @@ impl SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn finish_pending_cluster_input(&mut self) -> Result<PendingAggCompletion, DbError> {
-        let outcome = {
-            let Some(pending) = self.pending_cluster_input.as_mut() else {
-                return Ok(PendingAggCompletion::Waiting);
-            };
-            match (pending.send.as_ref(), pending.completion.as_mut()) {
-                (None, None) => return Ok(PendingAggCompletion::Waiting),
-                (Some(_), Some(completion)) => match completion.try_recv() {
-                    Ok(outcome) => Ok(outcome),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                        return Ok(PendingAggCompletion::Waiting);
-                    }
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                        Err("send task ended without a delivery outcome")
-                    }
-                },
-                _ => Err("send task lost its completion channel"),
-            }
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(reason) => {
+        let finished = self
+            .pending_cluster_input
+            .as_mut()
+            .and_then(|pending| ShuffleSend::take_finished(&mut pending.send));
+        let outcome = match finished {
+            None => return Ok(PendingAggCompletion::Waiting),
+            Some(Ok(outcome)) => outcome,
+            Some(Err(reason)) => {
                 drop(self.pending_cluster_input.take());
                 return Err(DbError::ShufflePartialSend(format!(
                     "aggregate '{}' {reason}",
@@ -2030,11 +1997,6 @@ impl SqlQueryOperator {
             .pending_cluster_input
             .take()
             .expect("finished aggregate send plan");
-        pending.send.take().expect("completed aggregate send task");
-        pending
-            .completion
-            .take()
-            .expect("completed aggregate send outcome");
         let (result, outbound) = outcome;
         if let Err(error) = result {
             if error.is_shuffle_not_ready() {
@@ -2123,13 +2085,10 @@ impl SqlQueryOperator {
                     ))),
                 );
             }
-            if self
-                .pending_cluster_input
-                .as_ref()
-                .is_some_and(|pending| pending.send.is_none())
-            {
-                self.start_pending_cluster_send(&config, assignment.version());
-            }
+            output.extend(
+                self.send_pending_cluster_input(&config, &assignment, drained_remote)
+                    .await?,
+            );
             return Ok(output);
         }
         if drained_remote {
@@ -2170,11 +2129,11 @@ impl SqlQueryOperator {
                 outbound: Some(outbound),
                 local_frontier,
                 send: None,
-                completion: None,
                 accounted_bytes,
             });
-            self.start_pending_cluster_send(&config, assignment.version());
-            return Ok(Vec::new());
+            return self
+                .send_pending_cluster_input(&config, &assignment, false)
+                .await;
         }
         let output = if plan.local_batches.is_empty() {
             Vec::new()

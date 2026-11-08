@@ -1278,7 +1278,6 @@ async fn zero_owner_transition_publishes_remote_topology_without_state() {
 #[tokio::test]
 async fn vnode_transition_is_atomic_and_publishes_target_topology() {
     use laminar_core::checkpoint::CheckpointParticipant;
-    use laminar_core::shuffle::ShuffleMessage;
 
     use crate::operator_graph::ManagedVnodeRestore;
 
@@ -1363,10 +1362,7 @@ async fn vnode_transition_is_atomic_and_publishes_target_topology() {
         vnode: 1,
         state: frame.as_ref(),
     }];
-    let send = tokio::spawn(std::future::pending::<(
-        Result<(), DbError>,
-        Option<Vec<(u64, ShuffleMessage)>>,
-    )>());
+    let send = ShuffleSend::spawned(std::future::pending());
     target.pending_cluster_input = Some(PendingTemporalClusterInput {
         routed: BTreeMap::new(),
         outbound: None,
@@ -1736,7 +1732,7 @@ async fn zero_admission_send_restarts_once_without_becoming_runnable() {
             idle: false,
         },
     )];
-    let send = tokio::spawn(async move {
+    let send = ShuffleSend::spawned(async move {
         (
             Err(DbError::ShuffleNotReady("injected zero admission".into())),
             Some(retry_plan),
@@ -1768,9 +1764,11 @@ async fn zero_admission_send_restarts_once_without_becoming_runnable() {
         .await
         .unwrap();
     assert!(output.is_empty());
+    // Peer 2 has no address, so the retry fails again while the cycle polls it and the plan waits
+    // for a later cycle without making the operator runnable.
     let pending = operator.pending_cluster_input.as_ref().unwrap();
-    assert!(pending.send.is_some());
-    assert!(pending.outbound.is_none());
+    assert!(pending.send.is_none());
+    assert!(pending.outbound.is_some());
     assert!(!operator.deferred_work_is_runnable());
 }
 
@@ -1816,7 +1814,7 @@ async fn pending_send_drains_remote_history_before_local_probe() {
     } = plan;
     let baseline = operator.managed_state_accounting().unwrap().live;
     let (release, wait) = tokio::sync::oneshot::channel();
-    let send = tokio::spawn(async move {
+    let send = ShuffleSend::spawned(async move {
         let _ = wait.await;
         drop(outbound);
         (Ok(()), None)

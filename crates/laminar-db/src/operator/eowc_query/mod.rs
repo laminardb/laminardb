@@ -34,6 +34,8 @@ use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorCapability};
 #[cfg(feature = "cluster")]
+use crate::operator::shuffle_send::ShuffleSend;
+#[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::merge_input_frontier_iter;
@@ -222,15 +224,11 @@ struct EowcClusterInputPlan {
 }
 
 #[cfg(feature = "cluster")]
-type EowcSendTask =
-    tokio::task::JoinHandle<(Result<(), DbError>, Option<Vec<(u64, ShuffleMessage)>>)>;
-
-#[cfg(feature = "cluster")]
 struct PendingEowcClusterInput {
     local_batches: Vec<(RecordBatch, Option<u32>)>,
     outbound: Option<Vec<(u64, ShuffleMessage)>>,
     local_frontier: InputFrontier,
-    send: Option<EowcSendTask>,
+    send: Option<ShuffleSend>,
     accounted_bytes: usize,
 }
 
@@ -239,15 +237,6 @@ enum PendingEowcCompletion {
     Waiting,
     RetryLater,
     Applied(Vec<RecordBatch>),
-}
-
-#[cfg(feature = "cluster")]
-impl Drop for PendingEowcClusterInput {
-    fn drop(&mut self) {
-        if let Some(send) = &self.send {
-            send.abort();
-        }
-    }
 }
 
 #[cfg(feature = "cluster")]
@@ -1522,38 +1511,31 @@ impl EowcQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn start_pending_cluster_send(
+    /// Starts the pending plan's send unless one is running, and applies its local rows, closing
+    /// windows, when the send finishes in this cycle.
+    async fn send_pending_cluster_input(
         &mut self,
         config: &ClusterShuffleConfig,
-        assignment_version: u64,
-    ) {
+        assignment: &VnodeAssignmentSnapshot,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let pending = self
             .pending_cluster_input
             .as_mut()
             .expect("CoreWindow send plan must be installed before it starts");
-        debug_assert!(pending.send.is_none());
+        if pending.send.is_some() {
+            return Ok(Vec::new());
+        }
         let outbound = pending
             .outbound
             .take()
             .expect("idle CoreWindow send plan must retain its outbound cut");
-        let topology = config.topology;
-        let sender = Arc::clone(&config.sender);
-        let wake = config.receiver.work_ready_notify();
         let context = format!("managed CoreWindow '{}' shuffle", self.op_name);
-        pending.send = Some(tokio::spawn(async move {
-            let result = crate::operator::send_shuffle_plan_retaining(
-                &sender,
-                topology,
-                assignment_version,
-                outbound,
-                &context,
-            )
-            .await;
-            if !matches!(&result.0, Err(error) if error.is_shuffle_not_ready()) {
-                wake.notify_one();
-            }
-            result
-        }));
+        pending.send =
+            Some(ShuffleSend::start(config, assignment.version(), outbound, context).await);
+        match self.finish_pending_cluster_input()? {
+            PendingEowcCompletion::Applied(output) => Ok(output),
+            PendingEowcCompletion::Waiting | PendingEowcCompletion::RetryLater => Ok(Vec::new()),
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -1569,26 +1551,27 @@ impl EowcQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    async fn finish_pending_cluster_input(&mut self) -> Result<PendingEowcCompletion, DbError> {
+    fn finish_pending_cluster_input(&mut self) -> Result<PendingEowcCompletion, DbError> {
         let finished = self
             .pending_cluster_input
-            .as_ref()
-            .and_then(|pending| pending.send.as_ref())
-            .is_some_and(tokio::task::JoinHandle::is_finished);
-        if !finished {
-            return Ok(PendingEowcCompletion::Waiting);
-        }
+            .as_mut()
+            .and_then(|pending| ShuffleSend::take_finished(&mut pending.send));
+        let outcome = match finished {
+            None => return Ok(PendingEowcCompletion::Waiting),
+            Some(Ok(outcome)) => outcome,
+            Some(Err(reason)) => {
+                drop(self.pending_cluster_input.take());
+                return Err(DbError::ShufflePartialSend(format!(
+                    "managed CoreWindow '{}' {reason}",
+                    self.op_name
+                )));
+            }
+        };
         let mut pending = self
             .pending_cluster_input
             .take()
             .expect("finished CoreWindow send plan");
-        let send = pending.send.take().expect("pending CoreWindow send task");
-        let (result, outbound) = send.await.map_err(|error| {
-            DbError::ShufflePartialSend(format!(
-                "managed CoreWindow '{}' send task ended without a delivery outcome: {error}",
-                self.op_name
-            ))
-        })?;
+        let (result, outbound) = outcome;
         if let Err(error) = result {
             if error.is_shuffle_not_ready() {
                 pending.outbound = Some(outbound.ok_or_else(|| {
@@ -1636,7 +1619,7 @@ impl EowcQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         self.idle_close_ceiling = super::frontier::idle_close_ceiling(frontier);
         let (config, assignment, peers) = self.active_cluster_scope()?;
-        match self.finish_pending_cluster_input().await? {
+        match self.finish_pending_cluster_input()? {
             PendingEowcCompletion::Applied(output) => return Ok(output),
             PendingEowcCompletion::Waiting | PendingEowcCompletion::RetryLater => {}
         }
@@ -1656,14 +1639,7 @@ impl EowcQueryOperator {
                     self.op_name
                 )));
             }
-            if self
-                .pending_cluster_input
-                .as_ref()
-                .is_some_and(|pending| pending.send.is_none())
-            {
-                self.start_pending_cluster_send(&config, assignment.version());
-            }
-            return Ok(Vec::new());
+            return self.send_pending_cluster_input(&config, &assignment).await;
         }
         let input_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let has_data = input_batches.iter().any(|batch| batch.num_rows() != 0);
@@ -1721,8 +1697,7 @@ impl EowcQueryOperator {
                 send: None,
                 accounted_bytes,
             });
-            self.start_pending_cluster_send(&config, assignment.version());
-            return Ok(Vec::new());
+            return self.send_pending_cluster_input(&config, &assignment).await;
         }
         let output = {
             let window = self.state.as_mut().expect("initialized CoreWindow state");

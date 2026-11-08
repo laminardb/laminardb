@@ -486,6 +486,8 @@ pub(crate) mod interval_join;
 /// Private mutable-input normalization state used only by explicitly configured bounded joins.
 pub(crate) mod interval_join_input;
 pub(crate) mod lookup_enrich;
+#[cfg(feature = "cluster")]
+pub(crate) mod shuffle_send;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;
 pub(crate) mod temporal_join;
