@@ -11,7 +11,7 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::event_time::{interval_join_event_time, window_event_time};
+use super::event_time::{interval_join_event_time, union_event_time, window_event_time};
 use super::{
     ChangelogKind, Distribution, EventTime, ExchangePlan, ExchangePlanError, InputPort, JoinSide,
     KeyColumn, PartitionKey, PortExchange, StreamPlan, StreamProperties, WindowBoundary,
@@ -199,7 +199,10 @@ async fn plan_stream(
         crate::sql_analysis::extract_projection_filter(logical),
     ) {
         ([input], Some(projection)) => stateless_output(input_properties(input), &projection),
-        _ => (Distribution::Arbitrary, None),
+        _ => (
+            Distribution::Arbitrary,
+            union_event_time(logical, &input_properties),
+        ),
     };
     Ok(forwarding(&inputs, forwarded.0, changelog, forwarded.1))
 }
@@ -257,7 +260,7 @@ async fn join_plan(
 
 /// What a stateless projection keeps of its input: the hash key and the event-time column, when
 /// each is forwarded unchanged.
-fn stateless_output(
+pub(super) fn stateless_output(
     input: StreamProperties,
     projection: &ProjectionFilterInfo,
 ) -> (Distribution, Option<EventTime>) {

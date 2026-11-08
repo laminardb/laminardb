@@ -9974,7 +9974,17 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  SELECT id FROM left_events UNION ALL SELECT id FROM right_events",
             )
             .await;
-            assert!(message.contains("single input frontier"), "{message}");
+            assert!(
+                message.contains("a UNION ALL whose every branch forwards one source event-time column"),
+                "{message}"
+            );
+            db.execute(
+                "CREATE STREAM event_time_union AS \
+                 SELECT id, ts FROM left_events UNION ALL SELECT id, ts FROM right_events",
+            )
+            .await
+            .expect("a union that forwards both sources' event-time column is admitted");
+            db.execute("DROP STREAM event_time_union").await.unwrap();
             db.execute(
                 "CREATE SOURCE unwatermarked_events (id BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL) \
                  FROM GENERATOR ('max.rows' = '1')",

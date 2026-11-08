@@ -316,20 +316,172 @@ async fn global_min_max_over_changelog_stream_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn union_all_is_rejected_in_cluster() {
-    let case = Case {
-        name: "union_all",
+const UNION_ALL: &str =
+    "SELECT k, v, ts FROM left_events UNION ALL SELECT k, v, ts FROM right_events";
+
+fn union_case(
+    name: &'static str,
+    streams: Vec<String>,
+    ground_truth: Option<&'static str>,
+) -> Case {
+    Case {
+        name,
         sources: vec![events("left_events", 0), events("right_events", 5)],
-        streams: vec!["CREATE STREAM out AS SELECT k, v FROM left_events \
-             UNION ALL SELECT k, v FROM right_events"
-            .into()],
+        streams,
         observe: "out",
         form: OutputForm::Rows,
-        ground_truth: Some("SELECT k, v FROM left_events UNION ALL SELECT k, v FROM right_events"),
+        ground_truth,
         checkpoint_under_load: false,
+    }
+}
+
+/// Each node unions the rows of the partitions it owns, forwarding both sources' event time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn union_all_is_equal() {
+    let case = union_case(
+        "union_all",
+        vec![format!("CREATE STREAM out AS {UNION_ALL}")],
+        Some(UNION_ALL),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+const SELF_UNION: &str = "SELECT k, v, ts FROM events WHERE v % 2 = 0 \
+     UNION ALL SELECT k, v, ts FROM events WHERE v % 3 = 0";
+
+/// A union that reads one source twice has one input, so cluster `CREATE` admits it; the graph
+/// classifies it as stateless and runs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn union_all_of_one_source_is_equal() {
+    let case = case(
+        "union_all_of_one_source",
+        &[&format!("CREATE STREAM out AS {SELF_UNION}")],
+        OutputForm::Rows,
+        Some(SELF_UNION),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A window over a union closes on the lower of its two sources' frontiers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_over_union_all_is_equal() {
+    let case = union_case(
+        "window_over_union_all",
+        vec![
+            format!("CREATE STREAM merged AS {UNION_ALL}"),
+            "CREATE STREAM out AS SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
+             COUNT(*) AS n, SUM(v) AS s FROM merged \
+             GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND) EMIT ON WINDOW CLOSE"
+                .into(),
+        ],
+        Some(
+            "SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n, \
+             SUM(v) AS s FROM (SELECT k, v, ts FROM left_events UNION ALL \
+             SELECT k, v, ts FROM right_events) WHERE ts < CAST(1400000 AS TIMESTAMP(6)) \
+             GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND)",
+        ),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A keyed aggregate over a union repartitions both sources' rows on its key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregate_over_union_all_is_equal() {
+    let case = Case {
+        form: OutputForm::Changelog,
+        ..union_case(
+            "aggregate_over_union_all",
+            vec![
+                format!("CREATE STREAM merged AS {UNION_ALL}"),
+                "CREATE STREAM out AS SELECT k, COUNT(*) AS n, SUM(v) AS s FROM merged \
+                 GROUP BY k EMIT CHANGES"
+                    .into(),
+            ],
+            Some(
+                "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM (SELECT k, v, ts FROM left_events \
+                 UNION ALL SELECT k, v, ts FROM right_events) GROUP BY k",
+            ),
+        )
     };
-    assert_rejected(verdict(case).await, "single input frontier");
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// An interval join whose right side is a union of two sources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interval_join_over_union_all_is_equal() {
+    let case = Case {
+        sources: vec![
+            events("orders", 0),
+            events("payments", 3),
+            events("refunds", 5),
+        ],
+        ground_truth: Some(
+            "SELECT o.k AS k, o.v AS ov, s.v AS sv FROM orders o INNER JOIN \
+             (SELECT k, v, ts FROM payments UNION ALL SELECT k, v, ts FROM refunds) s \
+             ON o.k = s.k AND s.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+        ),
+        ..join_case(
+            "interval_join_over_union_all",
+            vec![
+                "CREATE STREAM settled AS SELECT k, v, ts FROM payments \
+                 UNION ALL SELECT k, v, ts FROM refunds"
+                    .into(),
+                "CREATE STREAM out AS SELECT o.k AS k, o.v AS ov, s.v AS sv FROM orders o \
+                 INNER JOIN settled s ON o.k = s.k \
+                 AND s.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+                    .into(),
+            ],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+const UNION_REJECTION: &str =
+    "a UNION ALL whose every branch forwards one source event-time column";
+
+/// Without the event-time column a union has no frontier for a consumer to close on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn union_all_without_event_time_is_rejected_in_cluster() {
+    let case = union_case(
+        "union_all_without_event_time",
+        vec!["CREATE STREAM out AS SELECT k, v FROM left_events \
+              UNION ALL SELECT k, v FROM right_events"
+            .into()],
+        Some("SELECT k, v FROM left_events UNION ALL SELECT k, v FROM right_events"),
+    );
+    assert_rejected(verdict(case).await, UNION_REJECTION);
+}
+
+/// A union of interval join streams carries their event time in every mode, but a cluster
+/// consumer could close past an idle join's later rows, so cluster mode rejects it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn union_all_over_join_streams_is_rejected_in_cluster() {
+    let join = |name: &str, right: &str| {
+        format!(
+            "CREATE STREAM {name} AS SELECT o.k AS k, o.ts AS ts FROM orders o \
+             INNER JOIN {right} r ON o.k = r.k \
+             AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+        )
+    };
+    let case = Case {
+        sources: vec![
+            events("orders", 0),
+            events("payments", 3),
+            events("refunds", 5),
+        ],
+        ..join_case(
+            "union_all_over_join_streams",
+            vec![
+                join("paid", "payments"),
+                join("refunded", "refunds"),
+                "CREATE STREAM out AS SELECT k, ts FROM paid UNION ALL SELECT k, ts FROM refunded"
+                    .into(),
+            ],
+            OutputForm::Rows,
+        )
+    };
+    assert_rejected(verdict(case).await, UNION_REJECTION);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

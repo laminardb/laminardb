@@ -1169,7 +1169,7 @@ pub(crate) struct OperatorGraph {
     #[cfg(feature = "cluster")]
     event_time_forwards: FxHashSet<String>,
     #[cfg(feature = "cluster")]
-    event_time_roots: Vec<usize>,
+    event_time_chains: Vec<input_admission::SourceFrontierChain>,
     #[cfg(feature = "cluster")]
     remote_exchange_depth: u64,
     // One immutable assignment transition, consumed only after complete lifecycle success.
@@ -1243,7 +1243,7 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             event_time_forwards: FxHashSet::default(),
             #[cfg(feature = "cluster")]
-            event_time_roots: Vec::new(),
+            event_time_chains: Vec::new(),
             #[cfg(feature = "cluster")]
             remote_exchange_depth: 0,
             #[cfg(feature = "cluster")]

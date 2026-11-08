@@ -70,15 +70,15 @@ impl ExchangePlan {
             .collect()
     }
 
-    /// Streams that keep one input's rows and event time unchanged (a stateless projection that
-    /// forwards the event-time column), so a managed consumer may take that input's frontier.
+    /// Streams that keep their inputs' rows and event time unchanged (a stateless projection or a
+    /// `UNION ALL` that forwards the event-time column), so a managed consumer may take the
+    /// lowest of those inputs' frontiers.
     #[cfg(feature = "cluster")]
     pub(crate) fn event_time_forwards(&self) -> FxHashSet<String> {
         self.streams
             .iter()
             .filter(|(_, plan)| {
                 plan.output.event_time.is_some()
-                    && plan.inputs.len() == 1
                     && plan
                         .inputs
                         .values()

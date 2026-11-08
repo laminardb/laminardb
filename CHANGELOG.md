@@ -16,6 +16,15 @@
   stream, on the event-time column the input carries.
 - An append-only view over an interval join keeps an interval on the join's event-time column, so
   it no longer has to declare `retention = '<n> rows'`.
+- A `UNION ALL` carries its inputs' event-time column, in every mode, when every branch forwards it
+  unchanged to the same column from the same kind of operator; its watermark is the lowest of its
+  inputs' watermarks, and `EXPLAIN` shows the column. An interval join may read such a union, and
+  an append-only view over it keeps an interval on the column instead of declaring a row count.
+- Cluster mode admits a `UNION ALL` whose every branch forwards one source event-time column
+  through projections and filters, and windows, interval joins, aggregates and views over it.
+  Each node unions the rows it holds, and a window or join over the union closes on the lowest of
+  its sources' node-local watermarks. A union over a join or window stream, or one without the
+  event-time column, is still rejected.
 - A chain of interval joins over three or more named inputs (`a JOIN b ON .. JOIN c ON ..`, each
   `ON` with a `BETWEEN` bound) runs in every mode, in a stream or a materialized view. It is split
   into one internal stage per join, each admitted as a two-way join over the stage before it, so
@@ -50,6 +59,9 @@
 
 ### Fixed
 
+- In cluster mode a `UNION ALL` that reads one source twice passed `CREATE` and was then refused
+  when the pipeline started (`[LDB-6066]`, "SQL execution shape has not been classified"); it now
+  runs.
 - In every mode, `CREATE` certifies an aggregate over a changelog materialized view in its
   changelog form, as it already did over an `EMIT CHANGES` stream. One whose changelog state
   cannot hold its input (for example `MIN` or `MAX` over an `INTERVAL` column) is now rejected at

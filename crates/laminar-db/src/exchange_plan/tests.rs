@@ -281,6 +281,57 @@ async fn interval_join_repartitions_each_side_and_union_forwards() {
     );
 }
 
+/// A union carries its inputs' event-time column when every branch forwards it unchanged to the
+/// same output column from the same kind of operator.
+#[tokio::test]
+async fn union_all_forwards_a_shared_event_time_column() {
+    let db = db(&[
+        EVENTS,
+        ORDERS,
+        PAYMENTS,
+        "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS ts FROM orders o \
+         INNER JOIN payments p ON o.k = p.k \
+         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+    ])
+    .await;
+    for (query, output) in [
+        (
+            "SELECT k, ts FROM orders UNION ALL SELECT k, ts FROM payments",
+            "arbitrary, append-only, event time ts",
+        ),
+        (
+            "SELECT k, ts AS t FROM orders UNION ALL SELECT k, ts FROM payments WHERE v > 1",
+            "arbitrary, append-only, event time t",
+        ),
+        (
+            "SELECT k, ts FROM orders UNION ALL SELECT k, ts FROM payments \
+             UNION ALL SELECT k, ts FROM events",
+            "arbitrary, append-only, event time ts",
+        ),
+        (
+            "SELECT ts, ts AS later FROM orders \
+             UNION ALL SELECT ts + INTERVAL '1' SECOND, ts FROM payments",
+            "arbitrary, append-only",
+        ),
+        (
+            "SELECT k, ts FROM orders \
+             UNION ALL SELECT k, ts + INTERVAL '1' MILLISECOND FROM payments",
+            "arbitrary, append-only",
+        ),
+        (
+            "SELECT k, ts FROM joined UNION ALL SELECT k, ts FROM events",
+            "arbitrary, append-only",
+        ),
+    ] {
+        let rows = exchange(&db, &format!("CREATE STREAM merged AS {query}")).await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{query}"
+        );
+    }
+}
+
 const JOIN_BOUND: &str = "ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND";
 
 #[tokio::test]

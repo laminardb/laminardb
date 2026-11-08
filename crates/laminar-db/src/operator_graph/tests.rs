@@ -1421,6 +1421,93 @@ async fn cluster_windows_and_joins_wait_for_an_idle_managed_stage() {
     }
 }
 
+/// A managed port over a `UNION ALL` of two sources takes the lower of their node-local
+/// frontiers, passes over a source idle on this node, and holds while a branch has buffered rows.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn managed_port_over_a_union_takes_the_lowest_source_frontier() {
+    fn window_frontier(
+        graph: &mut OperatorGraph,
+        window: usize,
+        (left, right): (InputFrontier, InputFrontier),
+    ) -> InputFrontier {
+        graph.set_local_source_frontiers(&FxHashMap::from_iter([
+            (Arc::from("left"), left),
+            (Arc::from("right"), right),
+        ]));
+        graph.cap_join_source_frontiers(|_| Some(700));
+        graph.operator_input_frontiers(window, i64::MIN)[0]
+    }
+    let frontier = |watermark, idle| InputFrontier {
+        watermark: Some(watermark),
+        idle,
+    };
+    let mut harness = alignment_harness().await;
+    harness.graph.event_time_forwards = FxHashSet::from_iter(["merged".to_string()]);
+    let left = harness.graph.ensure_source_node("left");
+    let right = harness.graph.ensure_source_node("right");
+    let merged = harness
+        .graph
+        .place_operator_node("merged", Box::new(RichFrontierProbe(Arc::default())), 2)
+        .unwrap();
+    harness.graph.add_edge(left, merged, 0);
+    harness.graph.add_edge(right, merged, 1);
+    let window = harness
+        .graph
+        .place_operator_node(
+            "window",
+            Box::new(ManagedFrontierProbe {
+                capability: OperatorCapability::managed_core_window(),
+                seen: Arc::default(),
+            }),
+            1,
+        )
+        .unwrap();
+    harness.graph.add_edge(merged, window, 0);
+    harness.graph.compute_topo_order().unwrap();
+    let graph = &mut harness.graph;
+
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_200, false), frontier(800, false))
+        ),
+        frontier(800, false)
+    );
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_200, false), frontier(1_500, true))
+        ),
+        frontier(1_200, false),
+        "a source idle on this node does not hold the union back"
+    );
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_500, true), frontier(1_600, true))
+        ),
+        frontier(700, true),
+        "both sources idle close only to the committed cut"
+    );
+    graph.output_watermarks[merged] = 600;
+    let batches = vec![ordered_batch(650)];
+    let bytes = super::input_admission::retained_input_bytes(&batches);
+    graph.push_to_port(merged, 1, batches, bytes);
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_200, false), frontier(800, false))
+        ),
+        frontier(600, false),
+        "rows buffered on either branch hold the frontier at the union's output"
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn join_shuffles_use_the_committed_source_frontier() {

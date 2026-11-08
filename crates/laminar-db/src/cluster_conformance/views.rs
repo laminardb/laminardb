@@ -511,13 +511,15 @@ async fn row_placed_views_match_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-/// A projection over a source and a closed tumbling window both append; each node keeps its
-/// own part of their logs, and every node reads all of it at the committed cut.
+/// A projection over a source, a closed tumbling window and a union of two sources all append;
+/// each node keeps its own part of their logs, and every node reads all of it at the committed
+/// cut. The union keeps the default interval on the event-time column it forwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn append_views_match_batch_sql_in_cluster() {
+    const UNION_ALL: &str = "SELECT k, v, ts FROM events UNION ALL SELECT k, v, ts FROM more";
     let case = ViewCase {
         name: "append_views",
-        sources: vec![events("events", 0)],
+        sources: vec![events("events", 0), events("more", 5)],
         views: views(&[
             "CREATE MATERIALIZED VIEW multiples AS \
              SELECT k, v * 2 AS v2 FROM events WHERE v % 3 = 0 \
@@ -526,6 +528,7 @@ async fn append_views_match_batch_sql_in_cluster() {
              SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
              COUNT(*) AS n, SUM(v) AS s FROM events \
              GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND) EMIT ON WINDOW CLOSE",
+            &format!("CREATE MATERIALIZED VIEW merged AS {UNION_ALL}"),
         ]),
         reads: vec![
             (
@@ -533,6 +536,7 @@ async fn append_views_match_batch_sql_in_cluster() {
                 "SELECT k, v * 2 AS v2 FROM events WHERE v % 3 = 0",
             ),
             ("SELECT * FROM windows", CLOSED_TUMBLE_TRUTH),
+            ("SELECT * FROM merged", UNION_ALL),
         ],
         same_cycle_invariants: vec![],
     };

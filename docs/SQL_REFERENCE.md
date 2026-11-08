@@ -218,6 +218,31 @@ after the window that row belongs to has closed:
 `CREATE` rejects a window over a window stream that groups by any other column, and a window over a
 session window or over a window that projects no boundary, which carry no event time.
 
+### `UNION ALL` over event-time inputs
+
+A `UNION ALL` carries its inputs' event-time column when every branch is a projection or filter
+over one append-only input that forwards that input's event-time column unchanged to the same
+output column, with the same type, and every input's column comes from the same kind of operator
+(a source, an interval join, or a closed window). Its watermark is the lowest of its inputs'
+watermarks; an input that is idle does not hold it back. A window or an interval join may then read
+the union on that column, and an append-only view over it keeps an interval on it.
+
+```sql
+CREATE STREAM all_trades AS
+  SELECT symbol, price, ts FROM nyse_trades
+  UNION ALL
+  SELECT symbol, price, ts FROM lse_trades;
+
+CREATE STREAM bars AS
+  SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS minute, MAX(price) AS high
+  FROM all_trades
+  GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+  EMIT ON WINDOW CLOSE;
+```
+
+A union that computes the column in any branch, places it in different columns, or mixes kinds of
+operators carries no event time. In cluster mode see [Cluster SQL boundary](#cluster-sql-boundary).
+
 ---
 
 ## Joins
@@ -596,22 +621,28 @@ boundaries, poison-message handling, and tested behaviour.
 ### Cluster SQL boundary
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
-the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
-aggregates. A cluster window reads a source, or an append-only stream that carries an event-time
-column: a projection that forwards a source's, an interval join other than `FULL`, or a closed
+the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION` aggregates.
+A cluster window reads a source, or an append-only stream that carries an event-time column: a
+projection or `UNION ALL` that forwards a source's, an interval join other than `FULL`, or a closed
 `TUMBLE` or `HOP` window. It windows on that column, requires a bounded watermark on it, and needs
-`EMIT ON WINDOW CLOSE` or `EMIT FINAL`. An interval join may read another interval join's
-stream on that stream's event-time column. A join output may feed a keyed aggregate or a window,
-either as a named stream or in one statement that is split into stages, and a chain of interval
-joins over three or more inputs is split the same way. A stream may sit at most
-three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
-which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
+`EMIT ON WINDOW CLOSE` or `EMIT FINAL`. An interval join may read another interval join's stream on
+that stream's event-time column. A join output may feed a keyed aggregate or a window, either as a
+named stream or in one statement that is split into stages, and a chain of interval joins over three
+or more inputs is split the same way. A `UNION ALL` is admitted when every branch forwards one
+source event-time column unchanged through projections and filters (see [`UNION ALL` over event-time
+inputs](#union-all-over-event-time-inputs)); each node unions the rows it holds, and a window or
+join over it closes on the lowest of its sources' watermarks. Other multi-input queries, and a union
+over a join or window stream or one that drops the event-time column, are rejected with
+`[LDB-4007]`. A stream may sit at most three remote exchanges (joins, aggregates, or windows)
+downstream of its sources, the depth for which checkpoint pauses are measured; a deeper pipeline is
+rejected with `[LDB-4007]`.
 
 Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admits:
 
 - a keyed or global aggregate view;
 - a projection or filter over such a view, keeping or dropping its key columns;
-- an append-only view: a projection over a source, a closed window, or an interval join;
+- an append-only view: a projection over a source, a `UNION ALL` of them, a closed window, or an
+  interval join;
 - a chain of interval joins, an aggregate or window over a join or a chain, or an aggregate over
   an aggregating or joining subquery, split into stages as for a stream.
 
@@ -797,9 +828,10 @@ other nodes send their rows). Join inputs are named
 `left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
 (an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry an
-event-time column: a source's watermark column, one a projection forwards unchanged, an interval
-join's time column, or a closed window's boundary (see [Windows over windows](#windows-over-windows)
-and [Bounded event-time join](#bounded-event-time-join)).
+event-time column: a source's watermark column, one a projection or `UNION ALL` forwards unchanged,
+an interval join's time column, or a closed window's boundary (see
+[Windows over windows](#windows-over-windows) and
+[Bounded event-time join](#bounded-event-time-join)).
 
 For a statement that is split into stages, `EXPLAIN` lists each stage's SQL as a
 `stage.<name>` row, followed by that stage's `stage.<name>.exchange.*` rows. An aggregate that
@@ -927,17 +959,19 @@ full changelogs.
 
 ### 7. Append-only views keep rows by a declared retention
 
-A view whose query only appends rows (a projection or filter over a source, a window with `EMIT ON
-WINDOW CLOSE` or `EMIT FINAL`, or an interval join) keeps its rows as a log. With checkpointing,
-each checkpoint writes the rows appended since the previous one as one segment beside the
-checkpoint's state, memory holds only those rows, and `SELECT` reads committed segments back from
-the checkpoint store. Retention decides which rows a read returns and which segments later
+A view whose query only appends rows (a projection or filter over a source, a `UNION ALL` of them,
+a window with `EMIT ON WINDOW CLOSE` or `EMIT FINAL`, or an interval join) keeps its rows as a log.
+With checkpointing, each checkpoint writes the rows appended since the previous one as one segment
+beside the checkpoint's state, memory holds only those rows, and `SELECT` reads committed segments
+back from the checkpoint store. Retention decides which rows a read returns and which segments later
 checkpoints keep:
 
 - `WITH (retention = '<interval>')`, for example `'2 hours'`: rows whose event time is at or after
   the view's watermark minus the interval. The event-time column is the source's watermark column
-  when the query forwards it unchanged, or an interval join's event-time column. A windowed view
-  keeps rows by the first window column it projects, in `GROUP BY` order:
+  when the query forwards it unchanged (a projection, or a `UNION ALL` as described in
+  [`UNION ALL` over event-time inputs](#union-all-over-event-time-inputs)), or an interval join's
+  event-time column. A windowed view keeps rows by the first window column it projects, in
+  `GROUP BY` order:
   - a `TUMBLE` or `HOP` view keeps a window while the window's end is within the interval of the
     watermark its windows close at, less the allowed lateness, whichever boundary it projects;
   - a session view keeps a session while its start is within the interval plus the gap and the

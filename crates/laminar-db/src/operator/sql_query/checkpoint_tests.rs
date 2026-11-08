@@ -17,6 +17,28 @@ fn sql_capability_classification_is_shape_aware_and_fail_closed() {
     assert_eq!(stateless.state_class, OperatorStateClass::Stateless);
     assert_eq!(stateless.cluster_status, ClusterExecutionStatus::DdlGuarded);
 
+    for union in [
+        "SELECT key, ts FROM a UNION ALL SELECT key, ts FROM b WHERE value > 1",
+        "SELECT key FROM a UNION ALL SELECT key FROM b UNION ALL SELECT UPPER(key) FROM c",
+    ] {
+        assert_eq!(classify(union), stateless, "{union}");
+    }
+    for union in [
+        "SELECT key FROM a UNION SELECT key FROM b",
+        "SELECT key FROM a UNION ALL SELECT key FROM b ORDER BY key",
+        "SELECT key FROM a UNION ALL SELECT key FROM b LIMIT 3",
+        "SELECT key FROM a UNION ALL SELECT key FROM b JOIN c ON b.key = c.key",
+        "SELECT key FROM a UNION ALL SELECT key FROM b GROUP BY key",
+        "SELECT key FROM a UNION ALL SELECT COUNT(*) FROM b",
+        "SELECT key FROM a EXCEPT ALL SELECT key FROM b",
+    ] {
+        assert_eq!(
+            classify(union),
+            OperatorCapability::unclassified_sql_query(),
+            "{union}"
+        );
+    }
+
     let scalar = classify("SELECT UPPER(key) FROM events");
     assert_eq!(scalar.state_class, OperatorStateClass::Stateless);
     assert_eq!(scalar.cluster_status, ClusterExecutionStatus::DdlGuarded);
