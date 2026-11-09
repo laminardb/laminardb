@@ -1804,8 +1804,8 @@ impl CoreWindowState {
                     "window ending at {window_start} + {size_ms}ms does not fit in i64"
                 ))
             })?;
-            for (key, mut accumulators) in groups {
-                closed.push(key.row(), window_start, window_end, &mut accumulators)?;
+            for (key, accumulators) in groups {
+                closed.push(key.row(), window_start, window_end, &accumulators)?;
             }
         }
         if mutated {
@@ -1942,8 +1942,8 @@ impl CoreWindowState {
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.2.as_ref().cmp(right.2.as_ref()))
         });
-        for (start, end, key, mut accumulators) in rows {
-            closed.push(key.row(), start, end, &mut accumulators)?;
+        for (start, end, key, accumulators) in rows {
+            closed.push(key.row(), start, end, &accumulators)?;
         }
         Ok(())
     }

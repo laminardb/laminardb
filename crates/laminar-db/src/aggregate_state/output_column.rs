@@ -1,8 +1,11 @@
 //! One aggregate's output column, filled with each emitted group's value as the group is visited.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow::array::{new_empty_array, ArrayRef, Float64Builder, Int64Builder, UInt64Builder};
+use arrow::array::{
+    new_empty_array, ArrayRef, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
+};
 use datafusion_common::ScalarValue;
 
 use super::AggFuncSpec;
@@ -16,32 +19,19 @@ enum Values {
     Int64(Int64Builder),
     UInt64(UInt64Builder),
     Float64(Float64Builder),
+    Utf8(StringBuilder),
     Scalars(Vec<ScalarValue>),
 }
 
 impl Values {
-    fn first(value: ScalarValue, capacity: usize) -> Self {
+    /// An empty column for values of `value`'s type.
+    fn for_type_of(value: &ScalarValue, capacity: usize) -> Self {
         match value {
-            ScalarValue::Int64(value) => {
-                let mut builder = Int64Builder::with_capacity(capacity);
-                builder.append_option(value);
-                Self::Int64(builder)
-            }
-            ScalarValue::UInt64(value) => {
-                let mut builder = UInt64Builder::with_capacity(capacity);
-                builder.append_option(value);
-                Self::UInt64(builder)
-            }
-            ScalarValue::Float64(value) => {
-                let mut builder = Float64Builder::with_capacity(capacity);
-                builder.append_option(value);
-                Self::Float64(builder)
-            }
-            value => {
-                let mut values = Vec::with_capacity(capacity);
-                values.push(value);
-                Self::Scalars(values)
-            }
+            ScalarValue::Int64(_) => Self::Int64(Int64Builder::with_capacity(capacity)),
+            ScalarValue::UInt64(_) => Self::UInt64(UInt64Builder::with_capacity(capacity)),
+            ScalarValue::Float64(_) => Self::Float64(Float64Builder::with_capacity(capacity)),
+            ScalarValue::Utf8(_) => Self::Utf8(StringBuilder::with_capacity(capacity, 0)),
+            _ => Self::Scalars(Vec::with_capacity(capacity)),
         }
     }
 }
@@ -59,14 +49,26 @@ impl OutputColumn {
         }
     }
 
+    /// Appends `value`. A column without a typed builder keeps an owned value as it is and clones
+    /// a lent one.
     #[inline]
-    pub(crate) fn push(&mut self, value: ScalarValue) -> Result<(), DbError> {
-        match (&mut self.values, value) {
-            (Values::Scalars(values), value) => values.push(value),
-            (Values::Int64(builder), ScalarValue::Int64(value)) => builder.append_option(value),
-            (Values::UInt64(builder), ScalarValue::UInt64(value)) => builder.append_option(value),
-            (Values::Float64(builder), ScalarValue::Float64(value)) => builder.append_option(value),
-            (Values::Empty, value) => self.values = Values::first(value, self.capacity),
+    pub(crate) fn push(&mut self, value: Cow<'_, ScalarValue>) -> Result<(), DbError> {
+        if matches!(self.values, Values::Empty) {
+            self.values = Values::for_type_of(&value, self.capacity);
+        }
+        if let Values::Scalars(values) = &mut self.values {
+            values.push(value.into_owned());
+            return Ok(());
+        }
+        match (&mut self.values, value.as_ref()) {
+            (Values::Int64(builder), ScalarValue::Int64(value)) => builder.append_option(*value),
+            (Values::UInt64(builder), ScalarValue::UInt64(value)) => builder.append_option(*value),
+            (Values::Float64(builder), ScalarValue::Float64(value)) => {
+                builder.append_option(*value);
+            }
+            (Values::Utf8(builder), ScalarValue::Utf8(value)) => {
+                builder.append_option(value.as_deref());
+            }
             (_, value) => {
                 return Err(DbError::Pipeline(format!(
                     "aggregate output column mixes value types: got {}",
@@ -84,6 +86,7 @@ impl OutputColumn {
             Values::Int64(mut builder) => Arc::new(builder.finish()),
             Values::UInt64(mut builder) => Arc::new(builder.finish()),
             Values::Float64(mut builder) => Arc::new(builder.finish()),
+            Values::Utf8(mut builder) => Arc::new(builder.finish()),
             Values::Scalars(values) => ScalarValue::iter_to_array(values).map_err(|error| {
                 DbError::Pipeline(format!(
                     "aggregate '{}' result array build: {error}",
@@ -123,10 +126,15 @@ mod tests {
         }
     }
 
+    /// Pushes the values lent and owned in turn; a column builds the same array from either.
     fn column(values: Vec<ScalarValue>, return_type: DataType) -> Result<ArrayRef, DbError> {
         let mut column = OutputColumn::with_capacity(values.len());
-        for value in values {
-            column.push(value)?;
+        for (index, value) in values.iter().enumerate() {
+            if index % 2 == 0 {
+                column.push(Cow::Borrowed(value))?;
+            } else {
+                column.push(Cow::Owned(value.clone()))?;
+            }
         }
         column.finish(&spec(return_type))
     }
@@ -139,6 +147,11 @@ mod tests {
             vec![
                 ScalarValue::Float64(Some(0.5)),
                 ScalarValue::Float64(Some(-1.0)),
+            ],
+            vec![
+                ScalarValue::Utf8(Some("b".into())),
+                ScalarValue::Utf8(None),
+                ScalarValue::Utf8(Some(String::new())),
             ],
         ];
         for values in cases {
@@ -153,12 +166,12 @@ mod tests {
     #[test]
     fn untyped_values_go_through_iter_to_array() {
         let values = vec![
-            ScalarValue::Utf8(Some("b".into())),
-            ScalarValue::Utf8(None),
-            ScalarValue::Utf8(Some("a".into())),
+            ScalarValue::Date32(Some(2)),
+            ScalarValue::Date32(None),
+            ScalarValue::Date32(Some(1)),
         ];
         let expected = ScalarValue::iter_to_array(values.clone()).unwrap();
-        let array = column(values, DataType::Utf8).unwrap();
+        let array = column(values, DataType::Date32).unwrap();
         assert_eq!(array.to_data(), expected.to_data());
     }
 

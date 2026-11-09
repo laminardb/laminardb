@@ -175,8 +175,8 @@ impl ExtremumState {
         Ok(vec![delta.value])
     }
 
-    pub(super) fn evaluate(&self) -> ScalarValue {
-        self.value.clone()
+    pub(super) fn value(&self) -> &ScalarValue {
+        &self.value
     }
 
     pub(super) fn checkpoint_state(&self) -> Vec<ScalarValue> {

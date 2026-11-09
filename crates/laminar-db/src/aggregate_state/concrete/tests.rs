@@ -76,14 +76,14 @@ fn cloned_append_sum_is_an_exact_cut() {
         captured.checkpoint_state(),
         vec![ScalarValue::Int64(Some(6))]
     );
-    assert_eq!(live.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
+    assert_eq!(*live.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
 
     let mut restored =
         ConcreteAggregateState::try_new(&spec, ConcreteInputMode::AppendOnly).unwrap();
     restored
         .merge_checkpoint_state(&captured.checkpoint_state())
         .unwrap();
-    assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(6)));
+    assert_eq!(*restored.evaluate().unwrap(), ScalarValue::Int64(Some(6)));
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn decimal_avg_widens_running_sum_and_preserves_scale() {
         ]
     );
     assert_eq!(
-        state.evaluate().unwrap(),
+        *state.evaluate().unwrap(),
         ScalarValue::Decimal128(Some(99_999_999_990_000), 14, 6)
     );
 
@@ -140,7 +140,7 @@ fn weighted_arithmetic_uses_existing_checkpoint_shapes() {
             ScalarValue::Int64(Some(2)),
         ]
     );
-    assert_eq!(sum.evaluate().unwrap(), ScalarValue::Int64(Some(50)));
+    assert_eq!(*sum.evaluate().unwrap(), ScalarValue::Int64(Some(50)));
 
     let avg_spec = spec(Avg::new(), DataType::Float64, DataType::Float64, false);
     let mut avg = ConcreteAggregateState::try_new(&avg_spec, ConcreteInputMode::Weighted).unwrap();
@@ -161,7 +161,7 @@ fn weighted_arithmetic_uses_existing_checkpoint_shapes() {
             ScalarValue::Int64(Some(2)),
         ]
     );
-    assert_eq!(avg.evaluate().unwrap(), ScalarValue::Float64(Some(25.0)));
+    assert_eq!(*avg.evaluate().unwrap(), ScalarValue::Float64(Some(25.0)));
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
     assert!(append_sum
         .update_all(&[Arc::new(Int64Array::from(vec![i64::MAX, 1]))])
         .is_err());
-    assert_eq!(append_sum.evaluate().unwrap(), ScalarValue::Int64(None));
+    assert_eq!(*append_sum.evaluate().unwrap(), ScalarValue::Int64(None));
 
     let mut weighted_sum =
         ConcreteAggregateState::try_new(&sum_spec, ConcreteInputMode::Weighted).unwrap();
@@ -182,14 +182,14 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
             Arc::new(Int64Array::from(vec![1, 1])),
         ])
         .is_err());
-    assert_eq!(weighted_sum.evaluate().unwrap(), ScalarValue::Int64(None));
+    assert_eq!(*weighted_sum.evaluate().unwrap(), ScalarValue::Int64(None));
     assert!(weighted_sum
         .merge_checkpoint_state(&[
             ScalarValue::Decimal128(Some(i128::from(i64::MAX) + 1), 38, 0),
             ScalarValue::Int64(Some(1)),
         ])
         .is_err());
-    assert_eq!(weighted_sum.evaluate().unwrap(), ScalarValue::Int64(None));
+    assert_eq!(*weighted_sum.evaluate().unwrap(), ScalarValue::Int64(None));
 
     let count_spec = spec(Count::new(), DataType::Int64, DataType::Int64, true);
     let mut weighted_count =
@@ -201,7 +201,7 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
         ])
         .is_err());
     assert_eq!(
-        weighted_count.evaluate().unwrap(),
+        *weighted_count.evaluate().unwrap(),
         ScalarValue::Int64(Some(0))
     );
 
@@ -214,7 +214,10 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
             Arc::new(Int64Array::from(vec![1])),
         ])
         .is_err());
-    assert_eq!(weighted_avg.evaluate().unwrap(), ScalarValue::Float64(None));
+    assert_eq!(
+        *weighted_avg.evaluate().unwrap(),
+        ScalarValue::Float64(None)
+    );
 }
 
 #[test]
@@ -224,14 +227,14 @@ fn append_sum_adds_each_batch_sum_to_its_total() {
     let mut sum =
         ConcreteAggregateState::try_new(&int_spec, ConcreteInputMode::AppendOnly).unwrap();
     sum.update_all(&[ints(vec![None])]).unwrap();
-    assert_eq!(sum.evaluate().unwrap(), ScalarValue::Int64(None));
+    assert_eq!(*sum.evaluate().unwrap(), ScalarValue::Int64(None));
     sum.update_all(&[ints(vec![Some(i64::MAX - 1)])]).unwrap();
     // Added row by row this batch would pass i64::MAX; its own sum is zero.
     sum.update_all(&[ints(vec![Some(5), Some(-5)])]).unwrap();
     let error = sum.update_all(&[ints(vec![Some(2)])]).unwrap_err();
     assert!(error.to_string().contains("SUM state overflow"), "{error}");
     assert_eq!(
-        sum.evaluate().unwrap(),
+        *sum.evaluate().unwrap(),
         ScalarValue::Int64(Some(i64::MAX - 1))
     );
 
@@ -254,7 +257,7 @@ fn append_sum_adds_each_batch_sum_to_its_total() {
     let error = sum.update_all(&[decimals(vec![1])]).unwrap_err();
     assert!(error.to_string().contains("SUM state precision"), "{error}");
     assert_eq!(
-        sum.evaluate().unwrap(),
+        *sum.evaluate().unwrap(),
         ScalarValue::Decimal128(Some(9_999_999_999), 10, 2)
     );
 }
@@ -280,6 +283,67 @@ fn extrema_choose_their_state_by_input_mode() {
         ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::Weighted).unwrap(),
         ConcreteAggregateState::RetractableMin(_)
     ));
+}
+
+#[test]
+fn only_values_held_as_emitted_are_lent() {
+    let text = || -> ArrayRef { Arc::new(StringArray::from(vec!["pear", "apple"])) };
+    let ints = || -> ArrayRef { Arc::new(Int64Array::from(vec![4, 2])) };
+    let weights = || -> ArrayRef { Arc::new(Int64Array::from(vec![1, 1])) };
+    let cases = [
+        (
+            spec(Min::new(), DataType::Utf8, DataType::Utf8, false),
+            ConcreteInputMode::AppendOnly,
+            vec![text()],
+            Some(ScalarValue::Utf8(Some("apple".into()))),
+        ),
+        (
+            spec(Max::new(), DataType::Utf8, DataType::Utf8, false),
+            ConcreteInputMode::AppendOnly,
+            vec![text()],
+            Some(ScalarValue::Utf8(Some("pear".into()))),
+        ),
+        (
+            spec(Sum::new(), DataType::Int64, DataType::Int64, false),
+            ConcreteInputMode::AppendOnly,
+            vec![ints()],
+            Some(ScalarValue::Int64(Some(6))),
+        ),
+        (
+            spec(Count::new(), DataType::Int64, DataType::Int64, false),
+            ConcreteInputMode::AppendOnly,
+            vec![ints()],
+            None,
+        ),
+        (
+            spec(Avg::new(), DataType::Float64, DataType::Float64, false),
+            ConcreteInputMode::AppendOnly,
+            vec![Arc::new(Float64Array::from(vec![4.0, 2.0]))],
+            None,
+        ),
+        (
+            spec(Sum::new(), DataType::Int64, DataType::Int64, false),
+            ConcreteInputMode::Weighted,
+            vec![ints(), weights()],
+            None,
+        ),
+        (
+            spec(Min::new(), DataType::Utf8, DataType::Utf8, false),
+            ConcreteInputMode::Weighted,
+            vec![text(), weights()],
+            None,
+        ),
+    ];
+    for (spec, mode, values, lent) in cases {
+        let mut state = ConcreteAggregateState::try_new(&spec, mode).unwrap();
+        state.update_all(&values).unwrap();
+        let name = format!("{} {mode:?}", spec.udf.name());
+        match (state.evaluate().unwrap(), lent) {
+            (Cow::Borrowed(value), Some(expected)) => assert_eq!(value, &expected, "{name}"),
+            (Cow::Owned(_), None) => {}
+            (value, _) => panic!("{name} evaluated to {value:?}"),
+        }
+    }
 }
 
 /// A column of each type MIN and MAX compare in place, and three types whose rows they copy, all
@@ -797,13 +861,13 @@ fn changelog_extrema_match_datafusion_over_net_values_on_every_admitted_type() {
                     .update_batch(&[arrow::compute::take(&values, &held, None).unwrap()])
                     .unwrap();
                 let expected = expected.evaluate().unwrap();
-                assert_eq!(state.evaluate().unwrap(), expected, "{name}");
+                assert_eq!(*state.evaluate().unwrap(), expected, "{name}");
 
                 let mut restored = template.clone();
                 restored
                     .merge_checkpoint_state(&state.checkpoint_state())
                     .unwrap();
-                assert_eq!(restored.evaluate().unwrap(), expected, "{name} restored");
+                assert_eq!(*restored.evaluate().unwrap(), expected, "{name} restored");
                 assert_eq!(
                     restored.checkpoint_state(),
                     state.checkpoint_state(),
@@ -871,12 +935,12 @@ fn changelog_extremum_errors_leave_the_state_as_it_was() {
             Arc::new(Int64Array::from(vec![1])),
         ])
         .is_err());
-    assert_eq!(max.evaluate().unwrap(), ScalarValue::Int64(Some(7)));
+    assert_eq!(*max.evaluate().unwrap(), ScalarValue::Int64(Some(7)));
 
     apply(&mut max, vec![7, 7], vec![-1, -1]).unwrap();
-    assert_eq!(max.evaluate().unwrap(), ScalarValue::Int64(Some(4)));
+    assert_eq!(*max.evaluate().unwrap(), ScalarValue::Int64(Some(4)));
     apply(&mut max, vec![4], vec![-1]).unwrap();
-    assert_eq!(max.evaluate().unwrap(), ScalarValue::Int64(None));
+    assert_eq!(*max.evaluate().unwrap(), ScalarValue::Int64(None));
 }
 
 #[test]
@@ -936,9 +1000,9 @@ fn changelog_extremum_rejects_malformed_checkpoints_without_mutating() {
     target
         .merge_checkpoint_state(&[ScalarValue::Binary(Some(valid.clone()))])
         .unwrap();
-    assert_eq!(target.evaluate().unwrap(), ScalarValue::Int64(Some(5)));
+    assert_eq!(*target.evaluate().unwrap(), ScalarValue::Int64(Some(5)));
     apply(&mut target, vec![5, 2, 2, 2], vec![-1, -1, -1, -1]).unwrap();
-    assert_eq!(target.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
+    assert_eq!(*target.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
 }
 
 #[test]
@@ -965,7 +1029,7 @@ fn changelog_extremum_rejects_a_checkpoint_of_invalid_utf8() {
         .merge_checkpoint_state(&[ScalarValue::Binary(Some(valid.clone()))])
         .unwrap();
     assert_eq!(
-        target.evaluate().unwrap(),
+        *target.evaluate().unwrap(),
         ScalarValue::Utf8(Some("ab".into()))
     );
 }

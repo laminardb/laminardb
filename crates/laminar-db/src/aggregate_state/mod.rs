@@ -2,6 +2,7 @@
 //!
 //! One `IncrementalAggState` per operator; grouped accumulators are partitioned by stable vnodes.
 
+use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -797,7 +798,7 @@ fn build_weighted_batch(
     for (agg_idx, spec) in agg_specs.iter().enumerate() {
         let mut column = OutputColumn::with_capacity(vals.len());
         for values in vals {
-            column.push(values[agg_idx].clone())?;
+            column.push(Cow::Borrowed(&values[agg_idx]))?;
         }
         all_arrays.push(column.finish(spec)?);
     }

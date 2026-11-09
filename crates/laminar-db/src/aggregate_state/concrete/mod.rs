@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use arrow::datatypes::{DataType, Decimal128Type};
 use datafusion::functions_aggregate::average::Avg;
 use datafusion::functions_aggregate::count::Count;
@@ -159,14 +161,16 @@ impl ConcreteAggregateState {
         }
     }
 
-    pub(crate) fn evaluate(&mut self) -> Result<ScalarValue, DbError> {
+    /// The aggregate's value. MIN, MAX and append-only SUM lend the value they hold, so emitting
+    /// it copies it into the output column once, without an intermediate clone.
+    pub(crate) fn evaluate(&self) -> Result<Cow<'_, ScalarValue>, DbError> {
         match self {
-            Self::Count(state) => Ok(ScalarValue::Int64(Some(state.count))),
+            Self::Count(state) => Ok(Cow::Owned(ScalarValue::Int64(Some(state.count)))),
             Self::Sum(state) => state.evaluate(),
-            Self::Avg(state) => state.evaluate(),
-            Self::Min(state) | Self::Max(state) => Ok(state.evaluate()),
-            Self::RetractableMin(state) => state.evaluate(Extremum::Min),
-            Self::RetractableMax(state) => state.evaluate(Extremum::Max),
+            Self::Avg(state) => state.evaluate().map(Cow::Owned),
+            Self::Min(state) | Self::Max(state) => Ok(Cow::Borrowed(state.value())),
+            Self::RetractableMin(state) => state.evaluate(Extremum::Min).map(Cow::Owned),
+            Self::RetractableMax(state) => state.evaluate(Extremum::Max).map(Cow::Owned),
         }
     }
 
