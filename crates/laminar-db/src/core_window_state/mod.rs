@@ -380,6 +380,9 @@ pub(crate) struct CoreWindowState {
     session_group_count: usize,
     row_converter: Arc<arrow::row::RowConverter>,
     key_grouper: Option<FixedWidthKeyGrouper>,
+    /// Distinct keys in the last batch `key_grouper` grouped by value, which sizes the next
+    /// batch's grouping table.
+    previous_batch_groups: usize,
     agg_specs: Vec<AggFuncSpec>,
     aggregate_templates: Vec<ConcreteAggregateState>,
     num_group_cols: usize,
@@ -848,6 +851,7 @@ impl CoreWindowState {
             aggregate_templates,
             num_group_cols,
             key_grouper: FixedWidthKeyGrouper::for_key(&group_types),
+            previous_batch_groups: 0,
             group_types: Arc::from(group_types),
             query_sql: sql.to_string(),
             #[cfg(test)]

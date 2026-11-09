@@ -84,7 +84,7 @@ impl IncrementalAggState {
     /// Fold a routed pre-aggregate batch into one row per distinct group key, in first-appearance
     /// order.
     pub(crate) fn keyed_partial_batch(
-        &self,
+        &mut self,
         layout: &KeyedPartialLayout,
         batch: &RecordBatch,
     ) -> Result<RecordBatch, DbError> {
@@ -99,7 +99,8 @@ impl IncrementalAggState {
             &self.aggregate_templates,
             input_weights,
         )?;
-        let groups = BatchGroups::try_new(&keys, input_weights)?;
+        let groups = BatchGroups::try_new(&keys, input_weights, self.previous_batch_groups)?;
+        self.previous_batch_groups = groups.len();
         let mut first_rows = Vec::with_capacity(groups.len());
         let mut group_weights = Vec::with_capacity(groups.len());
         let mut states: Vec<Vec<ScalarValue>> =
@@ -168,8 +169,10 @@ impl IncrementalAggState {
             .filter(|weights| weights.null_count() == 0)
             .ok_or_else(|| partial_shape_error("input weight must be non-null Int64"))?;
         let keys = self.encode_group_keys(batch)?;
+        let groups = BatchGroups::try_new(&keys, Some(weights), self.previous_batch_groups)?;
+        self.previous_batch_groups = groups.len();
         self.apply_keyed_groups(
-            &BatchGroups::try_new(&keys, Some(weights))?,
+            &groups,
             |accs, rows| layout.merge_rows(accs, batch, rows),
             watermark_ms,
             uniform_vnode,
@@ -266,6 +269,25 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(emitted(&mut merged), emitted(&mut applied));
+    }
+
+    #[tokio::test]
+    async fn each_grouped_batch_sizes_the_next_from_its_distinct_keys() {
+        let mut state = state().await;
+        let keys: Vec<i64> = (0..4096).map(|row| row % 3001).collect();
+        let rows = pre_aggregate(&state, &keys);
+        state.process_batch_for_vnode(&rows, 0, None).unwrap();
+        assert_eq!(state.previous_batch_groups, 3001);
+        let layout = state.keyed_partial_layout(&rows.schema()).unwrap();
+        let partial = state
+            .keyed_partial_batch(&layout, &pre_aggregate(&state, &[5, 6, 5]))
+            .unwrap();
+        assert_eq!(state.previous_batch_groups, 2);
+        state.process_batch_for_vnode(&rows, 0, None).unwrap();
+        state
+            .merge_keyed_partials(&layout, &partial, 0, None)
+            .unwrap();
+        assert_eq!(state.previous_batch_groups, 2);
     }
 
     #[tokio::test]

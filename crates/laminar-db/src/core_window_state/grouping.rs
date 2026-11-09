@@ -111,9 +111,20 @@ impl BatchKeyIds {
 }
 
 impl CoreWindowState {
-    pub(super) fn encode_group_keys(&self, batch: &RecordBatch) -> Result<EncodedKeys, DbError> {
+    pub(super) fn encode_group_keys(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<EncodedKeys, DbError> {
         if let Some(grouper) = &self.key_grouper {
-            return grouper.encode(batch.column(0), &self.row_converter);
+            let keys = grouper.encode(
+                batch.column(0),
+                &self.row_converter,
+                self.previous_batch_groups,
+            )?;
+            if let EncodedKeys::PerGroup { keys: groups, .. } = &keys {
+                self.previous_batch_groups = groups.num_rows();
+            }
+            return Ok(keys);
         }
         self.row_converter
             .convert_columns(&batch.columns()[..self.num_group_cols])
@@ -267,7 +278,7 @@ mod tests {
         let converter = RowConverter::new(vec![SortField::new(data_type.clone())]).unwrap();
         let per_row = converter.convert_columns(&[Arc::clone(&key)]).unwrap();
         let keys = match FixedWidthKeyGrouper::for_key(&[data_type]) {
-            Some(grouper) => grouper.encode(&key, &converter).unwrap(),
+            Some(grouper) => grouper.encode(&key, &converter, 0).unwrap(),
             None => EncodedKeys::PerRow(converter.convert_columns(&[key]).unwrap()),
         };
         let mut expected: Vec<&[u8]> = Vec::new();
@@ -302,6 +313,7 @@ mod tests {
             .encode(
                 &key,
                 &RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap(),
+                0,
             )
             .unwrap();
         assert!(matches!(keys, EncodedKeys::PerGroup { .. }));

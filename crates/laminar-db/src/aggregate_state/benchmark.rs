@@ -94,7 +94,10 @@ impl AggregateBenchmark {
     ///
     /// # Errors
     /// Returns accumulator errors, or an unsupported error for a global aggregate.
-    pub fn fold_keyed_partial(&self, pre_aggregated: &RecordBatch) -> Result<RecordBatch, DbError> {
+    pub fn fold_keyed_partial(
+        &mut self,
+        pre_aggregated: &RecordBatch,
+    ) -> Result<RecordBatch, DbError> {
         let layout = self.keyed_partial.as_ref().ok_or_else(no_keyed_partial)?;
         self.state.keyed_partial_batch(layout, pre_aggregated)
     }
