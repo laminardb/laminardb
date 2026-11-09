@@ -63,49 +63,6 @@ pub(crate) use keys::global_aggregate_key;
 pub(crate) use output_column::OutputColumn;
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
-/// Builds the per-window result batch for one closed window.
-/// Output schema: `[group_cols..., agg_outputs...]`.
-pub(crate) fn emit_window_batch(
-    groups: FxHashMap<arrow::row::OwnedRow, Vec<ConcreteAggregateState>>,
-    row_converter: &arrow::row::RowConverter,
-    num_group_cols: usize,
-    agg_specs: &[AggFuncSpec],
-    output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>, DbError> {
-    let num_rows = groups.len();
-    if num_rows == 0 {
-        return Ok(None);
-    }
-
-    let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
-    let mut columns: Vec<OutputColumn> = agg_specs
-        .iter()
-        .map(|_| OutputColumn::with_capacity(num_rows))
-        .collect();
-    for (key, mut accs) in groups {
-        row_keys.push(key);
-        for (column, acc) in columns.iter_mut().zip(&mut accs) {
-            column.push(acc.evaluate()?)?;
-        }
-    }
-
-    let mut all_arrays = if num_group_cols == 0 {
-        Vec::new()
-    } else {
-        row_converter
-            .convert_rows(row_keys.iter().map(arrow::row::OwnedRow::row))
-            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
-    };
-    for (column, spec) in columns.into_iter().zip(agg_specs) {
-        all_arrays.push(column.finish(spec)?);
-    }
-
-    let batch = RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
-        .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
-
-    Ok(Some(batch))
-}
-
 pub(crate) struct AggFuncSpec {
     pub(crate) udf: Arc<AggregateUDF>,
     pub(crate) input_types: Vec<DataType>,
