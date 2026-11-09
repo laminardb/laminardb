@@ -93,7 +93,12 @@ impl IncrementalAggState {
         }
         let keys = self.encode_group_keys(batch)?;
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
-        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
+        let inputs = AggregateInput::resolve_all(
+            batch,
+            &self.agg_specs,
+            &self.aggregate_templates,
+            input_weights,
+        )?;
         let groups = BatchGroups::try_new(&keys, input_weights)?;
         let mut first_rows = Vec::with_capacity(groups.len());
         let mut group_weights = Vec::with_capacity(groups.len());

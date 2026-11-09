@@ -1411,7 +1411,12 @@ impl IncrementalAggState {
 
         let keys = self.encode_group_keys(batch)?;
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
-        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
+        let inputs = AggregateInput::resolve_all(
+            batch,
+            &self.agg_specs,
+            &self.aggregate_templates,
+            input_weights,
+        )?;
         self.apply_keyed_groups(
             &BatchGroups::try_new(&keys, input_weights)?,
             |accs, indices| Self::update_concrete_accumulators(accs, &inputs, indices),

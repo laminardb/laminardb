@@ -85,7 +85,12 @@ impl IncrementalAggState {
         for batch in batches {
             weights.push(Self::batch_input_weight(batch, self.weight_col_idx)?);
             let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
-            let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
+            let inputs = AggregateInput::resolve_all(
+                batch,
+                &self.agg_specs,
+                &self.aggregate_templates,
+                input_weights,
+            )?;
             let rows = all_row_indices(batch);
             let mut column = 0;
             for (template, input) in self.aggregate_templates.iter().zip(&inputs) {
@@ -234,15 +239,15 @@ fn apply_global_input(
     input: &GlobalInput<'_>,
 ) -> Result<(), DbError> {
     match input {
-        GlobalInput::Rows(batch) => IncrementalAggState::update_concrete_accumulators(
-            accs,
-            &AggregateInput::resolve_all(
-                batch,
-                agg_specs,
-                IncrementalAggState::validated_input_weights(batch, weight_col_idx)?,
-            )?,
-            &all_row_indices(batch),
-        ),
+        GlobalInput::Rows(batch) => {
+            let weights = IncrementalAggState::validated_input_weights(batch, weight_col_idx)?;
+            let inputs = AggregateInput::resolve_all(batch, agg_specs, accs, weights)?;
+            IncrementalAggState::update_concrete_accumulators(
+                accs,
+                &inputs,
+                &all_row_indices(batch),
+            )
+        }
         #[cfg(feature = "cluster")]
         GlobalInput::Partial(partial) => {
             if partial.len() != accs.len() {

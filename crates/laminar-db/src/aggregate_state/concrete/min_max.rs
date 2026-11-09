@@ -8,16 +8,17 @@ use std::cmp::Ordering;
 
 use arrow::array::{ArrayAccessor, ArrowNativeTypeOp, AsArray};
 use arrow::datatypes::{
-    DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type, Decimal32Type, Decimal64Type,
+    DataType, Date32Type, Date64Type, Decimal256Type, Decimal32Type, Decimal64Type,
     DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType, DurationSecondType,
-    Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    Float16Type, Float32Type, Int16Type, Int32Type, Int8Type, Time32MillisecondType,
+    Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
+    UInt8Type,
 };
 use datafusion_common::ScalarValue;
 use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
 
+use super::input::TypedValues;
 use super::sum::require_array_type;
 use super::{aggregate_error, AggregateInput};
 use crate::error::DbError;
@@ -61,13 +62,20 @@ impl ExtremumState {
         })
     }
 
+    pub(super) fn check_input(
+        &self,
+        extremum: Extremum,
+        input: &AggregateInput<'_>,
+    ) -> Result<(), DbError> {
+        require_array_type(input.value, &self.input_type, extremum.name())
+    }
+
     pub(super) fn update_rows(
         &mut self,
         extremum: Extremum,
         input: &AggregateInput<'_>,
         rows: &[u32],
     ) -> Result<(), DbError> {
-        require_array_type(input.value, &self.input_type, extremum.name())?;
         if self.update_in_place(extremum, input, rows) {
             return Ok(());
         }
@@ -95,29 +103,41 @@ impl ExtremumState {
         let values = input.value;
         macro_rules! in_place {
             ($($variant:ident => $arrow:ty),+ $(,)?) => {
-                match &mut self.value {
-                    $(ScalarValue::$variant(current, ..) => {
+                match (&mut self.value, input.values) {
+                    (ScalarValue::Int64(current), TypedValues::Int64(typed)) => {
+                        group.keep_copied(current, Some(typed), native_order)
+                    }
+                    (ScalarValue::UInt64(current), TypedValues::UInt64(typed)) => {
+                        group.keep_copied(current, Some(typed), native_order)
+                    }
+                    (ScalarValue::Float64(current), TypedValues::Float64(typed)) => {
+                        group.keep_copied(current, Some(typed), native_order)
+                    }
+                    (ScalarValue::Decimal128(current, ..), TypedValues::Decimal128(typed)) => {
+                        group.keep_copied(current, Some(typed), native_order)
+                    }
+                    $((ScalarValue::$variant(current, ..), _) => {
                         group.keep_copied(current, values.as_primitive_opt::<$arrow>(), native_order)
                     })+
-                    ScalarValue::Boolean(current) => {
+                    (ScalarValue::Boolean(current), _) => {
                         group.keep_copied(current, values.as_boolean_opt(), bool::cmp)
                     }
-                    ScalarValue::Utf8(current) => {
+                    (ScalarValue::Utf8(current), _) => {
                         group.keep_owned(current, values.as_string_opt::<i32>())
                     }
-                    ScalarValue::LargeUtf8(current) => {
+                    (ScalarValue::LargeUtf8(current), _) => {
                         group.keep_owned(current, values.as_string_opt::<i64>())
                     }
-                    ScalarValue::Utf8View(current) => {
+                    (ScalarValue::Utf8View(current), _) => {
                         group.keep_owned(current, values.as_string_view_opt())
                     }
-                    ScalarValue::Binary(current) => {
+                    (ScalarValue::Binary(current), _) => {
                         group.keep_owned(current, values.as_binary_opt::<i32>())
                     }
-                    ScalarValue::LargeBinary(current) => {
+                    (ScalarValue::LargeBinary(current), _) => {
                         group.keep_owned(current, values.as_binary_opt::<i64>())
                     }
-                    ScalarValue::BinaryView(current) => {
+                    (ScalarValue::BinaryView(current), _) => {
                         group.keep_owned(current, values.as_binary_view_opt())
                     }
                     _ => false,
@@ -125,11 +145,10 @@ impl ExtremumState {
             };
         }
         in_place!(
-            Int8 => Int8Type, Int16 => Int16Type, Int32 => Int32Type, Int64 => Int64Type,
-            UInt8 => UInt8Type, UInt16 => UInt16Type, UInt32 => UInt32Type, UInt64 => UInt64Type,
-            Float16 => Float16Type, Float32 => Float32Type, Float64 => Float64Type,
-            Decimal32 => Decimal32Type, Decimal64 => Decimal64Type,
-            Decimal128 => Decimal128Type, Decimal256 => Decimal256Type,
+            Int8 => Int8Type, Int16 => Int16Type, Int32 => Int32Type,
+            UInt8 => UInt8Type, UInt16 => UInt16Type, UInt32 => UInt32Type,
+            Float16 => Float16Type, Float32 => Float32Type,
+            Decimal32 => Decimal32Type, Decimal64 => Decimal64Type, Decimal256 => Decimal256Type,
             Date32 => Date32Type, Date64 => Date64Type,
             Time32Second => Time32SecondType, Time32Millisecond => Time32MillisecondType,
             Time64Microsecond => Time64MicrosecondType, Time64Nanosecond => Time64NanosecondType,

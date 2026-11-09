@@ -1196,7 +1196,8 @@ impl CoreWindowState {
         ts_array: &[i64],
     ) -> Result<(), DbError> {
         let empty_key = crate::aggregate_state::global_aggregate_key();
-        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
+        let inputs =
+            AggregateInput::resolve_all(batch, &self.agg_specs, &self.aggregate_templates, None)?;
         let mut grouped = std::mem::take(&mut self.scratch_nogroup);
         grouped.clear();
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
@@ -1307,7 +1308,8 @@ impl CoreWindowState {
                 )));
             }
         }
-        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
+        let inputs =
+            AggregateInput::resolve_all(batch, &self.agg_specs, &self.aggregate_templates, None)?;
         for (row, (&(id, vnode), &ts_ms)) in key_of_row.iter().zip(ts_array).enumerate() {
             if ts_ms == NULL_TIMESTAMP {
                 continue;

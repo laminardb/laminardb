@@ -128,7 +128,8 @@ impl CoreWindowState {
         vnode_hint: Option<u32>,
     ) -> Result<(), DbError> {
         let keys = self.encode_group_keys(batch)?;
-        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, None)?;
+        let inputs =
+            AggregateInput::resolve_all(batch, &self.agg_specs, &self.aggregate_templates, None)?;
 
         let mut grouped = std::mem::take(&mut self.scratch_grouped);
         let mut key_ids = std::mem::take(&mut self.scratch_key_ids);
