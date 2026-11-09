@@ -1,5 +1,6 @@
 //! Aggregate output construction and publication bookkeeping.
 
+use std::borrow::Cow;
 #[cfg(feature = "cluster")]
 use std::ops::Range;
 use std::sync::Arc;
@@ -111,6 +112,13 @@ impl PreparedAggregateEmission {
     }
 }
 
+/// Each aggregate's value, owned to be compared with and kept as the last emitted values.
+fn owned_values(accs: &[ConcreteAggregateState]) -> Result<Vec<ScalarValue>, DbError> {
+    accs.iter()
+        .map(|acc| acc.evaluate().map(Cow::into_owned))
+        .collect()
+}
+
 fn scalar_vectors_equal(left: &[ScalarValue], right: &[ScalarValue]) -> bool {
     left.len() == right.len()
         && left
@@ -156,7 +164,7 @@ fn finish_ranges(row_count: usize, chunk_start: usize, ranges: &mut Vec<Range<us
 
 #[cfg(feature = "cluster")]
 fn evaluate_changelog_vnode(
-    state: &mut AggregateVnodeState,
+    state: &AggregateVnodeState,
     dirty: &FxHashSet<arrow::row::OwnedRow>,
     grouped: bool,
 ) -> Result<EvaluatedVnodeOutput, DbError> {
@@ -168,7 +176,7 @@ fn evaluate_changelog_vnode(
     let mut chunk_start = 0usize;
 
     for key in keys {
-        let Some(entry) = state.groups.get_mut(GroupKey::new(key.row())) else {
+        let Some(entry) = state.groups.get(GroupKey::new(key.row())) else {
             continue;
         };
         let previous_len = changes.len();
@@ -183,11 +191,7 @@ fn evaluate_changelog_vnode(
             }
             deletions.push(key.clone());
         } else {
-            let current = entry
-                .accs
-                .iter_mut()
-                .map(ConcreteAggregateState::evaluate)
-                .collect::<Result<Vec<_>, _>>()?;
+            let current = owned_values(&entry.accs)?;
             match state.last_emitted.get(key) {
                 Some(old) if scalar_vectors_equal(old, &current) => {}
                 Some(old) => {
@@ -342,7 +346,7 @@ impl IncrementalAggState {
         let prepared = (|| {
             let evaluated = evaluate_changelog_vnode(
                 self.vnode_states
-                    .get_mut(vnode)
+                    .get(vnode)
                     .expect("dirty aggregate vnode must remain resident during emission"),
                 &dirty,
                 self.num_group_cols != 0,
@@ -470,10 +474,10 @@ impl IncrementalAggState {
     }
 
     #[cfg(feature = "cluster")]
-    fn evaluate_running_vnode(&mut self, vnode: u32) -> Result<EvaluatedVnodeOutput, DbError> {
+    fn evaluate_running_vnode(&self, vnode: u32) -> Result<EvaluatedVnodeOutput, DbError> {
         let state = self
             .vnode_states
-            .get_mut(vnode)
+            .get(vnode)
             .expect("active aggregate vnode must remain resident");
         let mut keys = state.groups.keys().cloned().collect::<Vec<_>>();
         keys.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
@@ -484,18 +488,14 @@ impl IncrementalAggState {
         for key in keys {
             let entry = state
                 .groups
-                .get_mut(GroupKey::new(key.row()))
+                .get(GroupKey::new(key.row()))
                 .expect("sorted aggregate key");
             if self.num_group_cols != 0 && entry.input_weight == 0 {
                 deletions.push(key);
                 continue;
             }
             let previous_len = changes.len();
-            let values = entry
-                .accs
-                .iter_mut()
-                .map(ConcreteAggregateState::evaluate)
-                .collect::<Result<Vec<_>, _>>()?;
+            let values = owned_values(&entry.accs)?;
             changes.push(PendingChange {
                 key,
                 values,
@@ -524,7 +524,7 @@ impl IncrementalAggState {
         for (index, spec) in self.agg_specs.iter().enumerate() {
             let mut column = OutputColumn::with_capacity(rows.len());
             for row in rows {
-                column.push(row.values[index].clone())?;
+                column.push(Cow::Borrowed(&row.values[index]))?;
             }
             arrays.push(column.finish(spec)?);
         }
@@ -676,9 +676,9 @@ impl IncrementalAggState {
             .iter()
             .map(|_| OutputColumn::with_capacity(num_rows))
             .collect();
-        for (_, state) in self.vnode_states.iter_mut() {
-            for entry in state.groups.values_mut() {
-                for (column, acc) in columns.iter_mut().zip(&mut entry.accs) {
+        for (_, state) in self.vnode_states.iter() {
+            for (_, entry) in &state.groups {
+                for (column, acc) in columns.iter_mut().zip(&entry.accs) {
                     column.push(acc.evaluate()?)?;
                 }
             }
@@ -704,10 +704,10 @@ impl IncrementalAggState {
             for (vnode, dirty) in &dirty_by_vnode {
                 let state = self
                     .vnode_states
-                    .get_mut(*vnode)
+                    .get(*vnode)
                     .expect("dirty aggregate vnode must remain resident during emission");
                 for key in dirty {
-                    let Some(entry) = state.groups.get_mut(GroupKey::new(key.row())) else {
+                    let Some(entry) = state.groups.get(GroupKey::new(key.row())) else {
                         continue;
                     };
                     if entry.input_weight == 0 && self.num_group_cols > 0 {
@@ -718,11 +718,7 @@ impl IncrementalAggState {
                         deleted_groups.push((*vnode, key.clone()));
                         continue;
                     }
-                    let current = entry
-                        .accs
-                        .iter_mut()
-                        .map(ConcreteAggregateState::evaluate)
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let current = owned_values(&entry.accs)?;
                     match state.last_emitted.get(key) {
                         Some(old) if scalar_vectors_equal(old, &current) => {}
                         Some(old) => {

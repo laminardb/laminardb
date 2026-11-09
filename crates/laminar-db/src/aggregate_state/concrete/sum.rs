@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, PrimitiveArray};
 use arrow::datatypes::{DataType, Decimal128Type, DecimalType};
 use datafusion_common::ScalarValue;
@@ -102,15 +104,16 @@ impl SumState {
         }
     }
 
-    pub(super) fn evaluate(&self) -> Result<ScalarValue, DbError> {
+    pub(super) fn evaluate(&self) -> Result<Cow<'_, ScalarValue>, DbError> {
         match self.mode {
-            SumMode::AppendOnly => Ok(self.sum.clone()),
+            SumMode::AppendOnly => Ok(Cow::Borrowed(&self.sum)),
             SumMode::Weighted { non_null_weight } => {
                 if non_null_weight == 0 {
                     ScalarValue::try_from(&self.output_type)
+                        .map(Cow::Owned)
                         .map_err(|error| aggregate_error("SUM null result", error))
                 } else {
-                    weighted_sum_result(&self.sum, &self.output_type)
+                    weighted_sum_result(&self.sum, &self.output_type).map(Cow::Owned)
                 }
             }
         }

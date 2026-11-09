@@ -30,7 +30,7 @@ impl ClosedRows {
         key: Row<'_>,
         start: i64,
         end: i64,
-        accumulators: &mut [ConcreteAggregateState],
+        accumulators: &[ConcreteAggregateState],
     ) -> Result<(), DbError> {
         if let Some(keys) = &mut self.keys {
             keys.push(key);
