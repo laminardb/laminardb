@@ -1,5 +1,5 @@
 use super::*;
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use datafusion::execution::FunctionRegistry;
 use laminar_core::operator::window::EmitStrategy as CoreEmit;
 
@@ -239,7 +239,6 @@ fn make_core_window_state(size_ms: i64) -> CoreWindowState {
         query_sql: String::new(),
         #[cfg(test)]
         pre_agg_sql: String::new(),
-        state_output_schema: Arc::clone(&output_schema),
         group_output_sources: vec![GroupOutputSource::Key(0)],
         output_schema,
         time_col_index: 2,
@@ -321,7 +320,6 @@ fn make_core_window_state_multi_agg(size_ms: i64) -> CoreWindowState {
         query_sql: String::new(),
         #[cfg(test)]
         pre_agg_sql: String::new(),
-        state_output_schema: Arc::clone(&output_schema),
         group_output_sources: vec![GroupOutputSource::Key(0)],
         output_schema,
         time_col_index: 2,
@@ -392,7 +390,6 @@ fn make_hopping_core_window_state(size_ms: i64, slide_ms: i64) -> CoreWindowStat
         query_sql: String::new(),
         #[cfg(test)]
         pre_agg_sql: String::new(),
-        state_output_schema: Arc::clone(&output_schema),
         group_output_sources: vec![GroupOutputSource::Key(0)],
         output_schema,
         time_col_index: 2,
@@ -461,7 +458,6 @@ fn make_session_core_window_state(gap_ms: i64) -> CoreWindowState {
         query_sql: String::new(),
         #[cfg(test)]
         pre_agg_sql: String::new(),
-        state_output_schema: Arc::clone(&output_schema),
         group_output_sources: vec![GroupOutputSource::Key(0)],
         output_schema,
         time_col_index: 2,
@@ -1185,11 +1181,11 @@ async fn sql_hop_emits_each_assigned_boundary() {
         .unwrap();
     state.update_batch(&projected).unwrap();
 
-    let mut actual = state
-        .close_windows(6000)
-        .unwrap()
-        .into_iter()
-        .map(|batch| {
+    let batches = state.close_windows(6000).unwrap();
+    assert_eq!(batches.len(), 1, "one close emits one batch");
+    let mut actual = batches
+        .iter()
+        .flat_map(|batch| {
             let starts = batch
                 .column_by_name("window_start")
                 .unwrap()
@@ -1208,7 +1204,9 @@ async fn sql_hop_emits_each_assigned_boundary() {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            (starts.value(0), ends.value(0), totals.value(0))
+            (0..batch.num_rows())
+                .map(|row| (starts.value(row), ends.value(row), totals.value(row)))
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     actual.sort_unstable();
@@ -2257,20 +2255,18 @@ async fn global_window_frame_restores_multi_column_state() {
     restored
         .restore_vnode(vnode, vnode_count, checkpoint)
         .unwrap();
-    let windows = restored
-        .close_windows(2000)
-        .unwrap()
-        .into_iter()
-        .map(|batch| {
-            let mean = batch
-                .column_by_name("mean")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap()
-                .value(0);
-            (sum_total(&batch), mean)
-        })
+    let batches = restored.close_windows(2000).unwrap();
+    assert_eq!(batches.len(), 1, "one close emits one batch");
+    let column = |name: &str| Arc::clone(batches[0].column_by_name(name).unwrap());
+    let totals = column("total");
+    let means = column("mean");
+    let totals = totals.as_any().downcast_ref::<Int64Array>().unwrap();
+    let means = means
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let windows = (0..batches[0].num_rows())
+        .map(|row| (totals.value(row), means.value(row)))
         .collect::<Vec<_>>();
     assert_eq!(windows, [(6, 3.0), (9, 9.0)]);
 }
@@ -2436,4 +2432,214 @@ fn window_sum_overflow_fails_instead_of_wrapping() {
 
     assert!(error.to_string().contains("SUM state overflow"), "{error}");
     assert_eq!(sum_total(&state.close_windows(1000).unwrap()[0]), i64::MAX);
+}
+
+async fn sql_window_over_vnodes(sql: &str, config: &WindowOperatorConfig) -> CoreWindowState {
+    let (ctx, _) = sql_window_context();
+    CoreWindowState::try_from_sql(
+        &ctx,
+        sql,
+        config,
+        None,
+        KeyGroupCount::try_from(16_u16).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+fn apply_events(state: &mut CoreWindowState, events: &[(String, i64, i64)]) {
+    let (_, schema) = sql_window_context();
+    let input = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                events
+                    .iter()
+                    .map(|(key, ..)| key.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                events
+                    .iter()
+                    .map(|&(_, amount, _)| amount)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                events.iter().map(|&(.., ts)| ts).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let projected = state
+        .compiled_projection()
+        .unwrap()
+        .evaluate(&input)
+        .unwrap();
+    state.update_batch(&projected).unwrap();
+}
+
+fn final_schema(state: &CoreWindowState) -> SchemaRef {
+    state.post_projection.as_ref().map_or_else(
+        || Arc::clone(&state.output_schema),
+        |projection| Arc::clone(&projection.final_schema),
+    )
+}
+
+/// Each output row's vnode and its `(user_id, window_start, total)` values, in batch order.
+fn closed_rows_by_vnode(
+    state: &CoreWindowState,
+    batch: &RecordBatch,
+) -> Vec<(u32, (String, i64, i64))> {
+    let keys = batch.column_by_name("user_id").unwrap();
+    let encoded = state
+        .row_converter
+        .convert_columns(std::slice::from_ref(keys))
+        .unwrap();
+    let keys = keys.as_any().downcast_ref::<StringArray>().unwrap();
+    let starts = batch
+        .column_by_name("window_start")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .unwrap();
+    let totals = batch
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|row| {
+            (
+                state.vnode_for_group_key(encoded.row(row).as_ref()),
+                (
+                    keys.value(row).to_string(),
+                    starts.value(row),
+                    totals.value(row),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Rows of one vnode are contiguous and each vnode's rows satisfy `in_order`.
+fn assert_vnode_major(
+    rows: &[(u32, (String, i64, i64))],
+    in_order: impl Fn(&(String, i64, i64), &(String, i64, i64)) -> bool,
+) {
+    let mut seen = BTreeSet::new();
+    for pair in rows.windows(2) {
+        let ((left_vnode, left), (right_vnode, right)) = (&pair[0], &pair[1]);
+        if left_vnode == right_vnode {
+            assert!(in_order(left, right), "{left:?} then {right:?}");
+        } else {
+            assert!(seen.insert(*left_vnode), "vnode {left_vnode} split");
+        }
+    }
+    let vnodes = rows
+        .iter()
+        .map(|(vnode, _)| *vnode)
+        .collect::<BTreeSet<_>>();
+    assert!(vnodes.len() > 1, "keys must span vnodes: {vnodes:?}");
+}
+
+#[tokio::test]
+async fn hop_close_emits_one_batch_across_vnodes_and_windows() {
+    use std::time::Duration;
+
+    let config = WindowOperatorConfig {
+        window_type: WindowType::Sliding,
+        time_column: "ts".to_string(),
+        size: Duration::from_secs(4),
+        slide: Some(Duration::from_secs(2)),
+        gap: None,
+        offset_ms: 0,
+        allowed_lateness: Duration::ZERO,
+        emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+        late_data_side_output: None,
+    };
+    let mut state = sql_window_over_vnodes(
+        "SELECT user_id, HOP(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND) AS window_start, \
+                SUM(amount) AS total \
+         FROM events \
+         GROUP BY user_id, HOP(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND) \
+         HAVING SUM(amount) > 0",
+        &config,
+    )
+    .await;
+    let keys = (0..32).map(|key| format!("k{key:02}")).collect::<Vec<_>>();
+    let mut events = Vec::new();
+    for (index, key) in (0_i64..).zip(&keys) {
+        events.push((key.clone(), index, 1000));
+        events.push((key.clone(), 100 + index, 3000));
+    }
+    apply_events(&mut state, &events);
+
+    let batches = state.close_windows(6000).unwrap();
+    assert_eq!(batches.len(), 1, "one close emits one batch");
+    assert_eq!(batches[0].schema(), final_schema(&state));
+    let rows = closed_rows_by_vnode(&state, &batches[0]);
+    assert_vnode_major(&rows, |left, right| left.1 <= right.1);
+
+    let mut expected = Vec::new();
+    for (index, key) in (0_i64..).zip(&keys) {
+        if index > 0 {
+            expected.push((key.clone(), -2_000_000, index));
+        }
+        expected.push((key.clone(), 0, 100 + 2 * index));
+        expected.push((key.clone(), 2_000_000, 100 + index));
+    }
+    expected.sort_unstable();
+    let mut actual = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(state.close_windows(8000).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn session_close_emits_one_batch_across_vnodes() {
+    use std::time::Duration;
+
+    let config = WindowOperatorConfig {
+        window_type: WindowType::Session,
+        time_column: "ts".to_string(),
+        size: Duration::ZERO,
+        slide: None,
+        gap: Some(Duration::from_secs(3)),
+        offset_ms: 0,
+        allowed_lateness: Duration::ZERO,
+        emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+        late_data_side_output: None,
+    };
+    let mut state = sql_window_over_vnodes(
+        "SELECT user_id, SESSION(ts, INTERVAL '3' SECOND) AS window_start, \
+                SUM(amount) AS total \
+         FROM events GROUP BY user_id, SESSION(ts, INTERVAL '3' SECOND)",
+        &config,
+    )
+    .await;
+    let keys = (0..32).map(|key| format!("k{key:02}")).collect::<Vec<_>>();
+    let mut events = Vec::new();
+    for (index, key) in (0_i64..).zip(&keys) {
+        events.push((key.clone(), 10 + index, 10_000));
+        events.push((key.clone(), index, 1000 + index));
+    }
+    apply_events(&mut state, &events);
+
+    let batches = state.close_windows(20_000).unwrap();
+    assert_eq!(batches.len(), 1, "one close emits one batch");
+    assert_eq!(batches[0].schema(), final_schema(&state));
+    let rows = closed_rows_by_vnode(&state, &batches[0]);
+    assert_vnode_major(&rows, |left, right| left.1 <= right.1);
+
+    let mut expected = Vec::new();
+    for (index, key) in (0_i64..).zip(&keys) {
+        expected.push((key.clone(), (1000 + index) * 1000, index));
+        expected.push((key.clone(), 10_000_000, 10 + index));
+    }
+    expected.sort_unstable();
+    let mut actual = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
 }
