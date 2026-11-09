@@ -534,6 +534,8 @@ pub(crate) struct IncrementalAggState {
     vnode_states: AggregateVnodeSlots,
     row_converter: Arc<arrow::row::RowConverter>,
     fixed_key_grouper: Option<FixedWidthKeyGrouper>,
+    /// Distinct keys in the last grouped batch, which sizes the next batch's grouping table.
+    previous_batch_groups: usize,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -1205,6 +1207,7 @@ impl IncrementalAggState {
             vnode_states,
             row_converter,
             fixed_key_grouper,
+            previous_batch_groups: 0,
             output_schema,
             compiled_projection,
             cached_pre_agg_physical,
@@ -1374,8 +1377,10 @@ impl IncrementalAggState {
             &self.aggregate_templates,
             input_weights,
         )?;
+        let groups = BatchGroups::try_new(&keys, input_weights, self.previous_batch_groups)?;
+        self.previous_batch_groups = groups.len();
         self.apply_keyed_groups(
-            &BatchGroups::try_new(&keys, input_weights)?,
+            &groups,
             |accs, indices| Self::update_concrete_accumulators(accs, &inputs, indices),
             watermark_ms,
             uniform_vnode,
@@ -1386,7 +1391,11 @@ impl IncrementalAggState {
     /// key, once per row otherwise.
     fn encode_group_keys(&self, batch: &RecordBatch) -> Result<EncodedKeys, DbError> {
         if let Some(grouper) = &self.fixed_key_grouper {
-            return grouper.encode(batch.column(0), &self.row_converter);
+            return grouper.encode(
+                batch.column(0),
+                &self.row_converter,
+                self.previous_batch_groups,
+            );
         }
         self.row_converter
             .convert_columns(&batch.columns()[..self.num_group_cols])

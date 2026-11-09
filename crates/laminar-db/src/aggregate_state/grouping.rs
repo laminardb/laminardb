@@ -32,6 +32,14 @@ pub(crate) struct FixedWidthKeyGrouper {
 /// grouping on values saves about 3 ns per row (measured: +23 ns at 1 row, +13 ns at 4).
 const MIN_GROUPED_ROWS: usize = 16;
 
+/// The grouping table's capacity for a batch of `rows`: the previous batch's distinct key count,
+/// at least a quarter of the rows and at most all of them. Without the previous count a batch of
+/// mostly new keys outgrows a quarter-sized table and rehashes every key it holds, twice at 4,096
+/// distinct keys.
+fn estimated_groups(rows: usize, previous_groups: usize) -> usize {
+    previous_groups.clamp(rows / 4, rows).max(16)
+}
+
 impl FixedWidthKeyGrouper {
     /// A grouper for `group_types`, or `None` unless it is one column of an admitted type.
     pub(crate) fn for_key(group_types: &[DataType]) -> Option<Self> {
@@ -43,10 +51,12 @@ impl FixedWidthKeyGrouper {
         }
     }
 
+    /// `previous_groups` is the previous batch's distinct key count; it sizes the grouping table.
     pub(crate) fn encode(
         &self,
         key: &ArrayRef,
         converter: &RowConverter,
+        previous_groups: usize,
     ) -> Result<EncodedKeys, DbError> {
         if !key.data_type().equals_datatype(&self.data_type) {
             return Err(DbError::Pipeline(format!(
@@ -64,7 +74,8 @@ impl FixedWidthKeyGrouper {
         row_count(key.len())?;
         let (group_values, group_of_row): (ArrayRef, _) = downcast_primitive_array!(
             key => {
-                let (values, group_of_row) = group_values(key);
+                let (values, group_of_row) =
+                    group_values(key, estimated_groups(key.len(), previous_groups));
                 (Arc::new(values), group_of_row)
             },
             other => {
@@ -82,8 +93,10 @@ impl FixedWidthKeyGrouper {
 
 /// Each group's value, in first-appearance order, and each row's group. `key` holds at most
 /// `u32::MAX` rows.
-fn group_values<T: ArrowPrimitiveType>(key: &PrimitiveArray<T>) -> (PrimitiveArray<T>, Vec<u32>) {
-    let estimated_groups = (key.len() / 4).max(16);
+fn group_values<T: ArrowPrimitiveType>(
+    key: &PrimitiveArray<T>,
+    estimated_groups: usize,
+) -> (PrimitiveArray<T>, Vec<u32>) {
     let mut groups: HashTable<(T::Native, u32)> = HashTable::with_capacity(estimated_groups);
     let mut values = Vec::with_capacity(estimated_groups);
     let mut group_of_row = Vec::with_capacity(key.len());
@@ -158,21 +171,28 @@ pub(super) struct BatchGroups<'a> {
 }
 
 impl<'a> BatchGroups<'a> {
+    /// `previous_groups` is the previous batch's distinct key count; it sizes the grouping table
+    /// when keys are encoded per row.
     pub(super) fn try_new(
         keys: &'a EncodedKeys,
         input_weights: Option<&Int64Array>,
+        previous_groups: usize,
     ) -> Result<Self, DbError> {
         match keys {
-            EncodedKeys::PerRow(rows) => Self::from_rows(rows, input_weights),
+            EncodedKeys::PerRow(rows) => Self::from_rows(rows, input_weights, previous_groups),
             EncodedKeys::PerGroup { keys, group_of_row } => {
                 Self::from_group_ids(keys, group_of_row, input_weights)
             }
         }
     }
 
-    fn from_rows(rows: &'a Rows, input_weights: Option<&Int64Array>) -> Result<Self, DbError> {
+    fn from_rows(
+        rows: &'a Rows,
+        input_weights: Option<&Int64Array>,
+        previous_groups: usize,
+    ) -> Result<Self, DbError> {
         let num_rows = row_count(rows.num_rows())?;
-        let estimated_groups = (rows.num_rows() / 4).max(16);
+        let estimated_groups = estimated_groups(rows.num_rows(), previous_groups);
         let mut group_ids: HashTable<(GroupKey<'a>, u32)> =
             HashTable::with_capacity(estimated_groups);
         let mut keys: Vec<GroupKey<'a>> = Vec::with_capacity(estimated_groups);
@@ -344,8 +364,12 @@ mod tests {
     }
 
     /// Each group's encoded key, row indices and summed weight.
-    fn grouped(keys: &EncodedKeys, weights: Option<&Int64Array>) -> Vec<(Vec<u8>, Vec<u32>, i64)> {
-        BatchGroups::try_new(keys, weights)
+    fn grouped(
+        keys: &EncodedKeys,
+        weights: Option<&Int64Array>,
+        previous_groups: usize,
+    ) -> Vec<(Vec<u8>, Vec<u32>, i64)> {
+        BatchGroups::try_new(keys, weights, previous_groups)
             .unwrap()
             .iter()
             .map(|(key, rows, weight)| (key.bytes().to_vec(), rows.to_vec(), weight))
@@ -366,16 +390,16 @@ mod tests {
             unreachable!()
         };
         let weights = Int64Array::from(vec![1, 2, 3, 4, 5, -6]);
-        assert_eq!(BatchGroups::try_new(&keys, None).unwrap().len(), 3);
+        assert_eq!(BatchGroups::try_new(&keys, None, 0).unwrap().len(), 3);
         assert_eq!(
-            grouped(&keys, Some(&weights)),
+            grouped(&keys, Some(&weights), 0),
             vec![
                 (rows.row(0).data().to_vec(), vec![0, 2, 5], -2),
                 (rows.row(1).data().to_vec(), vec![1, 4], 7),
                 (rows.row(3).data().to_vec(), vec![3], 4),
             ]
         );
-        let weights: Vec<i64> = grouped(&keys, None)
+        let weights: Vec<i64> = grouped(&keys, None, 0)
             .into_iter()
             .map(|(_, _, weight)| weight)
             .collect();
@@ -386,7 +410,7 @@ mod tests {
     fn group_weight_overflow_rejects_the_batch() {
         let keys = strings(vec![Some("a"), Some("a")]);
         let weights = Int64Array::from(vec![i64::MAX, 1]);
-        let Err(DbError::Pipeline(message)) = BatchGroups::try_new(&keys, Some(&weights)) else {
+        let Err(DbError::Pipeline(message)) = BatchGroups::try_new(&keys, Some(&weights), 0) else {
             panic!("an overflowing group weight must reject the batch");
         };
         assert_eq!(message, "aggregate input weight overflow");
@@ -467,14 +491,46 @@ mod tests {
             let reversed = take(&column, &UInt32Array::from(reversed), None).unwrap();
             for batch in [&column, &reversed, &column] {
                 let weights = Int64Array::from_iter_values((1..).take(batch.len()));
-                let keys = grouper.encode(batch, &converter).unwrap();
+                let keys = grouper.encode(batch, &converter, 0).unwrap();
                 assert!(matches!(keys, EncodedKeys::PerGroup { .. }));
                 assert_eq!(
-                    grouped(&keys, Some(&weights)),
-                    grouped(&per_row(batch), Some(&weights)),
+                    grouped(&keys, Some(&weights), 0),
+                    grouped(&per_row(batch), Some(&weights), 0),
                     "{data_type}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_table_is_sized_from_the_previous_batch_within_the_row_count() {
+        assert_eq!(estimated_groups(4096, 0), 1024);
+        assert_eq!(estimated_groups(4096, 16), 1024);
+        assert_eq!(estimated_groups(4096, 3000), 3000);
+        assert_eq!(estimated_groups(4096, 1 << 20), 4096);
+        assert_eq!(estimated_groups(100, 4096), 100);
+        assert_eq!(estimated_groups(8, 0), 16);
+    }
+
+    #[test]
+    fn the_previous_group_count_changes_only_the_table_size() {
+        let column: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..4096).map(|row| (row * 7919) % 3001),
+        ));
+        let weights = Int64Array::from_iter_values((1..).take(column.len()));
+        let grouper = FixedWidthKeyGrouper::for_key(&[DataType::Int64]).unwrap();
+        let converter = converter(&DataType::Int64);
+        let expected = grouped(&per_row(&column), Some(&weights), 0);
+        assert_eq!(expected.len(), 3001);
+        for previous_groups in [16, 3001, 4096, 1 << 20] {
+            let keys = grouper
+                .encode(&column, &converter, previous_groups)
+                .unwrap();
+            assert_eq!(grouped(&keys, Some(&weights), 0), expected);
+            assert_eq!(
+                grouped(&per_row(&column), Some(&weights), previous_groups),
+                expected
+            );
         }
     }
 
@@ -483,7 +539,7 @@ mod tests {
         let grouper = FixedWidthKeyGrouper::for_key(&[DataType::Int64]).unwrap();
         let column: ArrayRef = Arc::new(Int64Array::from(vec![1; MIN_GROUPED_ROWS - 1]));
         let keys = grouper
-            .encode(&column, &converter(&DataType::Int64))
+            .encode(&column, &converter(&DataType::Int64), 0)
             .unwrap();
         assert!(matches!(keys, EncodedKeys::PerRow(_)));
     }
@@ -512,7 +568,8 @@ mod tests {
     fn a_key_column_of_another_type_is_rejected() {
         let grouper = FixedWidthKeyGrouper::for_key(&[DataType::Int64]).unwrap();
         let column: ArrayRef = Arc::new(Int32Array::from(vec![1]));
-        let Err(DbError::Pipeline(message)) = grouper.encode(&column, &converter(&DataType::Int64))
+        let Err(DbError::Pipeline(message)) =
+            grouper.encode(&column, &converter(&DataType::Int64), 0)
         else {
             panic!("a mistyped key column must be rejected");
         };
