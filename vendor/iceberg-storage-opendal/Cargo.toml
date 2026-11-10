@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "laminardb-iceberg-storage-opendal"
-version = "0.34.0"
+version = "0.40.0"
 build = false
 publish = true
 autolib = false
@@ -104,7 +104,7 @@ version = "0.3"
 
 [dependencies.iceberg]
 package = "laminardb-iceberg"
-version = "=0.34.0"
+version = "=0.40.0"
 path = "../iceberg"
 
 [dependencies.opendal]
