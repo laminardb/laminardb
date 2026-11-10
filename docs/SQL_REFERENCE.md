@@ -1136,4 +1136,4 @@ window functions compose correctly against any precision.
 
 ---
 
-*Tracks LaminarDB 0.34 on DataFusion 55.x / Arrow 59.x. Corrections welcome: open an issue or PR.*
+*Tracks LaminarDB 0.40 on DataFusion 55.x / Arrow 59.x. Corrections welcome: open an issue or PR.*
