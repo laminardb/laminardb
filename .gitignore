@@ -47,6 +47,7 @@ coverage/
 laminardb.toml
 data/
 checkpoints/
+!crates/laminar-db/tests/fixtures/upgrade/checkpoint_0_34_0/nodes/1/checkpoints/
 wal/
 /tools/*
 !/tools/check_analytical_dependencies.py

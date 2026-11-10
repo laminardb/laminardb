@@ -303,6 +303,12 @@ impl LaminarDB {
     /// The registered streams' exchange plan exactly as cluster startup resolves it: cluster
     /// interval admissions and no changelog source.
     pub(crate) async fn cluster_exchange_plan(&self) -> Result<ExchangePlan, DbError> {
+        Ok(self.cluster_stream_outputs().await?.exchange_plan)
+    }
+
+    pub(crate) async fn cluster_stream_outputs(
+        &self,
+    ) -> Result<crate::pipeline_lifecycle::ResolvedStreamOutputs, DbError> {
         let (sources, sinks, streams) = {
             let manager = self.connector_manager.lock();
             (
@@ -319,7 +325,7 @@ impl LaminarDB {
                 RuntimeMode::Cluster,
             )
             .await?;
-        Ok(crate::pipeline_lifecycle::resolve_stream_output_schemas(
+        crate::pipeline_lifecycle::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
             &self.static_table_names(),
@@ -327,8 +333,7 @@ impl LaminarDB {
             &rustc_hash::FxHashSet::default(),
             &crate::exchange_plan::source_event_times(&self.catalog),
         )
-        .await?
-        .exchange_plan)
+        .await
     }
 
     pub(super) async fn validate_bound_parent_pipeline(
