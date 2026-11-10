@@ -272,7 +272,7 @@ fn inline_unnest_is_not_a_second_stream_or_join() {
                UNNEST(make_array('a', 'b')) AS tags(tag)";
     let refs = extract_table_references(sql);
     assert_eq!(refs, FxHashSet::from_iter(["events".to_string()]));
-    assert_eq!(join_clause_count(sql), 0);
+    assert!(!has_join_clause(sql));
     assert_eq!(single_source_table(sql), None);
 }
 

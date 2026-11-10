@@ -13,6 +13,7 @@ pub(crate) mod benchmark;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use output_admission::MAX_PENDING_OUTPUT_BYTES;
 pub(crate) use output_state::{
     ClusterSubscriptionOutputState, PreparedNodeSubscriptionOutput,
     PreparedPartitionSubscriptionOutput,

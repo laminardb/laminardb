@@ -17,6 +17,7 @@ mod catalog;
 mod cluster_checks;
 mod control;
 mod drop;
+mod event_time_admission;
 pub(crate) mod lookup_schema;
 mod materialized_view;
 mod running_state_inputs;
@@ -29,6 +30,7 @@ mod stream_stages;
 mod table;
 mod table_schema;
 mod topology;
+mod view_retention;
 
 pub(crate) use stream::{
     logical_aggregate_stage_count, validate_managed_aggregate_admission, PlannedStreamingQuery,

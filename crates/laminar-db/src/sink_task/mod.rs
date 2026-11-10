@@ -4,12 +4,14 @@
 //! Child modules: `protocol` (commands, events, config, epoch-gate types),
 //! `operation` (bounded connector awaits + deadline errors), `actor`
 //! (admission/close/terminal state and supervision), `handle` (the public
-//! `SinkTaskHandle`), `close` (close driver), `lifecycle` (run loops), and
-//! `commands` (command dispatch, epoch transitions, write paths).
+//! `SinkTaskHandle`), `epoch_gate` (the handle's epoch admission), `close` (close
+//! driver), `lifecycle` (run loops), and `commands` (command dispatch, epoch
+//! transitions, write paths).
 
 mod actor;
 mod close;
 mod commands;
+mod epoch_gate;
 mod handle;
 mod lifecycle;
 mod operation;

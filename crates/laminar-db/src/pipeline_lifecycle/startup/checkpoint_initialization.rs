@@ -27,6 +27,23 @@ pub(super) fn validate_checkpoint_timing(
             "checkpoint.interval_ms must be greater than zero; use None for manual-only".into(),
         ));
     }
+    if let Some(stall_ms) = config.sink_epoch_gate_stall_timeout_ms {
+        // A healthy epoch can stay closed for one interval plus one attempt.
+        let timeout = config.timeout_ms.map_or(
+            crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+            std::time::Duration::from_millis,
+        );
+        let floor = config
+            .interval_ms
+            .map(|interval_ms| std::time::Duration::from_millis(interval_ms) + timeout);
+        if floor.is_none_or(|floor| std::time::Duration::from_millis(stall_ms) <= floor) {
+            return Err(DbError::Config(
+                "checkpoint.sink_epoch_gate_stall_timeout_ms needs periodic checkpoints and must \
+                 exceed interval_ms plus the checkpoint timeout"
+                    .into(),
+            ));
+        }
+    }
     let Some(timeout_ms) = config.timeout_ms else {
         return Ok(());
     };
@@ -138,6 +155,13 @@ impl LaminarDB {
                 participant_id,
                 uses_local_checkpoint_store,
             )?;
+            let reader_store = checkpoint_store(
+                Arc::clone(&checkpoint_backing),
+                max_node_data_bytes,
+                key_group_count,
+                participant_id,
+                false,
+            )?;
             let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
 
             let defaults = CkpConfig::default();
@@ -234,6 +258,12 @@ impl LaminarDB {
                 ))
                 })?
             };
+            self.start_committed_view_reads(&coord, reader_store, &ds);
+            #[cfg(feature = "cluster")]
+            {
+                self.start_node_read_pin(&coord).await?;
+                coord.follow_committed_head()?;
+            }
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 
@@ -264,5 +294,56 @@ impl LaminarDB {
             *self.coordinator.lock().await = Some(coord);
         }
         Ok(bound_pipeline_identity)
+    }
+
+    /// Serve committed view reads from `reader_store`, and start the services that follow
+    /// each commit: freshness monitoring and append-log compaction. In a cluster, append-log
+    /// retention follows each view's committed frontier.
+    fn start_committed_view_reads(
+        &self,
+        coord: &crate::checkpoint_coordinator::CheckpointCoordinator,
+        reader_store: Box<dyn laminar_core::checkpoint::CheckpointStore>,
+        ds: &Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    ) {
+        let metrics = self.engine_metrics.lock().clone();
+        let freshness = {
+            let mut views = self.mv_store.write();
+            views.set_committed_views(Arc::new(crate::mv_store::CommittedViews::new(
+                Arc::from(reader_store),
+                Arc::clone(ds),
+                coord.committed_reads(),
+                self.config.materialized_view_read_cache_bytes,
+            )));
+            #[cfg(feature = "cluster")]
+            if self.cluster_controller.lock().is_some() {
+                views.follow_committed_frontiers(coord.committed_reads().0);
+            }
+            views.freshness_contracts()
+        };
+        crate::mv_store::spawn_freshness_monitor(freshness, coord.committed_reads().0, metrics);
+        crate::mv_store::spawn_log_compactor(Arc::clone(&self.mv_store), coord.committed_reads().0);
+    }
+
+    /// In a cluster, pin this node's committed reads against cluster cleanup.
+    #[cfg(feature = "cluster")]
+    async fn start_node_read_pin(
+        &self,
+        coord: &crate::checkpoint_coordinator::CheckpointCoordinator,
+    ) -> Result<(), DbError> {
+        let controller = self.cluster_controller.lock().clone();
+        let Some(controller) = controller else {
+            return Ok(());
+        };
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!("committed-read pin authority: {error}"))
+        })?;
+        let (cuts, pins) = coord.committed_reads();
+        crate::checkpoint_coordinator::start_cluster_read_pin(
+            pins,
+            cuts,
+            authority,
+            coord.participant_id(),
+        )
+        .await
     }
 }

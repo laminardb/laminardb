@@ -4,7 +4,7 @@
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "cluster")]
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[cfg(feature = "cluster")]
@@ -37,10 +37,19 @@ pub(super) struct SinkTaskInner {
     pub(super) requires_recovery_on_error: bool,
     pub(super) event_tx: Producer<SinkEvent>,
     pub(super) generation: tokio_util::sync::CancellationToken,
+    pub(super) flow: Arc<OnceLock<crate::flow_metrics::SinkFlowMetrics>>,
     #[cfg(feature = "cluster")]
     pub(super) process_authority: Option<Arc<ClusterController>>,
     #[cfg(feature = "cluster")]
     pub(super) admission: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl SinkTaskInner {
+    fn observe_command_queue(&self) {
+        if let Some(flow) = self.flow.get() {
+            flow.observe_command_queue(self.rx.len());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +102,7 @@ pub(super) async fn run_local_sink_task(
                     close_disconnected_sink(&mut inner).await;
                     break;
                 };
+                inner.observe_command_queue();
                 let stop = handle_sink_command(
                     &mut inner,
                     cmd.operation,
@@ -160,6 +170,7 @@ pub(super) async fn run_process_fenced_sink_task(
                     close_disconnected_sink(&mut inner).await;
                     return;
                 };
+                inner.observe_command_queue();
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
                         &mut inner,

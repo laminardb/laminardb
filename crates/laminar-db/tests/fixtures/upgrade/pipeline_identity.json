@@ -1,0 +1,1073 @@
+{
+  "pipeline": {
+    "canonical_version": 8,
+    "state_abi_version": 9,
+    "partitioning_abi_version": 2,
+    "state_layout": "vnode",
+    "vnode_count": 256,
+    "delivery_guarantee": "best-effort",
+    "source_idle_timeout_ms": null,
+    "event_time_max_future_skew_ms": 300000,
+    "sources": [
+      {
+        "name": "events",
+        "catalog_generation": 1,
+        "connector_type": "catalog-bridge",
+        "options": {},
+        "input_mode": "append_only",
+        "row_positions": "unavailable",
+        "schema": {
+          "fields": [
+            {
+              "name": "k",
+              "nullable": false,
+              "data_type": "Int64",
+              "metadata": {}
+            },
+            {
+              "name": "v",
+              "nullable": false,
+              "data_type": "Int64",
+              "metadata": {}
+            },
+            {
+              "name": "ts",
+              "nullable": false,
+              "data_type": "Timestamp(µs)",
+              "metadata": {}
+            }
+          ],
+          "metadata": {}
+        },
+        "primary_key": [],
+        "watermark_column": "ts",
+        "max_out_of_orderness_ms": 1,
+        "processing_time": false
+      },
+      {
+        "name": "orders",
+        "catalog_generation": 1,
+        "connector_type": "catalog-bridge",
+        "options": {},
+        "input_mode": "append_only",
+        "row_positions": "unavailable",
+        "schema": {
+          "fields": [
+            {
+              "name": "k",
+              "nullable": false,
+              "data_type": "Int64",
+              "metadata": {}
+            },
+            {
+              "name": "v",
+              "nullable": false,
+              "data_type": "Int64",
+              "metadata": {}
+            },
+            {
+              "name": "ts",
+              "nullable": false,
+              "data_type": "Timestamp(µs)",
+              "metadata": {}
+            }
+          ],
+          "metadata": {}
+        },
+        "primary_key": [],
+        "watermark_column": "ts",
+        "max_out_of_orderness_ms": 1,
+        "processing_time": false
+      },
+      {
+        "name": "payments",
+        "catalog_generation": 1,
+        "connector_type": "catalog-bridge",
+        "options": {},
+        "input_mode": "append_only",
+        "row_positions": "unavailable",
+        "schema": {
+          "fields": [
+            {
+              "name": "k",
+              "nullable": false,
+              "data_type": "Int64",
+              "metadata": {}
+            },
+            {
+              "name": "v",
+              "nullable": false,
+              "data_type": "Int64",
+              "metadata": {}
+            },
+            {
+              "name": "ts",
+              "nullable": false,
+              "data_type": "Timestamp(µs)",
+              "metadata": {}
+            }
+          ],
+          "metadata": {}
+        },
+        "primary_key": [],
+        "watermark_column": "ts",
+        "max_out_of_orderness_ms": 1,
+        "processing_time": false
+      }
+    ],
+    "streams": [
+      {
+        "name": "changes",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, SUM(v) AS total FROM events GROUP BY k",
+        "emit_clause": "Some(Changes)",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": {
+          "distribution": {
+            "kind": "vnode_partitioned",
+            "key_expressions_fingerprint": [
+              100,
+              247,
+              146,
+              77,
+              33,
+              231,
+              207,
+              134,
+              1,
+              198,
+              81,
+              141,
+              188,
+              137,
+              41,
+              7,
+              33,
+              99,
+              150,
+              9,
+              111,
+              250,
+              111,
+              79,
+              194,
+              111,
+              246,
+              206,
+              130,
+              33,
+              67,
+              43
+            ],
+            "partition_abi": 2,
+            "vnode_count": 256
+          },
+          "query_fingerprint": [
+            169,
+            97,
+            65,
+            213,
+            208,
+            99,
+            216,
+            7,
+            41,
+            20,
+            217,
+            225,
+            56,
+            144,
+            243,
+            175,
+            164,
+            184,
+            148,
+            242,
+            227,
+            242,
+            37,
+            75,
+            238,
+            205,
+            235,
+            65,
+            185,
+            19,
+            51,
+            3
+          ],
+          "canonical_query": "SELECT k, SUM(v) AS total FROM events GROUP BY k",
+          "changelog_mode": "weighted_retract_insert"
+        },
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "weighted"
+        }
+      },
+      {
+        "name": "filtered",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, v, ts FROM events WHERE v > 0",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "forward"
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "arbitrary"
+          },
+          "changelog": "append_only"
+        }
+      },
+      {
+        "name": "global_count",
+        "catalog_generation": 1,
+        "query_sql": "SELECT COUNT(*) AS n FROM events",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": {
+          "distribution": {
+            "kind": "singleton",
+            "partition": 0
+          },
+          "query_fingerprint": [
+            8,
+            240,
+            205,
+            4,
+            234,
+            204,
+            250,
+            113,
+            84,
+            206,
+            6,
+            193,
+            153,
+            11,
+            142,
+            214,
+            108,
+            19,
+            97,
+            42,
+            244,
+            79,
+            214,
+            168,
+            39,
+            173,
+            21,
+            228,
+            32,
+            182,
+            90,
+            108
+          ],
+          "canonical_query": "SELECT COUNT(*) AS n FROM events",
+          "changelog_mode": "full_partition_snapshot"
+        },
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "gather",
+                "vnode": 0,
+                "partial": true
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "singleton",
+            "vnode": 0
+          },
+          "changelog": "running_state"
+        }
+      },
+      {
+        "name": "hopping",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, HOP(ts, INTERVAL '50' MILLISECOND, INTERVAL '100' MILLISECOND) AS bucket, COUNT(*) AS n FROM events GROUP BY k, HOP(ts, INTERVAL '50' MILLISECOND, INTERVAL '100' MILLISECOND)",
+        "emit_clause": "Some(OnWindowClose)",
+        "window_config": "Some(WindowOperatorConfig { window_type: Sliding, time_column: \"ts\", size: 100ms, slide: Some(50ms), gap: None, offset_ms: 0, allowed_lateness: 0ns, emit_strategy: OnWindowClose, late_data_side_output: None })",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "append_only"
+        }
+      },
+      {
+        "name": "joined",
+        "catalog_generation": 1,
+        "query_sql": "SELECT o.k AS k, o.v AS ordered, p.v AS paid, o.ts AS ts FROM orders o JOIN payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "Some([StreamStream(StreamJoinConfig { join_type: Inner, left_keys: [\"k\"], right_keys: [\"k\"], left_time_column: \"ts\", right_time_column: \"ts\", left_table: \"orders\", right_table: \"payments\", time_bound: 50ms })])",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "left",
+              "upstream": "orders",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            },
+            {
+              "port": "right",
+              "upstream": "payments",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "append_only"
+        }
+      },
+      {
+        "name": "keyed",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, SUM(v) AS total, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi, AVG(v) AS mean FROM events GROUP BY k",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": {
+          "distribution": {
+            "kind": "vnode_partitioned",
+            "key_expressions_fingerprint": [
+              100,
+              247,
+              146,
+              77,
+              33,
+              231,
+              207,
+              134,
+              1,
+              198,
+              81,
+              141,
+              188,
+              137,
+              41,
+              7,
+              33,
+              99,
+              150,
+              9,
+              111,
+              250,
+              111,
+              79,
+              194,
+              111,
+              246,
+              206,
+              130,
+              33,
+              67,
+              43
+            ],
+            "partition_abi": 2,
+            "vnode_count": 256
+          },
+          "query_fingerprint": [
+            113,
+            44,
+            82,
+            161,
+            33,
+            30,
+            212,
+            221,
+            202,
+            228,
+            61,
+            44,
+            56,
+            158,
+            207,
+            201,
+            117,
+            89,
+            24,
+            131,
+            128,
+            49,
+            10,
+            2,
+            209,
+            8,
+            238,
+            195,
+            214,
+            239,
+            102,
+            150
+          ],
+          "canonical_query": "SELECT k, SUM(v) AS total, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi, AVG(v) AS mean FROM events GROUP BY k",
+          "changelog_mode": "full_partition_snapshot"
+        },
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "running_state"
+        }
+      },
+      {
+        "name": "merged",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, v, ts FROM orders UNION ALL SELECT k, v, ts FROM payments",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "orders",
+              "exchange": {
+                "kind": "forward"
+              }
+            },
+            {
+              "port": "input",
+              "upstream": "payments",
+              "exchange": {
+                "kind": "forward"
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "arbitrary"
+          },
+          "changelog": "append_only"
+        }
+      },
+      {
+        "name": "over_changes",
+        "catalog_generation": 1,
+        "query_sql": "SELECT total, COUNT(*) AS keys FROM changes GROUP BY total",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": {
+          "distribution": {
+            "kind": "vnode_partitioned",
+            "key_expressions_fingerprint": [
+              222,
+              114,
+              43,
+              170,
+              83,
+              20,
+              113,
+              116,
+              49,
+              3,
+              218,
+              33,
+              241,
+              131,
+              155,
+              105,
+              228,
+              76,
+              107,
+              72,
+              194,
+              42,
+              162,
+              73,
+              212,
+              140,
+              166,
+              172,
+              220,
+              243,
+              122,
+              251
+            ],
+            "partition_abi": 2,
+            "vnode_count": 256
+          },
+          "query_fingerprint": [
+            83,
+            178,
+            125,
+            74,
+            118,
+            215,
+            133,
+            144,
+            113,
+            65,
+            130,
+            182,
+            6,
+            83,
+            177,
+            195,
+            110,
+            51,
+            155,
+            47,
+            137,
+            135,
+            134,
+            221,
+            204,
+            138,
+            226,
+            45,
+            187,
+            130,
+            107,
+            109
+          ],
+          "canonical_query": "SELECT total, COUNT(*) AS keys FROM changes GROUP BY total",
+          "changelog_mode": "full_partition_snapshot"
+        },
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "changes",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "total",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "total",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "running_state"
+        }
+      },
+      {
+        "name": "periodic",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n FROM events GROUP BY k, TUMBLE(ts, INTERVAL '1' MINUTE)",
+        "emit_clause": "Some(Periodically { interval: Interval(Interval { value: Value(ValueWithSpan { value: SingleQuotedString(\"5\"), span: Span(Location(1,177)..Location(1,180)) }), leading_field: Some(Second), leading_precision: None, last_field: None, fractional_seconds_precision: None }) })",
+        "window_config": "Some(WindowOperatorConfig { window_type: Tumbling, time_column: \"ts\", size: 60s, slide: None, gap: None, offset_ms: 0, allowed_lateness: 0ns, emit_strategy: Periodic(5s), late_data_side_output: None })",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  },
+                  {
+                    "kind": "computed",
+                    "expr": "tumble(events.ts, IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"))",
+                    "data_type": "Timestamp(µs)"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              },
+              {
+                "kind": "column",
+                "name": "bucket",
+                "data_type": "Timestamp(µs)"
+              }
+            ]
+          },
+          "changelog": "running_state"
+        }
+      },
+      {
+        "name": "sessions",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, SESSION(ts, INTERVAL '5' MILLISECOND) AS s, COUNT(*) AS n FROM events GROUP BY k, SESSION(ts, INTERVAL '5' MILLISECOND)",
+        "emit_clause": "Some(OnWindowClose)",
+        "window_config": "Some(WindowOperatorConfig { window_type: Session, time_column: \"ts\", size: 0ns, slide: None, gap: Some(5ms), offset_ms: 0, allowed_lateness: 0ns, emit_strategy: OnWindowClose, late_data_side_output: None })",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "append_only"
+        }
+      },
+      {
+        "name": "split_join",
+        "catalog_generation": 1,
+        "query_sql": "SELECT \"o_k\" AS k, SUM(\"p_v\") AS total FROM \"split_join$stage1\" GROUP BY \"o_k\"",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": {
+          "distribution": {
+            "kind": "vnode_partitioned",
+            "key_expressions_fingerprint": [
+              7,
+              28,
+              173,
+              92,
+              167,
+              19,
+              128,
+              33,
+              250,
+              211,
+              172,
+              111,
+              97,
+              229,
+              93,
+              99,
+              183,
+              55,
+              22,
+              36,
+              22,
+              158,
+              230,
+              73,
+              110,
+              140,
+              195,
+              234,
+              245,
+              75,
+              194,
+              149
+            ],
+            "partition_abi": 2,
+            "vnode_count": 256
+          },
+          "query_fingerprint": [
+            186,
+            26,
+            4,
+            56,
+            189,
+            63,
+            187,
+            80,
+            128,
+            223,
+            143,
+            162,
+            35,
+            161,
+            53,
+            117,
+            199,
+            156,
+            141,
+            130,
+            95,
+            85,
+            103,
+            147,
+            95,
+            74,
+            184,
+            253,
+            217,
+            120,
+            133,
+            209
+          ],
+          "canonical_query": "SELECT \"o_k\" AS k, SUM(\"p_v\") AS total FROM \"split_join$stage1\" GROUP BY \"o_k\"",
+          "changelog_mode": "full_partition_snapshot"
+        },
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "split_join$stage1",
+              "exchange": {
+                "kind": "colocated",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "o_k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "running_state"
+        }
+      },
+      {
+        "name": "split_join$stage1",
+        "catalog_generation": 1,
+        "query_sql": "SELECT o.k AS \"o_k\", p.v AS \"p_v\" FROM orders o JOIN payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+        "emit_clause": "None",
+        "window_config": "None",
+        "order_config": "None",
+        "join_config": "Some([StreamStream(StreamJoinConfig { join_type: Inner, left_keys: [\"k\"], right_keys: [\"k\"], left_time_column: \"ts\", right_time_column: \"ts\", left_table: \"orders\", right_table: \"payments\", time_bound: 50ms })])",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "left",
+              "upstream": "orders",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            },
+            {
+              "port": "right",
+              "upstream": "payments",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "o_k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "append_only"
+        }
+      },
+      {
+        "name": "tumbling",
+        "catalog_generation": 1,
+        "query_sql": "SELECT k, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n FROM events GROUP BY k, TUMBLE(ts, INTERVAL '1' MINUTE)",
+        "emit_clause": "Some(OnWindowClose)",
+        "window_config": "Some(WindowOperatorConfig { window_type: Tumbling, time_column: \"ts\", size: 60s, slide: None, gap: None, offset_ms: 0, allowed_lateness: 0ns, emit_strategy: OnWindowClose, late_data_side_output: None })",
+        "order_config": "None",
+        "join_config": "None",
+        "incremental": false,
+        "subscription_output": null,
+        "subscription_retention_bytes": 0,
+        "exchange": {
+          "inputs": [
+            {
+              "port": "input",
+              "upstream": "events",
+              "exchange": {
+                "kind": "repartition",
+                "key": [
+                  {
+                    "kind": "column",
+                    "name": "k",
+                    "data_type": "Int64"
+                  }
+                ]
+              }
+            }
+          ],
+          "distribution": {
+            "kind": "hash",
+            "key": [
+              {
+                "kind": "column",
+                "name": "k",
+                "data_type": "Int64"
+              }
+            ]
+          },
+          "changelog": "append_only"
+        }
+      }
+    ],
+    "tables": [],
+    "sinks": []
+  },
+  "stream_output_schemas": {
+    "changes": [
+      "k: Int64 NOT NULL",
+      "total: Int64",
+      "__weight: Int64 NOT NULL"
+    ],
+    "filtered": [
+      "k: Int64 NOT NULL",
+      "v: Int64 NOT NULL",
+      "ts: Timestamp(µs) NOT NULL"
+    ],
+    "global_count": [
+      "n: Int64 NOT NULL"
+    ],
+    "hopping": [
+      "k: Int64 NOT NULL",
+      "bucket: Timestamp(µs)",
+      "n: Int64 NOT NULL"
+    ],
+    "joined": [
+      "k: Int64 NOT NULL",
+      "ordered: Int64 NOT NULL",
+      "paid: Int64 NOT NULL",
+      "ts: Timestamp(µs) NOT NULL"
+    ],
+    "keyed": [
+      "k: Int64 NOT NULL",
+      "total: Int64",
+      "n: Int64 NOT NULL",
+      "lo: Int64",
+      "hi: Int64",
+      "mean: Float64"
+    ],
+    "merged": [
+      "k: Int64 NOT NULL",
+      "v: Int64 NOT NULL",
+      "ts: Timestamp(µs) NOT NULL"
+    ],
+    "over_changes": [
+      "total: Int64",
+      "keys: Int64 NOT NULL"
+    ],
+    "periodic": [
+      "k: Int64 NOT NULL",
+      "bucket: Timestamp(µs)",
+      "n: Int64 NOT NULL"
+    ],
+    "sessions": [
+      "k: Int64 NOT NULL",
+      "s: Timestamp(µs)",
+      "n: Int64 NOT NULL"
+    ],
+    "split_join": [
+      "k: Int64 NOT NULL",
+      "total: Int64"
+    ],
+    "split_join$stage1": [
+      "o_k: Int64 NOT NULL",
+      "p_v: Int64 NOT NULL"
+    ],
+    "tumbling": [
+      "k: Int64 NOT NULL",
+      "bucket: Timestamp(µs)",
+      "n: Int64 NOT NULL"
+    ]
+  }
+}

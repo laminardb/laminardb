@@ -382,7 +382,8 @@ impl OperatorGraph {
                     | ManagedStateContract::CoreWindowV1
                     | ManagedStateContract::BoundedIntervalJoinV3
                     | ManagedStateContract::TemporalJoinV1
-                    | ManagedStateContract::ProcessFunctionV1,
+                    | ManagedStateContract::ProcessFunctionV1
+                    | ManagedStateContract::ViewResultV1,
                 ) => indices.push(node_idx),
                 #[cfg(test)]
                 Some(ManagedStateContract::TestVnodeStateV1) => indices.push(node_idx),

@@ -6,7 +6,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
 use super::error::ApiError;
-use crate::catalog::ArrowRecord;
+use crate::QueryRows;
 
 /// Materialized query result (all batches in memory). Use [`QueryStream`] for streaming.
 #[derive(Debug, Clone)]
@@ -80,18 +80,18 @@ impl QueryResult {
 pub struct QueryStream {
     schema: SchemaRef,
     handle: Option<crate::QueryHandle>,
-    subscription: Option<laminar_core::streaming::Subscription<ArrowRecord>>,
+    rows: Option<QueryRows>,
 }
 
 impl QueryStream {
     /// Create from a `QueryHandle`.
     pub(crate) fn from_handle(mut handle: crate::QueryHandle) -> Self {
         let schema = handle.schema().clone();
-        let subscription = handle.subscribe_raw().ok();
+        let rows = handle.subscribe_raw().ok();
         Self {
             schema,
             handle: Some(handle),
-            subscription,
+            rows,
         }
     }
 
@@ -110,14 +110,16 @@ impl QueryStream {
     /// Returns `ApiError` if receiving fails.
     #[allow(clippy::should_implement_trait)] // FFI method name, not Iterator
     pub fn next(&mut self) -> Result<Option<RecordBatch>, ApiError> {
-        match &mut self.subscription {
-            Some(sub) => match sub.recv() {
-                Ok(batch) => Ok(Some(batch)),
-                Err(laminar_core::streaming::RecvError::Disconnected) => Ok(None),
-                Err(e) => Err(ApiError::subscription(e.to_string())),
-            },
-            None => Ok(None),
-        }
+        let Some(rows) = &mut self.rows else {
+            return Ok(None);
+        };
+        let next = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|s| s.spawn(|| rows.blocking_next_batch()).join())
+                .map_err(|_| ApiError::internal("query reader thread panicked"))?
+        } else {
+            rows.blocking_next_batch()
+        };
+        next.map_err(ApiError::from)
     }
 
     /// Try to get the next batch (non-blocking).
@@ -128,8 +130,8 @@ impl QueryStream {
     ///
     /// Returns `ApiError` if receiving fails.
     pub fn try_next(&mut self) -> Result<Option<RecordBatch>, ApiError> {
-        match &mut self.subscription {
-            Some(sub) => Ok(sub.poll()),
+        match &mut self.rows {
+            Some(rows) => rows.try_next_batch().map_err(ApiError::from),
             None => Ok(None),
         }
     }
@@ -141,7 +143,7 @@ impl QueryStream {
     /// Returns `ApiError` if receiving fails.
     pub fn collect(mut self) -> Result<QueryResult, ApiError> {
         let mut batches = Vec::new();
-        while let Some(batch) = self.try_next()? {
+        while let Some(batch) = self.next()? {
             batches.push(batch);
         }
         Ok(QueryResult::from_batches(self.schema, batches))
@@ -160,7 +162,7 @@ impl QueryStream {
         if let Some(ref mut handle) = self.handle {
             handle.cancel();
         }
-        self.subscription = None;
+        self.rows = None;
     }
 }
 

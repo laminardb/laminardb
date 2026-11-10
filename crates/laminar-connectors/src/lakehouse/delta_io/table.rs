@@ -16,9 +16,37 @@ use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
 #[cfg(feature = "delta-lake")]
 use deltalake::kernel::schema::cast::cast_record_batch;
 
-/// WHY: the kernel accepts only microsecond timestamps; values scale by
-/// `1_000`, timezone metadata is preserved, and nested timestamps stay
-/// rejected (no upstream schema-level normalizer exists).
+/// The kernel maps nanosecond and nested millisecond Arrow timestamps onto Delta's microsecond
+/// type without converting the values, so those columns are refused before conversion.
+#[cfg(feature = "delta-lake")]
+pub(crate) fn validate_delta_timestamp_precision(schema: &SchemaRef) -> Result<(), String> {
+    fn unrepresentable(data_type: &DataType, nested: bool) -> Option<&DataType> {
+        match data_type {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(data_type),
+            DataType::Timestamp(TimeUnit::Millisecond, _) if nested => Some(data_type),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => unrepresentable(field.data_type(), true),
+            DataType::Struct(fields) => fields
+                .iter()
+                .find_map(|field| unrepresentable(field.data_type(), true)),
+            _ => None,
+        }
+    }
+    schema.fields().iter().try_for_each(|field| {
+        unrepresentable(field.data_type(), false).map_or(Ok(()), |data_type| {
+            Err(format!(
+                "column '{}' has type {data_type}, which Delta's microsecond timestamp cannot hold \
+                 without changing its values",
+                field.name()
+            ))
+        })
+    })
+}
+
+/// WHY: Delta timestamps are microsecond; values scale by `1_000` and timezone metadata is
+/// preserved. Nested timestamps are refused by [`validate_delta_timestamp_precision`].
 #[cfg(feature = "delta-lake")]
 pub(crate) fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
     let needs_widening = schema.fields().iter().any(|field| {
@@ -163,6 +191,9 @@ fn delta_table_url(
     } else {
         path_to_url(table_path)?
     };
+    super::storage_preflight::reject_removed_s3_locking(&url, storage_options, &|key| {
+        std::env::var(key).ok()
+    })?;
     #[cfg(feature = "delta-lake-gcs")]
     if url.scheme() == "gs" {
         super::gcs_factory::register_laminar_gcs_factory()?;
@@ -184,11 +215,7 @@ pub async fn open_table_metadata(
 ) -> Result<DeltaTable, ConnectorError> {
     let url = delta_table_url(table_path, &mut storage_options)?;
     let table = deltalake::DeltaTableBuilder::from_url(url)
-        .map(|builder| {
-            builder
-                .with_storage_options(storage_options)
-                .without_files()
-        })
+        .map(|builder| builder.with_storage_options(storage_options))
         .map_err(|error| {
             ConnectorError::ConfigurationError(format!(
                 "invalid Delta table location ({})",
@@ -281,6 +308,7 @@ pub async fn open_or_create_partitioned_table(
 
     info!("creating new Delta Lake table");
 
+    validate_delta_timestamp_precision(schema).map_err(ConnectorError::SchemaMismatch)?;
     // Convert Arrow schema to Delta Lake schema using TryIntoKernel.
     let delta_schema: deltalake::kernel::StructType = widen_millisecond_timestamps(schema)
         .as_ref()
@@ -432,6 +460,29 @@ async fn delta_prepublication_fault_boundary() -> Result<(), DeltaWriteAttemptEr
         ))
     })?;
     std::future::pending::<Result<(), DeltaWriteAttemptError>>().await
+}
+
+/// delta-rs accepts column-mapped tables for `write`, but `RecordBatchWriter` refuses them and the
+/// sink's upsert and append paths have not been validated against physical column names.
+///
+/// # Errors
+/// Returns `ConnectorError::ConfigurationError` when the table uses column mapping.
+#[cfg(feature = "delta-lake")]
+pub(crate) fn reject_column_mapped_table(table: &DeltaTable) -> Result<(), ConnectorError> {
+    let snapshot = table
+        .snapshot()
+        .map_err(|error| classify_delta_metadata_error("read Delta snapshot", &error))?;
+    if snapshot
+        .metadata()
+        .configuration()
+        .get("delta.columnMapping.mode")
+        .is_some_and(|mode| !mode.eq_ignore_ascii_case("none"))
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "the Delta sink does not write column-mapped tables".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Coordinated append stages files through delta-rs `RecordBatchWriter`, which does not evaluate

@@ -82,8 +82,8 @@ impl CheckpointCoordinator {
         }
         recovered.validate_topology_assignment(input)?;
         self.install_recovered_metadata(input.outcome(), input.checkpoint(), recovered)?;
-        if let Some((_, watermarks)) = self.last_committed_source_watermarks.as_mut() {
-            watermarks.retain(|name, _| {
+        if let Some((_, frontiers)) = self.last_committed_frontiers.as_mut() {
+            frontiers.sources.retain(|name, _| {
                 input.root().preserved_objects.iter().any(|object| {
                     object.kind == laminar_core::cluster::control::CatalogObjectKind::Source
                         && &object.name == name
@@ -339,24 +339,24 @@ impl CheckpointCoordinator {
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
             DbError::Checkpoint("Commit outcome has no committed checkpoint reference".into())
         })?;
-        let committed_source_watermarks = committed
-            .effective_source_watermarks()
-            .map_err(DbError::Checkpoint)?;
-        let local_manifest = (!recovered.reassigned)
-            .then(|| {
-                recovered
-                    .manifests
-                    .iter()
-                    .find(|manifest| manifest.participant_id == self.store.participant_id())
-                    .cloned()
-                    .map(Arc::new)
-            })
-            .flatten();
+        let committed_frontiers = super::CommittedFrontiers::of(committed)?;
+        let own_manifest = recovered
+            .manifests
+            .iter()
+            .find(|manifest| manifest.participant_id == self.store.participant_id())
+            .cloned()
+            .map(Arc::new);
+        let local_manifest = own_manifest.clone().filter(|_| !recovered.reassigned);
         self.local_watermark = Self::manifest_watermark(local_manifest.as_deref())?;
         self.last_committed_manifest = local_manifest;
+        self.view_log_predecessor = own_manifest;
+        self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
+            committed.clone(),
+            reference.clone(),
+            &recovered.manifests,
+        )));
         self.last_committed_ref = Some(reference.clone());
-        self.last_committed_source_watermarks =
-            Some((reference, committed_source_watermarks.clone()));
+        self.last_committed_frontiers = Some((reference, committed_frontiers.clone()));
         self.prepared.clear();
         self.allocator.advance_epoch_to(checked_successor_epoch(
             committed.epoch,
@@ -369,7 +369,7 @@ impl CheckpointCoordinator {
             controller
                 .replace_recovered_checkpoint_progress(
                     &committed.channel_progress,
-                    &committed_source_watermarks,
+                    &committed_frontiers.sources,
                 )
                 .map_err(DbError::Checkpoint)?;
         }
@@ -626,8 +626,10 @@ impl CheckpointCoordinator {
         }
         self.prepared.clear();
         self.last_committed_manifest = None;
+        self.view_log_predecessor = None;
+        self.publish_committed_cut(None);
         self.last_committed_ref = None;
-        self.last_committed_source_watermarks = None;
+        self.last_committed_frontiers = None;
         self.local_watermark = CheckpointWatermark::Uninitialized;
         self.failure_requires_recovery = false;
         self.phase = CheckpointPhase::Idle;

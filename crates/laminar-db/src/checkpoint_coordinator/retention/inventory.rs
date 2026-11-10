@@ -1,10 +1,10 @@
 use super::{
     checkpoint_manifest_bytes, BTreeSet, CheckpointManifest, CheckpointStore,
-    CommittedCheckpointIndex, DbError, LiveChunkInventory, StreamExt, TryStreamExt,
+    CommittedCheckpointIndex, DbError, LiveChunkInventory, StateChunkId, StreamExt, TryStreamExt,
     MAX_RETENTION_IO_CONCURRENCY,
 };
 
-pub(in crate::checkpoint_coordinator) async fn load_index_manifests(
+pub(crate) async fn load_index_manifests(
     store: &dyn CheckpointStore,
     index: &CommittedCheckpointIndex,
 ) -> Result<Vec<CheckpointManifest>, DbError> {
@@ -62,6 +62,10 @@ pub(in crate::checkpoint_coordinator) async fn load_index_manifests(
     index
         .validate_participant_manifests(&views)
         .map_err(DbError::Checkpoint)?;
+    laminar_core::checkpoint::validate_cut_view_logs(
+        loaded.iter().map(|(_, manifest, _)| manifest),
+    )
+    .map_err(DbError::Checkpoint)?;
     Ok(loaded
         .into_iter()
         .map(|(_, manifest, _)| manifest)
@@ -74,11 +78,13 @@ pub(in crate::checkpoint_coordinator) fn live_chunk_inventory(
     let mut references = BTreeSet::new();
     let mut pinned = BTreeSet::new();
     let mut subscription_segments = BTreeSet::new();
+    let mut view_logs = BTreeSet::new();
     for manifest in manifests {
         pinned.insert(manifest.node_data.chunk);
         for reference in &manifest.referenced_chunks {
             references.insert(reference.chunk);
         }
+        view_logs.extend(view_log_chunks(manifest));
         if let Some(output) = &manifest.subscription_output {
             for stream in &output.streams {
                 subscription_segments.extend(
@@ -94,5 +100,18 @@ pub(in crate::checkpoint_coordinator) fn live_chunk_inventory(
         references,
         pinned,
         subscription_segments,
+        view_logs,
     }
+}
+
+/// The view-log objects a manifest writes or references.
+pub(in crate::checkpoint_coordinator) fn view_log_chunks(
+    manifest: &CheckpointManifest,
+) -> impl Iterator<Item = StateChunkId> + '_ {
+    manifest.view_log.iter().map(|object| object.chunk).chain(
+        manifest
+            .referenced_view_logs
+            .iter()
+            .map(|reference| reference.chunk),
+    )
 }

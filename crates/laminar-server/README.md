@@ -9,7 +9,7 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 - **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
 - **Hot reload**: edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
-- **Platform allocators**: jemalloc on Linux, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
+- **Platform allocators**: jemalloc on Linux and macOS, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
 - **Docker and Helm** deployment with multi-arch images
 
 ## CLI
@@ -39,7 +39,7 @@ cargo build --release --bin laminardb
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
-  laminardb/laminardb-server:0.33.0
+  laminardb/laminardb-server:latest
 
 # Check health
 curl http://localhost:8080/health
@@ -74,11 +74,13 @@ reference_table_max_rows = 1000000 # independently per local reference table; mu
 reference_table_max_bytes = 268435456 # retained-memory charge per local table; 256 MiB default
 materialized_view_max_rows = 1000000 # per local MV; distinct rows for multiset storage
 materialized_view_max_bytes = 268435456 # retained-memory charge per local MV; must be > 0
+materialized_view_read_cache_bytes = 268435456 # decoded committed view state cached for reads; 0 disables
 # pipeline_max_managed_state_bytes = 268435456 # managed operator state charge; 256 MiB default
 # pipeline_max_input_buf_batches = 256 # per graph input port; 0 disables count limit
 # pipeline_max_input_buf_bytes = 33554432 # optional per-port Arrow bytes; unset disables
 # drain_timeout = "150s" # cluster SIGTERM handoff allowance; default checkpoint.timeout + 30s
-pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
+# shuffle_send_stall_timeout = "10m" # cluster: fail a stuck shuffle send for recovery; unset waits
+pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SELECT and SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.
@@ -97,7 +99,14 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # file:// until remote writer fencing lands. Startup verifies conditional puts.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
+# Optional: while a `recent` view read waits for a newer checkpoint, the next one starts this
+# long after the previous one ended instead of `interval` (shorter than `interval`; at least
+# 100ms in cluster mode). Each early checkpoint also commits exactly-once sinks.
+# recent_read_interval = "1s"
 timeout = "120s" # checkpoint deadline and per-phase cluster assignment-recovery bound
+# Optional: fail an exactly-once sink write for recovery when the sink's epoch stays in one state
+# this long. Must exceed interval + timeout. Unset: the write waits for the epoch to open.
+# sink_epoch_gate_stall_timeout = "10m"
 
 # Provider features, accepted aliases, ambient identity, and native evidence:
 # ../../docs/cloud-object-store-support.md
@@ -142,6 +151,20 @@ format = "json"
 [sink.properties]
 "bootstrap.servers" = "localhost:9092"
 topic = "avg-prices"
+```
+
+Materialized views have no structured section. Declare them, and any other DDL, in the top-level
+`sql` key, which must come before the first `[table]`. It runs after the structured sections, and
+in a cluster it is part of the startup catalog every node must agree on:
+
+```toml
+sql = """
+CREATE MATERIALIZED VIEW trade_counts AS
+SELECT symbol, COUNT(*) AS trades FROM trades GROUP BY symbol;
+"""
+
+[server]
+# ...
 ```
 
 ## AI Functions
@@ -202,11 +225,12 @@ including remote AI — runs normally.
 | GET | `/api/v1/streams` | List running streams |
 | GET | `/api/v1/streams/{name}` | Stream detail by name |
 | POST | `/api/v1/checkpoint` | Trigger immediate checkpoint |
-| POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
+| POST | `/api/v1/checkpoint/expedite` | Internal: a node forwards a waiting `recent` read's request to the cluster leader, which starts the next periodic checkpoint early under `recent_read_interval` (202) |
+| POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "...", "read_level": "committed", "min_epoch": 42}`; both read fields optional; `read_level` is `latest`, `committed` or `recent`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
+| GET | `/api/v1/cluster/vnodes/load` | Per-vnode state of each keyed operator: this node's live state and every participant's committed frame bytes ([Reading skew](#reading-skew)) |
 | GET | `/api/v1/cluster/topology` | Durable catalog version and this process's activation evidence (console authorization) |
-| POST | `/api/v1/cluster/topology/adopt` | Explicitly adopt an existing legacy catalog after a coordinated upgrade |
 | POST | `/api/v1/cluster/topology/validate` | Validate a topology candidate without applying it |
 | POST | `/api/v1/cluster/topology/operations` | Submit one atomic migration with an operation UUID and expected parent version |
 | GET | `/api/v1/cluster/topology/operations/{operation_id}` | Audited migration status (console authorization) |
@@ -214,15 +238,32 @@ including remote AI — runs normally.
 
 `POST /api/v1/sql` returns at most 1000 result rows (and stops after a 5s collection budget). When the result is larger, the JSON response sets `"truncated": true` and `data` holds the first 1000 rows; the field is omitted when the result is complete. Use SUBSCRIBE (pgwire/WebSocket) to stream unbounded results.
 
+A query reads materialized views at `read_level`: `latest` (the latest completed cycle, which
+recovery may roll back), `committed` (one committed checkpoint for every view in the query) or
+`recent` (a committed checkpoint holding every record written to the views' Kafka sources before
+the request arrived, waited for up to 30 seconds before the 5s collection budget starts; with
+`[checkpoint] recent_read_interval` the wait brings the next checkpoint forward).
+Omitted, it is `latest` locally and `committed` in cluster mode, where a node holds only part of
+each view. A committed or recent response adds `epoch`, `checkpoint_id` and `taken_at_ms`; pass
+the epoch back as `min_epoch` to read no earlier checkpoint. `min_epoch` without a committed or
+recent level is rejected. A read that passes its 30 second deadline (a `min_epoch` that never
+commits, or no checkpoint yet holding a recent read's records) answers 504; a recent read whose
+source cannot be asked how far it has been written answers 502; other read errors, including a
+recent read of a view over a source that cannot report it, answer 400. See
+[Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads). While a cluster node completes a coordinated recovery round, it keeps answering reads and
+keeps `/ws/{name}` subscriptions open; other statements and routes answer 503 until it ends.
+
 Supported cluster DDL returns an asynchronous migration receipt. See the main
 README's [topology support and limits](../../README.md#change-a-running-clusters-topology).
 
 ## Postgres Wire Protocol
 
-When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
+When `[server].pgwire_bind` is set, the server also listens for Postgres clients over the simple and extended query protocols. A cluster node opens the listener when it starts serving and closes it, with every session, when it stops. Like HTTP SQL reads and WebSocket subscriptions, it keeps answering committed reads while the node completes a coordinated recovery round (see [Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads)):
 
-- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
-- `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
+- `SELECT` reads the database, with the same read levels as `POST /api/v1/sql`, chosen per connection: `SET laminar.read_level = 'latest' | 'committed' | 'recent' | 'default'` and `SET laminar.min_epoch = <n>`. `SHOW laminar.read_epoch` returns the epoch of the connection's last committed or recent read, and later committed and recent reads on the connection read no earlier epoch. A recent read fails with `0A000` when a source behind its views cannot report how far it has been written, `58000` when one cannot be reached, and `57014` when no checkpoint holds every source within 30 seconds. Rows stream as the client reads them; statements with bind parameters are rejected (`0A000`).
+
+- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for materialized views and certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
+- `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect. `SET` of names outside `laminar.*` changes database-wide session properties, not the connection's.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
 `WHERE` is compiled with DataFusion against the resolved output schema; an unresolved named-stream
@@ -325,7 +366,7 @@ incarnations are fenced. Before you remove a node permanently, confirm that the 
 longer names it. More owners do not split a hot key, add source partitions or speed up a slow
 sink.
 
-After a [topology migration](../../docs/architecture/DISTRIBUTED_STATE.md) commits, the
+After a [topology migration](../../README.md#change-a-running-clusters-topology) commits, the
 complete owner map stays frozen until the new topology is Active **and** has committed its own
 checkpoint. Until then, only same-slot replacement of a failed process is admitted. Do not scale
 in or out while `GET /api/v1/cluster/topology` reports `live_migration`. Afterwards all three ownership changes work normally, and a later
@@ -343,6 +384,33 @@ The topology request journal keeps every admitted request identity, including fi
 a retried request returns its original outcome. It holds 64 requests and does not compact yet.
 `GET /api/v1/cluster/topology` reports `journal.retained` and `journal.capacity`. Once it is full,
 new topology requests are rejected; retries of existing identities still work.
+
+### Reading skew
+
+Start from the per-operator gauges on `/metrics`. `laminardb_vnode_state_bytes_max` well above
+`laminardb_vnode_state_bytes_mean` means one vnode of that operator holds more state than the
+others on that node, and `laminardb_vnode_hottest` names the vnode. Imbalance between nodes is
+the spread of each node's total, for example
+`max(sum by (instance) (laminardb_managed_state_accounted_bytes{phase="live"})) / avg(sum by (instance) (laminardb_managed_state_accounted_bytes{phase="live"}))`.
+
+`GET /api/v1/cluster/vnodes/load` (console authorization) then lists every vnode of every keyed
+operator:
+
+- `live`: this node's `state_bytes`, `groups` and `applied_rows` for each vnode it holds state
+  for, from the last sample (every 32 cycles; `live_sample_age_ms` is its age). `applied_rows`
+  counts the input rows applied to the vnode since the operator was built on this node, so the
+  difference between two reads is its input rate while the vnode holds state; a vnode without
+  state, such as a window vnode between windows, has no `live` entry. A window row counts once
+  per window it falls in.
+- `committed_frames`: the state frame bytes each participant wrote for the vnode in the newest
+  committed checkpoint (`committed`), read from the checkpoint manifests. Any node shows the
+  committed spread of the whole cluster.
+
+A vnode with a high input rate and few groups is a hot key: spread it with a salted two-stage
+aggregate ([Spreading a hot key](../../docs/SQL_REFERENCE.md#spreading-a-hot-key)). A vnode with
+many groups and bytes holds many warm keys; more owners do not split it, and placement does not
+move a vnode by load. A global aggregate or keyless window keeps all its state on vnode 0; a
+global aggregate counts no `applied_rows`, because other nodes send it partial rows.
 
 ## Cluster Control-Plane TLS (mTLS)
 
@@ -381,21 +449,24 @@ bytes in `laminardb.toml`; the example under [Configuration](#configuration) sho
 |---|---:|---|
 | `server.datafusion_memory_limit_bytes` | 256 MiB | Shared participating DataFusion reservations; DB-owned contexts do not spill to disk. |
 | `server.source_queue_max_bytes` | 64 MiB | Shared connector-to-coordinator Arrow queue, including parked input; each source's waiting batch must also fit. Must be positive and at most `MAX_SOURCE_QUEUE_BYTES`. |
-| `server.pipeline_max_managed_state_bytes` | 256 MiB | Charged bytes of managed operator state (keyed aggregates, windows, joins) per pipeline; must be positive. Lower bound, not RSS. |
+| `server.pipeline_max_managed_state_bytes` | 256 MiB | Charged bytes of operator state (keyed aggregates, windows, joins, process functions, temporal filters, analytic window frames) per pipeline; must be positive. Lower bound, not RSS. |
 | `server.pipeline_max_input_buf_batches` | 256 | Each graph input port; `0` disables the count limit. |
 | `server.pipeline_max_input_buf_bytes` | unset | Each graph input port; a configured value must be positive. |
 | `server.reference_table_max_rows` / `server.reference_table_max_bytes` | 1,000,000 / 256 MiB | Each local reference table; both values must be positive. |
 | `server.materialized_view_max_rows` / `server.materialized_view_max_bytes` | 1,000,000 / 256 MiB | Each local materialized view; both values must be positive. |
+| `server.materialized_view_read_cache_bytes` | 256 MiB | Decoded committed view state, cached by digest for committed reads and view subscriptions; `0` disables the cache. |
 | `checkpoint.max_node_data_bytes` | 512 MiB | Maximum participant checkpoint data object and in-flight captured-state admission, separate from live-state limits. |
 
 `server.pipeline_max_managed_state_bytes` is the same budget embedded users set through
 `LaminarConfig` or the builder. Exceeding it fails with a typed managed-state budget error at
-startup, restore or during a cycle; its accounting is a lower bound and is not RSS. In a cluster,
+startup, restore or during a cycle; its accounting is a lower bound and is not RSS. A cycle that
+fails it, or that would give an aggregate or window more than 1,000,000 groups, halts the
+pipeline with LDB-4008 instead of recovering, since replay would rebuild the same state. In a cluster,
 each node charges only the vnodes it owns, so rescaling changes per-node state but a single hot
 key still lands on one owner. Recovery and reassignment stage restored frames against the same
 budget, so leave headroom for restore. Shuffle queues have fixed per-peer and per-node byte
-budgets that are not configurable. Reference tables and materialized views are local only;
-cluster plans requiring them remain rejected.
+budgets that are not configurable. Reference tables are local only; cluster plans requiring
+them remain rejected.
 
 For a production deployment, start with a representative peak workload and a durable checkpoint
 location. Record **peak process/container RSS**, source lag, cycle backpressure, graph input bytes,
@@ -403,7 +474,26 @@ managed-state charge, checkpoint size and checkpoint duration during normal load
 recovery. The `/metrics` endpoint exposes `laminardb_cycles_backpressured_total`,
 `laminardb_input_buf_bytes`, `laminardb_managed_state_accounted_bytes`,
 `laminardb_checkpoint_size_bytes`, and checkpoint duration/failure metrics. The managed-state
-metric is a lower-bound charge, so use OS/container RSS for memory sizing.
+metric is a lower-bound charge, so use OS/container RSS for memory sizing. Where input waits
+is exported too: `laminardb_source_queue_wait_seconds_total`,
+`laminardb_intake_paused_seconds_total`, `laminardb_sink_epoch_gate_wait_seconds`,
+`laminardb_managed_state_budget_ratio`, the per-operator `laminardb_vnode_*` skew gauges, and in
+a cluster the per-peer `laminardb_shuffle_send_wait_seconds_total` and
+`laminardb_shuffle_budget_used_bytes`.
+The [flow-control table](../laminar-db/README.md#flow-control-and-backpressure) lists every
+bounded buffer, what happens when it is full, and its metrics.
+
+Waits have no deadline by default, since under load a slow peer or sink is expected to hold its
+producer. Two opt-in settings fail a wait that stops making progress as a recoverable fault, which
+recovers from the last checkpoint:
+
+- `server.shuffle_send_stall_timeout` (cluster only) fails a shuffle send when one wait, for its
+  peer's or the node's byte budget or for a slot in the peer's stream queue, lasts that long;
+- `checkpoint.sink_epoch_gate_stall_timeout` fails a cycle's write into an exactly-once sink when
+  the sink's epoch stays in one state that long.
+
+Each must exceed `checkpoint.interval` plus `checkpoint.timeout`, since a healthy epoch can stay
+closed for one interval and one attempt; startup refuses a shorter value.
 
 Set the container memory limit above the measured peak with room for connector decoding, Arrow
 buffers, operator scratch, query results, simultaneous old/new state during restore, checkpoint
@@ -415,6 +505,25 @@ or restored state can fail recovery. Set `checkpoint.max_node_data_bytes` high e
 largest expected participant artifact, then validate with fault/restart testing. Choose
 `checkpoint.interval` for acceptable replay work and storage traffic, and keep
 `checkpoint.timeout` above observed checkpoint duration (defaults: 10s and 120s).
+
+When the database first starts, it adds up its per-node budgets and compares the total with the
+process's cgroup memory limit. That limit is `memory.max`, or `memory.limit_in_bytes` under
+cgroup v1, and the lowest value from the process's cgroup up to the mount is used. If the
+budgets add up to more than the limit, it logs a warning naming each budget. The process can
+then be killed for memory before any budget fails closed. The check runs in every mode, never
+stops startup, and derives no default from the limit. The per-node budgets are:
+
+- managed state, `server.datafusion_memory_limit_bytes`, the source queue and the view read
+  cache;
+- `checkpoint.max_node_data_bytes`;
+- on a single node, local subscription logs (256 MiB);
+- on a cluster node, subscription output (256 MiB) and shuffle (128 MiB in each direction).
+
+With the defaults that is 1,600 MiB on a single node and 1,856 MiB on a cluster node. Per-view,
+per-table and per-source limits come on top.
+`/metrics` exports each per-node budget as `laminardb_memory_budget_bytes{area}`. When the
+process has a cgroup limit, it also exports `laminardb_cgroup_memory_max_bytes`, read once at
+startup.
 
 `server.datafusion_memory_limit_bytes` bounds participating fallible DataFusion reservations in both
 server modes and requires a restart to change. DB-owned contexts share the limit and disable
@@ -429,7 +538,7 @@ for producer scratch, parked messages and downstream retention.
 `server.pipeline_max_input_buf_batches` and `server.pipeline_max_input_buf_bytes` configure
 prospective graph-port limits in both server modes. The count default is 256; the byte cap is
 unset by default and must be greater than zero when supplied. Fan-out charges each port
-independently. Output that cannot fit after execution halts before routing; see the
+independently. A full port makes its producer wait; see the
 [graph input contract](../laminar-db/README.md#graph-input-limits). These startup settings are
 not hot-reloaded and do not bound total process RSS.
 
@@ -441,10 +550,10 @@ Cluster reference-table admission remains restricted. See the
 for shared Arrow buffers, external ownership, checkpoint captures and memory headroom.
 
 `server.materialized_view_max_rows` and `server.materialized_view_max_bytes` apply to every
-local MV storage mode. Both must be nonzero. Aggregate, upsert and multiset growth fails
-before any affected MV changes or publishes cycle output. Append storage evicts oldest
-complete batches, but rejects a single batch that cannot fit. Restore fails instead of
-truncating committed state. Cluster MV admission remains rejected. See the
+local MV storage mode, and on a cluster node to its part of each view. Both must be nonzero.
+Aggregate, upsert and multiset growth fails before any affected MV changes or publishes cycle
+output. Append views count the rows waiting for the next checkpoint and fail instead of dropping
+rows. Restore fails instead of truncating committed state. See the
 [MV accounting and publication scope](../laminar-db/README.md#materialized-view-memory-limits).
 
 ## Tuning the Allocator (`MALLOC_CONF`)
@@ -459,6 +568,8 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto
 
 - `background_thread:true` spawns an auxiliary thread that purges freed pages back to the OS asynchronously. Without this, decay only fires on alloc/free events; a server that settles into a steady rhythm can end up holding pages indefinitely and RSS drifts upward. **This is the single most impactful setting for a long-running streaming process.**
 - `metadata_thp:auto` backs jemalloc's internal metadata with transparent huge pages where available, reducing TLB pressure.
+
+Linux builds already enable `background_thread` by default. jemalloc has no background threads on macOS, where the option makes its initialisation fail and the server abort at startup, so macOS builds leave it off.
 
 ### When you're specifically trying to minimize RSS
 

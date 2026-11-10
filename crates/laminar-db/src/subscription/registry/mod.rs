@@ -16,7 +16,9 @@ use tokio::sync::watch;
 mod lifecycle;
 mod reader;
 
-pub(crate) use lifecycle::SubscriptionRegistry;
+pub(crate) use lifecycle::{
+    process_subscription_log_bytes, SubscriptionRegistry, PROCESS_SUBSCRIPTION_BYTES,
+};
 pub(super) use reader::SubscriptionRead;
 pub(crate) use reader::SubscriptionReader;
 #[cfg(test)]
@@ -104,7 +106,6 @@ impl SubscriptionMemoryBudget {
         debug_assert!(released.is_ok(), "subscription memory released twice");
     }
 
-    #[cfg(test)]
     fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
@@ -136,7 +137,7 @@ pub enum SubscribeStart {
     AfterSequence(u64),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum SubscriptionOpenError {
     ReplayPruned {
         /// Earliest barrier epoch eligible for replay; `0` if none is retained.

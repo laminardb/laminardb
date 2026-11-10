@@ -89,7 +89,7 @@ impl LeaderLeaseStore {
         retained: &mut std::collections::BTreeSet<u64>,
     ) -> Result<(), super::LeaseError> {
         if let Some(baseline) = head.topology_baseline.as_ref() {
-            self.audit_topology_adoption(baseline).await?;
+            self.audit_topology_baseline(baseline).await?;
             retained.insert(baseline.authority_sequence);
         }
         for operation in &head.topology_operations {

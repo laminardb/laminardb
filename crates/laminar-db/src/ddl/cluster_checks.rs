@@ -244,58 +244,9 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Certify that both interval-join inputs carry an event-time watermark on their time column.
-    async fn validate_interval_join_watermarks(
-        &self,
-        config: &laminar_sql::translator::StreamJoinConfig,
-    ) -> Result<(), DbError> {
-        for (side, input, time_column) in [
-            (
-                "left",
-                config.left_table.as_str(),
-                config.left_time_column.as_str(),
-            ),
-            (
-                "right",
-                config.right_table.as_str(),
-                config.right_time_column.as_str(),
-            ),
-        ] {
-            if self
-                .input_event_time(input)
-                .await?
-                .is_none_or(|event_time| event_time.column != time_column)
-            {
-                return Err(DbError::InvalidOperation(format!(
-                    "{side} interval join input '{input}' must carry an event-time watermark on '{time_column}': a source that declares it, or an append-only stream that forwards it unchanged"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// The event time an input carries for a consumer that orders by it: a source's declared
-    /// watermark, or the forwarded watermark of an append-only stream.
-    async fn input_event_time(
-        &self,
-        input: &str,
-    ) -> Result<Option<crate::exchange_plan::EventTime>, DbError> {
-        if let Some(source) = self.catalog.get_source(input) {
-            return Ok(crate::exchange_plan::source_event_time(&source));
-        }
-        let resolved = self.resolve_catalog_stream_outputs(None).await?;
-        Ok(resolved
-            .exchange_plan
-            .stream(input)
-            .filter(|stream| {
-                stream.output.changelog == crate::exchange_plan::ChangelogKind::AppendOnly
-            })
-            .and_then(|stream| stream.output.event_time.clone()))
-    }
-
     /// Reject a stream whose pipeline crosses more remote exchanges than cluster checkpoints are
     /// measured for; every flush wave moves rows one remote hop while sources are held. A stream
-    /// that reads only sources crosses at most one.
+    /// that reads only sources crosses at most one; a materialized view is a stream input too.
     async fn validate_cluster_exchange_depth(
         &self,
         object_kind: &str,
@@ -305,14 +256,23 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         if !crate::sql_analysis::extract_table_references(query_sql)
             .iter()
-            .any(|input| self.catalog.get_stream_entry(input).is_some())
+            .any(|input| {
+                self.catalog.get_stream_entry(input).is_some() || self.mv_store.read().has_mv(input)
+            })
         {
             return Ok(());
         }
         let resolved = self
             .resolve_catalog_stream_outputs(Some(plan.candidate_registration(name, query_sql)))
             .await?;
-        let depth = resolved.exchange_plan.remote_depth(name);
+        // A view placed by its full row routes its rows to their owners: one more exchange.
+        let routes_by_row = (object_kind == "materialized view"
+            || self.mv_store.read().has_mv(name))
+            && resolved.exchange_plan.stream(name).is_some_and(|plan| {
+                plan.output.distribution == crate::exchange_plan::Distribution::Arbitrary
+                    && plan.output.changelog == crate::exchange_plan::ChangelogKind::Weighted
+            });
+        let depth = resolved.exchange_plan.remote_depth(name) + usize::from(routes_by_row);
         if depth > MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH {
             return Err(Self::cluster_state_lifecycle_error(
                 object_kind,
@@ -446,15 +406,44 @@ impl LaminarDB {
             return Ok(true);
         }
         if crate::sql_analysis::extract_table_references(query_sql).len() > 1 {
-            return Err(Self::cluster_state_lifecycle_error(
-                object_kind,
-                name,
-                "ordinary SQL execution requires a single input frontier; multiple sources require a managed join stage",
-            ));
+            self.validate_cluster_union(object_kind, name, query_sql, plan)
+                .await?;
         }
 
         self.validate_cluster_aggregate_shape(object_kind, name, query_sql, plan)
             .await
+    }
+
+    /// A `UNION ALL` runs on each node over that node's rows, and a managed consumer closes on the
+    /// lowest node-local frontier of the sources its branches forward. So every branch must
+    /// forward one source event-time column through stateless projections only.
+    async fn validate_cluster_union(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        use crate::exchange_plan::{ChangelogKind, EventTimeOrigin};
+
+        let resolved = self
+            .resolve_catalog_stream_outputs(Some(plan.candidate_registration(name, query_sql)))
+            .await?;
+        if resolved.exchange_plan.stream(name).is_some_and(|stream| {
+            stream.output.changelog == ChangelogKind::AppendOnly
+                && stream
+                    .output
+                    .event_time
+                    .as_ref()
+                    .is_some_and(|event_time| event_time.origin == EventTimeOrigin::Source)
+        }) {
+            return Ok(());
+        }
+        Err(Self::cluster_state_lifecycle_error(
+            object_kind,
+            name,
+            "a query over several inputs needs a managed join stage, or a UNION ALL whose every branch forwards one source event-time column unchanged through projections and filters",
+        ))
     }
 
     /// Managed `TUMBLE`/`HOP`/`SESSION` window admission. `Some(true)` admits the
@@ -479,9 +468,9 @@ impl LaminarDB {
                 "cluster windows require EMIT ON WINDOW CLOSE or EMIT FINAL on the managed CoreWindow path",
             ));
         }
-        if plan.join_config.is_some() || crate::sql_analysis::has_join_clause(query_sql) {
+        if !window.allowed_lateness.is_zero() {
             return Err(reject(
-                "a windowed join requires a planner-certified combined join/window vnode lifecycle",
+                "ALLOW LATENESS is not certified for cluster windows; omit it to close windows at the watermark",
             ));
         }
         let input = crate::sql_analysis::managed_core_window_input(query_sql, window)
@@ -498,7 +487,7 @@ impl LaminarDB {
             })
         {
             return Err(reject(
-                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that forwards it unchanged",
+                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that carries it",
             ));
         }
         let managed = crate::core_window_state::CoreWindowState::try_from_sql(

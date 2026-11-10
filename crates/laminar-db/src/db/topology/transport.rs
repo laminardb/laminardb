@@ -215,7 +215,7 @@ impl LaminarDB {
                 .lock()
                 .clone()
                 .ok_or(TopologyError::Fenced)?;
-            let mut parent = if fresh.plan().expected_parent == TopologyVersion::LEGACY_BASELINE {
+            let mut parent = if fresh.plan().expected_parent == TopologyVersion::BASELINE {
                 None
             } else {
                 Some(

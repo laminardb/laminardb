@@ -19,19 +19,19 @@ impl Drop for PeriodicCheckpointHold<'_> {
 }
 
 impl ClusterController {
-    /// Hold periodic checkpoint admission so a topology admission observes a gap between
-    /// checkpoint artifact reservations; back-to-back periodic cuts otherwise leave none.
-    /// Manual checkpoints are unaffected, and the caller's deadline bounds the hold.
+    /// Hold periodic checkpoint admission so a topology admission or assignment drain observes a
+    /// gap between checkpoint cuts; back-to-back periodic cuts otherwise leave none. Manual
+    /// checkpoints are unaffected, and the caller's deadline bounds the hold.
     pub fn hold_periodic_checkpoints(&self) -> PeriodicCheckpointHold<'_> {
-        self.topology_admission_waiters
+        self.checkpoint_gap_waiters
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        PeriodicCheckpointHold(&self.topology_admission_waiters)
+        PeriodicCheckpointHold(&self.checkpoint_gap_waiters)
     }
 
-    /// Whether a local topology admission is waiting for a checkpoint gap.
+    /// Whether a local topology admission or assignment drain is waiting for a checkpoint gap.
     #[must_use]
     pub fn periodic_checkpoints_held(&self) -> bool {
-        self.topology_admission_waiters
+        self.checkpoint_gap_waiters
             .load(std::sync::atomic::Ordering::Acquire)
             > 0
     }

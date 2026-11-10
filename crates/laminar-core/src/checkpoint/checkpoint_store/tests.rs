@@ -1035,3 +1035,70 @@ fn create_attempt_timeout_scales_with_payload_size() {
         std::time::Duration::from_secs(128)
     );
 }
+
+#[tokio::test]
+async fn view_log_objects_are_create_once_range_readable_and_deletable() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(backing);
+    let payload = [Bytes::from_static(b"first"), Bytes::from_static(b"second")];
+    let chunk = StateChunkId {
+        participant_id: LOCAL_NODE_ID.0,
+        checkpoint_id: 7,
+    };
+    let object = NodeDataObject {
+        chunk,
+        object_length: 11,
+        sha256: checkpoint_sha256(b"firstsecond"),
+    };
+    store.save_view_log(&object, &payload).await.unwrap();
+    // An identical retry is accepted; different bytes under the same identity are not.
+    store.save_view_log(&object, &payload).await.unwrap();
+    let other = NodeDataObject {
+        sha256: checkpoint_sha256(b"secondfirst"),
+        ..object.clone()
+    };
+    let swapped = [payload[1].clone(), payload[0].clone()];
+    assert!(store.save_view_log(&other, &swapped).await.is_err());
+    let wrong_digest = NodeDataObject {
+        sha256: checkpoint_sha256(b"other"),
+        ..object.clone()
+    };
+    assert!(store.save_view_log(&wrong_digest, &payload).await.is_err());
+
+    let ranges = [
+        ByteRange {
+            offset: 5,
+            length: 6,
+        },
+        ByteRange {
+            offset: 0,
+            length: 5,
+        },
+    ];
+    let loaded = store
+        .load_view_log_ranges(chunk, 11, &ranges)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded,
+        [Bytes::from_static(b"second"), Bytes::from_static(b"first")]
+    );
+    assert!(store
+        .load_view_log_ranges(chunk, 12, &ranges)
+        .await
+        .is_err());
+    // The view log never aliases the node-data object at the same identity.
+    assert!(store
+        .load_node_data_ranges(chunk, 11, &ranges)
+        .await
+        .unwrap()
+        .is_none());
+
+    store.delete_view_log(chunk).await.unwrap();
+    assert!(store
+        .load_view_log_ranges(chunk, 11, &ranges)
+        .await
+        .unwrap()
+        .is_none());
+}

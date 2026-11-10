@@ -288,8 +288,8 @@ impl CheckpointCoordinator {
         let predecessor = self
             .authoritative_committed_predecessor_until(scope, deadline)
             .await?;
-        let predecessor_source_watermarks = self
-            .predecessor_source_watermarks_until(predecessor.as_ref(), deadline)
+        let predecessor_frontiers = self
+            .predecessor_frontiers_until(predecessor.as_ref(), deadline)
             .await?;
         let index = self
             .build_validated_committed_index_until(
@@ -297,7 +297,7 @@ impl CheckpointCoordinator {
                 scope,
                 assignment_fence.cloned(),
                 predecessor.clone(),
-                &predecessor_source_watermarks,
+                &predecessor_frontiers,
                 &prepared.manifests,
                 quorum_watermark,
                 deadline,
@@ -370,12 +370,18 @@ impl CheckpointCoordinator {
             .as_ref()
             .map_or(0, |reference| reference.checkpoint_id);
         self.last_committed_ref = Some(reference.clone());
-        self.last_committed_source_watermarks = Some((reference, index.source_watermarks.clone()));
+        self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
+            index.clone(),
+            reference.clone(),
+            prepared.manifests.iter().map(|(manifest, _)| manifest),
+        )));
+        self.last_committed_frontiers = Some((reference, super::CommittedFrontiers::of(&index)?));
         self.last_committed_manifest = prepared
             .manifests
             .iter()
             .find(|(manifest, _)| manifest.participant_id == self.store.participant_id())
             .map(|(manifest, _)| Arc::new(manifest.clone()));
+        self.view_log_predecessor = self.last_committed_manifest.clone();
         self.prepared.remove(&attempt);
         self.allocator
             .advance_epoch_to(super::checked_successor_epoch(
@@ -470,7 +476,7 @@ impl CheckpointCoordinator {
         let checkpoint_bytes = self
             .last_committed_manifest
             .as_ref()
-            .map(|manifest| manifest.node_data.object_length);
+            .map(|manifest| super::data_object_bytes(manifest));
         self.record_checkpoint_outcome(true, attempt, duration, checkpoint_bytes);
         let continuation_error = continuation.err().map(|error| {
             self.failure_requires_recovery = true;

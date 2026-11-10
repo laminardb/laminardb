@@ -15,8 +15,8 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 | `ts - INTERVAL '10' SECOND` | `ts - INTERVAL '10' SECOND` | Native on `TIMESTAMP` columns since v0.20.1 |
 | `CASE WHEN ... THEN vol ELSE 0` | `CASE WHEN ... THEN vol ELSE CAST(0 AS BIGINT)` | ELSE branch must match column type |
 | `SHOW TABLES` | `SHOW SOURCES` / `SHOW STREAMS` | LaminarDB uses source/stream terminology |
-| `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion 52 built-ins |
-| `UNNEST(array_col)` | `UNNEST(array_col)` | Available via DataFusion 52 built-ins |
+| `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion built-ins |
+| `UNNEST(array_col)` | `UNNEST(array_col)` | Available via DataFusion built-ins |
 
 ---
 
@@ -185,6 +185,64 @@ GROUP BY account_id, SESSION(ts, INTERVAL '2' SECOND)
 - Useful for detecting bursts/spikes in per-entity activity
 - Each entity (GROUP BY key) has independent sessions
 
+### Late rows and `ALLOW LATENESS`
+
+With `EMIT ON WINDOW CLOSE`, a window closes when the watermark reaches its end. A row that
+arrives for a closed window is dropped and counted in `window_late_dropped_total`.
+`ALLOW LATENESS` keeps each window open for longer:
+
+```sql
+CREATE STREAM per_minute AS
+SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS window_start, COUNT(*) AS trades
+FROM trades
+GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '30' SECOND
+```
+
+- Each window is emitted once, when the watermark reaches its end plus the lateness.
+- The clause must follow `EMIT ON WINDOW CLOSE`. `CREATE` rejects it with `EMIT FINAL` (which
+  drops late rows), with any other `EMIT` mode, on a query without a window, and in cluster mode.
+  `LATE DATA TO` is rejected too.
+
+### Windows over windows
+
+A closed `TUMBLE` or `HOP` window's output carries one event-time column, and its watermark
+trails the watermark its windows close at, so a window over that column never receives a row
+after the window that row belongs to has closed:
+
+- When the upstream projects `tumble_end` or `hop_end`, that end column is its event time, and its
+  watermark trails by the allowed lateness.
+- Otherwise, when it projects `tumble(...)` or `hop(...)`, that start column is its event time, and
+  its watermark also trails by the window size.
+
+`CREATE` rejects a window over a window stream that groups by any other column, and a window over a
+session window or over a window that projects no boundary, which carry no event time.
+
+### `UNION ALL` over event-time inputs
+
+A `UNION ALL` carries its inputs' event-time column when every branch is a projection or filter
+over one append-only input that forwards that input's event-time column unchanged to the same
+output column, with the same type, and every input's column comes from the same kind of operator
+(a source, an interval join, or a closed window). Its watermark is the lowest of its inputs'
+watermarks; an input that is idle does not hold it back. A window or an interval join may then read
+the union on that column, and an append-only view over it keeps an interval on it.
+
+```sql
+CREATE STREAM all_trades AS
+  SELECT symbol, price, ts FROM nyse_trades
+  UNION ALL
+  SELECT symbol, price, ts FROM lse_trades;
+
+CREATE STREAM bars AS
+  SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS minute, MAX(price) AS high
+  FROM all_trades
+  GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+  EMIT ON WINDOW CLOSE;
+```
+
+A union that computes the column in any branch, places it in different columns, or mixes kinds of
+operators carries no event time. In cluster mode see [Cluster SQL boundary](#cluster-sql-boundary).
+
 ---
 
 ## Joins
@@ -218,8 +276,8 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 **Key points:**
 
 - Each input must carry a watermark on its `TIMESTAMP NOT NULL` event-time column: a source that
-  declares it, or an append-only stream that forwards that column unchanged through a projection
-  or filter. Append-only pairs use the ordinary path. If either input is a mutable connector, both
+  declares it, or an append-only stream that carries it (a projection or filter that forwards it
+  unchanged, another interval join, or a closed window). Append-only pairs use the ordinary path. If either input is a mutable connector, both
   connectors must expose ordered deterministic row positions and a replayable recovery contract.
 - Append-only bounded intervals retain live hot-add support in a running local checkpoint-disabled
   pipeline; their post-projection is initialized before the first cycle can route or retain input.
@@ -246,10 +304,12 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
   projection/filter subqueries are not supported by the flattened pair projection.
 - Outer and anti unmatched rows become final only when the opposite input watermark closes their
   possible match interval.
-- Cross, unbounded, general non-equality, intermediate-input, and multi-way joins fail closed on
-  this bounded stream-stream path. `FOR SYSTEM_TIME AS OF` and `TEMPORAL PROBE JOIN` use the
-  separate managed vnode-keyed temporal path for one direct `INNER` or `LEFT` join in single-node
-  and cluster mode. `ASOF JOIN` is not an alias; use `FOR SYSTEM_TIME AS OF`.
+- Cross, unbounded, general non-equality, and intermediate-input joins fail closed on this bounded
+  stream-stream path, and so does a join of three or more inputs unless it is a chain of interval
+  joins over named inputs, which is split into stages (below). `FOR SYSTEM_TIME AS OF` and
+  `TEMPORAL PROBE JOIN` use the separate managed vnode-keyed temporal path for one direct `INNER`
+  or `LEFT` join in single-node and cluster mode. `ASOF JOIN` is not an alias; use
+  `FOR SYSTEM_TIME AS OF`.
 
 To aggregate rows from any of the eight kinds, name the join output and create a separate keyed
 aggregate stage:
@@ -336,15 +396,20 @@ non-`DISTINCT` aggregates:
 | `MIN(col)` / `MAX(col)` | Min/max |
 
 `first_value` and `last_value` are available on supported local window paths, not on the distributed
-named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog inputs remain rejected
-because bounded retractable extrema state is not supported. Mutable bounded-join output can feed
-`COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join output keeps
-the ordinary row stream.
+named-aggregate path. `DISTINCT` aggregates over changelog inputs remain rejected. `MIN` and `MAX`
+over a changelog (an `EMIT CHANGES` aggregate, a changelog view, or a CDC or change-feed source)
+keep each value a group holds with its net weight, so retracting the current extreme falls back
+to the next one; that state counts toward the memory budgets like other retained state. In
+cluster mode a global (ungrouped) `MIN` or `MAX` over a changelog has every node send its rows to
+the owner of vnode 0, which holds every value, so that one node applies the whole input. Mutable
+bounded-join output can feed `COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink;
+append-only join output keeps the ordinary row stream.
 
 ### Nested aggregates and aggregates over a join
 
-A statement that no single operator can run is split into internal stages named
-`<stream>$stage<n>`, each admitted by the rules for its own shape in every mode:
+A `CREATE STREAM` or `CREATE MATERIALIZED VIEW` that no single operator can run is split into
+internal stages named `<name>$stage<n>`, each admitted by the rules for its own shape in every
+mode:
 
 ```sql
 -- A join stage, then a keyed aggregate over it.
@@ -362,6 +427,12 @@ SELECT trade_count, COUNT(*) AS accounts
 FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
 GROUP BY trade_count
 EMIT CHANGES;
+
+-- The same split under a view, which keeps only the outer aggregate's rows.
+CREATE MATERIALIZED VIEW trade_count_histogram AS
+SELECT trade_count, COUNT(*) AS accounts
+FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
+GROUP BY trade_count;
 ```
 
 - An aggregate over one two-way join reads a join stage that projects each input column the
@@ -371,11 +442,62 @@ EMIT CHANGES;
   An aggregating subquery emits changes, so the outer aggregate supports `COUNT`, `SUM` and `AVG`
   but not `MIN` or `MAX`. In cluster mode a windowed subquery is rejected, because cluster windows
   emit only closed windows.
-- Stages belong to their stream. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
-  `DROP STREAM` removes its stages, and no other statement may read, drop or create a
-  `$stage` name. A failed `CREATE` removes the stages it created.
-- A join of three or more inputs still needs named two-way stages: a join's output carries no
-  event time, so an interval join cannot read it.
+- Stages belong to their stream or view. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
+  `DROP STREAM` or `DROP MATERIALIZED VIEW` removes its stages, and no other statement may read,
+  drop or create a `$stage` name. A failed `CREATE` removes the stages it created.
+- A join's output carries one event-time column, the time column of a side present on every
+  output row when the join projects it unchanged: for `INNER` the left one, otherwise the right
+  one; the left one for `LEFT`, `LEFT SEMI` and `LEFT ANTI`; the right one for `RIGHT`,
+  `RIGHT SEMI` and `RIGHT ANTI`. A `FULL` join's output carries none. Its watermark trails the
+  inputs' by the join bound, so a window or another interval join can read that column without
+  late rows.
+- A chain of interval joins over three or more named inputs (`a JOIN b ON .. JOIN c ON ..`, each
+  `ON` with a `BETWEEN` bound) is split into one stage per join: the first joins `a` and `b`, and
+  each later one joins the stage before it with the next input. Each stage projects the columns
+  read after it as `<qualifier>_<column>`, so every column must carry its input qualifier. Without
+  an aggregate the stream itself runs the last join and `WHERE` filters it; an aggregate or window
+  reads the last join's stage, which `WHERE` filters.
+- Each later join's `BETWEEN` must bound its time by the event-time column of the stage it reads,
+  chosen as for any join output (above) among the columns the stage projects. An inner join's
+  stage carries its left input's time column when anything after the join reads it, otherwise its
+  right input's: a chain whose second join is bounded by `b.ts` in `a JOIN b ON .. b.ts BETWEEN
+  a.ts AND ..` works only if nothing after the first join reads `a.ts`. Otherwise `CREATE` fails
+  and names the column the stage carries.
+- A window over a join or a chain in the same statement reads the last join's stage. In cluster
+  mode it must window on the time column that stage carries.
+- Other joins of three or more inputs, such as one with a lookup or temporal table, `USING`, or a
+  subquery input, need named two-way stages.
+
+### Spreading a hot key
+
+In cluster mode every row of a group key goes to the node that owns the key's vnode, so one very
+frequent key loads one node. Aggregate in two stages with a salt: the first stage groups by the
+key and the salt, which spreads the key's rows over the nodes that own the salted groups; the
+second adds the per-salt results back up.
+
+```sql
+CREATE STREAM symbol_volume_salted AS
+SELECT symbol, account_id % 8 AS salt, COUNT(*) AS trades, SUM(volume) AS volume
+FROM trades
+GROUP BY symbol, account_id % 8
+EMIT CHANGES;
+
+CREATE STREAM symbol_volume AS
+SELECT symbol, SUM(trades) AS trades, SUM(volume) AS volume
+FROM symbol_volume_salted
+GROUP BY symbol
+EMIT CHANGES;
+```
+
+- The salt must vary within the hot key; a column that is constant per key spreads nothing.
+- The second stage reads changes: at most two rows per salted group per cycle instead of every row
+  of the key.
+- `COUNT` becomes a `SUM` of counts and `SUM` a `SUM` of sums. For an average, keep both and
+  divide when reading, because an aggregate stage cannot compute `SUM(volume) / SUM(trades)`.
+  `MIN` becomes a `MIN` of minimums and `MAX` a `MAX` of maximums; the second stage keeps every
+  salted group's current extreme so it can take one back.
+- The salted stage is one more remote exchange (a pipeline may have three below its sources) and
+  adds one cycle of latency.
 
 ### Streaming UDFs
 
@@ -416,26 +538,28 @@ Otherwise the source must be owned by a route that keeps keyed state (a temporal
 or a bounded interval join); sink filters and plain streams over it are rejected before any I/O.
 
 ```rust
-// FromRow struct fields must match SELECT column order exactly
 #[derive(FromRow)]
 pub struct OhlcRow {
-    pub symbol: String,      // 1st SELECT column
-    pub window_start: i64,   // 2nd SELECT column
-    pub open: f64,           // 3rd SELECT column
-    // ... etc
+    pub symbol: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
 }
 
-let sub = db.subscribe::<OhlcRow>("ohlc")?;
+let mut sub = db.subscribe::<OhlcRow>("ohlc").await?;
 
-// Poll for results (non-blocking)
-while let Some(rows) = sub.poll() {
+// Poll for results without blocking; `sub.next_frame().await` waits instead.
+while let Some(rows) = sub.poll()? {
     for row in &rows {
         println!("{}: O={} H={} L={} C={}", row.symbol, row.open, row.high, row.low, row.close);
     }
 }
 ```
 
-**Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter, only position does.
+`FromRow` fills each field from the column with the same name, or the name given in
+`#[column("...")]`, so alias SQL expressions to match the struct. An `i64` field needs a
+`BIGINT` column; cast a window's `TIMESTAMP` first.
 
 ### Kafka
 
@@ -499,18 +623,87 @@ boundaries, poison-message handling, and tested behaviour.
 ### Cluster SQL boundary
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
-the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
-aggregates. A cluster window reads a source, or an append-only stream that forwards the source's
-event-time column unchanged; it requires a bounded watermark on that column and `EMIT ON WINDOW
-CLOSE` or `EMIT FINAL`. A join output may feed a keyed aggregate, either as a named stream or in
-one statement that is split into stages; windowed joins remain rejected. A stream may sit at most
-three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
-which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
+the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION` aggregates.
+A cluster window reads a source, or an append-only stream that carries an event-time column: a
+projection or `UNION ALL` that forwards a source's, an interval join other than `FULL`, or a closed
+`TUMBLE` or `HOP` window. It windows on that column, requires a bounded watermark on it, and needs
+`EMIT ON WINDOW CLOSE` or `EMIT FINAL`. An interval join may read another interval join's stream on
+that stream's event-time column. A join output may feed a keyed aggregate or a window, either as a
+named stream or in one statement that is split into stages, and a chain of interval joins over three
+or more inputs is split the same way. A `UNION ALL` is admitted when every branch forwards one
+source event-time column unchanged through projections and filters (see [`UNION ALL` over event-time
+inputs](#union-all-over-event-time-inputs)); each node unions the rows it holds, and a window or
+join over it closes on the lowest of its sources' watermarks. Other multi-input queries, and a union
+over a join or window stream or one that drops the event-time column, are rejected with
+`[LDB-4007]`. A stream may sit at most three remote exchanges (joins, aggregates, or windows)
+downstream of its sources, the depth for which checkpoint pauses are measured; a deeper pipeline is
+rejected with `[LDB-4007]`.
 
-Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
-retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
-the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. The
-cluster admission path rejects unsupported state before connector I/O.
+Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admits:
+
+- a keyed or global aggregate view;
+- a projection or filter over such a view, keeping or dropping its key columns;
+- an append-only view: a projection over a source, a `UNION ALL` of them, a closed window, or an
+  interval join;
+- a chain of interval joins, an aggregate or window over a join or a chain, or an aggregate over
+  an aggregating or joining subquery, split into stages as for a stream.
+
+Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
+moves them with their vnodes when ownership changes. A view that drops or changes its input's
+key places each row by the whole row, so the node that produces a row sends it to the node that
+owns it; that counts as one more remote exchange. Each node keeps the part of an append-only
+view's log that it produced. When a node leaves, through rebalancing or failure, another node
+takes over its log in the next checkpoint without copying it. A topology migration that adds,
+replaces or drops other objects keeps every view and its rows. A migration may also add a view
+(`CREATE MATERIALIZED VIEW`) or drop one (`DROP MATERIALIZED VIEW` without `CASCADE`), but not
+drop and recreate the same view. A new view over an existing aggregate or view starts from that
+input's rows at the migration's checkpoint, then follows its later changes; a new view over a
+source starts empty there and sees only later rows. A new view over a stream that only reshapes
+an aggregate's changes is rejected, because no node keeps that stream's rows; define it over the
+aggregate. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
+from every node's checkpointed state. A node that takes part in no checkpoint (draining, or not
+yet assigned) learns of each new checkpoint from the cluster's checkpoint authority within about
+a second; after a topology migration it keeps the last checkpoint of its own topology until it
+runs the new one. A `SELECT` over pgwire or HTTP on a cluster node reads committed checkpoints in
+the same way unless the session asks for the latest cycle, which a cluster node refuses because
+it holds only its part of each view (see section 8). `SUBSCRIBE` to a view reads committed
+checkpoints in the same way, as described below. [Delivery guarantees](DELIVERY_GUARANTEES.md#materialized-view-reads)
+lists what a committed read guarantees and the fault soak that checks it.
+
+An append-only view's interval retention follows one event-time frontier per view, committed
+with each checkpoint: the lowest frontier among the nodes whose input is active, never moving
+back. Every node keeps the same rows, wherever they were written. A row that arrives behind that
+frontier minus the interval is dropped and counted in `mv_rows_below_horizon_total`; embedded and
+single-node runtimes count their drops the same way. A `'<n> rows'` retention applies on each
+node separately, so a cluster keeps up to `n` rows per node and may keep fewer after a node
+leaves; when a node takes over another's log, the adopted rows count as its newest. A cluster
+checkpoint retains at most 24,576 view-log segments across all nodes, an even share per node
+(8,192 each on three nodes), and a rebalance is refused before it starts when the remaining nodes
+could not take over the leaving nodes' logs within their share.
+
+A `SUBSCRIBE` to a materialized view first delivers the view's rows, then each change to them.
+A changelog view (an aggregate, or a projection or filter over one) adds an Int64 `__weight`
+column. Every snapshot row has weight 1. A change gives each row the amount by which it changed
+the row's count, so an update retracts the old row with `-1` and inserts the new one with `+1`,
+and a row whose count did not change is not sent. Adding up everything received by weight gives
+the view's current rows. An append-only view delivers plain rows: its retained rows, then each
+row it keeps. A row leaving its retention is not a change, and a row dropped behind the retention
+horizon is never delivered. In embedded and single-node runtimes the snapshot is the view after
+the latest cycle and each later cycle's change follows it; `AS OF EPOCH` on a view is rejected
+(`0A000`), because a view subscription always starts from the view's rows. Earlier releases sent
+a changelog view's whole contents as plain rows after every cycle instead.
+
+In a cluster any node serves a subscription to any view from committed checkpoints. The snapshot
+is the view at the newest committed checkpoint, or at `AS OF EPOCH <n>` while checkpoint `n` is
+retained, and a progress frame for that epoch follows it. Each later committed checkpoint then
+delivers the view's change since the one before, followed by its own progress frame. A changelog
+view's change is netted over the whole checkpoint interval, so a row that changes and changes back
+between two checkpoints is not sent; rows within one interval arrive in no particular order. An
+append-only view delivers the rows each node appended in that interval; rows a node takes over
+from a node that left, and segments its log compaction rewrites, are not new rows. A subscription
+survives rebalancing, a node leaving, and topology migrations that keep the view. It ends with a
+typed error when a migration drops the view, or when it falls so far behind that the checkpoint
+it last delivered is no longer retained.
 
 ### SUBSCRIBE over the Postgres wire protocol
 
@@ -520,10 +713,10 @@ When the server is started with `pgwire_bind` set, materialized views can be str
 SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
 ```
 
-- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.
+- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable. A view's rows arrive as described above.
 - The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
 - The query stays open until the client disconnects. Local runtimes preserve their existing delivery behaviour; cluster data becomes visible only after a complete cluster checkpoint commits.
-- Cluster `SUBSCRIBE` is supported only for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, materialized views, and uncertified plans fail before subscription backend I/O.
+- Cluster `SUBSCRIBE` is supported for materialized views, as described above, and for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, and uncertified plans fail before subscription backend I/O.
 - Every cluster server is a gateway over the same shared committed history; clients do not need to locate current vnode owners.
 - Cluster ordering is strict and contiguous within each vnode output partition. Fair gateway merging defines no order between partitions and does not imply arrival, event-time, SQL-sort, or global total order.
 - Partition sequences describe committed source-log frames. A `WHERE` predicate can remove every row from a frame, so optional frame metadata observed by a filtered client can have non-adjacent partition sequences without indicating that a matching row was skipped.
@@ -545,7 +738,8 @@ aggregate scope, history is a byte-bounded suffix of verified immutable Arrow se
 by authoritative committed checkpoint indexes in shared object storage. Object listing is never
 commit authority.
 
-WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds
+WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`; in a
+cluster, a materialized view's data frames also carry `committed_epoch` and `snapshot`. Pgwire adds
 `__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` control columns without changing
 the user data schema. Cluster progress is emitted only after the complete participant roster and
 partition-frontier vector commit. Durably record a marker after processing its preceding data, then
@@ -631,11 +825,15 @@ An input is `forward` (rows stay where they are), `repartition on (...)` (rows m
 owner of their key), `colocated on (...)` (an aggregate whose input is already hashed on its
 group key, so no rows move), `gather partials to vnode N` (a global aggregate: in cluster mode
 each other node sends one partial row per input batch instead of its rows), or `gather to vnode N`
-(a window without a group key). Join inputs are named
+(a window without a group key, or a global aggregate with a `MIN` or `MAX` over a changelog: the
+other nodes send their rows). Join inputs are named
 `left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
-(an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry a source
-watermark on that column (a source's own, or one a projection forwards unchanged).
+(an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry an
+event-time column: a source's watermark column, one a projection or `UNION ALL` forwards unchanged,
+an interval join's time column, or a closed window's boundary (see
+[Windows over windows](#windows-over-windows) and
+[Bounded event-time join](#bounded-event-time-join)).
 
 For a statement that is split into stages, `EXPLAIN` lists each stage's SQL as a
 `stage.<name>` row, followed by that stage's `stage.<name>.exchange.*` rows. An aggregate that
@@ -698,27 +896,23 @@ SELECT TUMBLE_START(ts, INTERVAL '5' SECOND), FIRST(price), LAST(price)
 SELECT tumble(ts, INTERVAL '5' SECOND), first_value(price), last_value(price)
 ```
 
-### 4. FromRow field ordering
+### 4. FromRow matches columns by name
 
 ```rust
 // SQL: SELECT symbol, SUM(volume) AS total, AVG(price) AS avg_price
 
-// WRONG: field names don't matter, ORDER matters
 #[derive(FromRow)]
-pub struct Bad {
-    pub avg_price: f64,  // This gets the 1st column (symbol), not avg_price!
+pub struct Summary {
+    pub avg_price: f64,    // field order does not matter
     pub symbol: String,
-    pub total: i64,
-}
-
-// CORRECT: matches SELECT column order
-#[derive(FromRow)]
-pub struct Good {
-    pub symbol: String,    // 1st column
-    pub total: i64,        // 2nd column
-    pub avg_price: f64,    // 3rd column
+    #[column("total")]
+    pub total_volume: i64, // reads the `total` column
 }
 ```
+
+Each field reads the column with its own name, or the name given in `#[column("...")]`. A field
+whose column is missing from the result panics when rows are converted, so alias SQL
+expressions to match the struct.
 
 ### 5. Both sources must advance watermarks for bounded joins
 
@@ -755,6 +949,141 @@ CREATE STREAM histogram AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n;
 
 A server configuration or sealed cluster catalog containing this chain is rejected when it is
 replayed at startup.
+
+A non-windowed aggregate inside `CREATE MATERIALIZED VIEW` always emits its changelog, global
+aggregates included, so an aggregate or projection over a view needs no `EMIT` clause. The same
+rule makes a window or join over such a view fail, and a sink that reads the view must accept
+full changelogs.
+
+### 7. Append-only views keep rows by a declared retention
+
+A view whose query only appends rows (a projection or filter over a source, a `UNION ALL` of them,
+a window with `EMIT ON WINDOW CLOSE` or `EMIT FINAL`, or an interval join) keeps its rows as a log.
+With checkpointing, each checkpoint writes the rows appended since the previous one as one segment
+beside the checkpoint's state, memory holds only those rows, and `SELECT` reads committed segments
+back from the checkpoint store. Retention decides which rows a read returns and which segments later
+checkpoints keep:
+
+- `WITH (retention = '<interval>')`, for example `'2 hours'`: rows whose event time is at or after
+  the view's watermark minus the interval. The event-time column is the source's watermark column
+  when the query forwards it unchanged (a projection, or a `UNION ALL` as described in
+  [`UNION ALL` over event-time inputs](#union-all-over-event-time-inputs)), or an interval join's
+  event-time column. A windowed view keeps rows by the first window column it projects, in
+  `GROUP BY` order:
+  - a `TUMBLE` or `HOP` view keeps a window while the window's end is within the interval of the
+    watermark its windows close at, less the allowed lateness, whichever boundary it projects;
+  - a session view keeps a session while its start is within the interval plus the gap and the
+    allowed lateness. A session whose rows span longer than the interval can be behind that
+    horizon when it closes; it is then not kept.
+
+  A view that declares nothing keeps 1 hour.
+- `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (a
+  `FULL` join, a join that projects neither time column, or a source without a watermark) must
+  declare it.
+- `WITH (retention = 'unbounded')`: every row. It needs checkpointing, because without it the
+  whole log stays in memory.
+- A changelog view rejects `retention`.
+
+```sql
+CREATE MATERIALIZED VIEW minute_volume AS
+SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS window_start, SUM(qty) AS volume
+FROM trades GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE
+WITH (retention = '6 hours');
+```
+
+Rows waiting for the next checkpoint count against `materialized_view_max_rows` and
+`materialized_view_max_bytes`, and a cycle that would exceed them fails instead of dropping rows.
+Without checkpointing the whole retained log stays in memory under the same limits. A row whose
+event time is NULL is not returned once the view has a watermark. Earlier releases kept the last
+1,000 batches of an append view instead.
+
+Each checkpoint adds at most one segment per view. After each checkpoint, a background task
+merges consecutive older segments of a view, up to 16 MiB each, into one segment without the rows
+its retention no longer keeps, and the next checkpoint writes it in their place; reads do not
+change. A view therefore keeps a few dozen segments plus about one per 8 to 16 MiB of retained
+rows, whatever its age. One checkpoint retains at most 32,768 segments across all views, so
+`unbounded` views can grow to roughly 256 to 512 GiB of encoded rows per node before checkpoints
+fail with an error naming the largest view.
+
+### 8. Committed reads see one checkpoint; `freshness` bounds how old it may be
+
+An ad-hoc `SELECT` reads each table as a snapshot, so it may join views with each other and with
+sources and reference tables; the streaming join rules apply only to named streaming queries.
+It reads views at one of three levels:
+
+- **latest**: every view after the last completed cycle, under one guard. Recovery can roll this
+  back. It is the default in embedded and single-node mode, and a cluster node refuses it.
+- **committed**: every view at one committed checkpoint, as below. It is the default on a cluster
+  node.
+- **recent**: a committed read that waits for a checkpoint holding every record written to the
+  views' Kafka sources before the read arrived, so a client reads its own writes; see
+  `CommittedRead::Recent` below.
+
+The Rust API `LaminarDB::read(sql, level)` takes a `ReadLevel` and returns the rows with the
+committed cut it read; `LaminarDB::default_read_level()` gives the mode's default, and
+`execute` reads at the latest level. Over pgwire, `SET laminar.read_level = 'latest' |
+'committed' | 'recent' | 'default'` and `SET laminar.min_epoch = <n>` apply to the connection, `SHOW
+laminar.read_epoch` returns the epoch of its last committed read, and a later committed read on
+the connection never reads an earlier epoch. That floor lasts as long as the connection: after a
+pipeline is reset to an empty checkpoint store, reconnect, or committed reads wait for an epoch
+that will not come and fail after 30 seconds (`57014`). Over HTTP, `POST /api/v1/sql` takes `read_level`
+and `min_epoch` fields and a committed response carries `epoch`, `checkpoint_id` and
+`taken_at_ms`. Rows reach the reader in order and only as fast as it reads them; a query that
+fails part way ends with its error instead of a partial result.
+
+`LaminarDB::query_committed(sql, at)` reads every view a query scans at one committed checkpoint
+and returns the checkpoint's epoch and when it was taken:
+
+- `CommittedRead::Latest` reads the newest committed checkpoint.
+- `CommittedRead::AtLeast(epoch)` waits for a checkpoint at or after `epoch`. Pass an epoch a
+  previous result returned to read no earlier than it.
+- `CommittedRead::Exact(epoch)` reads that checkpoint, and fails once checkpoint cleanup retired
+  it. Cleanup keeps only the newest checkpoint and any checkpoint a read holds.
+- `CommittedRead::Recent { at_least }` asks each source behind the scanned views, through streams
+  and views of views, how far its upstream has been written when the read arrives, then reads the
+  newest checkpoint at or after `at_least` (0 for none) that holds all of it. Kafka sources with a
+  topic list can answer: transaction markers, and under `read_committed` open or aborted
+  transactions, are not waited for. A view over any other source, a topic pattern, or rows pushed
+  through the API fails before waiting (`0A000` over pgwire); a source that cannot be asked fails
+  with `58000`; when no checkpoint holds every source within 30 seconds, the error names the
+  sources still behind (`57014`). Reference tables are looked up, not waited for. With
+  `StreamCheckpointConfig::recent_read_interval_ms` (server `[checkpoint] recent_read_interval`),
+  shorter than the periodic interval, a read waiting for a checkpoint starts the next one that
+  long after the previous one ended instead of waiting the full interval.
+
+Such a result is never rolled back and never mixes checkpoints. It is as fresh as the checkpoint
+interval, or for a recent read with `recent_read_interval_ms`, that shorter interval plus one
+checkpoint. A committed read needs checkpointing, may scan only materialized views, and holds its
+checkpoint for at most 30 seconds, which also bounds the wait for `AtLeast`. A view with a
+row-count retention is not exact, because which rows the cap keeps depends on arrival order.
+Equality filters on every key column of an aggregate view read only the state of that key's
+vnode, and range filters on the event-time column of an append view kept by an interval or
+`unbounded` skip segments outside the range.
+Decoded checkpoint state is cached up to `materialized_view_read_cache_bytes` (256 MiB).
+
+`WITH (freshness = '<interval>')` declares the most committed reads of a view may lag. `CREATE`
+rejects it when checkpoints are manual or disabled, or when it is below the checkpoint interval.
+While the newest committed checkpoint is older than a view's freshness, a warning is logged and
+`mv_freshness_breaches_total{view}` counts the breach once; `mv_committed_staleness_ms` exports
+the age. Every view in a pipeline is read at the same newest checkpoint, so that age applies to
+each of them. `mv_reads_total{level}` counts reads by level (`latest`, `committed` or `recent`),
+`mv_committed_read_age_seconds` records the age of the checkpoint each committed or recent read
+observed, `mv_recent_read_wait_seconds` how long each recent read waited for its checkpoint, and
+`mv_recency_probe_failures_total{source}` the sources that could not be asked.
+
+```sql
+CREATE MATERIALIZED VIEW positions AS
+SELECT account, SUM(qty) AS qty FROM fills GROUP BY account
+WITH (freshness = '10 seconds');
+```
+
+### 9. Mixed string and number comparisons
+
+A string compared with a number converts the string to a number, so `int_col > '100'` is numeric
+and `int_col = 'hello'` fails with a cast error instead of matching no rows. `str_col IN ('a', 1)`
+is also rejected. Cast explicitly when you want a text comparison. In a `UNION ALL`, give a computed
+column an alias when another column in the same branch would otherwise share its output name.
 
 ---
 
@@ -805,4 +1134,4 @@ window functions compose correctly against any precision.
 
 ---
 
-*Tracks LaminarDB 0.22 on DataFusion 52.x / Arrow 57.x. Corrections welcome: open an issue or PR.*
+*Tracks LaminarDB 0.40 on DataFusion 55.x / Arrow 59.x. Corrections welcome: open an issue or PR.*

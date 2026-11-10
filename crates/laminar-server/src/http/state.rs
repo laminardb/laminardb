@@ -157,7 +157,8 @@ impl AppState {
         self.serving_gate.open()
     }
 
-    pub(super) fn serving_rejection(&self) -> Option<&'static str> {
+    /// Why this node must not serve at all: startup, a fenced gate, or a lost process lease.
+    pub(super) fn authority_rejection(&self) -> Option<&'static str> {
         if let Some(reason) = self.serving_gate.rejection_message() {
             return Some(reason);
         }
@@ -166,6 +167,19 @@ impl AppState {
             if !cluster.controller.process_lease_is_live() {
                 return Some("server process lease is no longer live");
             }
+        }
+        None
+    }
+
+    /// [`Self::authority_rejection`], or a coordinated recovery round in progress. Committed
+    /// reads and subscriptions check only the former: they read committed checkpoints, which
+    /// recovery never changes.
+    pub(super) fn serving_rejection(&self) -> Option<&'static str> {
+        if let Some(reason) = self.authority_rejection() {
+            return Some(reason);
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(cluster) = self.cluster.as_ref() {
             if cluster.controller.is_recovering() || self.db.coordinated_recovery_in_progress() {
                 return Some("server is completing coordinated recovery");
             }

@@ -145,8 +145,58 @@ async fn global_aggregate_gathers_to_the_global_vnode() {
                 "exchange.input.events",
                 "gather to vnode 0 from arbitrary, append-only, event time ts"
             ),
-            ("exchange.output", "singleton(vnode 0), append-only"),
+            (
+                "exchange.output",
+                "singleton(vnode 0), append-only, event time w"
+            ),
         ])
+    );
+}
+
+/// A global MIN or MAX over a changelog gathers raw rows, since one partial row cannot hold the
+/// values a retracted extreme falls back to; other global aggregates over it gather partials.
+#[tokio::test]
+async fn global_min_max_over_a_changelog_gathers_rows() {
+    let db = db(&[
+        EVENTS,
+        "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k EMIT CHANGES",
+    ])
+    .await;
+    for (sql, exchange_form) in [
+        (
+            "CREATE STREAM top AS SELECT MAX(n) AS peak FROM per_key EMIT CHANGES",
+            "gather to vnode 0",
+        ),
+        (
+            "CREATE STREAM range AS SELECT COUNT(*) AS keys, MIN(n) AS low FROM per_key \
+             EMIT CHANGES",
+            "gather to vnode 0",
+        ),
+        (
+            "CREATE STREAM total AS SELECT SUM(n) AS rows FROM per_key EMIT CHANGES",
+            "gather partials to vnode 0",
+        ),
+    ] {
+        assert_eq!(
+            exchange(&db, sql).await,
+            rows(&[
+                (
+                    "exchange.input.per_key",
+                    &format!("{exchange_form} from hash(k Int64), weighted changelog"),
+                ),
+                ("exchange.output", "singleton(vnode 0), weighted changelog"),
+            ]),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        exchange(
+            &db,
+            "CREATE STREAM top AS SELECT MAX(v) AS peak FROM events EMIT CHANGES"
+        )
+        .await[0]
+            .1,
+        "gather partials to vnode 0 from arbitrary, append-only, event time ts"
     );
 }
 
@@ -180,7 +230,10 @@ async fn computed_group_key_and_window_markers() {
                 "exchange.input.events",
                 "repartition on (k Int64) from arbitrary, append-only, event time ts"
             ),
-            ("exchange.output", "hash(k Int64), append-only"),
+            (
+                "exchange.output",
+                "hash(k Int64), append-only, event time w"
+            ),
         ])
     );
 }
@@ -228,6 +281,57 @@ async fn interval_join_repartitions_each_side_and_union_forwards() {
     );
 }
 
+/// A union carries its inputs' event-time column when every branch forwards it unchanged to the
+/// same output column from the same kind of operator.
+#[tokio::test]
+async fn union_all_forwards_a_shared_event_time_column() {
+    let db = db(&[
+        EVENTS,
+        ORDERS,
+        PAYMENTS,
+        "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS ts FROM orders o \
+         INNER JOIN payments p ON o.k = p.k \
+         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+    ])
+    .await;
+    for (query, output) in [
+        (
+            "SELECT k, ts FROM orders UNION ALL SELECT k, ts FROM payments",
+            "arbitrary, append-only, event time ts",
+        ),
+        (
+            "SELECT k, ts AS t FROM orders UNION ALL SELECT k, ts FROM payments WHERE v > 1",
+            "arbitrary, append-only, event time t",
+        ),
+        (
+            "SELECT k, ts FROM orders UNION ALL SELECT k, ts FROM payments \
+             UNION ALL SELECT k, ts FROM events",
+            "arbitrary, append-only, event time ts",
+        ),
+        (
+            "SELECT ts, ts AS later FROM orders \
+             UNION ALL SELECT ts + INTERVAL '1' SECOND AS shifted, ts AS original FROM payments",
+            "arbitrary, append-only",
+        ),
+        (
+            "SELECT k, ts FROM orders \
+             UNION ALL SELECT k, ts + INTERVAL '1' MILLISECOND FROM payments",
+            "arbitrary, append-only",
+        ),
+        (
+            "SELECT k, ts FROM joined UNION ALL SELECT k, ts FROM events",
+            "arbitrary, append-only",
+        ),
+    ] {
+        let rows = exchange(&db, &format!("CREATE STREAM merged AS {query}")).await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{query}"
+        );
+    }
+}
+
 const JOIN_BOUND: &str = "ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND";
 
 #[tokio::test]
@@ -268,6 +372,105 @@ async fn interval_join_output_is_hashed_on_the_side_every_row_carries() {
             rows.last(),
             Some(&("exchange.output".to_string(), output.to_string())),
             "{join} JOIN {projection}"
+        );
+    }
+}
+
+/// The output event time of each interval join kind: the time column of a side every row carries,
+/// left first, when it is projected unchanged.
+#[tokio::test]
+async fn interval_join_output_carries_the_time_of_a_side_every_row_carries() {
+    let db = db(&[ORDERS, PAYMENTS]).await;
+    for (join, projection, output) in [
+        (
+            "INNER",
+            "o.k AS k, o.ts AS ots, p.ts AS pts",
+            "hash(k Int64), append-only, event time ots",
+        ),
+        (
+            "INNER",
+            "o.k AS k, p.ts AS pts",
+            "hash(k Int64), append-only, event time pts",
+        ),
+        (
+            "LEFT",
+            "o.k AS k, p.ts AS pts",
+            "hash(k Int64), append-only",
+        ),
+        (
+            "RIGHT",
+            "p.k AS k, o.ts AS ots, p.ts AS pts",
+            "hash(k Int64), append-only, event time pts",
+        ),
+        (
+            "LEFT SEMI",
+            "o.k AS k, o.ts AS ots",
+            "hash(k Int64), append-only, event time ots",
+        ),
+        ("FULL", "o.ts AS ots, p.ts AS pts", "arbitrary, append-only"),
+    ] {
+        let rows = exchange(
+            &db,
+            &format!(
+                "CREATE STREAM joined AS SELECT {projection} FROM orders o \
+                 {join} JOIN payments p {JOIN_BOUND}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{join} JOIN {projection}"
+        );
+    }
+}
+
+/// A closed `TUMBLE` or `HOP` window carries its projected end marker, otherwise its start
+/// marker; a session window and an `EMIT CHANGES` window carry none.
+#[tokio::test]
+async fn closed_windows_carry_their_boundary_marker() {
+    let db = db(&[EVENTS]).await;
+    let tumble = "tumble(ts, INTERVAL '100' MILLISECOND)";
+    let tumble_end = "tumble_end(ts, INTERVAL '100' MILLISECOND)";
+    let session = "session(ts, INTERVAL '5' MILLISECOND)";
+    for (projection, groups, emit, output) in [
+        (
+            format!("{tumble} AS ws, {tumble_end} AS we"),
+            format!("{tumble}, {tumble_end}"),
+            "EMIT ON WINDOW CLOSE",
+            "singleton(vnode 0), append-only, event time we",
+        ),
+        (
+            format!("{tumble} AS ws"),
+            tumble.to_string(),
+            "EMIT FINAL",
+            "singleton(vnode 0), append-only, event time ws",
+        ),
+        (
+            format!("{session} AS s"),
+            session.to_string(),
+            "EMIT ON WINDOW CLOSE",
+            "singleton(vnode 0), append-only",
+        ),
+        (
+            format!("{tumble} AS ws"),
+            tumble.to_string(),
+            "EMIT CHANGES",
+            "hash(ws Timestamp(µs)), weighted changelog",
+        ),
+    ] {
+        let rows = exchange(
+            &db,
+            &format!(
+                "CREATE STREAM windows AS SELECT {projection}, COUNT(*) AS n FROM events \
+                 GROUP BY {groups} {emit}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{projection} {emit}"
         );
     }
 }

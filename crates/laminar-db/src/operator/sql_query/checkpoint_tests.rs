@@ -17,6 +17,28 @@ fn sql_capability_classification_is_shape_aware_and_fail_closed() {
     assert_eq!(stateless.state_class, OperatorStateClass::Stateless);
     assert_eq!(stateless.cluster_status, ClusterExecutionStatus::DdlGuarded);
 
+    for union in [
+        "SELECT key, ts FROM a UNION ALL SELECT key, ts FROM b WHERE value > 1",
+        "SELECT key FROM a UNION ALL SELECT key FROM b UNION ALL SELECT UPPER(key) FROM c",
+    ] {
+        assert_eq!(classify(union), stateless, "{union}");
+    }
+    for union in [
+        "SELECT key FROM a UNION SELECT key FROM b",
+        "SELECT key FROM a UNION ALL SELECT key FROM b ORDER BY key",
+        "SELECT key FROM a UNION ALL SELECT key FROM b LIMIT 3",
+        "SELECT key FROM a UNION ALL SELECT key FROM b JOIN c ON b.key = c.key",
+        "SELECT key FROM a UNION ALL SELECT key FROM b GROUP BY key",
+        "SELECT key FROM a UNION ALL SELECT COUNT(*) FROM b",
+        "SELECT key FROM a EXCEPT ALL SELECT key FROM b",
+    ] {
+        assert_eq!(
+            classify(union),
+            OperatorCapability::unclassified_sql_query(),
+            "{union}"
+        );
+    }
+
     let scalar = classify("SELECT UPPER(key) FROM events");
     assert_eq!(scalar.state_class, OperatorStateClass::Stateless);
     assert_eq!(scalar.cluster_status, ClusterExecutionStatus::DdlGuarded);
@@ -1122,16 +1144,31 @@ async fn colocated_input_applies_owned_batches_whole_and_repartitions_the_rest()
         .iter()
         .any(|(peer, message)| *peer == 2 && is_data(message)));
     assert_eq!(metrics.colocated_routing_fallbacks_total.get(), 1);
+    let shuffled = |form| {
+        metrics
+            .flow
+            .aggregate_shuffle_rows_total
+            .with_label_values(&["sum", form])
+            .get()
+    };
+    let remote_rows = u64::try_from(remote.num_rows()).unwrap();
+    assert_eq!(
+        (shuffled("input"), shuffled("sent")),
+        (remote_rows, remote_rows)
+    );
 }
 
 #[cfg(feature = "cluster")]
-async fn global_operator(scope: &ClusterShuffleConfig) -> SqlQueryOperator {
+async fn global_operator(
+    scope: &ClusterShuffleConfig,
+    metrics: Option<Arc<EngineMetrics>>,
+) -> SqlQueryOperator {
     let (context, _) = context_and_batch();
     let mut operator = SqlQueryOperator::new_with_key_groups(
         "total",
         "SELECT COUNT(*) AS n, SUM(value) AS total FROM events",
         context,
-        None,
+        metrics,
         false,
         KeyGroupCount::try_from(8_u16).unwrap(),
     );
@@ -1168,7 +1205,8 @@ fn projected_values(operator: &SqlQueryOperator, values: &[i64]) -> RecordBatch 
 #[tokio::test]
 async fn global_aggregate_ships_partials_and_restores_queued_ones() {
     let sender_scope = cluster_scope([2, 1, 1, 1, 1, 1, 1, 1]).await;
-    let sender = global_operator(&sender_scope).await;
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    let sender = global_operator(&sender_scope, Some(Arc::clone(&metrics))).await;
     let frontier = InputFrontier {
         watermark: Some(10),
         idle: false,
@@ -1206,9 +1244,17 @@ async fn global_aggregate_ships_partials_and_restores_queued_ones() {
         panic!("expected one partial message, got {}", partials.len());
     };
     assert_eq!(partial.num_rows(), rows.len());
+    let shuffled = |form| {
+        metrics
+            .flow
+            .aggregate_shuffle_rows_total
+            .with_label_values(&["total", form])
+            .get()
+    };
+    assert_eq!((shuffled("input"), shuffled("sent")), (4, 2));
 
     let receiver_scope = cluster_scope([1, 2, 2, 2, 2, 2, 2, 2]).await;
-    let mut receiver = global_operator(&receiver_scope).await;
+    let mut receiver = global_operator(&receiver_scope, None).await;
     let version = receiver_scope.registry.assignment_version();
     let recovery = receiver_scope.receiver.recovery_gen();
     let staged = |batch: RecordBatch| {
@@ -1237,7 +1283,7 @@ async fn global_aggregate_ships_partials_and_restores_queued_ones() {
     let mut staged_bytes = capture.retained_bytes();
     let encoded = capture.materialize(&mut staged_bytes, 1 << 20).unwrap();
 
-    let mut restored = global_operator(&receiver_scope).await;
+    let mut restored = global_operator(&receiver_scope, None).await;
     restored
         .restore(OperatorCheckpoint {
             data: encoded.to_vec(),
@@ -1260,6 +1306,297 @@ async fn global_aggregate_ships_partials_and_restores_queued_ones() {
         ),
         (4, 46)
     );
+}
+
+#[cfg(feature = "cluster")]
+fn changelog_values(values: &[i64], weight: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(values.to_vec())),
+            Arc::new(Int64Array::from(vec![weight; values.len()])),
+        ],
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "cluster")]
+async fn global_changelog_extremum_operator(
+    scope: &ClusterShuffleConfig,
+    metrics: Option<Arc<EngineMetrics>>,
+) -> SqlQueryOperator {
+    let context = laminar_sql::create_session_context();
+    let table = datafusion::datasource::MemTable::try_new(
+        changelog_values(&[], 1).schema(),
+        vec![Vec::new()],
+    )
+    .unwrap();
+    context.register_table("changes", Arc::new(table)).unwrap();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "extremes",
+        "SELECT COUNT(*) AS n, MIN(value) AS lo, MAX(value) AS hi FROM changes",
+        context,
+        metrics,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    operator
+}
+
+/// A MIN or MAX over a changelog has no one-row partial, so a non-owner ships its rows and the
+/// owner falls back to the next extreme when a peer retracts the current one.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn global_changelog_extremum_ships_rows_and_restores_queued_ones() {
+    let sender_scope = cluster_scope([2, 1, 1, 1, 1, 1, 1, 1]).await;
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    let mut sender =
+        global_changelog_extremum_operator(&sender_scope, Some(Arc::clone(&metrics))).await;
+    let frontier = InputFrontier {
+        watermark: Some(10),
+        idle: false,
+    };
+    let rows = sender
+        .pre_aggregate(&[
+            changelog_values(&[1, 2, 3, 40], 1),
+            changelog_values(&[40], -1),
+        ])
+        .await
+        .unwrap();
+    let plan = sender
+        .plan_cluster_batches(
+            rows.clone(),
+            frontier,
+            &sender_scope,
+            &sender_scope.registry.versioned_snapshot(),
+            &[2],
+        )
+        .unwrap();
+    assert!(plan.local_batches.is_empty());
+    let shipped = plan
+        .outbound
+        .iter()
+        .filter_map(|(peer, message)| match message {
+            ShuffleMessage::Data {
+                routed_vnodes,
+                batch,
+                ..
+            } => {
+                assert_eq!((*peer, routed_vnodes.as_ref()), (2, &[0][..]));
+                Some(batch.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(shipped, rows);
+    let shuffled = |form| {
+        metrics
+            .flow
+            .aggregate_shuffle_rows_total
+            .with_label_values(&["extremes", form])
+            .get()
+    };
+    assert_eq!((shuffled("input"), shuffled("sent")), (5, 5));
+
+    let receiver_scope = cluster_scope([1, 2, 2, 2, 2, 2, 2, 2]).await;
+    let mut receiver = global_changelog_extremum_operator(&receiver_scope, None).await;
+    assert_eq!(
+        receiver.expected_shuffle_schema().unwrap(),
+        rows[0].schema()
+    );
+    let version = receiver_scope.registry.assignment_version();
+    let recovery = receiver_scope.receiver.recovery_gen();
+    for batch in shipped {
+        let staged = crate::operator::RetainedBatch::restored_channel(
+            batch,
+            2,
+            version,
+            recovery,
+            Arc::from([0_u32]),
+        );
+        receiver
+            .stage_checkpointed_shuffle("extremes", staged, i64::MIN)
+            .unwrap();
+    }
+    receiver
+        .stage_checkpointed_shuffle_frontier("extremes", 2, frontier, version, recovery)
+        .unwrap();
+    let capture = receiver
+        .checkpoint_capture(1 << 20)
+        .unwrap()
+        .expect("cluster aggregate always captures its channel cut");
+    let mut staged_bytes = capture.retained_bytes();
+    let encoded = capture.materialize(&mut staged_bytes, 1 << 20).unwrap();
+
+    let mut restored = global_changelog_extremum_operator(&receiver_scope, None).await;
+    restored
+        .restore(OperatorCheckpoint {
+            data: encoded.to_vec(),
+        })
+        .unwrap();
+    assert_eq!(restored.queued_remote_events, 3);
+    let mut outputs = Vec::new();
+    for _ in 0..3 {
+        let output = restored
+            .process_cluster(&[Vec::new()], InputFrontier::default())
+            .await
+            .unwrap();
+        outputs.extend(output.iter().map(|batch| {
+            let column = |index| {
+                arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(
+                    batch.column(index),
+                )
+                .value(0)
+            };
+            (column(0), column(1), column(2))
+        }));
+    }
+    assert_eq!(restored.queued_remote_events, 0);
+    assert_eq!(outputs, [(4, 1, 40), (3, 1, 3)]);
+}
+
+/// Binds node 2 of `scope`'s assignment as a live loopback endpoint that node 1 can reach.
+#[cfg(feature = "cluster")]
+async fn live_peer(
+    scope: &ClusterShuffleConfig,
+    owners: [u64; 8],
+) -> Arc<laminar_core::shuffle::ShuffleReceiver> {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::LeaseDeadline;
+    use laminar_core::shuffle::ShuffleReceiver;
+
+    let peer = Arc::new(
+        ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(2))
+            .await
+            .unwrap(),
+    );
+    peer.install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+        std::time::Duration::from_secs(60),
+    )))
+    .unwrap();
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        scope.registry.assignment_version(),
+        &owners,
+        [1, 2]
+            .into_iter()
+            .map(|node_id| CheckpointParticipant {
+                node_id,
+                boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+            })
+            .collect(),
+    )
+    .unwrap();
+    peer.install_assignment_fence(&fence, &owners).unwrap();
+    scope.sender.register_peer(2, peer.local_addr());
+    peer
+}
+
+/// A cycle whose rows all stay local still sends its frontier to every peer. When the transport
+/// admits those frames while the cycle polls the send, the rows apply in that cycle; the first
+/// send waits for the peer's connection, so its rows apply on the next cycle.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn admitted_frontier_send_applies_local_rows_in_the_same_cycle() {
+    use std::time::Duration;
+
+    let owners = [1, 2, 1, 1, 1, 1, 1, 1];
+    let scope = cluster_scope(owners).await;
+    let peer = live_peer(&scope, owners).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    let (key, _) = projected_batch_for_vnode(&operator, 0, 1);
+    let local = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![key.as_str()])),
+            Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    operator.attach_cluster_shuffle(scope);
+    let at = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let rows = |output: &[RecordBatch]| output.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+    let output = operator
+        .process_cluster(&[vec![local.clone()]], at(100))
+        .await
+        .unwrap();
+    assert_eq!(rows(&output), 0);
+    let send = operator
+        .pending_cluster_input
+        .as_ref()
+        .unwrap()
+        .send
+        .as_ref();
+    assert!(send.is_some_and(|send| matches!(send, ShuffleSend::Running(_))));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !operator
+            .pending_cluster_input
+            .as_ref()
+            .and_then(|pending| pending.send.as_ref())
+            .is_some_and(ShuffleSend::is_finished)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first frontier send never finished");
+    let output = operator
+        .process_cluster(&[Vec::new()], at(100))
+        .await
+        .unwrap();
+    assert_eq!(rows(&output), 1);
+    assert!(operator.pending_cluster_input.is_none());
+
+    for (cycle, watermark) in [200, 300, 400].into_iter().enumerate() {
+        let output = operator
+            .process_cluster(&[vec![local.clone()]], at(watermark))
+            .await
+            .unwrap();
+        assert_eq!(rows(&output), 1, "cycle {cycle}");
+        assert!(operator.pending_cluster_input.is_none(), "cycle {cycle}");
+        assert!(operator.wants_input(), "cycle {cycle}");
+    }
+
+    let mut frontiers = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while frontiers.last() != Some(&Some(400)) {
+            frontiers.extend(peer.drain_available().iter().filter_map(|received| {
+                match received.message() {
+                    ShuffleMessage::Frontier { watermark, .. } => Some(*watermark),
+                    _ => None,
+                }
+            }));
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer 2 never received the last frontier");
+    assert_eq!(frontiers, [Some(100), Some(200), Some(300), Some(400)]);
 }
 
 #[cfg(feature = "cluster")]
@@ -1323,10 +1660,9 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
         )]
     ));
     operator.process_cluster(&[Vec::new()], live).await.unwrap();
-    let mut pending = operator.pending_cluster_input.take().unwrap();
+    let pending = operator.pending_cluster_input.take().unwrap();
     assert_eq!(pending.local_frontier, restored);
     assert!(pending.local_batches.is_empty());
-    pending.send.take().unwrap().abort();
 
     // Simulate completion of the bootstrap send. The graph may now release its retained row,
     // and the ordinary node-local frontier is used without being globally frozen.
@@ -1343,10 +1679,9 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
         .process_cluster(&[vec![buffered]], live)
         .await
         .unwrap();
-    let mut pending = operator.pending_cluster_input.take().unwrap();
+    let pending = operator.pending_cluster_input.take().unwrap();
     assert_eq!(pending.local_frontier, live);
     assert_eq!(pending.local_batches.len(), 1);
-    pending.send.take().unwrap().abort();
 }
 
 #[cfg(feature = "cluster")]
@@ -1439,18 +1774,16 @@ async fn pending_send_drains_remote_sum_before_publishing_local_cut() {
         effective_frontier: _,
     } = plan;
     let (release, held) = tokio::sync::oneshot::channel();
-    let (completion_tx, completion) = tokio::sync::oneshot::channel();
-    let send = tokio::spawn(async move {
+    let send = ShuffleSend::spawned(async move {
         let _ = held.await;
         drop(outbound);
-        let _ = completion_tx.send((Ok(()), None));
+        (Ok(()), None)
     });
     operator.pending_cluster_input = Some(PendingAggClusterInput {
         local_batches,
         outbound: None,
         local_frontier,
         send: Some(send),
-        completion: Some(completion),
         accounted_bytes,
     });
     let version = assignment.version();
@@ -1562,14 +1895,11 @@ async fn ready_pending_send_waits_for_certified_remote_publication() {
         effective_frontier: _,
     } = plan;
     drop(outbound);
-    let (completion_tx, completion) = tokio::sync::oneshot::channel();
-    completion_tx.send((Ok(()), None)).unwrap();
     operator.pending_cluster_input = Some(PendingAggClusterInput {
         local_batches,
         outbound: None,
         local_frontier,
-        send: Some(tokio::spawn(async {})),
-        completion: Some(completion),
+        send: Some(ShuffleSend::Completed((Ok(()), None))),
         accounted_bytes,
     });
     let version = assignment.version();
@@ -1715,20 +2045,14 @@ async fn zero_admission_retry_has_no_runnable_spin() {
             idle: false,
         },
     )];
-    let (completion_tx, completion) = tokio::sync::oneshot::channel();
-    assert!(completion_tx
-        .send((
-            Err(DbError::ShuffleNotReady("injected zero admission".into())),
-            Some(retry_plan),
-        ))
-        .is_ok());
-    let send = tokio::spawn(async {});
     operator.pending_cluster_input = Some(PendingAggClusterInput {
         local_batches: Vec::new(),
         outbound: None,
         local_frontier: InputFrontier::default(),
-        send: Some(send),
-        completion: Some(completion),
+        send: Some(ShuffleSend::Completed((
+            Err(DbError::ShuffleNotReady("injected zero admission".into())),
+            Some(retry_plan),
+        ))),
         accounted_bytes: 0,
     });
     assert!(!operator.deferred_work_is_runnable());
@@ -1736,9 +2060,11 @@ async fn zero_admission_retry_has_no_runnable_spin() {
         .process_cluster(&[Vec::new()], InputFrontier::default())
         .await
         .unwrap();
+    // Peer 2 has no address, so the retry fails again while the cycle polls it and the plan waits
+    // for a later cycle without making the operator runnable.
     let pending = operator.pending_cluster_input.as_ref().unwrap();
-    assert!(pending.send.is_some());
-    assert!(pending.outbound.is_none());
+    assert!(pending.send.is_none());
+    assert!(pending.outbound.is_some());
     assert!(!operator.deferred_work_is_runnable());
 }
 
@@ -2748,7 +3074,7 @@ fn aggregate_shuffle_wrappers_preserve_terminal_disposition() {
 }
 
 #[tokio::test]
-async fn later_aggregate_batch_failure_requires_recovery_after_prior_mutation() {
+async fn later_aggregate_batch_over_the_group_cap_halts_after_prior_mutation() {
     let (context, seed) = context_and_batch();
     let schema = seed.schema();
     let first = RecordBatch::try_new(
@@ -2785,12 +3111,18 @@ async fn later_aggregate_batch_failure_requires_recovery_after_prior_mutation() 
         .await
         .expect_err("the later batch must exceed the aggregate group limit");
 
-    assert!(matches!(
-        &error,
-        DbError::StatefulOperatorPartialApply(message)
-            if message.contains("state update") && message.contains("outcome is unknown")
-    ));
-    assert!(error.requires_pipeline_recovery());
+    assert!(
+        matches!(
+            &error,
+            DbError::GroupLimitExceeded {
+                groups: 3,
+                limit: 2,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.requires_pipeline_halt());
 }
 
 #[test]

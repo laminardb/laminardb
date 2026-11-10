@@ -104,10 +104,6 @@ fn flatten_value(
 }
 
 impl ScalarUDFImpl for JsonbFlatten {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_flatten"
     }
@@ -228,10 +224,6 @@ fn unflatten_insert(root: &mut serde_json::Value, parts: &[&str], value: serde_j
 }
 
 impl ScalarUDFImpl for JsonbUnflatten {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_unflatten"
     }
@@ -349,10 +341,6 @@ fn parse_type_spec_fields(spec: &str) -> Vec<String> {
 }
 
 impl ScalarUDFImpl for JsonToColumns {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "json_to_columns"
     }
@@ -485,10 +473,6 @@ fn infer_type(val: &serde_json::Value) -> String {
 }
 
 impl ScalarUDFImpl for JsonInferSchema {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "json_infer_schema"
     }

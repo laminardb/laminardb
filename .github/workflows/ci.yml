@@ -63,9 +63,9 @@ jobs:
           docker-images: true
           swap-storage: false
       - name: Set swap space
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -106,9 +106,9 @@ jobs:
           swap-storage: false
       - name: Set swap space (Linux)
         if: runner.os == 'Linux'
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -392,9 +392,9 @@ jobs:
           docker-images: true
           swap-storage: false
       - name: Set swap space
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -552,6 +552,11 @@ jobs:
           cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
           cargo package --manifest-path vendor/quickfix-ffi/Cargo.toml --no-verify
           cargo package --manifest-path vendor/libxml2-ffi/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/iceberg/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/iceberg-catalog-rest/Cargo.toml --no-verify \
+            --config 'patch.crates-io.laminardb-iceberg.path="vendor/iceberg"'
+          cargo package --manifest-path vendor/iceberg-storage-opendal/Cargo.toml --no-verify \
+            --config 'patch.crates-io.laminardb-iceberg.path="vendor/iceberg"'
       - name: Verify workspace packages can be assembled
         run: |
           # The release publishes the maintained forks before the Laminar crates.
@@ -559,7 +564,10 @@ jobs:
             --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
             --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"' \
             --config 'patch.crates-io.laminardb-quickfix-ffi.path="vendor/quickfix-ffi"' \
-            --config 'patch.crates-io.laminardb-libxml2-ffi.path="vendor/libxml2-ffi"'
+            --config 'patch.crates-io.laminardb-libxml2-ffi.path="vendor/libxml2-ffi"' \
+            --config 'patch.crates-io.laminardb-iceberg.path="vendor/iceberg"' \
+            --config 'patch.crates-io.laminardb-iceberg-catalog-rest.path="vendor/iceberg-catalog-rest"' \
+            --config 'patch.crates-io.laminardb-iceberg-storage-opendal.path="vendor/iceberg-storage-opendal"'
 
   # ============================================
   # MSRV Check
@@ -592,6 +600,10 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    env:
+      # nightly-2026-11-01 fails to compile DataFusion and Arrow with E0391 ("cycle detected when
+      # computing when ... needs async drop"). Move forward once a later nightly builds the docs.
+      DOCS_TOOLCHAIN: nightly-2026-10-31
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
@@ -605,12 +617,14 @@ jobs:
           docker-images: true
           swap-storage: false
       # Match the toolchain used by the Pages documentation build.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.DOCS_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Build docs
-        run: cargo +nightly doc --workspace --no-deps --all-features
+        run: cargo "+$DOCS_TOOLCHAIN" doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings --cfg docsrs"
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"

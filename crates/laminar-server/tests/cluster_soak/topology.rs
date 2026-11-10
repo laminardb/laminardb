@@ -1,24 +1,19 @@
-//! Legacy authority adoption in the existing stateful, real-process soak.
-//!
-//! This is an identical-inventory format upgrade, not an additive graph migration. The fixture
-//! uses one verified executable for every process and a unique checkpoint namespace, satisfying
-//! adoption's coordinated binary upgrade precondition without claiming mixed-version support.
+//! Topology one written by the catalog seal in the existing stateful, real-process soak.
 
 use super::{has_full_membership, wait_for, Node};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::{
-    CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, LegacyTopologyBaseline,
-    TopologyAdoptionOutcome, TopologyCatalogState,
+    CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, TopologyBaseline,
+    TopologyCatalogState,
 };
-use object_store::ObjectStoreExt;
 
-pub(super) fn adopt_inventory(
+pub(super) fn sealed_inventory(
     checkpoint_url: &str,
     nodes: &mut [Node],
     recovery_ceiling: Duration,
-) -> LegacyTopologyBaseline {
+) -> TopologyBaseline {
     let objects = objects_for_namespace(checkpoint_url);
     let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
     let catalog = CatalogManifestStore::new(Arc::clone(&authority));
@@ -27,70 +22,27 @@ pub(super) fn adopt_inventory(
         .build()
         .expect("soak authority runtime");
     let baseline = runtime.block_on(async {
-        let TopologyCatalogState::LegacySealed { manifest } = catalog
+        let TopologyCatalogState::Versioned {
+            baseline,
+            committed: None,
+        } = catalog
             .topology_state()
             .await
-            .expect("read original legacy topology")
+            .expect("read sealed topology")
         else {
-            panic!("fresh soak must use a sealed, explicitly unversioned catalog");
+            panic!("a fresh soak catalog must be sealed as topology one");
         };
-        let manifest_path = object_store::path::Path::from(format!(
-            "control/catalog-manifest/v1/{}.json",
-            manifest.sha256
-        ));
-        let original_bytes = objects
-            .get(&manifest_path)
-            .await
-            .expect("read original inventory")
-            .bytes()
-            .await
-            .expect("original inventory bytes");
         let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
             .load_deployment_id()
             .await
             .expect("read existing deployment")
-            .expect("running cluster must already have a deployment identity");
-        let proof = authority
-            .load()
-            .await
-            .expect("read active lease")
-            .expect("running cluster must have leader authority")
-            .proof();
-        let operation = uuid::Uuid::new_v4()
-            .try_into()
-            .expect("nonzero request UUID");
-        let TopologyAdoptionOutcome::Created(baseline) = catalog
-            .adopt_legacy_topology(&proof, operation, &manifest, &deployment)
-            .await
-            .expect("adopt exact running inventory")
-        else {
-            panic!("unique soak namespace must admit exactly one baseline");
-        };
-        assert_eq!(baseline.manifest, manifest);
+            .expect("the seal must create the deployment identity");
         assert_eq!(baseline.deployment_id, deployment);
-        assert_eq!(
-            objects
-                .get(&manifest_path)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap(),
-            original_bytes,
-            "adoption rewrote the original catalog blob"
-        );
-        assert_eq!(
-            catalog
-                .adopt_legacy_topology(&proof, operation, &manifest, &deployment)
-                .await
-                .expect("retry original adoption"),
-            TopologyAdoptionOutcome::Existing(baseline.clone())
-        );
         baseline
     });
     wait_for_status(nodes, &baseline, false, recovery_ceiling);
     eprintln!(
-        "soak: adopted identical catalog as topology {} at authority sequence {} with operation {}",
+        "soak: sealed catalog is topology {} at authority sequence {} with operation {}",
         baseline.topology_version.get(),
         baseline.authority_sequence,
         baseline.operation_id.get()
@@ -119,12 +71,12 @@ pub(super) fn objects_for_namespace(checkpoint_url: &str) -> Arc<dyn object_stor
 
 fn wait_for_status(
     nodes: &mut [Node],
-    baseline: &LegacyTopologyBaseline,
+    baseline: &TopologyBaseline,
     require_active: bool,
     recovery_ceiling: Duration,
 ) {
     wait_for(
-        "all processes to observe adopted topology",
+        "all processes to observe sealed topology one",
         recovery_ceiling,
         || {
             nodes.iter_mut().all(|node| {
@@ -143,7 +95,7 @@ fn wait_for_status(
                         baseline: baseline.clone(),
                         committed: None
                     },
-                    "node{} observed a different adopted inventory or operation",
+                    "node{} observed a different sealed inventory or operation",
                     node.id
                 );
                 assert_eq!(status["committed_version"].as_u64(), Some(1));
@@ -164,7 +116,7 @@ fn wait_for_status(
 
 pub(super) fn restart_all(
     nodes: &mut [Node],
-    baseline: &LegacyTopologyBaseline,
+    baseline: &TopologyBaseline,
     recovery_ceiling: Duration,
 ) {
     let started = Instant::now();
@@ -178,7 +130,7 @@ pub(super) fn restart_all(
     }
     wait_for_status(nodes, baseline, true, recovery_ceiling);
     wait_for(
-        "full membership after adopted-catalog restart",
+        "full membership after sealed-catalog restart",
         recovery_ceiling,
         || has_full_membership(nodes),
     );

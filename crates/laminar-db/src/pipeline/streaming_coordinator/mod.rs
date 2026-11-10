@@ -39,8 +39,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::callback::{
     BarrierOutcome, CheckpointAssignmentAdmission, CheckpointCompletion, CheckpointControlOutcome,
-    CheckpointControlWake, CycleError, CycleOutcome, PipelineCallback, SourceBarrierControl,
-    SourceBarrierSignal, SourceRegistration,
+    CheckpointControlWake, CycleError, CycleOutcome, PipelineCallback, PortHeadroom,
+    SourceBarrierControl, SourceBarrierSignal, SourceRegistration,
 };
 #[cfg(test)]
 use super::config::CheckpointSchedule;
@@ -49,7 +49,7 @@ use crate::catalog::{schema_has_reserved_mutation_columns, validate_source_batch
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
-pub(crate) use source_channel::metrics::SourceQueueMetrics;
+pub(crate) use flow_metrics::CoordinatorFlowMetrics;
 use source_channel::{QueuedSourceMsg, SourceMsgRx, SourceMsgTx};
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 type ForceCheckpointRequest = crate::db::ForceCheckpointRequest;
@@ -67,7 +67,9 @@ mod construction;
 mod cycle;
 mod drain_ownership;
 mod execution;
+mod flow_metrics;
 mod intake_backpressure;
+use intake_backpressure::SourceAdmission;
 mod shutdown;
 mod source_actor;
 mod source_channel;
@@ -393,9 +395,11 @@ pub struct StreamingCoordinator {
     checkpoint_retry_not_before: Option<Instant>,
     checkpoint_retry_backoff: Duration,
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    /// At most one FIFO message removed just as the external intake gate closes. Exact source
-    /// barrier holds make post-barrier data impossible; this slot exists only for that gate race.
+    /// At most one FIFO message held back: removed just as the external intake gate closed, or
+    /// the first message that did not fit its source's graph ports. Later messages stay in the
+    /// FIFO behind it. Exact source barrier holds make post-barrier data impossible.
     parked_source_msg: Option<QueuedSourceMsg>,
+    source_admission: SourceAdmission,
     pending_watermark_batches: Vec<PendingWatermarkBatch>,
     /// Sources that delivered a barrier this drain cycle. A later batch from one of these sources
     /// violates the source hold protocol and faults the pipeline.
@@ -426,6 +430,7 @@ pub struct StreamingCoordinator {
     #[cfg(feature = "cluster")]
     process_authority: Option<Arc<SourceProcessAuthority>>,
     public_generation: Option<StreamingCoordinatorGeneration>,
+    intake_stats: Arc<flow_metrics::IntakeStats>,
 }
 
 // These flags describe independent protocol state and cannot be combined without obscuring the
@@ -510,6 +515,7 @@ impl Drop for StreamingCoordinator {
         for handle in &self.source_handles {
             handle.task.request_shutdown();
         }
+        self.intake_stats.close();
         // Release public construction ownership only after every source has observed shutdown.
         drop(self.public_generation.take());
     }

@@ -11,7 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.33.0" }
+laminar-core = { path = "../laminar-core", version = "0.40.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
@@ -23,9 +23,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # Database drivers for CDC and sinks
 tokio-postgres = { version = "0.7", optional = true, features = ["with-chrono-0_4"] }
 postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_4"] }
-pgpq = { version = "0.11", optional = true }
+pgpq = { version = "0.12", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-pgwire-replication = { package = "laminardb-pgwire-replication", path = "../../vendor/pgwire-replication", version = "=0.33.0", optional = true }
+pgwire-replication = { package = "laminardb-pgwire-replication", path = "../../vendor/pgwire-replication", version = "=0.40.0", optional = true }
 # Client-side verified TLS for PostgreSQL CDC, sink, and lookup connections.
 tokio-postgres-rustls = { version = "0.13", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs", "tls12"] }
@@ -36,6 +36,7 @@ tokio-stream = { workspace = true, optional = true }
 
 # Delta Lake
 deltalake = { workspace = true, optional = true, features = ["rustls"] }
+deltalake-core = { workspace = true, optional = true }
 deltalake-catalog-glue = { workspace = true, optional = true }
 deltalake-catalog-unity = { workspace = true, optional = true }
 aws-sdk-glue = { workspace = true, optional = true }
@@ -122,13 +123,13 @@ tonic = { version = "0.14", optional = true }
 base64 = { workspace = true, optional = true }
 
 # FIX source: QuickFIX C++ session engine (vendored binding with a length-aware bridge)
-quickfix-ffi = { package = "laminardb-quickfix-ffi", path = "../../vendor/quickfix-ffi", version = "=0.33.0", optional = true }
+quickfix-ffi = { package = "laminardb-quickfix-ffi", path = "../../vendor/quickfix-ffi", version = "=0.40.0", optional = true }
 xxhash-rust = { workspace = true, optional = true }
 # Ed25519 Logon signatures for the Binance profile; already built for the FIX TLS bridge.
 aws-lc-rs = { version = "1.18", optional = true, default-features = false, features = ["aws-lc-sys"] }
 
 # FpML decoder: libxml2 XML Schema validation (static, vendored), quick-xml pre-scan, TOML profiles
-libxml2-ffi = { package = "laminardb-libxml2-ffi", path = "../../vendor/libxml2-ffi", version = "=0.33.0", optional = true }
+libxml2-ffi = { package = "laminardb-libxml2-ffi", path = "../../vendor/libxml2-ffi", version = "=0.40.0", optional = true }
 quick-xml = { version = "0.41", default-features = false, optional = true }
 toml = { version = "1.1", optional = true }
 
@@ -157,8 +158,7 @@ default = [
 ]
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest", "dep:zstd", "changelog-collapse"]
-# zstd record compression in librdkafka. zstd-sys generates its bindings with bindgen, so this
-# build additionally needs libclang.
+# zstd record compression in librdkafka.
 kafka-zstd = ["kafka", "rdkafka/zstd"]
 postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "changelog-collapse"]
@@ -169,7 +169,7 @@ mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.
 changelog-collapse = ["dep:arrow-row"]
 # Delta Lake
-delta-lake = ["dep:deltalake", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
+delta-lake = ["dep:deltalake", "dep:deltalake-core", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure", "deltalake-catalog-unity?/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs", "laminar-core/gcs", "dep:futures-util", "deltalake-catalog-unity?/gcp"]

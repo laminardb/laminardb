@@ -42,13 +42,12 @@ pub(super) fn contains_builtin_join_without_cluster_lifecycle(
         SymmetricHashJoinExec,
     };
 
-    let plan_type = plan.as_any();
-    plan_type.is::<CrossJoinExec>()
-        || plan_type.is::<HashJoinExec>()
-        || plan_type.is::<NestedLoopJoinExec>()
-        || plan_type.is::<PiecewiseMergeJoinExec>()
-        || plan_type.is::<SortMergeJoinExec>()
-        || plan_type.is::<SymmetricHashJoinExec>()
+    plan.is::<CrossJoinExec>()
+        || plan.is::<HashJoinExec>()
+        || plan.is::<NestedLoopJoinExec>()
+        || plan.is::<PiecewiseMergeJoinExec>()
+        || plan.is::<SortMergeJoinExec>()
+        || plan.is::<SymmetricHashJoinExec>()
         || plan
             .children()
             .into_iter()
@@ -105,6 +104,7 @@ pub(super) struct StreamDefinition<'a> {
     pub(super) name: &'a sqlparser::ast::ObjectName,
     pub(super) query: &'a StreamingStatement,
     pub(super) emit_clause: Option<&'a laminar_sql::parser::EmitClause>,
+    pub(super) late_data: Option<&'a laminar_sql::parser::LateDataClause>,
     pub(super) query_sql: &'a str,
     pub(super) retention_bytes: Option<u64>,
 }
@@ -161,13 +161,23 @@ impl LaminarDB {
     pub(crate) async fn handle_create_stream(
         &self,
         sql: &str,
-        name: &sqlparser::ast::ObjectName,
-        query: &StreamingStatement,
-        emit_clause: Option<&laminar_sql::parser::EmitClause>,
-        if_not_exists: bool,
-        query_sql: &str,
-        retention_bytes: Option<u64>,
+        statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
+        let StreamingStatement::CreateStream {
+            name,
+            query,
+            emit_clause,
+            late_data,
+            if_not_exists,
+            query_sql,
+            retention_bytes,
+            ..
+        } = statement
+        else {
+            return Err(DbError::InvalidOperation(
+                "expected a CREATE STREAM statement".into(),
+            ));
+        };
         self.ensure_topology_ddl_allowed("CREATE STREAM")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
@@ -180,7 +190,7 @@ impl LaminarDB {
             self.validate_stream_query_text(&name_str, query_sql)?;
         }
         let Some(reservation) =
-            self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, if_not_exists)?
+            self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, *if_not_exists)?
         else {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE STREAM".to_string(),
@@ -194,9 +204,10 @@ impl LaminarDB {
             ddl: Some(sql),
             name,
             query,
-            emit_clause,
+            emit_clause: emit_clause.as_ref(),
+            late_data: late_data.as_ref(),
             query_sql,
-            retention_bytes,
+            retention_bytes: *retention_bytes,
         };
         match split {
             None => self.create_stream_object(definition, reservation).await?,
@@ -237,12 +248,13 @@ impl LaminarDB {
             name,
             query,
             emit_clause,
+            late_data,
             query_sql,
             retention_bytes,
         } = definition;
         let name_str = canonical_object_name(name)?;
         let (planned, temporal_output_schema) = self
-            .validate_stream_admission("stream", name, query, emit_clause, query_sql)
+            .validate_stream_admission("stream", name, query, emit_clause, late_data, query_sql)
             .await?;
         if self.is_cluster_runtime()
             && retention_bytes.is_some()
@@ -281,12 +293,19 @@ impl LaminarDB {
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<&laminar_sql::parser::EmitClause>,
+        late_data: Option<&laminar_sql::parser::LateDataClause>,
         query_sql: &str,
     ) -> Result<(PlannedStreamingQuery, Option<arrow::datatypes::SchemaRef>), DbError> {
         let name_str = canonical_object_name(name)?;
         self.validate_cluster_query_shape_before_plan(kind, &name_str, query_sql)?;
         let planned = self
-            .plan_streaming_query(name, query, emit_clause.cloned(), query_sql)
+            .plan_streaming_query(
+                name,
+                query,
+                emit_clause.cloned(),
+                late_data.cloned(),
+                query_sql,
+            )
             .await?;
         self.reject_stateful_consumer_of_running_state(kind, &name_str, query_sql, &planned)
             .await?;
@@ -307,6 +326,8 @@ impl LaminarDB {
             .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
             .await?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
+        self.validate_window_input_event_time(&name_str, query_sql, planned.window_config.as_ref())
             .await?;
         let topology = self
             .validate_interval_topology_candidate(kind, &name_str, query_sql, &planned)
@@ -513,6 +534,7 @@ impl LaminarDB {
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<laminar_sql::parser::EmitClause>,
+        late_data: Option<laminar_sql::parser::LateDataClause>,
         query_sql: &str,
     ) -> Result<PlannedStreamingQuery, DbError> {
         let admission = if crate::sql_analysis::has_join_clause(query_sql) {
@@ -547,6 +569,7 @@ impl LaminarDB {
             name: name.clone(),
             query: Box::new(query.clone()),
             emit_clause,
+            late_data,
             or_replace: false,
             if_not_exists: false,
             query_sql: query_sql.to_string(),

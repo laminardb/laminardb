@@ -155,6 +155,7 @@ impl LaminarDB {
             name,
             query,
             emit_clause,
+            late_data,
             query_sql,
             ..
         } = statement
@@ -165,13 +166,24 @@ impl LaminarDB {
             let stream = super::canonical_object_name(name)?;
             if let Some(split) = self.split_stream_query(&stream, query_sql)? {
                 let candidates = self
-                    .split_stream_candidates(&stream, &split, emit_clause.as_ref())
+                    .split_stream_candidates(
+                        &stream,
+                        &split,
+                        emit_clause.as_ref(),
+                        late_data.as_ref(),
+                    )
                     .await?;
                 let resolved = self.resolve_catalog_stream_outputs(candidates).await?;
                 return split_rows(&resolved, &stream, &split);
             }
             let planned = self
-                .plan_streaming_query(name, query, emit_clause.clone(), query_sql)
+                .plan_streaming_query(
+                    name,
+                    query,
+                    emit_clause.clone(),
+                    late_data.clone(),
+                    query_sql,
+                )
                 .await?;
             let resolved = self
                 .resolve_catalog_stream_outputs(Some(

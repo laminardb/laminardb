@@ -172,7 +172,9 @@ pub(crate) async fn resolve_table(
         "resolved Unity Catalog table"
     );
     Ok(ResolvedUnityTable {
-        storage_location: table.storage_location,
+        storage_location: table.storage_location.ok_or_else(|| {
+            ConnectorError::ConfigurationError("Unity Catalog table has no storage location".into())
+        })?,
         vended_options,
         expires_at,
     })
@@ -186,7 +188,7 @@ pub(crate) fn validate_table(
     access: CatalogAccess,
     credentials: UnityStorageCredentials,
 ) -> Result<(), ConnectorError> {
-    if !matches!(table.data_source_format, DataSourceFormat::Delta) {
+    if !matches!(table.data_source_format, Some(DataSourceFormat::Delta)) {
         return Err(ConnectorError::ConfigurationError(format!(
             "Unity Catalog table format {:?} is not Delta",
             table.data_source_format

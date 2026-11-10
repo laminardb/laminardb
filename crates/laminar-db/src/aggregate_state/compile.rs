@@ -1,5 +1,6 @@
 //! Plan introspection + SQL compilation helpers for aggregate operators.
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -56,9 +57,13 @@ pub(crate) fn compile_plan_expr(
         return Ok(None);
     };
     match coerced.data.get_type(schema) {
-        Ok(actual) if actual == declared => {
-            Ok(create_physical_expr(&coerced.data, schema, props).ok())
-        }
+        Ok(actual) if actual == declared => Ok(create_physical_expr(
+            &coerced.data,
+            schema,
+            props,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()),
         Ok(actual) => Err(DbError::Unsupported(format!(
             "[{}] '{expr}' is typed {declared} but its operands need {actual}; CAST the CASE \
              branches to one type",
@@ -595,11 +600,11 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
         }
         Expr::Cast(cast) => {
             let inner = expr_to_sql(&cast.expr);
-            format!("CAST({inner} AS {})", cast.data_type)
+            format!("CAST({inner} AS {})", cast.field.data_type())
         }
         Expr::TryCast(cast) => {
             let inner = expr_to_sql(&cast.expr);
-            format!("TRY_CAST({inner} AS {})", cast.data_type)
+            format!("TRY_CAST({inner} AS {})", cast.field.data_type())
         }
         Expr::ScalarFunction(func) => {
             let args: Vec<String> = func.args.iter().map(expr_to_sql).collect();
@@ -764,9 +769,14 @@ pub(crate) fn compile_having_filter(
         .data;
     let state = ctx.state();
     let props = state.execution_props();
-    create_physical_expr(&having_pred, aggregate_schema, props)
-        .map(Some)
-        .map_err(|e| DbError::Pipeline(format!("HAVING compilation: {e}")))
+    create_physical_expr(
+        &having_pred,
+        aggregate_schema,
+        props,
+        &PhysicalPlanningContext::default(),
+    )
+    .map(Some)
+    .map_err(|e| DbError::Pipeline(format!("HAVING compilation: {e}")))
 }
 
 pub(crate) struct SqlClauses {

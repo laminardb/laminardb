@@ -1,34 +1,47 @@
 use super::*;
+use crate::cluster::control::topology::TopologyBaseline;
+use crate::cluster::control::{TopologyCatalogState, TopologyError};
 
-fn topology_operation() -> crate::cluster::control::TopologyOperationId {
-    Uuid::from_u128(42).try_into().unwrap()
-}
-
-pub(super) async fn topology_adoption_fixture(
-    store: &LeaderLeaseStore,
-) -> (LeaderLease, CatalogManifestRef, String) {
-    let incumbent = owner(1, 1, 1);
-    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+async fn acquire(store: &LeaderLeaseStore) -> LeaderLease {
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&owner(1, 1, 1), 0).await.unwrap()
+    else {
         panic!("fresh authority must admit the leader");
     };
-    let manifest = catalog("events");
-    store.seal_catalog(&lease.proof(), &manifest).await.unwrap();
-    let (_, reference) = manifest.encode_and_reference().unwrap();
-    let deployment = CheckpointDecisionStore::new(store.store.clone())
-        .load_or_create_deployment_id()
+    lease
+}
+
+async fn sealed_baseline(store: &LeaderLeaseStore) -> TopologyBaseline {
+    let TopologyCatalogState::Versioned {
+        baseline,
+        committed: None,
+    } = store.topology_catalog_state().await.unwrap()
+    else {
+        panic!("a sealed catalog must be topology one");
+    };
+    baseline
+}
+
+pub(super) async fn sealed_topology_fixture(
+    store: &LeaderLeaseStore,
+) -> (LeaderLease, TopologyBaseline) {
+    let lease = acquire(store).await;
+    store
+        .seal_catalog(&lease.proof(), &catalog("events"))
         .await
         .unwrap();
-    (lease, reference, deployment)
+    (lease, sealed_baseline(store).await)
 }
 
 #[tokio::test(start_paused = true)]
 async fn topology_status_deadline_cancels_blocked_read_without_writes() {
-    use crate::cluster::control::{TopologyCatalogState, TopologyError};
     let authority = store(30_000);
-    let (_, reference, _) = topology_adoption_fixture(&authority).await;
+    let (_, baseline) = sealed_topology_fixture(&authority).await;
     let before = authority.load().await.unwrap().unwrap();
-    let (raw, blocked) =
-        blocking_get_once_with_inner(30_000, authority.store.clone(), reference.object_path());
+    let (raw, blocked) = blocking_get_once_with_inner(
+        30_000,
+        authority.store.clone(),
+        baseline.manifest.object_path(),
+    );
     let status_authority = blocked.clone();
     let read = tokio::spawn(async move { status_authority.topology_catalog_state().await });
     raw.entered.acquire().await.unwrap().forget();
@@ -39,24 +52,18 @@ async fn topology_status_deadline_cancels_blocked_read_without_writes() {
     ));
     assert!(raw.put_counts.lock().unwrap().is_empty());
     assert_eq!(authority.load().await.unwrap().unwrap(), before);
-    assert_eq!(
-        blocked.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::LegacySealed {
-            manifest: reference
-        }
-    );
+    assert_eq!(sealed_baseline(&blocked).await, baseline);
 }
 
 #[tokio::test]
-async fn topology_adoption_racing_renewal_preserves_winner_and_retries_exact_operation() {
-    use crate::cluster::control::{TopologyAdoptionOutcome, TopologyCatalogState};
-    let (raw, authority) = blocking_once_at(30_000, lease_path(3));
-    let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
+async fn catalog_seal_racing_renewal_preserves_winner_and_binds_its_own_sequence() {
+    let (raw, authority) = blocking_once_at(30_000, lease_path(2));
+    let lease = acquire(&authority).await;
     let proof = lease.proof();
     let task_authority = authority.clone();
     let task = tokio::spawn(async move {
         task_authority
-            .adopt_legacy_topology(&proof, topology_operation(), &reference, &deployment)
+            .seal_catalog(&proof, &catalog("events"))
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), raw.entered.acquire())
@@ -71,36 +78,26 @@ async fn topology_adoption_racing_renewal_preserves_winner_and_retries_exact_ope
     else {
         panic!("renewal must win the blocked append");
     };
-    assert_eq!(renewed.seq, 3);
+    assert_eq!(renewed.seq, 2);
     raw.release.add_permits(1);
-    let TopologyAdoptionOutcome::Created(baseline) = task.await.unwrap().unwrap() else {
-        panic!("adoption must retry through the renewal");
-    };
-    assert_eq!(baseline.authority_sequence, 4);
+    assert_eq!(task.await.unwrap().unwrap(), CatalogSealOutcome::Created);
+    let baseline = sealed_baseline(&authority).await;
+    assert_eq!(baseline.authority_sequence, 3);
     assert_eq!(
         authority.load().await.unwrap().unwrap().renewal_sequence,
         renewed.renewal_sequence
     );
-    assert_eq!(
-        authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::Versioned {
-            baseline,
-            committed: None
-        }
-    );
 }
 
 #[tokio::test]
-async fn topology_adoption_before_term_loss_is_fenced_without_upgrade() {
-    use crate::cluster::control::{TopologyCatalogState, TopologyError};
-    let (raw, authority) = blocking_once_at(30_000, lease_path(3));
-    let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
+async fn catalog_seal_before_term_loss_is_fenced_without_baseline() {
+    let (raw, authority) = blocking_once_at(30_000, lease_path(2));
+    let lease = acquire(&authority).await;
     let task_authority = authority.clone();
     let proof = lease.proof();
-    let task_reference = reference.clone();
     let task = tokio::spawn(async move {
         task_authority
-            .adopt_legacy_topology(&proof, topology_operation(), &task_reference, &deployment)
+            .seal_catalog(&proof, &catalog("events"))
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), raw.entered.acquire())
@@ -115,67 +112,46 @@ async fn topology_adoption_before_term_loss_is_fenced_without_upgrade() {
     };
     assert!(replacement.token > lease.token);
     raw.release.add_permits(1);
-    assert!(matches!(task.await.unwrap(), Err(TopologyError::Fenced)));
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(CatalogManifestError::Fenced)
+    ));
     assert_eq!(
         authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::LegacySealed {
-            manifest: reference
-        }
+        TopologyCatalogState::Uninitialized
     );
 }
 
 #[tokio::test]
-async fn topology_adoption_resolves_lost_record_and_head_responses() {
-    use crate::cluster::control::{TopologyAdoptionOutcome, TopologyCatalogState};
-    for path in [lease_path(3), authority_head_path()] {
+async fn catalog_seal_resolves_lost_record_and_head_responses() {
+    for path in [lease_path(2), authority_head_path()] {
         let (raw, authority) = ambiguous_once_at(30_000, path);
-        let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
+        let lease = acquire(&authority).await;
         raw.did_return_ambiguous
             .store(false, std::sync::atomic::Ordering::Release);
-        let outcome = authority
-            .adopt_legacy_topology(
-                &lease.proof(),
-                topology_operation(),
-                &reference,
-                &deployment,
-            )
+        authority
+            .seal_catalog(&lease.proof(), &catalog("events"))
             .await
             .unwrap();
-        let (TopologyAdoptionOutcome::Created(baseline)
-        | TopologyAdoptionOutcome::Existing(baseline)) = outcome;
         assert!(raw
             .did_return_ambiguous
             .load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(
-            authority.topology_catalog_state().await.unwrap(),
-            TopologyCatalogState::Versioned {
-                baseline,
-                committed: None
-            }
-        );
-        assert_eq!(authority.load().await.unwrap().unwrap().seq, 3);
-        assert_eq!(raw.put_count(&lease_path(3), "create"), 1);
+        assert_eq!(sealed_baseline(&authority).await.authority_sequence, 2);
+        assert_eq!(authority.load().await.unwrap().unwrap().seq, 2);
+        assert_eq!(raw.put_count(&lease_path(2), "create"), 1);
     }
 }
 
 #[tokio::test]
-async fn topology_adoption_cancelled_after_durable_create_is_recoverable() {
-    use crate::cluster::control::{TopologyAdoptionOutcome, TopologyCatalogState};
-    let (raw, authority) = delayed_response_once_at_with_ambiguity(30_000, lease_path(3), false);
-    let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
+async fn catalog_seal_cancelled_after_durable_create_is_recoverable() {
+    let (raw, authority) = delayed_response_once_at_with_ambiguity(30_000, lease_path(2), false);
+    let lease = acquire(&authority).await;
     let proof = lease.proof();
     let task_authority = authority.clone();
-    let task_reference = reference.clone();
-    let task_deployment = deployment.clone();
     let task_proof = proof.clone();
     let task = tokio::spawn(async move {
         task_authority
-            .adopt_legacy_topology(
-                &task_proof,
-                topology_operation(),
-                &task_reference,
-                &task_deployment,
-            )
+            .seal_catalog(&task_proof, &catalog("events"))
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), raw.entered.acquire())
@@ -186,38 +162,27 @@ async fn topology_adoption_cancelled_after_durable_create_is_recoverable() {
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     let restarted = LeaderLeaseStore::new(raw.clone(), 30_000);
-    let TopologyCatalogState::Versioned {
-        baseline,
-        committed: None,
-    } = restarted.topology_catalog_state().await.unwrap()
-    else {
-        panic!("durable append must be recovered independently of the cancelled request");
-    };
+    let baseline = sealed_baseline(&restarted).await;
+    assert_eq!(baseline.authority_sequence, 2);
     assert_eq!(
         restarted
-            .adopt_legacy_topology(&proof, topology_operation(), &reference, &deployment)
+            .seal_catalog(&proof, &catalog("events"))
             .await
             .unwrap(),
-        TopologyAdoptionOutcome::Existing(baseline)
+        CatalogSealOutcome::ExistingIdentical
     );
-    assert_eq!(raw.put_count(&lease_path(3), "create"), 1);
+    assert_eq!(sealed_baseline(&restarted).await, baseline);
+    assert_eq!(raw.put_count(&lease_path(2), "create"), 1);
 }
 
 #[tokio::test]
-async fn topology_adoption_cancelled_before_create_leaves_legacy_authority() {
-    use crate::cluster::control::TopologyCatalogState;
-    let (raw, authority) = blocking_once_at(30_000, lease_path(3));
-    let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
+async fn catalog_seal_cancelled_before_create_leaves_authority_unsealed() {
+    let (raw, authority) = blocking_once_at(30_000, lease_path(2));
+    let lease = acquire(&authority).await;
     let task_authority = authority.clone();
-    let task_reference = reference.clone();
     let task = tokio::spawn(async move {
         task_authority
-            .adopt_legacy_topology(
-                &lease.proof(),
-                topology_operation(),
-                &task_reference,
-                &deployment,
-            )
+            .seal_catalog(&lease.proof(), &catalog("events"))
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), raw.entered.acquire())
@@ -229,74 +194,75 @@ async fn topology_adoption_cancelled_before_create_leaves_legacy_authority() {
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(
         authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::LegacySealed {
-            manifest: reference
-        }
+        TopologyCatalogState::Uninitialized
     );
-    assert_eq!(authority.load().await.unwrap().unwrap().seq, 2);
+    assert_eq!(authority.load().await.unwrap().unwrap().seq, 1);
 }
 
 #[tokio::test]
-async fn topology_adoption_preserves_unresolved_checkpoint_and_commit_chain() {
-    use crate::cluster::control::{TopologyAdoptionOutcome, TopologyCatalogState};
+async fn unsealed_to_sealed_append_requires_baseline_but_history_stays_readable() {
     let authority = store(30_000);
-    let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
-    let proof = lease.proof();
-    let fence = assignment_fence(&lease.owner);
-    record_commit(&authority, &proof, &fence, 1, 1).await;
-    let original_commit = authority
-        .highest_cluster_committed_outcome()
+    let lease = acquire(&authority).await;
+    let manifest = catalog("events");
+    let (encoded, reference) = manifest.encode_and_reference().unwrap();
+    authority
+        .ensure_catalog_manifest_blob(&encoded, &reference)
+        .await
+        .unwrap();
+    let head = authority
+        .load_published_authority_head()
         .await
         .unwrap()
         .unwrap();
-    let pending = begin_checkpoint_artifacts(&authority, &proof, &fence, 2).await;
-    let before = authority.load_record().await.unwrap().unwrap();
-    let TopologyAdoptionOutcome::Created(baseline) = authority
-        .adopt_legacy_topology(&proof, topology_operation(), &reference, &deployment)
-        .await
-        .unwrap()
-    else {
-        panic!("first adoption must create");
-    };
-    let after = authority.load_record().await.unwrap().unwrap();
-    assert_eq!(after, {
-        let mut expected = before.preserve_with_lease(after.lease.clone());
-        expected.version = TOPOLOGY_AUTHORITY_RECORD_VERSION;
-        expected.topology_baseline = Some(baseline.clone());
-        expected
-    });
-    assert_eq!(
-        authority.cluster_checkpoint_artifacts().await.unwrap(),
-        Some(pending)
-    );
-    assert_eq!(
-        authority.highest_cluster_committed_outcome().await.unwrap(),
-        Some(original_commit)
-    );
-    record_commit(&authority, &proof, &fence, 2, 2).await;
-    assert_eq!(
+    let mut sealed_lease = lease.clone();
+    sealed_lease.seq += 1;
+    sealed_lease.catalog_manifest = Some(reference.clone());
+    let unversioned = head.record.preserve_with_lease(sealed_lease);
+    assert!(matches!(
         authority
-            .highest_cluster_committed_outcome()
-            .await
-            .unwrap()
-            .unwrap()
-            .epoch,
-        2
-    );
-    assert_eq!(
-        authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::Versioned {
-            baseline,
-            committed: None
-        }
-    );
+            .create_authority_record(Some(&head), &unversioned)
+            .await,
+        Err(LeaseError::Invalid(_))
+    ));
+    assert_eq!(authority.load().await.unwrap().unwrap().seq, 1);
+
+    // Records sealed before topology versioning remain valid history, but cannot be given a
+    // baseline afterwards and are not a startable catalog.
+    unversioned.validate().unwrap();
+    let mut late_baseline = unversioned.preserve_with_lease(LeaderLease {
+        seq: unversioned.lease.seq + 1,
+        ..unversioned.lease.clone()
+    });
+    late_baseline.version = TOPOLOGY_AUTHORITY_RECORD_VERSION;
+    late_baseline.topology_baseline = Some(TopologyBaseline {
+        protocol_version: crate::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
+        topology_version: crate::cluster::control::TopologyVersion::BASELINE,
+        manifest: reference.clone(),
+        deployment_id: Uuid::from_u128(7).to_string(),
+        operation_id: Uuid::from_u128(8).try_into().unwrap(),
+        authority_sequence: unversioned.lease.seq + 1,
+    });
+    late_baseline.validate().unwrap();
+    assert!(matches!(
+        unversioned.validate_topology_successor(&late_baseline),
+        Err(LeaseError::Invalid(_))
+    ));
+    let (raw, legacy) = blocking_once_at(30_000, OsPath::from("control/never-block"));
+    let mut record = bare_authority_record(&lease.owner, 1);
+    record.lease.catalog_manifest = Some(reference);
+    seed_authority_record(&raw, &record).await;
+    seed_authority_head(&raw, 1).await;
+    assert_eq!(legacy.load().await.unwrap().unwrap(), record.lease);
+    assert!(matches!(
+        legacy.topology_catalog_state().await,
+        Err(TopologyError::Invalid(_))
+    ));
 }
 
 #[tokio::test]
-async fn topology_adoption_record_is_retained_and_format_cannot_downgrade() {
-    use crate::cluster::control::{TopologyAdoptionOutcome, TopologyCatalogState};
+async fn topology_baseline_record_is_retained_and_format_cannot_downgrade() {
     let authority = store(30_000);
-    let (lease, reference, deployment) = topology_adoption_fixture(&authority).await;
+    let lease = acquire(&authority).await;
     let old_head = authority
         .load_published_authority_head()
         .await
@@ -306,19 +272,15 @@ async fn topology_adoption_record_is_retained_and_format_cannot_downgrade() {
         .record
         .preserve_with_lease(old_head.record.lease.clone());
     frozen_old_candidate.lease.seq += 1;
-    let TopologyAdoptionOutcome::Created(baseline) = authority
-        .adopt_legacy_topology(
-            &lease.proof(),
-            topology_operation(),
-            &reference,
-            &deployment,
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("first adoption must create");
-    };
-    // An old writer frozen before the upgrade cannot win the same create-only successor.
+    assert_eq!(
+        authority
+            .seal_catalog(&lease.proof(), &catalog("events"))
+            .await
+            .unwrap(),
+        CatalogSealOutcome::Created
+    );
+    let baseline = sealed_baseline(&authority).await;
+    // An unsealed writer frozen before the seal cannot win the same create-only successor.
     assert!(matches!(
         authority
             .create_authority_record(Some(&old_head), &frozen_old_candidate)
@@ -358,11 +320,43 @@ async fn topology_adoption_record_is_retained_and_format_cannot_downgrade() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(
-        authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::Versioned {
-            baseline,
-            committed: None
+    assert_eq!(sealed_baseline(&authority).await, baseline);
+}
+
+#[tokio::test]
+async fn namespace_adopted_before_seal_time_baselines_still_reads_as_topology_one() {
+    let (raw, authority) = blocking_once_at(30_000, OsPath::from("control/never-block"));
+    let leader = owner(1, 1, 1);
+    let (encoded, reference) = catalog("events").encode_and_reference().unwrap();
+    authority
+        .ensure_catalog_manifest_blob(&encoded, &reference)
+        .await
+        .unwrap();
+    let deployment_id = CheckpointDecisionStore::new(authority.store.clone())
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    let baseline = TopologyBaseline {
+        protocol_version: crate::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
+        topology_version: crate::cluster::control::TopologyVersion::BASELINE,
+        manifest: reference.clone(),
+        deployment_id,
+        operation_id: Uuid::from_u128(40).try_into().unwrap(),
+        authority_sequence: 3,
+    };
+    // Unsealed, sealed without a baseline, adopted, then renewed.
+    for sequence in 1..=4 {
+        let mut record = bare_authority_record(&leader, sequence);
+        if sequence >= 2 {
+            record.lease.catalog_manifest = Some(reference.clone());
         }
-    );
+        if sequence >= 3 {
+            record.version = TOPOLOGY_AUTHORITY_RECORD_VERSION;
+            record.topology_baseline = Some(baseline.clone());
+        }
+        seed_authority_record(&raw, &record).await;
+    }
+    seed_authority_head(&raw, 4).await;
+    let restarted = LeaderLeaseStore::new(raw.clone(), 30_000);
+    assert_eq!(sealed_baseline(&restarted).await, baseline);
 }

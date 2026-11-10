@@ -66,19 +66,25 @@ impl StreamingCoordinator {
         let output_checkpoint_due = callback.external_output_pressure().checkpoint_due();
         #[cfg(not(feature = "cluster"))]
         let output_checkpoint_due = false;
+        let since_last = self.last_checkpoint.elapsed();
+        let read_checkpoint_due = self
+            .config
+            .recent_read_checkpoints
+            .as_ref()
+            .is_some_and(|reads| reads.demand.requested() && since_last >= reads.interval);
         let interval = leader
             && self
                 .config
                 .checkpoint_schedule
                 .periodic_interval()
                 .is_some_and(|value| {
-                    output_checkpoint_due || self.last_checkpoint.elapsed() >= value
+                    output_checkpoint_due || read_checkpoint_due || since_last >= value
                 });
         let retry_ready = self
             .checkpoint_retry_not_before
             .is_none_or(|deadline| Instant::now() >= deadline);
-        // A due periodic cut stays due; it waits only while this leader's topology submission
-        // needs the gap between artifact reservations that back-to-back cuts never leave.
+        // A due periodic cut stays due; it waits only while this leader's topology submission or
+        // assignment drain needs a gap between cuts that back-to-back cuts never leave.
         if !manual && (!interval || !retry_ready || callback.periodic_checkpoints_held()) {
             return None;
         }
@@ -194,6 +200,9 @@ impl StreamingCoordinator {
         let attempt = callback
             .reserve_checkpoint_attempt(admission.deadline)
             .await?;
+        if let Some(reads) = &self.config.recent_read_checkpoints {
+            reads.demand.clear();
+        }
         // Durable reservation succeeded. Install the exact attempt before notifying claimed
         // callers; Prepare and every later failure path must publish or abandon it before reply.
         if admission.manual && !self.activate_manual_attempt(attempt, admission.flags) {

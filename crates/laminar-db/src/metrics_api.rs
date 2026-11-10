@@ -15,7 +15,24 @@ impl LaminarDB {
     }
 
     /// Inject prometheus engine metrics. Called once at startup before `start()`.
+    ///
+    /// The metrics report this database's per-node memory budgets. A cluster database also
+    /// reports the shuffle endpoints its builder installed.
     pub fn set_engine_metrics(&self, metrics: Arc<crate::engine_metrics::EngineMetrics>) {
+        metrics
+            .flow
+            .observe_memory_budgets(&crate::memory_budget::node_budgets(
+                &self.config,
+                self.runtime_mode(),
+            ));
+        #[cfg(feature = "cluster")]
+        {
+            let sender = self.shuffle_sender.lock().clone();
+            let receiver = self.shuffle_receiver.lock().clone();
+            if let (Some(sender), Some(receiver)) = (sender, receiver) {
+                metrics.flow.shuffle.observe(&sender, &receiver);
+            }
+        }
         *self.engine_metrics.lock() = Some(metrics);
     }
 
@@ -189,8 +206,8 @@ impl LaminarDB {
                     m.events_dropped.get(),
                     m.cycles.get(),
                     m.batches.get(),
-                    m.mv_updates.get(),
-                    m.mv_bytes_stored.get() as u64,
+                    m.views.updates.get(),
+                    m.views.bytes_stored.get() as u64,
                 )
             } else {
                 (0, 0, 0, 0, 0, 0, 0)
@@ -487,6 +504,36 @@ mod tests {
 
         DbState::Created.store(&db.state);
         assert!(error.contains("Created"), "{error}");
+    }
+
+    #[test]
+    fn attached_metrics_report_the_database_memory_budgets() {
+        let db = LaminarDB::open_with_config(crate::LaminarConfig {
+            source_queue_max_bytes: 4096,
+            ..crate::LaminarConfig::default()
+        })
+        .unwrap();
+        let registry = prometheus::Registry::new();
+        db.set_engine_metrics(Arc::new(crate::engine_metrics::EngineMetrics::new(
+            &registry,
+        )));
+
+        let budgets = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "memory_budget_bytes")
+            .unwrap();
+        let budget = |area: &str| {
+            budgets
+                .get_metric()
+                .iter()
+                .find(|metric| metric.get_label()[0].value() == area)
+                .map(|metric| metric.get_gauge().value())
+        };
+        assert_eq!(budget("source_queue"), Some(4096.0));
+        assert_eq!(budget("managed_state"), Some(256.0 * 1024.0 * 1024.0));
+        assert_eq!(budget("subscription_logs"), Some(256.0 * 1024.0 * 1024.0));
+        assert_eq!(budget("shuffle_outbound"), None);
     }
 
     #[cfg(feature = "cluster")]

@@ -184,6 +184,11 @@ pub enum DbError {
     /// durable cut before replay.
     ShufflePartialSend(String),
 
+    /// A cross-node shuffle send waited the configured stall timeout without progress, so its
+    /// peer's stream stopped draining. Retrying would wait again; recovery rewinds the failure
+    /// domain to a durable cut.
+    ShuffleSendStalled(String),
+
     /// A stateful operator may have changed local state before the attempt failed. This denotes an
     /// indeterminate apply outcome, not proof that exactly a prefix was applied. The graph must not
     /// replay that input against the possibly changed state; recovery rewinds the failure domain to
@@ -202,6 +207,17 @@ pub enum DbError {
         limit_bytes: usize,
     },
 
+    /// A keyed aggregate or window would hold more groups than its cardinality cap. It halts for
+    /// the same reason as [`Self::ManagedStateBudgetExceeded`]: replay refills the same groups.
+    GroupLimitExceeded {
+        /// Boundary at which the excess was detected.
+        context: String,
+        /// Projected group count.
+        groups: usize,
+        /// Group cap.
+        limit: usize,
+    },
+
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
     QueryPipeline {
@@ -214,6 +230,9 @@ pub enum DbError {
 
     /// Materialized view error
     MaterializedView(String),
+
+    /// A read of materialized views at a committed checkpoint could not be served.
+    CommittedRead(crate::mv_store::CommittedReadError),
 
     /// A local materialized-view update or restore exceeded its live or staging quota.
     MaterializedViewQuotaExceeded {
@@ -328,12 +347,15 @@ impl DbError {
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
+            | Self::ShuffleSendStalled(_)
             | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
-            Self::ManagedStateBudgetExceeded { .. } => error_codes::MANAGED_STATE_BUDGET_EXCEEDED,
-            Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
-            Self::MaterializedView(_) | Self::MaterializedViewQuotaExceeded { .. } => {
-                error_codes::MATERIALIZED_VIEW_ERROR
+            Self::ManagedStateBudgetExceeded { .. } | Self::GroupLimitExceeded { .. } => {
+                error_codes::MANAGED_STATE_BUDGET_EXCEEDED
             }
+            Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
+            Self::MaterializedView(_)
+            | Self::MaterializedViewQuotaExceeded { .. }
+            | Self::CommittedRead(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
             Self::Config(_) => error_codes::INVALID_CONFIG,
         }
@@ -355,6 +377,8 @@ impl DbError {
                 | Self::GraphBufferBudgetExceeded { .. }
                 | Self::ShuffleTerminal(_)
                 | Self::ManagedStateBudgetExceeded { .. }
+                | Self::GroupLimitExceeded { .. }
+                | Self::MaterializedViewQuotaExceeded { .. }
         )
     }
 
@@ -365,6 +389,7 @@ impl DbError {
             self,
             Self::Checkpoint(_)
                 | Self::ShufflePartialSend(_)
+                | Self::ShuffleSendStalled(_)
                 | Self::StatefulOperatorPartialApply(_)
         )
     }
@@ -464,16 +489,21 @@ impl std::fmt::Display for DbError {
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
+            | Self::ShuffleSendStalled(_)
             | Self::StatefulOperatorPartialApply(_)
             | Self::ReferenceTableQuotaExceeded { .. }
             | Self::MaterializedViewQuotaExceeded { .. }
-            | Self::ManagedStateBudgetExceeded { .. } => self.fmt_execution_error(f),
+            | Self::ManagedStateBudgetExceeded { .. }
+            | Self::GroupLimitExceeded { .. } => self.fmt_execution_error(f),
             Self::QueryPipeline {
                 context,
                 translated,
             } => write!(f, "Stream '{context}': {translated}"),
             Self::MaterializedView(msg) => {
                 write!(f, "[{}] Materialized view error: {msg}", self.code())
+            }
+            Self::CommittedRead(error) => {
+                write!(f, "[{}] Committed read: {error}", self.code())
             }
             Self::Storage(msg) => {
                 write!(f, "[{}] Storage error: {msg}", self.code())
@@ -572,6 +602,9 @@ impl DbError {
             Self::ShufflePartialSend(msg) => {
                 write!(f, "[{}] Shuffle partial send: {msg}", self.code())
             }
+            Self::ShuffleSendStalled(msg) => {
+                write!(f, "[{}] Shuffle send stalled: {msg}", self.code())
+            }
             Self::StatefulOperatorPartialApply(msg) => {
                 write!(
                     f,
@@ -586,6 +619,15 @@ impl DbError {
             } => write!(
                 f,
                 "[{}] Managed state budget exceeded during {context}: accounted={accounted_bytes} bytes, limit={limit_bytes} bytes",
+                self.code()
+            ),
+            Self::GroupLimitExceeded {
+                context,
+                groups,
+                limit,
+            } => write!(
+                f,
+                "[{}] Group limit exceeded during {context}: groups={groups}, limit={limit}",
                 self.code()
             ),
             Self::MaterializedViewQuotaExceeded { view, rows, bytes, max_rows, max_bytes } => write!(

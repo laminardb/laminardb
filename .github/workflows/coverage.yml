@@ -32,9 +32,9 @@ jobs:
       RUST_MIN_STACK: 4194304
     steps:
       - uses: actions/checkout@v6
-      # The --all-features build under -C instrument-coverage (run 3x in this
-      # job) overflowed the runner disk ("No space left on device" -> ld bus
-      # error). Use the same aggressive cleanup + swap as the CI Test job.
+      # The --all-features build under -C instrument-coverage overflowed the
+      # runner disk ("No space left on device" -> ld bus error). Use the same
+      # aggressive cleanup + swap as the CI Test job.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -46,9 +46,9 @@ jobs:
           docker-images: true
           swap-storage: false
       - name: Set swap space
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -60,15 +60,36 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev protobuf-compiler
 
-      - name: Generate coverage
+      # Testcontainers pulls on first use inside the test run, where one dropped registry
+      # stream fails that test ("bytes remaining on stream"); pull up front with retries.
+      # Only images of tests that run by default: an `#[ignore]` test's image is never pulled.
+      - name: Pre-pull integration test images
         run: |
-          cargo llvm-cov --workspace --all-features \
+          for image in mongo:8.0 postgres:11-alpine postgres:18 \
+              redpandadata/redpanda:v24.3.1; do
+            for attempt in 1 2 3; do
+              docker pull --quiet "$image" && break
+              [ "$attempt" -eq 3 ] && exit 1
+              sleep $((attempt * 10))
+            done
+          done
+
+      # One instrumented test run; every report below reads its profile data. `--no-report`
+      # skips the automatic clean, so stale profiles are removed first.
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-features --no-report
+
+      - name: Generate LCOV report
+        run: |
+          cargo llvm-cov report \
             --ignore-filename-regex 'tests?\.rs$|benches?/' \
             --lcov --output-path lcov.info
 
       - name: Generate HTML report
         run: |
-          cargo llvm-cov --workspace --all-features \
+          cargo llvm-cov report \
             --ignore-filename-regex 'tests?\.rs$|benches?/' \
             --html --output-dir coverage-html
 
@@ -90,6 +111,6 @@ jobs:
         run: |
           echo "## Code Coverage" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov --workspace --all-features \
+          cargo llvm-cov report \
             --ignore-filename-regex 'tests?\.rs$|benches?/' \
             2>&1 | tail -30 >> $GITHUB_STEP_SUMMARY || true

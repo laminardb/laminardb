@@ -1,10 +1,10 @@
 //! Aggregate output construction and publication bookkeeping.
 
+use std::borrow::Cow;
 #[cfg(feature = "cluster")]
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::ScalarValue;
 #[cfg(feature = "cluster")]
@@ -17,7 +17,10 @@ use rustc_hash::FxHashSet;
 use super::apply_compiled_having;
 #[cfg(feature = "cluster")]
 use super::vnode_state::AggregateVnodeState;
-use super::{build_weighted_batch, ConcreteAggregateState, DbError, IncrementalAggState};
+use super::{
+    build_weighted_batch, ConcreteAggregateState, DbError, GroupKey, IncrementalAggState,
+    OutputColumn,
+};
 #[cfg(feature = "cluster")]
 use crate::subscription::PartitionedOutputBatch;
 
@@ -109,6 +112,13 @@ impl PreparedAggregateEmission {
     }
 }
 
+/// Each aggregate's value, owned to be compared with and kept as the last emitted values.
+fn owned_values(accs: &[ConcreteAggregateState]) -> Result<Vec<ScalarValue>, DbError> {
+    accs.iter()
+        .map(|acc| acc.evaluate().map(Cow::into_owned))
+        .collect()
+}
+
 fn scalar_vectors_equal(left: &[ScalarValue], right: &[ScalarValue]) -> bool {
     left.len() == right.len()
         && left
@@ -154,7 +164,7 @@ fn finish_ranges(row_count: usize, chunk_start: usize, ranges: &mut Vec<Range<us
 
 #[cfg(feature = "cluster")]
 fn evaluate_changelog_vnode(
-    state: &mut AggregateVnodeState,
+    state: &AggregateVnodeState,
     dirty: &FxHashSet<arrow::row::OwnedRow>,
     grouped: bool,
 ) -> Result<EvaluatedVnodeOutput, DbError> {
@@ -166,7 +176,7 @@ fn evaluate_changelog_vnode(
     let mut chunk_start = 0usize;
 
     for key in keys {
-        let Some(entry) = state.groups.get_mut(key) else {
+        let Some(entry) = state.groups.get(GroupKey::new(key.row())) else {
             continue;
         };
         let previous_len = changes.len();
@@ -181,11 +191,7 @@ fn evaluate_changelog_vnode(
             }
             deletions.push(key.clone());
         } else {
-            let current = entry
-                .accs
-                .iter_mut()
-                .map(ConcreteAggregateState::evaluate)
-                .collect::<Result<Vec<_>, _>>()?;
+            let current = owned_values(&entry.accs)?;
             match state.last_emitted.get(key) {
                 Some(old) if scalar_vectors_equal(old, &current) => {}
                 Some(old) => {
@@ -340,7 +346,7 @@ impl IncrementalAggState {
         let prepared = (|| {
             let evaluated = evaluate_changelog_vnode(
                 self.vnode_states
-                    .get_mut(vnode)
+                    .get(vnode)
                     .expect("dirty aggregate vnode must remain resident during emission"),
                 &dirty,
                 self.num_group_cols != 0,
@@ -468,10 +474,10 @@ impl IncrementalAggState {
     }
 
     #[cfg(feature = "cluster")]
-    fn evaluate_running_vnode(&mut self, vnode: u32) -> Result<EvaluatedVnodeOutput, DbError> {
+    fn evaluate_running_vnode(&self, vnode: u32) -> Result<EvaluatedVnodeOutput, DbError> {
         let state = self
             .vnode_states
-            .get_mut(vnode)
+            .get(vnode)
             .expect("active aggregate vnode must remain resident");
         let mut keys = state.groups.keys().cloned().collect::<Vec<_>>();
         keys.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
@@ -480,17 +486,16 @@ impl IncrementalAggState {
         let mut deletions = Vec::new();
         let mut chunk_start = 0usize;
         for key in keys {
-            let entry = state.groups.get_mut(&key).expect("sorted aggregate key");
+            let entry = state
+                .groups
+                .get(GroupKey::new(key.row()))
+                .expect("sorted aggregate key");
             if self.num_group_cols != 0 && entry.input_weight == 0 {
                 deletions.push(key);
                 continue;
             }
             let previous_len = changes.len();
-            let values = entry
-                .accs
-                .iter_mut()
-                .map(ConcreteAggregateState::evaluate)
-                .collect::<Result<Vec<_>, _>>()?;
+            let values = owned_values(&entry.accs)?;
             changes.push(PendingChange {
                 key,
                 values,
@@ -509,32 +514,20 @@ impl IncrementalAggState {
 
     #[cfg(feature = "cluster")]
     fn build_running_batch(&self, rows: &[PendingChange]) -> Result<RecordBatch, DbError> {
-        let group_arrays = if self.num_group_cols == 0 {
+        let mut arrays = if self.num_group_cols == 0 {
             Vec::new()
         } else {
             self.row_converter
                 .convert_rows(rows.iter().map(|row| row.key.row()))
                 .map_err(|error| DbError::Pipeline(format!("group key array build: {error}")))?
         };
-        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (index, spec) in self.agg_specs.iter().enumerate() {
-            let values = rows.iter().map(|row| row.values[index].clone());
-            let array = ScalarValue::iter_to_array(values)
-                .map_err(|error| DbError::Pipeline(format!("agg result array build: {error}")))?;
-            let array = if array.data_type() == &spec.return_type {
-                array
-            } else {
-                arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "aggregate '{}' result cast failed: {error}",
-                        spec.output_name
-                    ))
-                })?
-            };
-            agg_arrays.push(array);
+            let mut column = OutputColumn::with_capacity(rows.len());
+            for row in rows {
+                column.push(Cow::Borrowed(&row.values[index]))?;
+            }
+            arrays.push(column.finish(spec)?);
         }
-        let mut arrays = group_arrays;
-        arrays.extend(agg_arrays);
         RecordBatch::try_new(Arc::clone(&self.output_schema), arrays)
             .map_err(|error| DbError::Pipeline(format!("result batch build: {error}")))
     }
@@ -630,7 +623,7 @@ impl IncrementalAggState {
         debug_assert!(self.vnode_states.iter().all(|(_, state)| state
             .last_emitted
             .keys()
-            .all(|key| state.groups.contains_key(key))));
+            .all(|key| state.groups.get(GroupKey::new(key.row())).is_some())));
     }
 
     /// Restore dirty-key ownership when publication fails before bookkeeping commit.
@@ -666,7 +659,7 @@ impl IncrementalAggState {
             return Ok(Vec::new());
         }
 
-        let group_arrays = if self.num_group_cols > 0 {
+        let mut arrays = if self.num_group_cols > 0 {
             self.row_converter
                 .convert_rows(
                     self.vnode_states
@@ -678,30 +671,21 @@ impl IncrementalAggState {
         } else {
             Vec::new()
         };
-        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
-        for (index, spec) in self.agg_specs.iter().enumerate() {
-            let mut scalars = Vec::with_capacity(num_rows);
-            for (_, state) in self.vnode_states.iter_mut() {
-                for entry in state.groups.values_mut() {
-                    scalars.push(entry.accs[index].evaluate()?);
+        let mut columns: Vec<OutputColumn> = self
+            .agg_specs
+            .iter()
+            .map(|_| OutputColumn::with_capacity(num_rows))
+            .collect();
+        for (_, state) in self.vnode_states.iter() {
+            for (_, entry) in &state.groups {
+                for (column, acc) in columns.iter_mut().zip(&entry.accs) {
+                    column.push(acc.evaluate()?)?;
                 }
             }
-            let array = ScalarValue::iter_to_array(scalars)
-                .map_err(|error| DbError::Pipeline(format!("agg result array build: {error}")))?;
-            let array = if array.data_type() == &spec.return_type {
-                array
-            } else {
-                arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "aggregate '{}' result cast failed: {error}",
-                        spec.output_name
-                    ))
-                })?
-            };
-            agg_arrays.push(array);
         }
-        let mut arrays = group_arrays;
-        arrays.extend(agg_arrays);
+        for (column, spec) in columns.into_iter().zip(&self.agg_specs) {
+            arrays.push(column.finish(spec)?);
+        }
         let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), arrays)
             .map_err(|error| DbError::Pipeline(format!("result batch build: {error}")))?;
         Ok(vec![batch])
@@ -720,10 +704,10 @@ impl IncrementalAggState {
             for (vnode, dirty) in &dirty_by_vnode {
                 let state = self
                     .vnode_states
-                    .get_mut(*vnode)
+                    .get(*vnode)
                     .expect("dirty aggregate vnode must remain resident during emission");
                 for key in dirty {
-                    let Some(entry) = state.groups.get_mut(key) else {
+                    let Some(entry) = state.groups.get(GroupKey::new(key.row())) else {
                         continue;
                     };
                     if entry.input_weight == 0 && self.num_group_cols > 0 {
@@ -734,11 +718,7 @@ impl IncrementalAggState {
                         deleted_groups.push((*vnode, key.clone()));
                         continue;
                     }
-                    let current = entry
-                        .accs
-                        .iter_mut()
-                        .map(ConcreteAggregateState::evaluate)
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let current = owned_values(&entry.accs)?;
                     match state.last_emitted.get(key) {
                         Some(old) if scalar_vectors_equal(old, &current) => {}
                         Some(old) => {

@@ -29,25 +29,22 @@ fn source_with_limit(limit: usize, capacity: usize) -> (Source<Payload>, Sink<Pa
 }
 
 #[tokio::test]
-async fn byte_limit_survives_broadcast_and_slow_subscribers() {
+async fn byte_limit_holds_until_the_sink_receives() {
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = source_with_limit(bytes, 16);
-    let mut fast = sink.subscribe();
-    let slow = sink.subscribe();
+    let (source, mut sink) = source_with_limit(bytes, 16);
     source.push_arrow(batch.clone()).unwrap();
     assert_eq!(source.queued_arrow_bytes(), bytes);
-    let received = fast.recv_async().await.unwrap();
-    assert_eq!(source.pending(), 0);
     assert_eq!(
         source.push_arrow(batch.clone()),
         Err(StreamingError::ChannelFull)
     );
     assert_eq!(source.sequence(), 1);
-    drop(slow);
+    let received = sink.recv_async().await.unwrap();
+    assert_eq!(source.pending(), 0);
     assert_eq!(source.queued_arrow_bytes(), 0);
     source.push_arrow(batch).unwrap();
-    fast.recv_async().await.unwrap();
+    sink.recv_async().await.unwrap();
     assert_eq!(source.queued_arrow_bytes(), 0);
     // Returned batches belong to the caller, outside the queue reservation.
     assert_eq!(received.num_rows(), 1);
@@ -57,8 +54,7 @@ async fn byte_limit_survives_broadcast_and_slow_subscribers() {
 async fn cloned_concurrent_producers_share_one_budget() {
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = source_with_limit(bytes * 8, 64);
-    let mut subscription = sink.subscribe();
+    let (source, mut sink) = source_with_limit(bytes * 8, 64);
     let accepted = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..16)
             .map(|_| {
@@ -80,7 +76,7 @@ async fn cloned_concurrent_producers_share_one_budget() {
     assert_eq!(source.sequence(), 8);
     assert_eq!(source.queued_arrow_bytes(), bytes * 8);
     for _ in 0..accepted {
-        subscription.recv_async().await.unwrap();
+        sink.recv_async().await.unwrap();
     }
     assert_eq!(source.queued_arrow_bytes(), 0);
     source.push_arrow(batch).unwrap();
@@ -90,8 +86,7 @@ async fn cloned_concurrent_producers_share_one_budget() {
 async fn count_rejection_returns_arrow_charge() {
     let batch = Payload("x".repeat(32)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = source_with_limit(bytes * 16, 4);
-    let mut subscription = sink.subscribe();
+    let (source, mut sink) = source_with_limit(bytes * 16, 4);
     for _ in 0..4 {
         source.push_arrow(batch.clone()).unwrap();
     }
@@ -102,27 +97,21 @@ async fn count_rejection_returns_arrow_charge() {
     assert_eq!(source.queued_arrow_bytes(), bytes * 4);
     assert_eq!(source.sequence(), 4);
     for _ in 0..4 {
-        subscription.recv_async().await.unwrap();
+        sink.recv_async().await.unwrap();
     }
     assert_eq!(source.queued_arrow_bytes(), 0);
     source.push_arrow(batch).unwrap();
 }
 
 #[test]
-fn runtime_cancellation_closes_admission_and_final_producer_drop_releases_charges() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+fn sink_drop_closes_admission_and_final_producer_drop_releases_charges() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = {
-        let _guard = runtime.enter();
-        source_with_limit(bytes, 16)
-    };
+    let (source, sink) = source_with_limit(bytes, 16);
     let budget = Arc::clone(&source.inner.arrow_budget);
     source.push_arrow(batch.clone()).unwrap();
-    drop(runtime);
+    drop(sink);
     assert!(source.is_closed());
     // Crossfire retains unread queue storage until its remaining producer handles drop.
     assert_eq!(source.pending(), 1);
@@ -137,63 +126,38 @@ fn runtime_cancellation_closes_admission_and_final_producer_drop_releases_charge
     assert_eq!(source.sequence(), 1);
     drop(source);
     assert_eq!(budget.available_permits(), bytes);
-    drop(sink);
 }
 
 #[tokio::test]
-async fn dropped_subscription_releases_bytes_after_cancelled_receive() {
+async fn cancelled_receive_keeps_the_queued_batch_and_its_charge() {
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = source_with_limit(bytes, 16);
-    let mut subscription = sink.subscribe();
+    let (source, mut sink) = source_with_limit(bytes, 16);
     assert!(
-        tokio::time::timeout(Duration::from_millis(1), subscription.recv_async())
+        tokio::time::timeout(Duration::from_millis(1), sink.recv_async())
             .await
             .is_err()
     );
     source.push_arrow(batch.clone()).unwrap();
-    tokio::task::yield_now().await;
     assert_eq!(source.queued_arrow_bytes(), bytes);
-    drop(subscription);
-    assert_eq!(source.queued_arrow_bytes(), 0);
-    source.push_arrow(batch).unwrap();
-    tokio::task::yield_now().await;
+    assert_eq!(sink.recv_async().await.unwrap(), batch);
     assert_eq!(source.queued_arrow_bytes(), 0);
 }
 
 #[tokio::test]
-async fn broadcast_eviction_releases_only_the_evicted_batch() {
+async fn source_drop_preserves_accepted_tail_then_releases_bytes() {
     let batch = Payload("x".repeat(32)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = source_with_limit(bytes * 4096, 4096);
-    let subscription = sink.subscribe();
-    for _ in 0..2049 {
-        source.push_arrow(batch.clone()).unwrap();
-    }
-    while source.pending() != 0 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(source.queued_arrow_bytes(), bytes * 2048);
-    drop(subscription);
-    assert_eq!(source.queued_arrow_bytes(), 0);
-}
-
-#[tokio::test]
-async fn source_and_sink_drop_preserve_accepted_tail_then_release_bytes() {
-    let batch = Payload("x".repeat(32)).to_record_batch();
-    let bytes = retained_arrow_bytes(&batch);
-    let (source, sink) = source_with_limit(bytes * 2, 16);
+    let (source, mut sink) = source_with_limit(bytes * 2, 16);
     let budget = Arc::clone(&source.inner.arrow_budget);
-    let mut subscription = sink.subscribe();
     source.push_arrow(batch.clone()).unwrap();
     source.push_arrow(batch).unwrap();
     drop(source);
-    drop(sink);
-    assert_eq!(subscription.recv_async().await.unwrap().num_rows(), 1);
-    assert_eq!(subscription.recv_async().await.unwrap().num_rows(), 1);
+    assert_eq!(sink.recv_async().await.unwrap().num_rows(), 1);
+    assert_eq!(sink.recv_async().await.unwrap().num_rows(), 1);
     assert_eq!(budget.available_permits(), bytes * 2);
     assert!(matches!(
-        subscription.recv_async().await,
+        sink.recv_async().await,
         Err(crate::streaming::RecvError::Disconnected)
     ));
 }

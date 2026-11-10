@@ -1,9 +1,11 @@
-use arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray};
-use arrow::compute;
-use arrow::datatypes::{DataType, Decimal128Type, DecimalType, Float64Type, Int64Type, UInt64Type};
+use std::borrow::Cow;
+
+use arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, PrimitiveArray};
+use arrow::datatypes::{DataType, Decimal128Type, DecimalType};
 use datafusion_common::ScalarValue;
 
-use super::{aggregate_error, append_value, weighted_values, ConcreteInputMode};
+use super::input::TypedValues;
+use super::{aggregate_error, AggregateInput, ConcreteInputMode};
 use crate::error::DbError;
 
 #[derive(Clone, Debug)]
@@ -48,50 +50,47 @@ impl SumState {
         })
     }
 
-    pub(super) fn update_batch(&mut self, values: &[ArrayRef]) -> Result<(), DbError> {
+    pub(super) fn check_input(&self, input: &AggregateInput<'_>) -> Result<(), DbError> {
+        let name = match self.mode {
+            SumMode::AppendOnly => "SUM",
+            SumMode::Weighted { .. } => "weighted SUM",
+        };
+        require_array_type(input.value, &self.input_type, name)
+    }
+
+    pub(super) fn update_rows(
+        &mut self,
+        input: &AggregateInput<'_>,
+        rows: &[u32],
+    ) -> Result<(), DbError> {
         match &mut self.mode {
-            SumMode::AppendOnly => {
-                let value = append_value(values)?;
-                require_array_type(value, &self.input_type, "SUM")?;
-                let delta = sum_array(value, &self.output_type)?;
-                merge_sum_scalar(&mut self.sum, &delta)
-            }
-            SumMode::Weighted { non_null_weight } => {
-                let (value, weights) = weighted_values(values)?;
-                require_array_type(value, &self.input_type, "weighted SUM")?;
-                update_weighted_sum(
-                    &mut self.sum,
-                    non_null_weight,
-                    value,
-                    weights,
-                    &self.output_type,
-                )
-            }
+            SumMode::AppendOnly => add_rows_sum(&mut self.sum, input, rows),
+            SumMode::Weighted { non_null_weight } => update_weighted_sum(
+                &mut self.sum,
+                non_null_weight,
+                input,
+                rows,
+                &self.output_type,
+            ),
         }
     }
 
     #[cfg(feature = "cluster")]
-    pub(super) fn batch_delta(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+    pub(super) fn batch_delta(
+        &self,
+        input: &AggregateInput<'_>,
+        rows: &[u32],
+    ) -> Result<Vec<ScalarValue>, DbError> {
         match self.mode {
-            SumMode::AppendOnly => {
-                let value = append_value(values)?;
-                require_array_type(value, &self.input_type, "SUM")?;
-                Ok(vec![sum_array(value, &self.output_type)?])
-            }
+            SumMode::AppendOnly => Ok(vec![sum_rows(input, rows, &self.output_type)?]),
             SumMode::Weighted { .. } => {
-                let (value, weights) = weighted_values(values)?;
-                require_array_type(value, &self.input_type, "weighted SUM")?;
                 let (sum, weight) = match &self.sum {
                     ScalarValue::Decimal128(Some(_), 38, 0) => {
-                        let (sum, weight) = exact_weighted_sum_delta(value, weights)?;
+                        let (sum, weight) = exact_weighted_sum_delta(input, rows)?;
                         (ScalarValue::Decimal128(Some(sum), 38, 0), weight)
                     }
                     ScalarValue::Float64(Some(_)) => {
-                        let (sum, weight) = weighted_f64_delta(
-                            value.as_primitive::<Float64Type>(),
-                            weights,
-                            "weighted SUM",
-                        )?;
+                        let (sum, weight) = weighted_f64_delta(input, rows, "weighted SUM")?;
                         (ScalarValue::Float64(Some(sum)), weight)
                     }
                     _ => {
@@ -105,15 +104,16 @@ impl SumState {
         }
     }
 
-    pub(super) fn evaluate(&self) -> Result<ScalarValue, DbError> {
+    pub(super) fn evaluate(&self) -> Result<Cow<'_, ScalarValue>, DbError> {
         match self.mode {
-            SumMode::AppendOnly => Ok(self.sum.clone()),
+            SumMode::AppendOnly => Ok(Cow::Borrowed(&self.sum)),
             SumMode::Weighted { non_null_weight } => {
                 if non_null_weight == 0 {
                     ScalarValue::try_from(&self.output_type)
+                        .map(Cow::Owned)
                         .map_err(|error| aggregate_error("SUM null result", error))
                 } else {
-                    weighted_sum_result(&self.sum, &self.output_type)
+                    weighted_sum_result(&self.sum, &self.output_type).map(Cow::Owned)
                 }
             }
         }
@@ -212,42 +212,70 @@ pub(super) fn require_array_type(
     Ok(())
 }
 
-pub(super) fn sum_array(array: &ArrayRef, output_type: &DataType) -> Result<ScalarValue, DbError> {
-    macro_rules! primitive_sum {
-        ($arrow_type:ty, $scalar:ident) => {
-            ScalarValue::$scalar(
-                compute::sum_checked(array.as_primitive::<$arrow_type>())
-                    .map_err(|error| aggregate_error("SUM batch overflow", error))?,
-            )
-        };
-        ($arrow_type:ty, $scalar:ident, $precision:expr, $scale:expr) => {
-            ScalarValue::$scalar(
-                compute::sum_checked(array.as_primitive::<$arrow_type>())
-                    .map_err(|error| aggregate_error("SUM batch overflow", error))?,
-                $precision,
-                $scale,
-            )
-        };
+/// Checked sum of the admitted non-NULL values, added in row order from zero as Arrow's
+/// `sum_checked` adds a column, or `None` when no row has a value.
+fn checked_rows_sum<T: ArrowPrimitiveType>(
+    values: &PrimitiveArray<T>,
+    input: &AggregateInput<'_>,
+    rows: &[u32],
+) -> Result<Option<T::Native>, DbError> {
+    let mut sum = T::default_value();
+    let mut any = false;
+    for row in input.selected(rows) {
+        if values.is_null(row) {
+            continue;
+        }
+        sum = sum
+            .add_checked(values.value(row))
+            .map_err(|error| aggregate_error("SUM batch overflow", error))?;
+        any = true;
     }
+    Ok(any.then_some(sum))
+}
 
-    let sum = match (array.data_type(), output_type) {
-        (DataType::Int64, DataType::Int64) => primitive_sum!(Int64Type, Int64),
-        (DataType::UInt64, DataType::UInt64) => primitive_sum!(UInt64Type, UInt64),
-        (DataType::Float64, DataType::Float64) => primitive_sum!(Float64Type, Float64),
-        (DataType::Decimal128(_, _), DataType::Decimal128(precision, scale)) => {
-            primitive_sum!(Decimal128Type, Decimal128, *precision, *scale)
+/// Adds the admitted rows' sum to `total`. The rows are summed from zero first, so a batch
+/// overflows and rounds exactly as its delta row would.
+pub(super) fn add_rows_sum(
+    total: &mut ScalarValue,
+    input: &AggregateInput<'_>,
+    rows: &[u32],
+) -> Result<(), DbError> {
+    match (input.values, total) {
+        (TypedValues::Int64(values), ScalarValue::Int64(total)) => {
+            add_sum(total, checked_rows_sum(values, input, rows)?)
         }
-        _ => {
-            return Err(DbError::Pipeline(format!(
-                "SUM cannot combine input {:?} with state {output_type:?}",
-                array.data_type()
-            )))
+        (TypedValues::UInt64(values), ScalarValue::UInt64(total)) => {
+            add_sum(total, checked_rows_sum(values, input, rows)?)
         }
-    };
-    if let ScalarValue::Decimal128(Some(value), precision, scale) = &sum {
-        Decimal128Type::validate_decimal_precision(*value, *precision, *scale)
-            .map_err(|error| aggregate_error("SUM batch precision", error))?;
+        (TypedValues::Float64(values), ScalarValue::Float64(total)) => {
+            add_sum(total, checked_rows_sum(values, input, rows)?)
+        }
+        (TypedValues::Decimal128(values), ScalarValue::Decimal128(total, precision, scale)) => {
+            add_decimal_sum(
+                total,
+                checked_rows_sum(values, input, rows)?,
+                *precision,
+                *scale,
+                "SUM batch precision",
+            )
+        }
+        (_, total) => Err(DbError::Pipeline(format!(
+            "SUM cannot combine input {:?} with state {:?}",
+            input.value.data_type(),
+            total.data_type()
+        ))),
     }
+}
+
+#[cfg(feature = "cluster")]
+pub(super) fn sum_rows(
+    input: &AggregateInput<'_>,
+    rows: &[u32],
+    output_type: &DataType,
+) -> Result<ScalarValue, DbError> {
+    let mut sum = ScalarValue::try_from(output_type)
+        .map_err(|error| aggregate_error("SUM state type", error))?;
+    add_rows_sum(&mut sum, input, rows)?;
     Ok(sum)
 }
 
@@ -255,57 +283,62 @@ pub(super) fn merge_sum_scalar(
     total: &mut ScalarValue,
     delta: &ScalarValue,
 ) -> Result<(), DbError> {
-    if total.data_type() != delta.data_type() {
-        return Err(sum_state_type_error(total, delta));
-    }
-    if let ScalarValue::Decimal128(Some(value), precision, scale) = delta {
-        Decimal128Type::validate_decimal_precision(*value, *precision, *scale)
-            .map_err(|error| aggregate_error("SUM checkpoint precision", error))?;
-    }
-    if delta.is_null() {
-        return Ok(());
-    }
-    if total.is_null() {
-        *total = delta.clone();
-        return Ok(());
-    }
-
     match (total, delta) {
-        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            *left = Some(next);
-        }
-        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            *left = Some(next);
-        }
-        (ScalarValue::Float64(left), ScalarValue::Float64(right)) => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            *left = Some(next);
-        }
+        (ScalarValue::Int64(total), ScalarValue::Int64(delta)) => add_sum(total, *delta),
+        (ScalarValue::UInt64(total), ScalarValue::UInt64(delta)) => add_sum(total, *delta),
+        (ScalarValue::Float64(total), ScalarValue::Float64(delta)) => add_sum(total, *delta),
         (
-            ScalarValue::Decimal128(left, left_precision, left_scale),
-            ScalarValue::Decimal128(right, right_precision, right_scale),
-        ) if left_precision == right_precision && left_scale == right_scale => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            Decimal128Type::validate_decimal_precision(next, *left_precision, *left_scale)
-                .map_err(|error| aggregate_error("SUM state precision", error))?;
-            *left = Some(next);
-        }
-        (left, right) => return Err(sum_state_type_error(left, right)),
+            ScalarValue::Decimal128(total, precision, scale),
+            ScalarValue::Decimal128(delta, delta_precision, delta_scale),
+        ) if *precision == *delta_precision && *scale == *delta_scale => add_decimal_sum(
+            total,
+            *delta,
+            *precision,
+            *scale,
+            "SUM checkpoint precision",
+        ),
+        (total, delta) => Err(sum_state_type_error(total, delta)),
     }
+}
+
+fn add_sum<T: ArrowNativeTypeOp>(total: &mut Option<T>, delta: Option<T>) -> Result<(), DbError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    let next = match *total {
+        None => delta,
+        Some(total) => total
+            .add_checked(delta)
+            .map_err(|error| aggregate_error("SUM state overflow", error))?,
+    };
+    *total = Some(next);
+    Ok(())
+}
+
+fn add_decimal_sum(
+    total: &mut Option<i128>,
+    delta: Option<i128>,
+    precision: u8,
+    scale: i8,
+    delta_context: &str,
+) -> Result<(), DbError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    Decimal128Type::validate_decimal_precision(delta, precision, scale)
+        .map_err(|error| aggregate_error(delta_context, error))?;
+    let next = match *total {
+        None => delta,
+        Some(total) => {
+            let next = total
+                .add_checked(delta)
+                .map_err(|error| aggregate_error("SUM state overflow", error))?;
+            Decimal128Type::validate_decimal_precision(next, precision, scale)
+                .map_err(|error| aggregate_error("SUM state precision", error))?;
+            next
+        }
+    };
+    *total = Some(next);
     Ok(())
 }
 
@@ -370,31 +403,13 @@ fn sum_state_type_error(left: &ScalarValue, right: &ScalarValue) -> DbError {
 fn update_weighted_sum(
     sum: &mut ScalarValue,
     non_null_weight: &mut i64,
-    values: &ArrayRef,
-    weights: &arrow::array::Int64Array,
+    input: &AggregateInput<'_>,
+    rows: &[u32],
     output_type: &DataType,
 ) -> Result<(), DbError> {
     match sum {
         ScalarValue::Decimal128(Some(total), 38, 0) => {
-            let (delta_sum, delta_weight) = match values.data_type() {
-                DataType::Int64 => {
-                    let values = values.as_primitive::<Int64Type>();
-                    exact_weighted_delta(values, weights, |row| i128::from(values.value(row)))?
-                }
-                DataType::UInt64 => {
-                    let values = values.as_primitive::<UInt64Type>();
-                    exact_weighted_delta(values, weights, |row| i128::from(values.value(row)))?
-                }
-                DataType::Decimal128(_, _) => {
-                    let values = values.as_primitive::<Decimal128Type>();
-                    exact_weighted_delta(values, weights, |row| values.value(row))?
-                }
-                other => {
-                    return Err(DbError::Pipeline(format!(
-                        "weighted exact SUM does not support input type {other:?}"
-                    )))
-                }
-            };
+            let (delta_sum, delta_weight) = exact_weighted_sum_delta(input, rows)?;
             let next_sum = total
                 .checked_add(delta_sum)
                 .ok_or_else(|| DbError::Pipeline("weighted SUM state overflow".into()))?;
@@ -413,16 +428,7 @@ fn update_weighted_sum(
             Ok(())
         }
         ScalarValue::Float64(Some(total)) if output_type == &DataType::Float64 => {
-            let values = values
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "weighted SUM(Float64) received {:?}",
-                        values.data_type()
-                    ))
-                })?;
-            let (delta_sum, delta_weight) = weighted_f64_delta(values, weights, "weighted SUM")?;
+            let (delta_sum, delta_weight) = weighted_f64_delta(input, rows, "weighted SUM")?;
             let next_weight = non_null_weight
                 .checked_add(delta_weight)
                 .ok_or_else(|| DbError::Pipeline("weighted SUM weight overflow".into()))?;
@@ -439,39 +445,38 @@ fn update_weighted_sum(
     }
 }
 
-#[cfg(feature = "cluster")]
 fn exact_weighted_sum_delta(
-    values: &ArrayRef,
-    weights: &arrow::array::Int64Array,
+    input: &AggregateInput<'_>,
+    rows: &[u32],
 ) -> Result<(i128, i64), DbError> {
-    match values.data_type() {
-        DataType::Int64 => {
-            let values = values.as_primitive::<Int64Type>();
-            exact_weighted_delta(values, weights, |row| i128::from(values.value(row)))
+    match input.values {
+        TypedValues::Int64(values) => {
+            exact_weighted_delta(input, rows, |row| i128::from(values.value(row)))
         }
-        DataType::UInt64 => {
-            let values = values.as_primitive::<UInt64Type>();
-            exact_weighted_delta(values, weights, |row| i128::from(values.value(row)))
+        TypedValues::UInt64(values) => {
+            exact_weighted_delta(input, rows, |row| i128::from(values.value(row)))
         }
-        DataType::Decimal128(_, _) => {
-            let values = values.as_primitive::<Decimal128Type>();
-            exact_weighted_delta(values, weights, |row| values.value(row))
+        TypedValues::Decimal128(values) => {
+            exact_weighted_delta(input, rows, |row| values.value(row))
         }
-        other => Err(DbError::Pipeline(format!(
-            "weighted exact SUM does not support input type {other:?}"
+        TypedValues::Float64(_) | TypedValues::Other => Err(DbError::Pipeline(format!(
+            "weighted exact SUM does not support input type {:?}",
+            input.value.data_type()
         ))),
     }
 }
 
-fn exact_weighted_delta<A: Array>(
-    values: &A,
-    weights: &arrow::array::Int64Array,
+fn exact_weighted_delta(
+    input: &AggregateInput<'_>,
+    rows: &[u32],
     value_at: impl Fn(usize) -> i128,
 ) -> Result<(i128, i64), DbError> {
+    let weights = input.weights()?;
+    let nulls = input.nulls;
     let mut sum = 0_i128;
     let mut non_null_weight = 0_i64;
-    for row in 0..values.len() {
-        if values.is_null(row) {
+    for row in input.selected(rows) {
+        if nulls.is_some_and(|nulls| nulls.is_null(row)) {
             continue;
         }
         let weight = weights.value(row);
@@ -489,13 +494,20 @@ fn exact_weighted_delta<A: Array>(
 }
 
 pub(super) fn weighted_f64_delta(
-    values: &arrow::array::Float64Array,
-    weights: &arrow::array::Int64Array,
+    input: &AggregateInput<'_>,
+    rows: &[u32],
     name: &str,
 ) -> Result<(f64, i64), DbError> {
+    let TypedValues::Float64(values) = input.values else {
+        return Err(DbError::Pipeline(format!(
+            "{name} expected Float64 input, got {:?}",
+            input.value.data_type()
+        )));
+    };
+    let weights = input.weights()?;
     let mut sum = 0.0;
     let mut non_null_weight = 0_i64;
-    for row in 0..values.len() {
+    for row in input.selected(rows) {
         if values.is_null(row) {
             continue;
         }

@@ -194,6 +194,7 @@ pub(super) async fn build_shuffle_sender(
     advertise_addr: String,
     membership_rx: watch::Receiver<Vec<NodeInfo>>,
     process_incarnation: uuid::Uuid,
+    send_stall_timeout: Option<std::time::Duration>,
 ) -> Arc<laminar_core::shuffle::ShuffleSender> {
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
     use laminar_core::shuffle::{ShuffleSender, SHUFFLE_ADDR_KEY};
@@ -213,7 +214,7 @@ pub(super) async fn build_shuffle_sender(
             ShuffleSender::with_kv(node_id, kv, process_incarnation)
         }
     };
-    let sender = Arc::new(sender);
+    let sender = Arc::new(sender.with_send_stall_timeout(send_stall_timeout));
 
     // Static advertises shuffle addrs in heartbeat metadata; register peers as they appear.
     if matches!(discovery, DiscoveryImpl::Static(_)) {

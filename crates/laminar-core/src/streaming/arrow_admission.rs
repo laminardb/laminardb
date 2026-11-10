@@ -7,7 +7,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::StreamingError;
 
-/// Default Arrow-byte limit per source, shared by its input ring and broadcast (64 MiB).
+/// Default Arrow-byte limit per source for batches its sink has not yet received (64 MiB).
 pub const DEFAULT_SOURCE_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Largest byte limit supported by source semaphore reservations.
@@ -58,7 +58,7 @@ impl QueuedArrowBatch {
         batch: RecordBatch,
         budget: &Arc<Semaphore>,
         limit: usize,
-    ) -> Result<Arc<Self>, StreamingError> {
+    ) -> Result<Self, StreamingError> {
         validate_source_max_queued_bytes(limit)?;
         let bytes = retained_arrow_bytes(&batch);
         let permits = u32::try_from(bytes)
@@ -72,18 +72,13 @@ impl QueuedArrowBatch {
                     TryAcquireError::NoPermits => StreamingError::ChannelFull,
                     TryAcquireError::Closed => StreamingError::Disconnected,
                 })?;
-        Ok(Arc::new(Self {
+        Ok(Self {
             batch,
             _permit: permit,
-        }))
+        })
     }
 
-    pub(crate) fn into_batch(self: Arc<Self>) -> RecordBatch {
-        // The last subscriber can transfer the batch without cloning its column vector.
-        // Other subscribers share the reservation until their queued references are gone.
-        match Arc::try_unwrap(self) {
-            Ok(queued) => queued.batch,
-            Err(shared) => shared.batch.clone(),
-        }
+    pub(crate) fn into_batch(self) -> RecordBatch {
+        self.batch
     }
 }

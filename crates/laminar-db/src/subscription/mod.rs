@@ -21,6 +21,7 @@ pub use portal::{
     SubscriptionPortal,
 };
 pub use registry::SubscribeStart;
-#[cfg(all(test, feature = "cluster"))]
-pub(crate) use registry::SubscriptionReader;
-pub(crate) use registry::{SubscriptionOpenError, SubscriptionRegistry};
+pub(crate) use registry::{
+    process_subscription_log_bytes, SubscriptionOpenError, SubscriptionReader,
+    SubscriptionRegistry, PROCESS_SUBSCRIPTION_BYTES,
+};

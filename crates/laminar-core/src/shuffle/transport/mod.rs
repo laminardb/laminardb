@@ -678,9 +678,12 @@ struct InboundReservation;
 #[cfg(feature = "cluster")]
 mod grpc {
     mod delivery_loss;
+    mod flow;
     mod handshake;
     mod pipeline_identity;
     mod topology;
+    pub use flow::{is_shuffle_send_stalled, ShufflePeerFlow};
+    use flow::{OutboundReservation, PeerSendCounters, SendFlow};
     use std::collections::hash_map::Entry;
     use std::collections::VecDeque;
     use std::io;
@@ -725,9 +728,9 @@ mod grpc {
     const OUTBOUND_PEER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
     const CHECKPOINTED_CONTROL_PEER_BUDGET_BYTES: usize = 256 * 1024;
     const CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
-    const OUTBOUND_NODE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    const OUTBOUND_NODE_BUDGET_BYTES: usize = crate::shuffle::SHUFFLE_NODE_BUDGET_BYTES;
     const INBOUND_PEER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
-    const INBOUND_NODE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    const INBOUND_NODE_BUDGET_BYTES: usize = crate::shuffle::SHUFFLE_NODE_BUDGET_BYTES;
     const MAX_SOURCE_SCHEMA_MEMORY_BYTES: usize = 256 * 1024;
     /// The encoded schema is the canonical protocol bound. It must fit entirely in fragment zero
     /// so a receiver can verify it before allocating an Arrow decoder.
@@ -1033,36 +1036,6 @@ mod grpc {
     struct Encoded {
         frames: VecDeque<ShuffleFrame>,
         _budget: OutboundReservation,
-    }
-
-    struct OutboundReservation {
-        peer: OwnedSemaphorePermit,
-        node: OwnedSemaphorePermit,
-    }
-
-    impl OutboundReservation {
-        fn shrink_to(&mut self, retained_bytes: usize) -> io::Result<()> {
-            let peer_bytes = self.peer.num_permits();
-            let node_bytes = self.node.num_permits();
-            if peer_bytes != node_bytes || retained_bytes > peer_bytes {
-                return Err(io::Error::other(
-                    "shuffle outbound reservation accounting mismatch",
-                ));
-            }
-            let release = peer_bytes - retained_bytes;
-            if release != 0 {
-                let peer = self
-                    .peer
-                    .split(release)
-                    .expect("validated outbound peer reservation split");
-                let node = self
-                    .node
-                    .split(release)
-                    .expect("validated outbound node reservation split");
-                drop((peer, node));
-            }
-            Ok(())
-        }
     }
 
     struct Inbound {
@@ -2049,6 +2022,7 @@ mod grpc {
         tx: MAsyncTx<mpsc::Array<Outbound>>,
         byte_budget: Arc<Semaphore>,
         control_byte_budget: Arc<Semaphore>,
+        counters: Arc<PeerSendCounters>,
         /// Sequence allocation and queue insertion must be one ordered operation. Without this,
         /// concurrent callers can enqueue sequence 1 before sequence 0.
         send_lock: tokio::sync::Mutex<()>,
@@ -2086,6 +2060,7 @@ mod grpc {
         current_assignment: Arc<AtomicU64>,
         current_recovery_gen: Arc<AtomicU64>,
         scope_cancel: CancellationToken,
+        counters: Arc<PeerSendCounters>,
     }
 
     type ConnectLock = Arc<tokio::sync::Mutex<()>>;
@@ -2113,6 +2088,9 @@ mod grpc {
         /// Ordered data/frontier frames enqueued per peer. Lives here, not on `PeerConn`, so it
         /// survives a reconnect that discards a queue and leaves a detectable gap.
         seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
+        /// Flow totals per peer, kept here for the same reason so they survive reconnects, and
+        /// the send stall timeout.
+        flow: SendFlow,
         checkpointed_control_node_budget: Arc<Semaphore>,
         node_budget: Arc<Semaphore>,
         #[cfg(test)]
@@ -2156,6 +2134,7 @@ mod grpc {
                 topology_version: Arc::new(AtomicU64::new(0)),
                 pipeline_identity: RwLock::new(None),
                 seqs: Mutex::new(FxHashMap::default()),
+                flow: SendFlow::default(),
                 checkpointed_control_node_budget: Arc::new(Semaphore::new(
                     CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES,
                 )),
@@ -2551,46 +2530,9 @@ mod grpc {
                     "shuffle recovery generation changed while opening the stream",
                 ));
             }
-            let admission_permits = u32::try_from(admission_bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "shuffle admission is too large",
-                )
-            })?;
-            let control = matches!(msg, ShuffleMessage::Barrier(_));
-            let (peer_byte_budget, node_budget) = if control {
-                (
-                    &conn.control_byte_budget,
-                    &self.checkpointed_control_node_budget,
-                )
-            } else {
-                (&conn.byte_budget, &self.node_budget)
-            };
-            let peer_budget = tokio::select! {
-                biased;
-                () = scope.cancel.cancelled() => return Err(scope_cancelled_io()),
-                permit = Arc::clone(peer_byte_budget).acquire_many_owned(admission_permits) => {
-                    permit.map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "shuffle byte budget closed")
-                    })?
-                }
-            };
-            let node_budget = tokio::select! {
-                biased;
-                () = scope.cancel.cancelled() => return Err(scope_cancelled_io()),
-                permit = Arc::clone(node_budget).acquire_many_owned(admission_permits) => {
-                    permit.map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "shuffle node byte budget closed",
-                        )
-                    })?
-                }
-            };
-            let budget = OutboundReservation {
-                peer: peer_budget,
-                node: node_budget,
-            };
+            let budget = self
+                .reserve_outbound(&conn, peer, msg, admission_bytes, &scope.cancel)
+                .await?;
             let (prepared, budget) = prepare_outbound_message(msg, budget).await?;
             self.validate_scope(&scope, expected_assignment_version)?;
             // Stamp ordered frames before enqueue. A frame the transport later discards leaves a
@@ -2631,26 +2573,7 @@ mod grpc {
                 _budget: budget,
             };
             self.validate_scope(&scope, expected_assignment_version)?;
-            match conn.tx.try_send(out) {
-                Ok(()) => {}
-                Err(crossfire::TrySendError::Full(out)) => tokio::select! {
-                    biased;
-                    () = self.process_lease.wait_until_lost() => {
-                        return Err(process_lease_expired_io());
-                    }
-                    () = scope.cancel.cancelled() => return Err(scope_cancelled_io()),
-                    result = conn.tx.send(out) => result.map_err(|_| io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("shuffle stream to peer {peer} closed"),
-                    ))?,
-                },
-                Err(crossfire::TrySendError::Disconnected(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("shuffle stream to peer {peer} closed"),
-                    ));
-                }
-            }
+            self.enqueue(&conn, peer, msg, out, &scope.cancel).await?;
 
             #[cfg(test)]
             let post_enqueue_pause = { self.post_enqueue_pause.lock().take() };
@@ -2980,6 +2903,7 @@ mod grpc {
                     recovery_gen,
                     current_assignment: Arc::clone(&self.assignment_version),
                     current_recovery_gen: Arc::clone(&self.recovery_gen),
+                    counters: self.counters_for(peer),
                     scope_cancel: scope.cancel.clone(),
                 })
                 .await?,
@@ -3095,6 +3019,7 @@ mod grpc {
             current_assignment,
             current_recovery_gen,
             scope_cancel,
+            counters,
             ..
         } = call;
         let (tx, rx) = mpsc::bounded_async::<Outbound>(SEND_QUEUE);
@@ -3184,6 +3109,7 @@ mod grpc {
             tx,
             byte_budget: Arc::new(Semaphore::new(OUTBOUND_PEER_BUDGET_BYTES)),
             control_byte_budget: Arc::new(Semaphore::new(CHECKPOINTED_CONTROL_PEER_BUDGET_BYTES)),
+            counters,
             send_lock: tokio::sync::Mutex::new(()),
             alive,
             driver,
@@ -3253,6 +3179,7 @@ mod grpc {
         assignment_resumed: tokio::sync::Notify,
         pending_handshakes: Arc<PendingHandshakes>,
         delivery: Arc<DeliveryTracker>,
+        inbound_budget: Arc<InboundBudget>,
         #[cfg(test)]
         active_streams: Arc<Semaphore>,
     }
@@ -3326,7 +3253,7 @@ mod grpc {
                 delivery: Arc::clone(&delivery),
                 barrier_arrivals: Arc::clone(&barrier_arrivals),
                 holdover: Arc::clone(&holdover),
-                inbound_budget,
+                inbound_budget: Arc::clone(&inbound_budget),
                 active_streams: Arc::clone(&active_streams),
                 active_stream_registry,
             };
@@ -3386,6 +3313,7 @@ mod grpc {
                 assignment_resumed: tokio::sync::Notify::new(),
                 pending_handshakes,
                 delivery,
+                inbound_budget,
                 #[cfg(test)]
                 active_streams,
             })
@@ -5372,7 +5300,7 @@ mod grpc {
 }
 
 #[cfg(feature = "cluster")]
-pub use grpc::{ShuffleReceiver, ShuffleSender};
+pub use grpc::{is_shuffle_send_stalled, ShufflePeerFlow, ShuffleReceiver, ShuffleSender};
 
 #[cfg(not(feature = "cluster"))]
 mod shim {

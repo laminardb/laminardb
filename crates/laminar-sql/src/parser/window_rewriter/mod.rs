@@ -204,11 +204,15 @@ impl WindowRewriter {
         match arg {
             FunctionArg::Unnamed(arg_expr) => match arg_expr {
                 FunctionArgExpr::Expr(expr) => Some(expr.clone()),
-                FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => None,
+                FunctionArgExpr::Wildcard
+                | FunctionArgExpr::QualifiedWildcard(_)
+                | FunctionArgExpr::WildcardWithOptions(_) => None,
             },
             FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => match arg {
                 FunctionArgExpr::Expr(expr) => Some(expr.clone()),
-                FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => None,
+                FunctionArgExpr::Wildcard
+                | FunctionArgExpr::QualifiedWildcard(_)
+                | FunctionArgExpr::WildcardWithOptions(_) => None,
             },
         }
     }
@@ -401,7 +405,7 @@ impl WindowRewriter {
     }
 
     /// Parse an interval string like "5 MINUTES" or "1 HOUR".
-    fn parse_interval_string(s: &str) -> Result<std::time::Duration, ParseError> {
+    pub(crate) fn parse_interval_string(s: &str) -> Result<std::time::Duration, ParseError> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.is_empty() {
             return Err(ParseError::WindowError("Empty interval string".to_string()));

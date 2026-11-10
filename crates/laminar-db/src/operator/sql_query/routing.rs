@@ -1,5 +1,5 @@
 //! Cluster routing of pre-aggregated input batches: local apply, remote shuffle (as per-batch
-//! partials for a global aggregate), and the frontier frames every peer receives.
+//! partials for a global aggregate that has them), and the frontier frames every peer receives.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -50,17 +50,24 @@ impl SqlQueryOperator {
             .collect();
         let (local_batches, mut remote_data) =
             match self.remote_global_owner(aggregate, &batches, assignment, config.self_id)? {
-                Some(owner) => (
-                    Vec::new(),
-                    BTreeMap::from([(
-                        owner.0,
-                        vec![ShuffleMessage::checkpointed_routed(
-                            self.op_name.to_string(),
-                            Arc::from([0]),
-                            aggregate.global_partial_batch(&batches)?,
-                        )],
-                    )]),
-                ),
+                Some(owner) => {
+                    let partial = aggregate.global_partial_batch(&batches)?;
+                    self.count_shuffled_rows(
+                        batches.iter().map(RecordBatch::num_rows).sum(),
+                        partial.num_rows(),
+                    );
+                    (
+                        Vec::new(),
+                        BTreeMap::from([(
+                            owner.0,
+                            vec![ShuffleMessage::checkpointed_routed(
+                                self.op_name.to_string(),
+                                Arc::from([0]),
+                                partial,
+                            )],
+                        )]),
+                    )
+                }
                 None => self.route_rows(aggregate, batches, config, assignment)?,
             };
         let mut outbound = Vec::new();
@@ -106,8 +113,9 @@ impl SqlQueryOperator {
         })
     }
 
-    /// The owner of the global vnode when it is another node; only then do this node's rows
-    /// travel, folded into partials. The owner applies its own rows directly.
+    /// The owner of the global vnode when it is another node and this aggregate gathers
+    /// partials; only then do this node's rows travel folded. The owner applies its own rows
+    /// directly, and every other aggregate's rows are routed as they are.
     fn remote_global_owner(
         &self,
         aggregate: &IncrementalAggState,
@@ -115,7 +123,7 @@ impl SqlQueryOperator {
         assignment: &VnodeAssignmentSnapshot,
         self_id: NodeId,
     ) -> Result<Option<NodeId>, DbError> {
-        if aggregate.num_group_cols() != 0 || batches.is_empty() {
+        if batches.is_empty() || !aggregate.gathers_partials() {
             return Ok(None);
         }
         let error = match assignment.owners().first() {
@@ -143,6 +151,7 @@ impl SqlQueryOperator {
     ) -> Result<RoutedRows, DbError> {
         let mut local_batches = Vec::new();
         let mut remote_data = BTreeMap::<u64, Vec<ShuffleMessage>>::new();
+        let mut remote_rows = 0;
         for batch in batches {
             let row_vnodes = hash_rows_to_vnodes(
                 &batch,
@@ -187,6 +196,7 @@ impl SqlQueryOperator {
                     .map(|route| (route.batch, Some(route.vnode))),
             );
             for route in plan.remote {
+                remote_rows += route.batch.num_rows();
                 remote_data.entry(route.owner.0).or_default().push(
                     ShuffleMessage::checkpointed_routed(
                         self.op_name.to_string(),
@@ -196,11 +206,28 @@ impl SqlQueryOperator {
                 );
             }
         }
+        // Raw rows travel to their owners unchanged, so every routed row is sent.
+        self.count_shuffled_rows(remote_rows, remote_rows);
         Ok((local_batches, remote_data))
     }
 
+    /// Once per cycle: `input` rows owned elsewhere, `sent` rows put on the wire for them.
+    fn count_shuffled_rows(&self, input: usize, sent: usize) {
+        if input == 0 {
+            return;
+        }
+        let Some(metrics) = &self.prom else {
+            return;
+        };
+        let rows = &metrics.flow.aggregate_shuffle_rows_total;
+        for (form, count) in [("input", input), ("sent", sent)] {
+            rows.with_label_values(&[&*self.op_name, form])
+                .inc_by(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+    }
+
     /// The schema every peer's shuffle batch carries: pre-aggregate rows, or for a global
-    /// aggregate the partial rows each node folds from its own.
+    /// aggregate that gathers partials the partial rows each node folds from its own.
     pub(super) fn expected_shuffle_schema(&self) -> Result<SchemaRef, DbError> {
         let QueryState::Agg(aggregate) = &self.state else {
             return Err(DbError::Checkpoint(format!(
@@ -208,8 +235,8 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         };
-        if aggregate.num_group_cols() == 0 {
-            return aggregate.global_partial_schema();
+        if aggregate.gathers_partials() {
+            return Ok(aggregate.global_partial_schema());
         }
         if let Some(projection) = aggregate.compiled_projection() {
             return Ok(Arc::clone(&projection.output_schema));
@@ -225,7 +252,8 @@ impl SqlQueryOperator {
         )
     }
 
-    /// Apply batches a peer shuffled here. A global aggregate's peers send partials.
+    /// Apply batches a peer shuffled here: partial rows for an aggregate that gathers them,
+    /// otherwise pre-aggregate rows.
     pub(super) fn apply_remote_aggregate(
         &mut self,
         batches: &[(RecordBatch, Option<u32>)],
@@ -233,7 +261,7 @@ impl SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         self.invalidate_local_aggregate_output_cache();
         match &mut self.state {
-            QueryState::Agg(aggregate) if aggregate.num_group_cols() == 0 => {
+            QueryState::Agg(aggregate) if aggregate.gathers_partials() => {
                 for (batch, _) in batches {
                     aggregate.merge_global_partials(batch, watermark)?;
                 }

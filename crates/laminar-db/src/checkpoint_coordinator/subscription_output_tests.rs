@@ -250,6 +250,7 @@ fn index(
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     }
 }
 

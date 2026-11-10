@@ -265,6 +265,8 @@ fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> Stri
             format!("{} AS {alias}", rewrite_lookup_expr(expr, ctx))
         }
         SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
+        // Left unrewritten: the SQL planner rejects multi-column aliases.
+        SelectItem::ExprWithAliases { .. } => item.to_string(),
         SelectItem::QualifiedWildcard(name, _) => {
             let table = name.to_string();
             if ctx.is_stream(&table) {

@@ -7,9 +7,10 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
-use laminar_core::streaming::{Record, Subscription};
+use laminar_core::streaming::Record;
 
-use crate::catalog::{ArrowRecord, SourceEntry};
+use crate::catalog::SourceEntry;
+use crate::query_rows::QueryRows;
 use crate::DbError;
 
 /// Result of executing a SQL statement.
@@ -61,7 +62,7 @@ pub struct QueryHandle {
     pub(crate) id: u64,
     pub(crate) schema: SchemaRef,
     pub(crate) sql: String,
-    pub(crate) subscription: Option<Subscription<ArrowRecord>>,
+    pub(crate) rows: Option<QueryRows>,
     pub(crate) active: bool,
     pub(crate) cancel_token: tokio_util::sync::CancellationToken,
 }
@@ -91,22 +92,23 @@ impl QueryHandle {
         self.active
     }
 
-    /// Take the raw `RecordBatch` subscription for this query.
+    /// Take the query's rows. They end with an error if this handle is dropped or cancelled
+    /// before they are read to the end.
     ///
-    /// The subscription is consumed on first call; subsequent calls error.
+    /// The rows are taken on the first call; subsequent calls error.
     ///
     /// # Errors
-    /// Returns `DbError::InvalidOperation` if the subscription was already consumed.
-    pub fn subscribe_raw(&mut self) -> Result<Subscription<ArrowRecord>, DbError> {
-        self.subscription
+    /// Returns `DbError::InvalidOperation` if the rows were already taken.
+    pub fn subscribe_raw(&mut self) -> Result<QueryRows, DbError> {
+        self.rows
             .take()
             .ok_or_else(|| DbError::InvalidOperation("Subscription already consumed".to_string()))
     }
 
-    /// Cancel the query and drop its subscription.
+    /// Cancel the query and drop its rows.
     pub fn cancel(&mut self) {
         self.active = false;
-        self.subscription = None;
+        self.rows = None;
         self.cancel_token.cancel();
     }
 }

@@ -7,8 +7,10 @@ use super::accounting::{
     owned_row_payload_usage, retained_changelog_vector_element_usage, topology_element_usage,
     vnode_inline_usage, AggregateStateUsage,
 };
-use super::GroupEntry;
+use super::group_map::{GroupKey, GroupMap};
+use super::{GroupEntry, IncrementalAggState};
 use crate::error::DbError;
+use crate::operator_graph::VnodeStateLoad;
 
 /// Complete mutable working set owned by one aggregate vnode.
 ///
@@ -16,7 +18,7 @@ use crate::error::DbError;
 /// changelog state, and accounting under the same owner prevents a vnode transition from
 /// publishing only part of a group's state.
 pub(super) struct AggregateVnodeState {
-    pub(super) groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+    pub(super) groups: GroupMap,
     pub(super) last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(super) emit_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
     pub(super) next_output_sequence: u64,
@@ -28,13 +30,15 @@ pub(super) struct AggregateVnodeSlots {
     slots: Box<[Option<Box<AggregateVnodeState>>]>,
     active_vnodes: Vec<u32>,
     resident_group_count: usize,
+    /// Input rows applied per vnode. Not state: it survives vnode moves and is never captured.
+    applied_rows: Box<[u64]>,
     fixed_topology_usage: AggregateStateUsage,
 }
 
 impl Default for AggregateVnodeState {
     fn default() -> Self {
         Self {
-            groups: FxHashMap::default(),
+            groups: GroupMap::default(),
             last_emitted: FxHashMap::default(),
             emit_dirty_keys: FxHashSet::default(),
             next_output_sequence: 0,
@@ -73,7 +77,7 @@ impl AggregateVnodeState {
     }
 
     pub(super) fn try_from_recovered(
-        groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+        groups: GroupMap,
         last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
         next_output_sequence: u64,
         mark_emit_dirty: bool,
@@ -120,11 +124,10 @@ impl AggregateVnodeState {
         self.usage = self.usage.saturating_add(usage);
     }
 
-    pub(super) fn insert_new_group(&mut self, key: arrow::row::OwnedRow, entry: GroupEntry) {
+    pub(super) fn insert_new_group(&mut self, key: GroupKey<'_>, entry: GroupEntry) {
         let previous_spare = self.collection_spare_usage();
-        let usage = Self::group_usage(&key, &entry);
-        let previous = self.groups.insert(key, entry);
-        debug_assert!(previous.is_none());
+        let (key, entry) = self.groups.insert_new(key, entry);
+        let usage = Self::group_usage(key, entry);
         self.add_usage(usage);
         self.reconcile_collection_spare_usage(previous_spare);
     }
@@ -297,15 +300,24 @@ impl AggregateVnodeSlots {
                     "aggregate active vnode roster could not reserve {slot_count} entries: {error}"
                 ))
             })?;
-        let fixed_topology_usage = topology_element_usage::<AggregateVnodeSlots>(1).saturating_add(
-            topology_element_usage::<Option<Box<AggregateVnodeState>>>(slots.len()),
-        );
+        let fixed_topology_usage = topology_element_usage::<AggregateVnodeSlots>(1)
+            .saturating_add(topology_element_usage::<Option<Box<AggregateVnodeState>>>(
+                slots.len(),
+            ))
+            .saturating_add(topology_element_usage::<u64>(slot_count));
         Ok(Self {
             slots: slots.into_boxed_slice(),
             active_vnodes,
             resident_group_count: 0,
+            applied_rows: vec![0; slot_count].into_boxed_slice(),
             fixed_topology_usage,
         })
+    }
+
+    #[inline]
+    pub(super) fn count_applied_rows(&mut self, vnode: u32, rows: usize) {
+        let applied = &mut self.applied_rows[vnode as usize];
+        *applied = applied.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     }
 
     #[inline]
@@ -415,5 +427,20 @@ impl AggregateVnodeSlots {
     #[cfg(test)]
     pub(super) fn active_vnodes_for_test(&self) -> &[u32] {
         &self.active_vnodes
+    }
+}
+
+impl IncrementalAggState {
+    /// Each resident vnode's live groups, from its cached usage.
+    pub(crate) fn vnode_loads(&self) -> Vec<VnodeStateLoad> {
+        self.vnode_states
+            .iter()
+            .map(|(vnode, state)| VnodeStateLoad {
+                vnode,
+                state_bytes: state.usage().accounted_bytes(),
+                groups: state.groups.len(),
+                applied_rows: self.vnode_states.applied_rows[vnode as usize],
+            })
+            .collect()
     }
 }

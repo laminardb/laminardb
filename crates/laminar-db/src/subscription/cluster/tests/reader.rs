@@ -218,6 +218,7 @@ impl GatewayFixture {
             channel_progress: Vec::new(),
             source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
+            view_frontiers: Default::default(),
         };
         let reference = self
             .authority
@@ -445,6 +446,7 @@ impl MultiParticipantFixture {
             channel_progress: Vec::new(),
             source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
+            view_frontiers: Default::default(),
         };
         let reference = self
             .authority
@@ -561,6 +563,9 @@ async fn read_through_progress(
                 ClusterReaderRead::Frame(ClusterReaderFrame::Progress { epoch, .. }) => {
                     panic!("unexpected progress epoch {epoch}");
                 }
+                ClusterReaderRead::Frame(
+                    ClusterReaderFrame::ViewRows { .. } | ClusterReaderFrame::ViewProgress { .. },
+                ) => panic!("a stream gateway delivered view frames"),
                 ClusterReaderRead::Terminal(error) => panic!("gateway failed: {error}"),
             }
         }

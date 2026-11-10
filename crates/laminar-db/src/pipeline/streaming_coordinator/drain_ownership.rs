@@ -76,6 +76,31 @@ pub(super) async fn await_source_drain_receipt(
     }
 }
 
+/// Whether a source must still deliver queued input before it can publish its receipt for the
+/// drain it was told to begin. Its actor may be blocked on the full source queue before it sees
+/// the command, so this reads the retained command rather than waiting for `Pausing`.
+#[cfg(feature = "cluster")]
+pub(super) fn source_drain_awaits_intake(task: &SourceTaskLease) -> bool {
+    if task.is_finished() {
+        return false;
+    }
+    let Some(control) = task.drain_control() else {
+        return false;
+    };
+    let round = match &*control.command_tx.borrow() {
+        Some(SourceDrainCommand::Begin { request, .. }) => request.round,
+        Some(SourceDrainCommand::Resolve { .. }) | None => return false,
+    };
+    let status = control.status_tx.borrow();
+    match &*status {
+        SourceDrainTaskStatus::Ready(receipt) => receipt.round != round,
+        SourceDrainTaskStatus::Resolved {
+            round: resolved, ..
+        } => *resolved != round,
+        SourceDrainTaskStatus::Idle | SourceDrainTaskStatus::Pausing(_) => true,
+    }
+}
+
 #[cfg(feature = "cluster")]
 pub(crate) async fn prepare_owned_source_drain(
     tasks: &OwnedSourceTasks,

@@ -106,17 +106,12 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         .seal_catalog(&lease.proof(), &parent)
         .await
         .unwrap();
-    let decisions = CheckpointDecisionStore::new(authority.store.clone());
-    let deployment = decisions.load_or_create_deployment_id().await.unwrap();
     authority
-        .adopt_legacy_topology(
-            &lease.proof(),
-            Uuid::from_u128(40).try_into().unwrap(),
-            &parent.reference().unwrap(),
-            &deployment,
-        )
+        .renew_exact(&lease.owner, lease.token, 1)
         .await
         .unwrap();
+    let decisions = CheckpointDecisionStore::new(authority.store.clone());
+    let deployment = decisions.load_or_create_deployment_id().await.unwrap();
     let assignments = AssignmentSnapshotStore::new(authority.store.clone());
     let snapshot = AssignmentSnapshot::empty()
         .next_for_participants(
@@ -174,7 +169,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
-        parent_version: TopologyVersion::LEGACY_BASELINE,
+        parent_version: TopologyVersion::BASELINE,
         target_version: TopologyVersion::new(2).unwrap(),
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),
@@ -436,6 +431,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
             .collect(),
         source_watermarks: BTreeMap::from([("events".into(), 10)]),
         checkpoint_watermark: Some(10),
+        view_frontiers: Default::default(),
     };
     let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
     authority

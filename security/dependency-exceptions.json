@@ -1,19 +1,13 @@
 {
   "owner": "LaminarDB maintainers responsible for PR #600",
-  "approved": "2026-10-21",
-  "expires": "2026-11-20",
+  "approved": "2026-10-31",
+  "expires": "2026-11-30",
   "exceptions": [
     {
       "advisory": "RUSTSEC-2023-0071",
       "crate": "rsa",
       "version": "0.9.10",
       "reason": "Accepted residual timing leakage risk; no patched release, reqsign uses randomized signing for cloud authentication."
-    },
-    {
-      "advisory": "RUSTSEC-2024-0384",
-      "crate": "instant",
-      "version": "0.1.13",
-      "reason": "Accepted unmaintained wider lockfile dependency through reqwest-retry, wasm-timer and old parking_lot."
     },
     {
       "advisory": "RUSTSEC-2024-0436",
@@ -40,18 +34,96 @@
       "reason": "Workspace backport is source-verified; registry publication separately accepts the unpatched namespace-allocation denial-of-service risk until expiry."
     },
     {
-      "advisory": "RUSTSEC-2026-0381",
-      "crate": "webpki-roots",
-      "version": "0.26.11",
-      "reason": "Scanner match on a compatibility shim, not accepted residual risk: webpki-roots 0.26.11 bundles no certificates and re-exports TLS_SERVER_ROOTS from webpki-roots 1.x, locked at the patched 1.0.10. Only async-nats reaches it, through tokio-websockets 0.10, which every async-nats release up to 0.50 still requires."
+      "advisory": "RUSTSEC-2026-0391",
+      "crate": "zstd",
+      "version": "0.13.3",
+      "reason": "Not reached: needs a context reused across streams through the with_context constructors; workspace code calls only zstd::bulk and upstream callers create a context per stream. Fixed only in zstd 0.14.3; DataFusion 55.2, Arrow and Parquet 59.3, iceberg 0.11.0, chitchat 0.13 and apache-avro 0.22 still require zstd ^0.13."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0395",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: CParameter::StableInBuffer requires the zstd-safe experimental feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0396",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: Seekable requires the zstd-safe seekable feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0397",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: async-compression, the only caller of OutBuffer::around_pos in the graph, now resolves compression-codecs 0.4.46 on the patched zstd 0.14.3 and zstd-safe 8.2.0; no caller on zstd-safe 7.3.0 remains."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0398",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: Seekable requires the zstd-safe seekable feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0399",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: init_using_cdict and init_using_ddict require the zstd-safe experimental feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0400",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: requires a zstd dictionary on a context with an open stream; workspace code uses no dictionaries and no upstream caller in the graph passes one."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0401",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: train_from_buffer is compiled through the default zdict_builder feature but nothing in the graph trains dictionaries."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0402",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: CCtx::try_clone requires the zstd-safe experimental feature and a multithreaded context requires zstdmt; no crate in the graph enables either."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0403",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Accepted residual risk: the default legacy feature is on, so a failed streaming decompression of a legacy frame from untrusted input (DataFusion's synchronous compressed-file reads, Parquet, Iceberg and Avro data) can expose uninitialized memory in the decoder's output buffer. Fixed only in zstd-safe 8.2.0; DataFusion 55.2, Arrow and Parquet 59.3, iceberg 0.11.0, chitchat 0.13 and apache-avro 0.22 still require zstd ^0.13."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0404",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: DCtx::try_clone requires the zstd-safe experimental feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0405",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: needs an InBuffer position past its slice; callers in the graph build InBuffer::around at position zero and only zstd advances it."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0406",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: requires a multithreaded context, which needs the zstdmt feature that no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0440",
+      "crate": "astral-tokio-tar",
+      "version": "0.6.2",
+      "reason": "Unmaintained since 2026-11-03 with no maintained release. Reached only through testcontainers 0.27.2 (the latest, 0.28.0, still requires ^0.6.1), a dev-dependency of laminar-connectors that starts Docker containers for integration tests; no shipped build compiles it."
     }
   ],
   "packages": [
     {
-      "name": "instant",
-      "version": "0.1.13",
+      "name": "astral-tokio-tar",
+      "version": "0.6.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
+      "checksum": "cb50a7aae84a03bf55b067832bc376f4961b790c97e64d3eacee97d389b90277"
     },
     {
       "name": "paste",
@@ -82,24 +154,36 @@
       "checksum": "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
     },
     {
-      "name": "webpki-roots",
-      "version": "0.26.11",
+      "name": "zstd",
+      "version": "0.13.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+      "checksum": "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
     },
     {
-      "name": "webpki-roots",
-      "version": "1.0.10",
+      "name": "zstd",
+      "version": "0.14.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
+      "checksum": "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+    },
+    {
+      "name": "zstd-safe",
+      "version": "7.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+    },
+    {
+      "name": "zstd-safe",
+      "version": "8.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
     }
   ],
   "publication": {
     "advisories": ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"],
-    "reason": "Explicitly accepted on 2026-09-21 and re-accepted on 2026-10-21 through the policy expiry: Cargo does not propagate the workspace XML patch to registry consumers. object_store 0.13.2 still requires quick-xml ^0.39.0; upgrading the analytical dependency generation is outside this repair. Unpatched registry consumers retain CPU and memory denial-of-service exposure when parsing hostile XML."
+    "reason": "Explicitly accepted on 2026-09-21 and re-accepted on 2026-10-21 and 2026-10-31 through the policy expiry: Cargo does not propagate the workspace XML patch to registry consumers. object_store 0.13.2 still requires quick-xml ^0.39.0; upgrading the analytical dependency generation is outside this repair. Unpatched registry consumers retain CPU and memory denial-of-service exposure when parsing hostile XML."
   },
   "backport": {
     "path": "vendor/quick-xml",
-    "sha256": "23298fbf98aa8264a6fcd8a87a64040f4e1c3ef086279e4300f5f7fa6d3e46ce"
+    "sha256": "24c8629fc3fbd2e26cff6bae8072f9212885584636c7d6f2228a6c73bcd51ea2"
   }
 }

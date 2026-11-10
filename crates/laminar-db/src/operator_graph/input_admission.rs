@@ -2,10 +2,18 @@
 
 use laminar_core::streaming::retained_arrow_bytes;
 
+use crate::pipeline::callback::PortHeadroom;
+
+#[cfg(feature = "cluster")]
+use super::merge_input_frontier_iter;
 use super::{
     Arc, BackpressurePolicy, DbError, FxHashMap, GateDecision, InputFrontier, OperatorGraph,
     OperatorImplementation, Ordering, RecordBatch, SourceBatchView,
 };
+
+/// A node and the stateless forwards and sources below it whose node-local frontiers it carries.
+#[cfg(feature = "cluster")]
+pub(super) type SourceFrontierChain = smallvec::SmallVec<[usize; 4]>;
 
 pub(super) fn retained_input_bytes(batches: &[RecordBatch]) -> usize {
     batches.iter().fold(0usize, |total, batch| {
@@ -139,7 +147,7 @@ impl OperatorGraph {
         )
     }
 
-    fn require_port_capacity(
+    pub(super) fn require_port_capacity(
         &self,
         target: usize,
         port: u8,
@@ -173,12 +181,49 @@ impl OperatorGraph {
         batches: usize,
         bytes: usize,
     ) -> Result<(), DbError> {
+        // The output already exists and the producer's state has moved past it, and the gate ran
+        // the producer only while every target port was below its bound. Under `Backpressure`
+        // the port takes the whole output and the gate holds the producer until the consumer
+        // drains it, so a port exceeds its bound by at most one producer run.
+        if self.backpressure_policy != BackpressurePolicy::Fail {
+            return Ok(());
+        }
         // Each destination owns its full charge even when Arrow backing storage is shared.
         // Duplicate edge registration is normalized when topology is built.
         for &(target, port) in &self.nodes[node].output_routes {
             self.require_port_capacity(target, port, batches, bytes)?;
         }
         Ok(())
+    }
+
+    /// Room left on the ports a source's staged batches are primed into. The coordinator's drain
+    /// stages a source message only when it fits, so source intake waits on a full port.
+    pub(crate) fn source_port_headroom(&self, source: &str) -> PortHeadroom {
+        let mut headroom = PortHeadroom::UNBOUNDED;
+        if self.backpressure_policy == BackpressurePolicy::ShedOldest {
+            return headroom;
+        }
+        let views = [
+            self.source_map.get(source),
+            self.positioned_source_map.get(source),
+        ];
+        for &node in views.into_iter().flatten() {
+            let (batches, bytes) = (
+                self.input_bufs[node][0].len(),
+                self.input_buf_bytes[node][0],
+            );
+            if self.max_input_buf_batches > 0 {
+                headroom.batches = headroom
+                    .batches
+                    .min(self.max_input_buf_batches.saturating_sub(batches));
+            }
+            if let Some(max) = self.max_input_buf_bytes {
+                let left = max.saturating_sub(bytes);
+                headroom.bytes = Some(headroom.bytes.map_or(left, |bytes| bytes.min(left)));
+            }
+            headroom.empty &= batches == 0;
+        }
+        headroom
     }
 
     pub(super) fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
@@ -340,6 +385,20 @@ impl OperatorGraph {
                         | ManagedStateContract::TemporalJoinV1
                 )
             );
+        // A managed stage's idle output can revive below the frontier its peers merged to: an
+        // interval join matches a stored row against a revived input. A cluster window or interval
+        // join that merges that output across nodes must wait for it rather than exclude it.
+        #[cfg(feature = "cluster")]
+        let stage_output_never_idle = self.cluster_shuffle.is_some()
+            && matches!(
+                managed_state,
+                Some(
+                    ManagedStateContract::CoreWindowV1
+                        | ManagedStateContract::BoundedIntervalJoinV3
+                )
+            );
+        #[cfg(not(feature = "cluster"))]
+        let stage_output_never_idle = false;
         #[cfg(feature = "cluster")]
         let capped_source_frontiers = match managed_state {
             Some(ManagedStateContract::TemporalJoinV1) => Some(&self.temporal_source_frontiers),
@@ -354,21 +413,29 @@ impl OperatorGraph {
             .map(|port| {
                 let upstream = self.input_sources[node_id][port];
                 #[cfg(feature = "cluster")]
-                if let Some(root) = use_local_source_frontier
-                    .then(|| self.event_time_roots.get(upstream).copied())
+                if let Some(chain) = use_local_source_frontier
+                    .then(|| self.event_time_chains.get(upstream))
                     .flatten()
-                    .filter(|&root| root != usize::MAX)
+                    .filter(|chain| !chain.is_empty())
                 {
-                    let frontier = capped_source_frontiers
-                        .and_then(|capped| capped.get(&root).copied())
-                        .unwrap_or(self.local_source_frontiers[root]);
-                    return self.hold_buffered_chain_frontier(upstream, root, frontier);
+                    let roots = chain
+                        .iter()
+                        .filter(|node| self.source_node_ids.contains(node))
+                        .map(|root| {
+                            capped_source_frontiers
+                                .and_then(|capped| capped.get(root).copied())
+                                .unwrap_or(self.local_source_frontiers[*root])
+                        });
+                    let frontier = merge_input_frontier_iter(roots, current_watermark);
+                    return self.hold_buffered_chain_frontier(upstream, chain, frontier);
                 }
                 if upstream < self.output_watermarks.len() {
                     InputFrontier {
                         watermark: (self.output_watermarks[upstream] != i64::MIN)
                             .then_some(self.output_watermarks[upstream]),
-                        idle: self.output_idle[upstream] && !self.node_has_buffered_input(upstream),
+                        idle: !stage_output_never_idle
+                            && self.output_idle[upstream]
+                            && !self.node_has_buffered_input(upstream),
                     }
                 } else {
                     InputFrontier::from_watermark(current_watermark)
@@ -377,24 +444,17 @@ impl OperatorGraph {
             .collect()
     }
 
-    /// A node-local source frontier passes to a managed port only once the source and every
+    /// Node-local source frontiers pass to a managed port only once the sources and every
     /// stateless forward between them have delivered their buffered rows.
     #[cfg(feature = "cluster")]
     fn hold_buffered_chain_frontier(
         &self,
         upstream: usize,
-        root: usize,
+        chain: &[usize],
         frontier: InputFrontier,
     ) -> InputFrontier {
-        let mut node = upstream;
-        for _ in 0..self.nodes.len() {
-            if self.node_has_buffered_input(node) {
-                return frontier.held_at(Some(self.output_watermarks[upstream]));
-            }
-            if node == root {
-                break;
-            }
-            node = self.input_sources[node][0];
+        if chain.iter().any(|&node| self.node_has_buffered_input(node)) {
+            return frontier.held_at(Some(self.output_watermarks[upstream]));
         }
         frontier
     }
@@ -405,12 +465,12 @@ impl OperatorGraph {
         self.remote_exchange_depth
     }
 
-    /// Per topology: for every node, the source whose node-local frontier it carries (the source
-    /// itself, or the root of the stateless event-time forward it reads; `usize::MAX` otherwise),
-    /// and the remote exchange depth.
+    /// Per topology: for every node, the chain whose node-local source frontiers it carries (a
+    /// source alone; a stateless event-time forward, itself and the chains of all its inputs;
+    /// empty otherwise), and the remote exchange depth.
     #[cfg(feature = "cluster")]
     pub(super) fn compute_cluster_routing(&mut self) {
-        let mut roots = vec![usize::MAX; self.nodes.len()];
+        let mut chains = vec![SourceFrontierChain::new(); self.nodes.len()];
         let mut depths = vec![0_u64; self.nodes.len()];
         for &node in &self.topo_order {
             depths[node] = self.input_sources[node]
@@ -419,21 +479,37 @@ impl OperatorGraph {
                 .max()
                 .unwrap_or(0)
                 + u64::from(self.nodes[node].capability.managed_state.is_some());
-            roots[node] = if self.source_node_ids.contains(&node) {
-                node
-            } else if self.nodes[node].input_port_count == 1
-                && self.event_time_forwards.contains(&*self.nodes[node].name)
-            {
-                self.input_sources[node]
-                    .first()
-                    .and_then(|&upstream| roots.get(upstream).copied())
-                    .unwrap_or(usize::MAX)
+            chains[node] = if self.source_node_ids.contains(&node) {
+                smallvec::smallvec![node]
+            } else if self.event_time_forwards.contains(&*self.nodes[node].name) {
+                self.forward_chain(node, &chains)
             } else {
-                usize::MAX
+                SourceFrontierChain::new()
             };
         }
-        self.event_time_roots = roots;
+        self.event_time_chains = chains;
         self.remote_exchange_depth = depths.into_iter().max().unwrap_or(0);
+    }
+
+    /// A forward carries its inputs' source frontiers only when every input carries some.
+    #[cfg(feature = "cluster")]
+    fn forward_chain(&self, node: usize, chains: &[SourceFrontierChain]) -> SourceFrontierChain {
+        if self.input_sources[node].is_empty() {
+            return SourceFrontierChain::new();
+        }
+        let mut chain: SourceFrontierChain = smallvec::smallvec![node];
+        for &upstream in &self.input_sources[node] {
+            let Some(upstream_chain) = chains.get(upstream).filter(|chain| !chain.is_empty())
+            else {
+                return SourceFrontierChain::new();
+            };
+            for &member in upstream_chain {
+                if !chain.contains(&member) {
+                    chain.push(member);
+                }
+            }
+        }
+        chain
     }
 
     pub(super) fn bind_input_tables(&mut self, node: usize, inputs: &[Vec<RecordBatch>]) {

@@ -62,6 +62,11 @@ fn bench_embedded_push(c: &mut Criterion) {
                     db.execute("CREATE SOURCE input (payload VARCHAR) WITH ('buffer_size' = '64')")
                         .await
                         .unwrap();
+                    // A source no pipeline reads keeps its queue, so a stream must consume it.
+                    db.execute("CREATE STREAM output AS SELECT payload FROM input")
+                        .await
+                        .unwrap();
+                    db.start().await.unwrap();
                     db
                 });
                 let source = db.source::<PushPayload>("input").unwrap();
@@ -73,7 +78,6 @@ fn bench_embedded_push(c: &mut Criterion) {
                             source.push_arrow(batch.clone()).unwrap();
                         }
                     }
-                    // Drain into the broadcast with no subscribers; snapshot history remains.
                     rt.block_on(async {
                         while source.pending() != 0 {
                             tokio::task::yield_now().await;

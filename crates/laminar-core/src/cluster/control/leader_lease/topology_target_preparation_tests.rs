@@ -91,7 +91,7 @@ async fn topology_target_preparation_requires_every_frozen_process_and_preserves
     assert_eq!(reopened.load().await.unwrap().unwrap().seq, head.lease.seq);
     assert!(matches!(reopened.topology_catalog_state().await.unwrap(),
         crate::cluster::control::TopologyCatalogState::Versioned { baseline, committed: None }
-            if baseline.topology_version == TopologyVersion::LEGACY_BASELINE));
+            if baseline.topology_version == TopologyVersion::BASELINE));
     assert_eq!(
         input(&reopened, &fixture, 0).await.checkpoint(),
         &fixture.index

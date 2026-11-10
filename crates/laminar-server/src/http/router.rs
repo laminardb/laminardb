@@ -25,10 +25,10 @@ use super::catalog::{
     execute_sql, get_graph, get_stream, list_connectors, list_mvs, list_sinks, list_sources,
     list_streams,
 };
-use super::checkpoints::{cluster_checkpoints, trigger_checkpoint};
+use super::checkpoints::{cluster_checkpoints, expedite_checkpoint, trigger_checkpoint};
 use super::cluster_admin::{
-    cluster_leader, cluster_nodes, cluster_status, cluster_vnodes, pipeline_status, start_pipeline,
-    stop_pipeline,
+    cluster_leader, cluster_nodes, cluster_status, cluster_vnode_load, cluster_vnodes,
+    pipeline_status, start_pipeline, stop_pipeline,
 };
 use super::cluster_evidence::{cluster_local_checkpoint_barrier_timings, cluster_local_evidence};
 use super::error_response;
@@ -39,7 +39,7 @@ use super::topology::{
     cluster_topology, cluster_topology_operation, prepare_cluster_topology,
     validate_cluster_topology,
 };
-use super::topology_submission::{adopt_cluster_topology, submit_cluster_topology};
+use super::topology_submission::submit_cluster_topology;
 use super::ws::ws_upgrade;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -64,22 +64,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/mvs", get(list_mvs))
         .route("/api/v1/connectors", get(list_connectors))
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
+        .route("/api/v1/checkpoint/expedite", post(expedite_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
         .route("/api/v1/graph", get(get_graph))
         .route("/api/v1/cluster", get(cluster_status))
         .route("/api/v1/cluster/nodes", get(cluster_nodes))
         .route("/api/v1/cluster/vnodes", get(cluster_vnodes))
+        .route("/api/v1/cluster/vnodes/load", get(cluster_vnode_load))
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/cluster/topology", get(cluster_topology))
         .route(
             "/api/v1/cluster/topology/operations",
             post(submit_cluster_topology).layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
-        )
-        .route(
-            "/api/v1/cluster/topology/adopt",
-            post(adopt_cluster_topology).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/cluster/topology/validate",
@@ -148,10 +146,20 @@ async fn startup_gate_middleware(
 ) -> axum::response::Response {
     let path = req.uri().path();
     let startup_probe = matches!(path, "/health" | "/ready" | "/metrics");
-    if !startup_probe {
-        if let Some(reason) = state.serving_rejection() {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
-        }
+    // SQL reads and subscriptions keep serving through coordinated recovery; the SQL handler
+    // refuses other statements itself. A recent read waiting across the round asks for its
+    // checkpoint then too; no checkpoint starts before the round ends.
+    let committed_reads =
+        path == "/api/v1/sql" || path.starts_with("/ws/") || path == "/api/v1/checkpoint/expedite";
+    let rejection = if startup_probe {
+        None
+    } else if committed_reads {
+        state.authority_rejection()
+    } else {
+        state.serving_rejection()
+    };
+    if let Some(reason) = rejection {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
     }
     next.run(req).await
 }

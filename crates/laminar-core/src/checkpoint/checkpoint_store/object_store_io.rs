@@ -304,14 +304,15 @@ impl ObjectStoreCheckpointStore {
         }
     }
 
-    pub(super) async fn existing_node_data_matches(
+    /// Whether the immutable object at `path` already holds exactly `object`'s bytes.
+    pub(super) async fn existing_object_matches(
         &self,
+        path: &object_store::path::Path,
         object: &NodeDataObject,
     ) -> Result<bool, CheckpointStoreError> {
         use futures::TryStreamExt;
 
-        let path = self.node_data_path(object.chunk);
-        let meta = match self.store.head(&path).await {
+        let meta = match self.store.head(path).await {
             Ok(meta) => meta,
             Err(object_store::Error::NotFound { .. }) => return Ok(false),
             Err(error) => return Err(error.into()),
@@ -319,7 +320,7 @@ impl ObjectStoreCheckpointStore {
         if meta.size != object.object_length || meta.size > self.max_node_data_bytes {
             return Ok(false);
         }
-        let result = self.store.get(&path).await?;
+        let result = self.store.get(path).await?;
         if result.meta.size != object.object_length {
             return Ok(false);
         }
@@ -348,14 +349,14 @@ impl ObjectStoreCheckpointStore {
         }
     }
 
-    pub(super) async fn load_node_data_ranges_inner(
+    /// Read exact ranges of the immutable object at `path` after verifying its declared length.
+    pub(super) async fn load_object_ranges(
         &self,
-        chunk: StateChunkId,
+        path: &object_store::path::Path,
         expected_object_length: u64,
         ranges: &[ByteRange],
     ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
-        let path = self.node_data_path(chunk);
-        let meta = match self.store.head(&path).await {
+        let meta = match self.store.head(path).await {
             Ok(meta) => meta,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -393,7 +394,7 @@ impl ObjectStoreCheckpointStore {
         let loaded = if nonempty.is_empty() {
             Vec::new()
         } else {
-            object_store::coalesce_ranges(&nonempty, |range| self.store.get_range(&path, range), 0)
+            object_store::coalesce_ranges(&nonempty, |range| self.store.get_range(path, range), 0)
                 .await?
         };
         let mut loaded = loaded.into_iter();

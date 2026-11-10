@@ -82,6 +82,8 @@ pub struct ClusterHandle {
     discovery: DiscoveryImpl,
     serving_gate: Arc<crate::http::ServingGate>,
     api_handle: tokio::task::JoinHandle<()>,
+    /// Aborted when the serving gate fences, which also closes its sessions.
+    pgwire_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     membership_handle: tokio::task::JoinHandle<()>,
     /// This node's own membership record. Cloned and re-announced with

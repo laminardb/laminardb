@@ -1,5 +1,6 @@
 //! The global aggregate's single group, updated from raw pre-aggregate rows on its owner or, in
-//! cluster mode, from partial rows other nodes fold from theirs.
+//! cluster mode, from partial rows other nodes fold from theirs when every aggregate has a
+//! one-row partial form.
 
 #[cfg(feature = "cluster")]
 use std::sync::Arc;
@@ -13,7 +14,9 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::ScalarValue;
 
 use super::IncrementalAggState;
-use super::{global_aggregate_key, AggFuncSpec, ConcreteAggregateState, GroupEntry};
+use super::{
+    global_aggregate_key, AggFuncSpec, AggregateInput, ConcreteAggregateState, GroupEntry, GroupKey,
+};
 use crate::error::DbError;
 
 /// What one update applies to the global group.
@@ -34,12 +37,31 @@ impl IncrementalAggState {
         self.update_global_group(input_weight_delta, watermark_ms, &GlobalInput::Rows(batch))
     }
 
+    /// Whether other nodes send this aggregate one partial row per batch. A keyed aggregate takes
+    /// their rows, and so does a global one with a MIN or MAX over a changelog: its owner needs
+    /// every value to fall back to when the extreme is retracted.
+    // PERF: inlined into the two cluster routing callers, it moved the global update kernel to a
+    // placement that ran `agg/update/global` 16% slower with identical instructions. It runs once
+    // per cycle, so the call costs nothing measurable.
+    #[cfg(feature = "cluster")]
+    #[inline(never)]
+    pub(crate) fn gathers_partials(&self) -> bool {
+        self.num_group_cols == 0
+            && !self.aggregate_templates.iter().any(|template| {
+                matches!(
+                    template,
+                    ConcreteAggregateState::RetractableMin(_)
+                        | ConcreteAggregateState::RetractableMax(_)
+                )
+            })
+    }
+
     /// Schema of a partial batch: the net input weight, then each aggregate's state columns.
     #[cfg(feature = "cluster")]
-    pub(crate) fn global_partial_schema(&self) -> Result<SchemaRef, DbError> {
+    pub(crate) fn global_partial_schema(&self) -> SchemaRef {
         let mut fields = vec![Field::new("__input_weight", DataType::Int64, false)];
         for (index, template) in self.aggregate_templates.iter().enumerate() {
-            for (column, scalar) in template.checkpoint_state()?.iter().enumerate() {
+            for (column, scalar) in template.checkpoint_state().iter().enumerate() {
                 fields.push(Field::new(
                     format!("__partial_{index}_{column}"),
                     scalar.data_type(),
@@ -47,7 +69,7 @@ impl IncrementalAggState {
                 ));
             }
         }
-        Ok(Arc::new(Schema::new(fields)))
+        Arc::new(Schema::new(fields))
     }
 
     /// Fold each pre-aggregate batch into one partial row. One row per batch makes merging it on
@@ -57,28 +79,29 @@ impl IncrementalAggState {
         &self,
         batches: &[RecordBatch],
     ) -> Result<RecordBatch, DbError> {
-        let schema = self.global_partial_schema()?;
+        let schema = self.global_partial_schema();
         let mut weights = Vec::with_capacity(batches.len());
         let mut states = vec![Vec::with_capacity(batches.len()); schema.fields().len() - 1];
         for batch in batches {
             weights.push(Self::batch_input_weight(batch, self.weight_col_idx)?);
-            let mut column = 0;
-            Self::for_each_aggregate_input(
+            let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
+            let inputs = AggregateInput::resolve_all(
                 batch,
-                &all_row_indices(batch),
                 &self.agg_specs,
-                self.weight_col_idx,
-                |index, values| {
-                    for scalar in self.aggregate_templates[index].batch_delta(values)? {
-                        states
-                            .get_mut(column)
-                            .ok_or_else(|| partial_shape_error("delta has extra state"))?
-                            .push(scalar);
-                        column += 1;
-                    }
-                    Ok(())
-                },
+                &self.aggregate_templates,
+                input_weights,
             )?;
+            let rows = all_row_indices(batch);
+            let mut column = 0;
+            for (template, input) in self.aggregate_templates.iter().zip(&inputs) {
+                for scalar in template.batch_delta(input, &rows)? {
+                    states
+                        .get_mut(column)
+                        .ok_or_else(|| partial_shape_error("delta has extra state"))?
+                        .push(scalar);
+                    column += 1;
+                }
+            }
         }
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
         columns.push(Arc::new(Int64Array::from(weights)));
@@ -101,8 +124,8 @@ impl IncrementalAggState {
         let arities = self
             .aggregate_templates
             .iter()
-            .map(|template| template.checkpoint_state().map(|state| state.len()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|template| template.checkpoint_state().len())
+            .collect::<Vec<_>>();
         if batch.num_columns() != 1 + arities.iter().sum::<usize>() {
             return Err(partial_shape_error(
                 "column count differs from the aggregate state",
@@ -142,10 +165,11 @@ impl IncrementalAggState {
         input: &GlobalInput<'_>,
     ) -> Result<(), DbError> {
         let empty_key = global_aggregate_key();
+        let key = GroupKey::new(empty_key.row());
         let (current_input_weight, is_new) = self
             .vnode_states
             .get(0)
-            .and_then(|state| state.groups.get(&empty_key))
+            .and_then(|state| state.groups.get(key))
             .map_or((0, true), |entry| (entry.input_weight, false));
         let input_weight = Self::next_group_input_weight(current_input_weight, input_weight_delta)?;
         if is_new {
@@ -156,9 +180,9 @@ impl IncrementalAggState {
             entry.refresh_accumulator_usage();
 
             let vnode_state = self.vnode_states.get_or_insert(0);
-            vnode_state.insert_new_group(empty_key.clone(), entry);
+            vnode_state.insert_new_group(key, entry);
             if self.emit_changelog {
-                vnode_state.insert_emit_dirty_key(empty_key);
+                vnode_state.insert_emit_dirty_key(key.owned());
             }
             self.vnode_states.increment_resident_groups();
             self.mark_checkpoint_vnode_dirty(0);
@@ -172,7 +196,7 @@ impl IncrementalAggState {
         let (update_result, previous_usage, current_usage) = {
             let entry = vnode_state
                 .groups
-                .get_mut(&empty_key)
+                .get_mut(key)
                 .expect("global aggregate group must remain resident");
             let update_result =
                 apply_global_input(&mut entry.accs, &self.agg_specs, self.weight_col_idx, input);
@@ -215,13 +239,15 @@ fn apply_global_input(
     input: &GlobalInput<'_>,
 ) -> Result<(), DbError> {
     match input {
-        GlobalInput::Rows(batch) => IncrementalAggState::update_concrete_accumulators(
-            accs,
-            batch,
-            &all_row_indices(batch),
-            agg_specs,
-            weight_col_idx,
-        ),
+        GlobalInput::Rows(batch) => {
+            let weights = IncrementalAggState::validated_input_weights(batch, weight_col_idx)?;
+            let inputs = AggregateInput::resolve_all(batch, agg_specs, accs, weights)?;
+            IncrementalAggState::update_concrete_accumulators(
+                accs,
+                &inputs,
+                &all_row_indices(batch),
+            )
+        }
         #[cfg(feature = "cluster")]
         GlobalInput::Partial(partial) => {
             if partial.len() != accs.len() {

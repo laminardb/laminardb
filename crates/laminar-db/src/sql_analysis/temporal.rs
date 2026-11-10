@@ -306,6 +306,11 @@ fn validate_temporal_projection_items(
                     "wildcard modifiers are not supported",
                 ));
             }
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(temporal_projection_error(
+                    "multi-column aliases are not supported",
+                ));
+            }
             SelectItem::QualifiedWildcard(..) => {
                 return Err(temporal_projection_error(
                     "qualified wildcards are not supported",
@@ -462,6 +467,7 @@ fn build_temporal_projection_sql(
                     rewrite_temporal_expr(expr, left_qualifier, right_qualifier, config);
                 format!("{rewritten} AS {alias}")
             }
+            SelectItem::ExprWithAliases { .. } => item.to_string(),
             SelectItem::Wildcard(_) => "*".to_string(),
             SelectItem::QualifiedWildcard(name, _) => {
                 let table = name.to_string();

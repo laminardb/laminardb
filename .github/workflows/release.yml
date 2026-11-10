@@ -55,6 +55,16 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   # ============================================
+  # Certify Delivery Guarantees
+  # ============================================
+  # Cluster exactly-once is admitted from sink configuration alone; these kill-9 and
+  # paused-leader soaks on the tagged commit are its evidence, so the release waits for them.
+  soak:
+    name: Fault soak
+    needs: verify
+    uses: ./.github/workflows/checkpoint-fault-soak.yml
+
+  # ============================================
   # Build Release Artifacts
   # ============================================
   build:
@@ -115,7 +125,12 @@ jobs:
           # Keep the publishable maintained forks on the release version.
           perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
             vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml \
-            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml
+            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml \
+            vendor/iceberg/Cargo.toml vendor/iceberg-catalog-rest/Cargo.toml \
+            vendor/iceberg-storage-opendal/Cargo.toml
+          perl -0pi -e 's{(\[dependencies\.iceberg\]\npackage = "laminardb-iceberg"\nversion = "=)[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/iceberg-catalog-rest/Cargo.toml vendor/iceberg-storage-opendal/Cargo.toml
+          perl -i -pe 's/(path = "vendor\/[^"]*", version = "=)[^"]*"/${1}'"$VERSION"'"/g' Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -131,9 +146,9 @@ jobs:
 
       - name: Set swap space (Linux)
         if: runner.os == 'Linux'
-        uses: pierotofy/set-swap-space@v1.0
+        uses: ./.github/actions/add-swap
         with:
-          swap-size-gb: 10
+          size-gb: 10
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
@@ -242,7 +257,7 @@ jobs:
   # ============================================
   release:
     name: Create Release
-    needs: [verify, build]
+    needs: [verify, build, soak]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -338,7 +353,12 @@ jobs:
           # Keep the publishable maintained forks on the release version.
           perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
             vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml \
-            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml
+            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml \
+            vendor/iceberg/Cargo.toml vendor/iceberg-catalog-rest/Cargo.toml \
+            vendor/iceberg-storage-opendal/Cargo.toml
+          perl -0pi -e 's{(\[dependencies\.iceberg\]\npackage = "laminardb-iceberg"\nversion = "=)[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/iceberg-catalog-rest/Cargo.toml vendor/iceberg-storage-opendal/Cargo.toml
+          perl -i -pe 's/(path = "vendor\/[^"]*", version = "=)[^"]*"/${1}'"$VERSION"'"/g' Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -373,6 +393,18 @@ jobs:
 
       - name: Publish laminardb-libxml2-ffi
         run: cargo publish --manifest-path vendor/libxml2-ffi/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-iceberg
+        run: cargo publish --manifest-path vendor/iceberg/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-iceberg-catalog-rest
+        run: cargo publish --manifest-path vendor/iceberg-catalog-rest/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-iceberg-storage-opendal
+        run: cargo publish --manifest-path vendor/iceberg-storage-opendal/Cargo.toml --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for fork index entries

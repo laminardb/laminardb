@@ -2,6 +2,7 @@
 
 pub(crate) mod capability;
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -161,6 +162,9 @@ pub(crate) fn shuffle_send_error(
             "{context}: send to peer {peer} failed after a frame was or may have been admitted: {error}"
         ));
     }
+    if laminar_core::shuffle::is_shuffle_send_stalled(error) {
+        return DbError::ShuffleSendStalled(format!("{context}: {error}"));
+    }
     if matches!(
         error.kind(),
         std::io::ErrorKind::InvalidInput
@@ -298,7 +302,8 @@ async fn send_shuffle_plan_inner(
                     | std::io::ErrorKind::InvalidData
                     | std::io::ErrorKind::Unsupported
             );
-            (!terminal, *index)
+            let stalled = laminar_core::shuffle::is_shuffle_send_stalled(error);
+            (!terminal, !stalled, *index)
         })
     };
 
@@ -361,16 +366,15 @@ pub(crate) async fn create_cached_physical_plan(
     )?;
     let physical = state.create_physical_plan(logical).await?;
     physical.apply(|plan| {
-        if plan.as_any().is::<RecursiveQueryExec>() {
+        if plan.is::<RecursiveQueryExec>() {
             return datafusion::common::not_impl_err!(
                 "recursive queries cannot use cached streaming execution"
             );
         }
         // DataSourceExec returns itself on reset; file-source metrics would keep accumulating.
         if plan
-            .as_any()
             .downcast_ref::<DataSourceExec>()
-            .is_some_and(|scan| scan.data_source().as_any().is::<FileScanConfig>())
+            .is_some_and(|scan| scan.data_source().is::<FileScanConfig>())
         {
             return datafusion::common::not_impl_err!(
                 "file scans cannot use cached streaming execution; use a connector source"
@@ -482,9 +486,12 @@ pub(crate) mod interval_join;
 /// Private mutable-input normalization state used only by explicitly configured bounded joins.
 pub(crate) mod interval_join_input;
 pub(crate) mod lookup_enrich;
+#[cfg(feature = "cluster")]
+pub(crate) mod shuffle_send;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;
 pub(crate) mod temporal_join;
+pub(crate) mod view_result;
 pub(crate) mod window_frame;
 
 pub(crate) async fn try_compile_post_projection(
@@ -511,9 +518,13 @@ pub(crate) async fn try_compile_post_projection(
     let mut exprs = Vec::with_capacity(info.proj_exprs.len());
     let mut fields = Vec::with_capacity(info.proj_exprs.len());
     for expr in &info.proj_exprs {
-        let physical =
-            datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
-                .ok()?;
+        let physical = datafusion::physical_expr::create_physical_expr(
+            expr,
+            &info.input_df_schema,
+            props,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()?;
         let data_type = physical.data_type(info.input_df_schema.as_arrow()).ok()?;
         let nullable = physical
             .nullable(info.input_df_schema.as_arrow())
@@ -532,6 +543,7 @@ pub(crate) async fn try_compile_post_projection(
                 predicate,
                 &info.input_df_schema,
                 props,
+                &PhysicalPlanningContext::default(),
             )
             .ok()?,
         )
@@ -685,6 +697,58 @@ mod shuffle_tests {
         let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShuffleTerminal(_)));
+        assert!(retry_plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_plan_reports_a_stalled_peer_for_recovery_ahead_of_an_unready_one() {
+        let (sender, _receiver) = sender_with_reachable_peer_two().await;
+        let sender = sender.with_send_stall_timeout(Some(std::time::Duration::from_secs(1)));
+        // The receiver never reads, so its inbound budget, the stream window and then the
+        // sender's outbound budget fill.
+        let wide = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                "x".repeat(
+                    4096
+                );
+                1024
+            ]))],
+        )
+        .unwrap();
+        let wide = ShuffleMessage::checkpointed("stage".into(), 1, wide);
+        let mut sends = 0;
+        let stalled = loop {
+            assert!(sends < 64, "an unread peer never stalled a send");
+            sends += 1;
+            if let Err(error) = sender.send_to(2, &wide).await {
+                break error;
+            }
+        };
+        assert!(
+            laminar_core::shuffle::is_shuffle_send_stalled(&stalled),
+            "{stalled}"
+        );
+
+        let (result, retry_plan) = send_shuffle_plan_retaining(
+            &sender,
+            None,
+            1,
+            vec![
+                (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(1))),
+                (2, wide),
+            ],
+            "test shuffle",
+        )
+        .await;
+        let error = result.unwrap_err();
+
+        assert!(matches!(error, DbError::ShuffleSendStalled(_)), "{error}");
+        assert!(error.requires_pipeline_recovery());
         assert!(retry_plan.is_none());
     }
 

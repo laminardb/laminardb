@@ -460,6 +460,20 @@ pub trait SourceConnector: Send {
         Ok(None)
     }
 
+    /// How far the upstream of a source configured by `config` has been written, for reads
+    /// that must include it. Configuration only, no external I/O. The default, `None`, means the
+    /// connector cannot tell, and such reads are refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when `config` is invalid for this connector.
+    fn recency(
+        &self,
+        _config: &ConnectorConfig,
+    ) -> Result<Option<Arc<dyn super::SourceRecency>>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Acknowledge that `epoch` has been durably committed.
     ///
     /// Called after the manifest and exact engine commit decision are durable. Coordinated

@@ -2,24 +2,23 @@ use super::*;
 
 #[tokio::test]
 async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metrics() {
-    use crate::mv_store::{MvStorageMode, MvStore};
+    use crate::mv_store::{MvStorageMode, MvStore, ViewKey};
     use crate::pipeline::PipelineCallback;
     use crate::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
     for mode in [
-        MvStorageMode::Aggregate,
-        MvStorageMode::append_default(),
-        MvStorageMode::Upsert { key_cols: vec![0] },
-        MvStorageMode::Multiset,
+        MvStorageMode::append_rows(1_000),
+        MvStorageMode::changelog(ViewKey::Keyed(vec![0])),
+        MvStorageMode::changelog(ViewKey::MultisetByRow),
     ] {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let input = |ids: Vec<i64>| {
             let rows = ids.len();
             let mut fields = schema.fields().to_vec();
             let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(Int64Array::from(ids))];
-            if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset) {
+            if matches!(mode, MvStorageMode::Changelog { .. }) {
                 fields.push(Arc::new(Field::new("__weight", DataType::Int64, false)));
                 columns.push(Arc::new(Int64Array::from(vec![1; rows])));
             }
@@ -56,10 +55,10 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
         let before_bytes = callback.mv_store.read().total_bytes();
         let error = callback.update_mv_stores(&results).unwrap_err();
         assert!(
-            matches!(error, crate::pipeline::CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
+            matches!(error, crate::pipeline::CycleError::Halt(ref reason) if reason.contains("quota exceeded"))
         );
-        assert!(callback.checkpoint_fault.lock().is_some());
-        assert_eq!(callback.prom.mv_updates.get(), 0);
+        assert!(callback.checkpoint_fault.lock().is_none());
+        assert_eq!(callback.prom.views.updates.get(), 0);
         assert_eq!(callback.mv_store.read().total_bytes(), before_bytes);
         for name in ["a", "b"] {
             let snapshot = callback
@@ -84,19 +83,23 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
             .all(|portal| portal.try_next_frame().is_none()));
         *results.get_mut(&second).unwrap() = vec![input(vec![2])];
         callback.update_mv_stores(&results).unwrap();
-        assert_eq!(callback.prom.mv_updates.get(), 2);
+        assert_eq!(callback.prom.views.updates.get(), 2);
         for portal in &mut portals {
             let Some(PortalFrame::Batch { batch, .. }) = portal.try_next_frame() else {
-                panic!("successful cycle must publish plain rows")
+                panic!("successful cycle must publish its change")
             };
-            assert_eq!(batch.num_columns(), 1);
-            let expected = if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset)
-            {
+            let weighted = matches!(mode, MvStorageMode::Changelog { .. });
+            assert_eq!(batch.num_columns(), 1 + usize::from(weighted));
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
                 2
-            } else {
-                1
-            };
-            assert_eq!(batch.num_rows(), expected);
+            );
         }
     }
 }
@@ -992,16 +995,6 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     catalog.seal(&parent, &leader.proof).await.unwrap();
     let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&leader.objects)));
     let deployment = decisions.load_or_create_deployment_id().await.unwrap();
-    leader
-        .authority
-        .adopt_legacy_topology(
-            &leader.proof,
-            uuid::Uuid::from_u128(40).try_into().unwrap(),
-            &parent.reference().unwrap(),
-            &deployment,
-        )
-        .await
-        .unwrap();
     let mut target = parent.clone();
     target.entries.push(CatalogManifestEntry {
         schema_binding: None,
@@ -1044,7 +1037,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
-        parent_version: TopologyVersion::LEGACY_BASELINE,
+        parent_version: TopologyVersion::BASELINE,
         target_version: TopologyVersion::new(2).unwrap(),
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),
@@ -1079,7 +1072,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     let plan = TopologyAdmissionPlan {
         protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::from_u128(41).try_into().unwrap(),
-        expected_parent: TopologyVersion::LEGACY_BASELINE,
+        expected_parent: TopologyVersion::BASELINE,
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),
         assignment: leader.fence.clone(),
@@ -4231,7 +4224,10 @@ async fn terminal_operator_capture_populates_halt_without_recovery_fault() {
         .push_test_node("terminal-capture", Box::new(TerminalCaptureFailureOperator));
 
     let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .err()
         .expect("terminal operator capture must reject the checkpoint");
 
@@ -4291,7 +4287,10 @@ async fn unchanged_vnode_capture_does_not_arm_the_mutable_capture_guard() {
         .push_test_node("unchanged-vnodes", Box::new(UnchangedVnodeCaptureOperator));
 
     let capture = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .unwrap();
     drop(capture);
 
@@ -4314,9 +4313,10 @@ async fn busy_serialization_gate_rejects_synchronously_before_mutating_operator_
         .await
         .unwrap();
 
-    let error = match callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(10))
-    {
+    let error = match callback.capture_operator_state_until(
+        CheckpointAttempt::new(1, 1),
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    ) {
         Ok(_) => panic!("a busy serialization gate must reject synchronously"),
         Err(error) => error,
     };
@@ -4358,7 +4358,8 @@ async fn busy_serialization_gate_does_not_hold_assignment_writer_until_timeout()
         .unwrap()
         .expect("configured callback must acquire its rotation token");
 
-    let error = match callback.capture_operator_state_until(deadline) {
+    let error = match callback.capture_operator_state_until(CheckpointAttempt::new(1, 1), deadline)
+    {
         Ok(_) => panic!("serialization contention must not wait under the rotation token"),
         Err(error) => error,
     };
@@ -4413,7 +4414,9 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
         }),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let capture = callback.capture_operator_state_until(deadline).unwrap();
+    let capture = callback
+        .capture_operator_state_until(CheckpointAttempt::new(1, 1), deadline)
+        .unwrap();
     let serialized = capture
         .serialize_until(
             callback.checkpoint_state_cap_bytes,
@@ -4446,7 +4449,10 @@ async fn destructive_vnode_capture_failure_faults_runtime() {
     );
 
     let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .err()
         .expect("vnode capture failure must reject the checkpoint");
 
@@ -4707,6 +4713,29 @@ async fn managed_state_budget_exhaustion_halts_and_notifies_shutdown() {
     tokio::time::timeout(Duration::from_millis(50), notify.notified())
         .await
         .expect("managed-state exhaustion must notify shutdown");
+}
+
+#[tokio::test]
+async fn group_limit_halts_and_notifies_shutdown() {
+    use crate::pipeline::CycleError;
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let error = DbError::GroupLimitExceeded {
+        context: "aggregate record processing".into(),
+        groups: 1_000_001,
+        limit: 1_000_000,
+    };
+
+    let mapped = ConnectorPipelineCallback::map_graph_error(&error, &notify);
+
+    assert!(matches!(
+        &mapped,
+        CycleError::Halt(message)
+            if message.contains(laminar_core::error_codes::MANAGED_STATE_BUDGET_EXCEEDED)
+                && message.contains("groups=1000001")
+    ));
+    tokio::time::timeout(Duration::from_millis(50), notify.notified())
+        .await
+        .expect("group-limit exhaustion must notify shutdown");
 }
 
 #[tokio::test]
@@ -5426,6 +5455,7 @@ async fn cold_empty_successor_rehydrates_the_callback_source_pin() {
         }],
         source_watermarks: BTreeMap::from([("orders".into(), 900)]),
         checkpoint_watermark: Some(900),
+        view_frontiers: Default::default(),
     };
     let predecessor_ref = warm_store
         .create_committed_checkpoint(&predecessor)
@@ -7052,6 +7082,7 @@ async fn gate_committed_checkpoint(
         channel_progress,
         source_watermarks: std::collections::BTreeMap::from([("source".into(), 42)]),
         checkpoint_watermark: Some(42),
+        view_frontiers: Default::default(),
     }
 }
 
@@ -7500,6 +7531,49 @@ async fn aligned_resume_gate_releases_on_newer_epoch() {
     );
 }
 
+/// A follower that misses the transient Aligned resumes on the same leader's next Prepare over the
+/// same assignment: that leader prepares only after its own gate has passed.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn same_leader_newer_prepare_releases_the_resume_gate() {
+    use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+    let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+    let (fence, identity) = resume_identity(3, 3);
+    kv.seed(
+        leader_id,
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&BarrierAnnouncement {
+            epoch: 4,
+            checkpoint_id: 4,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(identity.leader_proof.clone()),
+            phase: Phase::Prepare,
+            flags: 0,
+        })
+        .unwrap(),
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ConnectorPipelineCallback::wait_for_aligned_resume(
+            true,
+            &controller,
+            identity,
+            &fence,
+            Duration::from_secs(3),
+        ),
+    )
+    .await
+    .expect("the same leader's newer Prepare must release the gate")
+    .expect("the awaited assignment is already certified");
+    assert_eq!(
+        controller.cluster_min_watermark(),
+        None,
+        "a newer Prepare says nothing about the awaited attempt's outcome"
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn newer_reversible_phase_requires_successor_alignment_authority() {
@@ -7510,6 +7584,22 @@ async fn newer_reversible_phase_requires_successor_alignment_authority() {
             epoch: 4,
             checkpoint_id: 4,
             assignment_fence: Some(assignment_fence(2, &[1, 7])),
+            leader_proof: Some(leader_proof(1)),
+            phase: Phase::Prepare,
+            flags: 0,
+        },
+        BarrierAnnouncement {
+            epoch: 4,
+            checkpoint_id: 4,
+            assignment_fence: Some(assignment_fence(1, &[1, 7])),
+            leader_proof: Some(leader_proof(2)),
+            phase: Phase::Prepare,
+            flags: 0,
+        },
+        BarrierAnnouncement {
+            epoch: 4,
+            checkpoint_id: 4,
+            assignment_fence: None,
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
             flags: 0,

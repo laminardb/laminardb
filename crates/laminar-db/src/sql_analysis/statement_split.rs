@@ -1,22 +1,27 @@
-//! Statement splitting: a stream query whose shape no single managed operator executes — an
-//! aggregate over a join, or an aggregate over an aggregating or joining subquery — is rewritten
-//! into internal named stages that each admit and execute as an ordinary stream.
+//! Statement splitting: a stream or view query whose shape no single managed operator executes —
+//! a chain of interval joins over more than two inputs, an aggregate over a join, or an aggregate
+//! over an aggregating or joining subquery — is rewritten into internal named stages that each
+//! admit and execute as an ordinary stream.
 //!
 //! INVARIANT: stage names are `<owner>$stage<n>` in creation order. Stage `n` reads only catalog
-//! objects and stages below `n`; the owner's own query reads only its stages.
+//! objects and stages below `n`; the owner's own query reads its stages and, when it runs the
+//! last join of a chain, that join's catalog input.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    visit_expressions, visit_expressions_mut, Distinct, Expr, GroupByExpr, Ident, ObjectName,
-    ObjectNamePart, Query, Select, SelectItem, SetExpr, TableAlias, TableFactor, TableWithJoins,
+    visit_expressions, visit_expressions_mut, Distinct, Expr, GroupByExpr, Ident, Join,
+    JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderBy, Query, Select, SelectItem,
+    SetExpr, TableAlias, TableFactor, TableWithJoins,
 };
 
 use super::ast::parse_standard_query;
 use crate::error::DbError;
 
-const STAGE_MARKER: &str = "$stage";
+pub(crate) use laminar_core::catalog::stage_owner;
+use laminar_core::catalog::STAGE_MARKER;
+
 /// Each stage is a stream operator; deeper nesting is a query to write as named streams.
 const MAX_STAGES: usize = 8;
 
@@ -34,13 +39,6 @@ pub(crate) struct SplitQuery {
     pub(crate) stages: Vec<StageQuery>,
     /// The owner's query over its stages.
     pub(crate) query_sql: String,
-}
-
-/// The stream that owns `name` when `name` is an internal stage.
-pub(crate) fn stage_owner(name: &str) -> Option<&str> {
-    let (owner, index) = name.rsplit_once(STAGE_MARKER)?;
-    (!owner.is_empty() && !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
-        .then_some(owner)
 }
 
 /// `owner`'s stages among `names`, in creation order.
@@ -96,17 +94,19 @@ impl Splitter<'_> {
         let SetExpr::Select(select) = query.body.as_mut() else {
             return Ok(None);
         };
-        if !self.aggregates(select) {
-            return Ok(None);
-        }
+        let aggregates = self.aggregates(select);
         let split = match select.from.as_slice() {
-            [from] if from.joins.is_empty() => self.split_subquery(select)?,
+            [from] if is_interval_join_chain(from) => {
+                self.split_joins(select, &mut query.order_by, aggregates)?
+            }
+            [from] if aggregates && from.joins.is_empty() => self.split_subquery(select)?,
             [from]
-                if from.joins.len() == 1
+                if aggregates
+                    && from.joins.len() == 1
                     && is_named_table(&from.relation)
                     && is_named_table(&from.joins[0].relation) =>
             {
-                self.split_join(select, &mut query.order_by)?
+                self.split_joins(select, &mut query.order_by, true)?
             }
             _ => false,
         };
@@ -146,39 +146,91 @@ impl Splitter<'_> {
         Ok(true)
     }
 
-    /// `SELECT <aggregates> FROM a JOIN b ON .. [WHERE ..] ..` joins in a stage that projects
-    /// every input column the aggregate reads as `<qualifier>_<column>`.
-    fn split_join(
+    /// `SELECT .. FROM r0 JOIN r1 ON .. [JOIN r2 ON ..] ..` runs the first join over `r0` and
+    /// `r1` in stage 1, and join `j` over stage `j - 1` and `r<j>`. Each stage projects every
+    /// input column read after it as `<qualifier>_<column>`. An aggregate reads the last join's
+    /// stage; otherwise the owner runs the last join.
+    fn split_joins(
         &mut self,
         select: &mut Select,
-        order_by: &mut Option<sqlparser::ast::OrderBy>,
+        order_by: &mut Option<OrderBy>,
+        aggregates: bool,
     ) -> Result<bool, DbError> {
-        let from = std::mem::take(&mut select.from);
-        let selection = select.selection.take();
-        let mut columns = JoinColumns::new(self.owner, select)?;
-        columns.collect(&*select)?;
-        columns.collect(&*order_by)?;
-        if columns.aliases.is_empty() {
-            columns.collect_first(&from[0].joins[0])?;
+        let TableWithJoins {
+            relation,
+            mut joins,
+        } = select.from.remove(0);
+        let mut selection = select.selection.take();
+        let last = joins.len();
+        let owner_reads_at = if aggregates { last + 1 } else { last };
+        let mut columns = JoinColumns::new(self.owner, select, &relation, &joins)?;
+        columns.collect(&*select, owner_reads_at)?;
+        columns.collect(&*order_by, owner_reads_at)?;
+        if last > 1 {
+            columns.collect(&selection, last)?;
+        }
+        for (index, join) in joins.iter().enumerate().skip(1) {
+            columns.collect(join, index + 1)?;
+        }
+        if aggregates && !columns.projects(last) {
+            columns.collect_first(&joins[last - 1], owner_reads_at)?;
         }
         columns.reject_shadowed_outputs()?;
-        let projection = columns
-            .aliases
-            .iter()
-            .map(|(alias, column)| format!("{column} AS {}", quoted(alias)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let filter = selection.map_or_else(String::new, |filter| format!(" WHERE {filter}"));
-        let stage = self.push(
-            format!("SELECT {projection} FROM {}{filter}", from[0]),
-            false,
-        )?;
-        columns.rewrite(&mut *select);
-        columns.rewrite(&mut *order_by);
+
+        let owner_join = if aggregates { None } else { joins.pop() };
+        let mut left = relation;
+        let mut previous: Option<String> = None;
+        for (index, mut join) in joins.into_iter().enumerate() {
+            let position = index + 1;
+            if let Some(stage) = &previous {
+                columns.rewrite_from_stage(&mut join, position, stage);
+            }
+            let mut filter = String::new();
+            if position == last {
+                if let (Some(stage), Some(selection)) = (&previous, &mut selection) {
+                    columns.rewrite_from_stage(selection, position, stage);
+                }
+                filter = selection
+                    .take()
+                    .map_or_else(String::new, |filter| format!(" WHERE {filter}"));
+            }
+            let projection = columns.projection(position, previous.as_deref());
+            if projection.is_empty() {
+                return Err(columns.unsupported(&format!(
+                    "the join after stage {position} reads none of its columns"
+                )));
+            }
+            let input = TableWithJoins {
+                relation: left,
+                joins: vec![join],
+            };
+            let stage = self.push(
+                format!("SELECT {} FROM {input}{filter}", projection.join(", ")),
+                false,
+            )?;
+            left = stage_relation(&stage, None);
+            previous = Some(stage);
+        }
+        let Some(mut join) = owner_join else {
+            columns.rewrite(&mut *select);
+            columns.rewrite(&mut *order_by);
+            select.from = vec![TableWithJoins {
+                relation: left,
+                joins: Vec::new(),
+            }];
+            return Ok(true);
+        };
+        if let Some(stage) = &previous {
+            columns.rewrite_from_stage(&mut join, last, stage);
+            columns.rewrite_from_stage(&mut *select, last, stage);
+            columns.rewrite_from_stage(&mut *order_by, last, stage);
+            columns.rewrite_from_stage(&mut selection, last, stage);
+        }
         select.from = vec![TableWithJoins {
-            relation: stage_relation(&stage, None),
-            joins: Vec::new(),
+            relation: left,
+            joins: vec![join],
         }];
+        select.selection = selection;
         Ok(true)
     }
 
@@ -230,23 +282,45 @@ impl Splitter<'_> {
     }
 }
 
-/// The join inputs an aggregate reads, keyed by their stage column name.
+/// An input column that a stage projects for the stages and owner after it.
+struct StageColumn {
+    /// The column as the statement names it.
+    input: String,
+    /// The first stage that reads the column's input.
+    stage: usize,
+    /// The position of its last reader: a stage, or the owner.
+    read_until: usize,
+}
+
+/// The join inputs read after the stage that joins them, keyed by their stage column name.
+/// Position `j` is join `j`; an aggregate over the joins reads at the position after the last.
 struct JoinColumns<'a> {
     owner: &'a str,
+    /// Each input's qualifier, in join order.
+    qualifiers: Vec<Option<String>>,
     /// Bare identifiers that name an output column rather than an input column.
     output_names: Vec<String>,
     /// Output names the query references bare.
     referenced_outputs: Vec<String>,
-    aliases: BTreeMap<String, String>,
+    aliases: BTreeMap<String, StageColumn>,
     columns: BTreeMap<(String, String), String>,
 }
 
 impl<'a> JoinColumns<'a> {
     /// Names each output explicitly, because the stage renames the input columns that unaliased
     /// expressions would otherwise be named after.
-    fn new(owner: &'a str, select: &mut Select) -> Result<Self, DbError> {
+    fn new(
+        owner: &'a str,
+        select: &mut Select,
+        relation: &TableFactor,
+        joins: &[Join],
+    ) -> Result<Self, DbError> {
         let mut columns = Self {
             owner,
+            qualifiers: std::iter::once(relation)
+                .chain(joins.iter().map(|join| &join.relation))
+                .map(relation_qualifier)
+                .collect(),
             output_names: Vec::new(),
             referenced_outputs: Vec::new(),
             aliases: BTreeMap::new(),
@@ -266,6 +340,9 @@ impl<'a> JoinColumns<'a> {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
                     return Err(columns.unsupported("list the output columns instead of '*'"));
                 }
+                SelectItem::ExprWithAliases { .. } => {
+                    return Err(columns.unsupported("use one alias per output column"));
+                }
             }
             if let SelectItem::ExprWithAlias { alias, .. } = item {
                 columns.output_names.push(alias.value.clone());
@@ -274,10 +351,28 @@ impl<'a> JoinColumns<'a> {
         Ok(columns)
     }
 
-    fn collect<V: sqlparser::ast::Visit>(&mut self, node: &V) -> Result<(), DbError> {
+    fn last_join(&self) -> usize {
+        self.qualifiers.len() - 1
+    }
+
+    /// The first stage that reads `qualifier`'s input; an unknown qualifier is left to the last
+    /// join, whose planning names it.
+    fn stage_of(&self, qualifier: &str) -> usize {
+        self.qualifiers
+            .iter()
+            .position(|name| name.as_deref() == Some(qualifier))
+            .map_or(self.last_join(), |index| index.max(1))
+    }
+
+    /// Records the input columns `node` reads at position `read_at`.
+    fn collect<V: sqlparser::ast::Visit>(
+        &mut self,
+        node: &V,
+        read_at: usize,
+    ) -> Result<(), DbError> {
         let mut result = Ok(());
         let _ = visit_expressions(node, |expr| {
-            result = self.reference(expr);
+            result = self.reference(expr, read_at);
             if result.is_err() {
                 ControlFlow::Break(())
             } else {
@@ -288,7 +383,7 @@ impl<'a> JoinColumns<'a> {
     }
 
     /// An aggregate that reads no input column still needs one row per join match.
-    fn collect_first(&mut self, join: &sqlparser::ast::Join) -> Result<(), DbError> {
+    fn collect_first(&mut self, join: &Join, read_at: usize) -> Result<(), DbError> {
         let mut first = None;
         let _ = visit_expressions(join, |expr| match expr {
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
@@ -297,10 +392,10 @@ impl<'a> JoinColumns<'a> {
             }
             _ => ControlFlow::Continue(()),
         });
-        first.map_or(Ok(()), |expr| self.reference(&expr))
+        first.map_or(Ok(()), |expr| self.reference(&expr, read_at))
     }
 
-    fn reference(&mut self, expr: &Expr) -> Result<(), DbError> {
+    fn reference(&mut self, expr: &Expr, read_at: usize) -> Result<(), DbError> {
         match expr {
             Expr::CompoundIdentifier(parts) => {
                 let [qualifier, column] = parts.as_slice() else {
@@ -308,8 +403,15 @@ impl<'a> JoinColumns<'a> {
                         self.unsupported(&format!("reference '{expr}' must name one input column"))
                     );
                 };
+                let stage = self.stage_of(&qualifier.value);
+                if stage >= read_at {
+                    return Ok(());
+                }
                 let key = (qualifier.value.clone(), column.value.clone());
-                if self.columns.contains_key(&key) {
+                if let Some(alias) = self.columns.get(&key) {
+                    if let Some(stage_column) = self.aliases.get_mut(alias) {
+                        stage_column.read_until = stage_column.read_until.max(read_at);
+                    }
                     return Ok(());
                 }
                 let alias = format!("{}_{}", qualifier.value, column.value);
@@ -318,7 +420,12 @@ impl<'a> JoinColumns<'a> {
                         "stage column '{alias}' for '{expr}' is ambiguous"
                     )));
                 }
-                self.aliases.insert(alias.clone(), expr.to_string());
+                let stage_column = StageColumn {
+                    input: expr.to_string(),
+                    stage,
+                    read_until: read_at,
+                };
+                self.aliases.insert(alias.clone(), stage_column);
                 self.columns.insert(key, alias);
                 Ok(())
             }
@@ -350,28 +457,80 @@ impl<'a> JoinColumns<'a> {
         }
     }
 
-    fn rewrite<V: sqlparser::ast::VisitMut>(&self, node: &mut V) {
-        let _ = visit_expressions_mut(node, |expr| {
-            if let Expr::CompoundIdentifier(parts) = expr {
-                if let [qualifier, column] = parts.as_slice() {
-                    if let Some(alias) = self
-                        .columns
-                        .get(&(qualifier.value.clone(), column.value.clone()))
-                    {
-                        *expr = Expr::Identifier(Ident::with_quote('"', alias));
-                    }
+    fn projects(&self, stage: usize) -> bool {
+        self.aliases
+            .values()
+            .any(|column| column.stage <= stage && stage < column.read_until)
+    }
+
+    /// Stage `stage`'s select list: its own inputs' columns as the statement names them, and the
+    /// columns it carries on from `previous`.
+    fn projection(&self, stage: usize, previous: Option<&str>) -> Vec<String> {
+        self.aliases
+            .iter()
+            .filter(|(_, column)| column.stage <= stage && stage < column.read_until)
+            .map(|(alias, column)| match previous {
+                Some(previous) if column.stage < stage => {
+                    format!(
+                        "{}.{} AS {}",
+                        quoted(previous),
+                        quoted(alias),
+                        quoted(alias)
+                    )
                 }
+                _ => format!("{} AS {}", column.input, quoted(alias)),
+            })
+            .collect()
+    }
+
+    /// Reads each column that an earlier stage carries from the previous stage, `stage`.
+    fn rewrite_from_stage<V: sqlparser::ast::VisitMut>(
+        &self,
+        node: &mut V,
+        position: usize,
+        stage: &str,
+    ) {
+        let _ = visit_expressions_mut(node, |expr| {
+            if let Some(alias) = self.stage_alias(expr, |column| column.stage < position) {
+                *expr = Expr::CompoundIdentifier(vec![quoted(stage), quoted(alias)]);
             }
             ControlFlow::<()>::Continue(())
         });
     }
 
+    /// Reads every collected column bare, from the one stage the owner aggregates over.
+    fn rewrite<V: sqlparser::ast::VisitMut>(&self, node: &mut V) {
+        let _ = visit_expressions_mut(node, |expr| {
+            if let Some(alias) = self.stage_alias(expr, |_| true) {
+                *expr = Expr::Identifier(quoted(alias));
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+
+    fn stage_alias(&self, expr: &Expr, carried: impl Fn(&StageColumn) -> bool) -> Option<&str> {
+        let Expr::CompoundIdentifier(parts) = expr else {
+            return None;
+        };
+        let [qualifier, column] = parts.as_slice() else {
+            return None;
+        };
+        let alias = self
+            .columns
+            .get(&(qualifier.value.clone(), column.value.clone()))?;
+        self.aliases
+            .get(alias)
+            .is_some_and(carried)
+            .then_some(alias.as_str())
+    }
+
     fn unsupported(&self, reason: &str) -> DbError {
-        DbError::Unsupported(format!(
-            "stream '{}' aggregates over a join, which runs as a join stage and an aggregate \
-             stage: {reason}",
-            self.owner
-        ))
+        let shape = match self.qualifiers.len() {
+            2 => "aggregates over a join, which runs as a join stage and an aggregate stage"
+                .to_string(),
+            inputs => format!("joins {inputs} inputs, which runs as one stage per join"),
+        };
+        DbError::Unsupported(format!("stream '{}' {shape}: {reason}", self.owner))
     }
 }
 
@@ -385,6 +544,67 @@ fn reads_qualified_column(expr: &Expr) -> bool {
 
 fn is_named_table(factor: &TableFactor) -> bool {
     matches!(factor, TableFactor::Table { args: None, .. })
+}
+
+/// Two or more joins, each an interval join (an `ON` condition with a `BETWEEN` bound) of a
+/// single-part catalog name onto the inputs before it.
+fn is_interval_join_chain(from: &TableWithJoins) -> bool {
+    let catalog_input = |factor: &TableFactor| {
+        matches!(
+            factor,
+            TableFactor::Table { name, alias, args: None, version: None, .. }
+                if name.0.len() == 1 && alias.as_ref().is_none_or(|alias| alias.columns.is_empty())
+        )
+    };
+    from.joins.len() > 1
+        && catalog_input(&from.relation)
+        && from.joins.iter().all(|join| {
+            catalog_input(&join.relation)
+                && join_condition(&join.join_operator).is_some_and(|condition| {
+                    visit_expressions(condition, |expr| match expr {
+                        Expr::Between { negated: false, .. } => ControlFlow::Break(()),
+                        _ => ControlFlow::Continue(()),
+                    })
+                    .is_break()
+                })
+        })
+}
+
+fn join_condition(operator: &JoinOperator) -> Option<&Expr> {
+    let (JoinOperator::Join(constraint)
+    | JoinOperator::Inner(constraint)
+    | JoinOperator::Left(constraint)
+    | JoinOperator::LeftOuter(constraint)
+    | JoinOperator::Right(constraint)
+    | JoinOperator::RightOuter(constraint)
+    | JoinOperator::FullOuter(constraint)
+    | JoinOperator::Semi(constraint)
+    | JoinOperator::LeftSemi(constraint)
+    | JoinOperator::RightSemi(constraint)
+    | JoinOperator::Anti(constraint)
+    | JoinOperator::LeftAnti(constraint)
+    | JoinOperator::RightAnti(constraint)) = operator
+    else {
+        return None;
+    };
+    match constraint {
+        JoinConstraint::On(condition) => Some(condition),
+        _ => None,
+    }
+}
+
+/// The name a query qualifies an input's columns with: its alias, else its last name part.
+fn relation_qualifier(factor: &TableFactor) -> Option<String> {
+    let TableFactor::Table { name, alias, .. } = factor else {
+        return None;
+    };
+    match alias {
+        Some(alias) => Some(alias.name.value.clone()),
+        None => match name.0.last()? {
+            ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+            ObjectNamePart::Function(_) => None,
+        },
+    }
 }
 
 fn quoted(name: &str) -> Ident {
@@ -414,15 +634,6 @@ mod tests {
         split_stream_query("out", sql, &|name| {
             matches!(name, "count" | "sum" | "avg" | "min" | "max")
         })
-    }
-
-    #[test]
-    fn stage_names_round_trip_to_their_owner() {
-        assert_eq!(stage_owner("out$stage1"), Some("out"));
-        assert_eq!(stage_owner("a$stage2$stage12"), Some("a$stage2"));
-        for name in ["out", "$stage1", "out$stage", "out$stagex", "out$stage1a"] {
-            assert_eq!(stage_owner(name), None, "{name}");
-        }
     }
 
     #[test]
@@ -597,6 +808,124 @@ mod tests {
         assert_eq!(
             split.query_sql,
             "SELECT \"o_k\" AS key, COUNT(*) AS n FROM \"out$stage1\" GROUP BY key ORDER BY n"
+        );
+    }
+
+    const THREE_WAY: &str = "FROM orders o \
+         JOIN payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+         JOIN refunds r ON p.v = r.v AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND";
+
+    #[test]
+    fn multi_way_join_runs_its_last_join_in_the_owner() {
+        let split = split(&format!(
+            "SELECT o.k, p.v AS pv, r.v AS rv {THREE_WAY} WHERE o.v > r.v"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            split.stages,
+            vec![StageQuery {
+                name: "out$stage1".into(),
+                sql: "SELECT o.k AS \"o_k\", o.ts AS \"o_ts\", o.v AS \"o_v\", \
+                      p.v AS \"p_v\" FROM orders o \
+                      JOIN payments p ON o.k = p.k \
+                      AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+                    .into(),
+                changelog: false,
+            }]
+        );
+        assert_eq!(
+            split.query_sql,
+            "SELECT \"out$stage1\".\"o_k\" AS k, \"out$stage1\".\"p_v\" AS pv, r.v AS rv \
+             FROM \"out$stage1\" JOIN refunds r ON \"out$stage1\".\"p_v\" = r.v \
+             AND r.ts BETWEEN \"out$stage1\".\"o_ts\" \
+             AND \"out$stage1\".\"o_ts\" + INTERVAL '30' MILLISECOND \
+             WHERE \"out$stage1\".\"o_v\" > r.v"
+        );
+    }
+
+    #[test]
+    fn multi_way_aggregate_carries_only_the_columns_read_after_each_join() {
+        let split = split(&format!(
+            "SELECT r.k AS k, COUNT(*) AS n {THREE_WAY} WHERE o.v > 0 GROUP BY r.k"
+        ))
+        .unwrap()
+        .unwrap();
+        let sql: Vec<_> = split
+            .stages
+            .iter()
+            .map(|stage| stage.sql.as_str())
+            .collect();
+        assert_eq!(
+            sql,
+            [
+                "SELECT o.ts AS \"o_ts\", o.v AS \"o_v\", p.v AS \"p_v\" FROM orders o \
+                 JOIN payments p ON o.k = p.k \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+                "SELECT r.k AS \"r_k\" FROM \"out$stage1\" \
+                 JOIN refunds r ON \"out$stage1\".\"p_v\" = r.v \
+                 AND r.ts BETWEEN \"out$stage1\".\"o_ts\" \
+                 AND \"out$stage1\".\"o_ts\" + INTERVAL '30' MILLISECOND \
+                 WHERE \"out$stage1\".\"o_v\" > 0",
+            ]
+        );
+        assert!(split.stages.iter().all(|stage| !stage.changelog));
+        assert_eq!(
+            split.query_sql,
+            "SELECT \"r_k\" AS k, COUNT(*) AS n FROM \"out$stage2\" GROUP BY \"r_k\""
+        );
+    }
+
+    #[test]
+    fn four_way_join_chains_three_stages() {
+        let split = split(&format!(
+            "SELECT s.v AS v {THREE_WAY} \
+             JOIN shipments s ON r.k = s.k AND s.ts BETWEEN o.ts AND o.ts + INTERVAL '10' MILLISECOND"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(split.stages.len(), 2);
+        assert_eq!(
+            split.stages[1].sql,
+            "SELECT \"out$stage1\".\"o_ts\" AS \"o_ts\", r.k AS \"r_k\" FROM \"out$stage1\" \
+             JOIN refunds r ON \"out$stage1\".\"p_v\" = r.v \
+             AND r.ts BETWEEN \"out$stage1\".\"o_ts\" \
+             AND \"out$stage1\".\"o_ts\" + INTERVAL '30' MILLISECOND"
+        );
+        assert_eq!(
+            split.query_sql,
+            "SELECT s.v AS v FROM \"out$stage2\" JOIN shipments s \
+             ON \"out$stage2\".\"r_k\" = s.k AND s.ts BETWEEN \"out$stage2\".\"o_ts\" \
+             AND \"out$stage2\".\"o_ts\" + INTERVAL '10' MILLISECOND"
+        );
+    }
+
+    #[test]
+    fn multi_way_joins_without_an_interval_on_every_join_are_not_split() {
+        for sql in [
+            "SELECT o.k AS k FROM orders o \
+             JOIN payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND \
+             JOIN customers c ON p.c = c.id",
+            "SELECT o.k AS k FROM orders o \
+             JOIN payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND \
+             JOIN refunds r USING (k)",
+            "SELECT o.k AS k FROM orders o \
+             JOIN payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND \
+             JOIN (SELECT k, ts FROM refunds) r \
+             ON o.k = r.k AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND",
+        ] {
+            assert_eq!(split(sql).unwrap(), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn multi_way_join_requires_qualified_columns() {
+        let error = split(&format!("SELECT o.k AS k {THREE_WAY} WHERE v > 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("joins 3 inputs, which runs as one stage per join: qualify column 'v'"),
+            "{error}"
         );
     }
 

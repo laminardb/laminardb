@@ -546,13 +546,17 @@ impl CoordinatedAbortCleaner for BarrierCommitSink {
     }
 }
 
-#[tokio::test]
-async fn sink_artifact_intent_is_durable_before_connector_begin() {
+async fn coordinator_with_intent_order_sink(
+    prefix: &str,
+) -> (
+    CheckpointCoordinator,
+    crate::sink_task::SinkTaskHandle,
+    Arc<AtomicUsize>,
+) {
     let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let decisions = Arc::new(
         laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(&objects)),
     );
-    let prefix = "intent-before-begin";
     let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix);
     let mut coordinator =
         CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
@@ -594,11 +598,88 @@ async fn sink_artifact_intent_is_durable_before_connector_begin() {
         process_authority: None,
     });
     coordinator.register_sink("sink", handle.clone());
+    (coordinator, handle, begins)
+}
+
+#[tokio::test]
+async fn sink_artifact_intent_is_durable_before_connector_begin() {
+    let (mut coordinator, handle, begins) =
+        coordinator_with_intent_order_sink("intent-before-begin").await;
 
     coordinator.begin_initial_epoch().await.unwrap();
 
     assert_eq!(begins.load(Ordering::Acquire), 1);
     handle.rollback_epoch(1).await.unwrap();
+    handle.close().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn drain_admission_requires_an_unconsumed_committable_sink_epoch() {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "no-sinks");
+    let coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    assert!(coordinator.sink_epoch_admits_drain());
+
+    let (mut coordinator, handle, _begins) =
+        coordinator_with_intent_order_sink("drain-admission").await;
+    assert!(
+        !coordinator.sink_epoch_admits_drain(),
+        "a committable sink without an open epoch cannot accept the drain flush"
+    );
+    coordinator.begin_initial_epoch().await.unwrap();
+    assert!(coordinator.sink_epoch_admits_drain());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let attempt = coordinator
+        .allocator
+        .consume_sink_epoch_until(deadline)
+        .await
+        .unwrap();
+    assert!(
+        !coordinator.sink_epoch_admits_drain(),
+        "a reserved checkpoint has consumed the open epoch"
+    );
+
+    // An ownerless process outside the certified fence never opens a sink epoch.
+    let control_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(1)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![NodeInfo {
+        id: NodeId(2),
+        name: "owner".into(),
+        rpc_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    }]);
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        NodeId(1),
+        Arc::clone(&control_kv),
+        control_kv,
+        None,
+        members_rx,
+        uuid::Uuid::from_u128(1),
+    ));
+    controller.publish_checkpoint_assignment_fence(Some(
+        CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[2],
+            vec![CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: uuid::Uuid::from_u128(2),
+            }],
+        )
+        .unwrap(),
+    ));
+    coordinator.set_assignment_version(1);
+    coordinator.set_vnode_set(Vec::new());
+    coordinator.set_cluster_controller(controller);
+    assert!(coordinator.sink_epoch_admits_drain());
+
+    handle.rollback_epoch(attempt.epoch).await.unwrap();
     handle.close().await.unwrap();
 }
 

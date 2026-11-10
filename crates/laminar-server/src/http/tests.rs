@@ -831,6 +831,19 @@ async fn test_auth_with_valid_bearer_returns_200() {
 }
 
 #[tokio::test]
+async fn a_forwarded_recent_read_checkpoint_request_is_accepted() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/checkpoint/expedite")
+        .header("authorization", "Bearer supersecret-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn test_auth_with_wrong_bearer_returns_401() {
     let state = test_state_with_token("supersecret-token");
     let app = build_router(state);
@@ -860,6 +873,7 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
         ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/checkpoint/expedite"),
         ("POST", "/api/v1/pipeline/start"),
         ("POST", "/api/v1/pipeline/stop"),
         ("GET", "/ws/events"),
@@ -1147,7 +1161,7 @@ async fn expired_process_deadline_rejects_serving_before_async_gate_fence() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn recovering_cluster_rejects_readiness_and_serving_routes() {
+async fn recovering_cluster_serves_only_committed_reads_subscriptions_and_checkpoint_requests() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
 
     let node = laminar_core::cluster::discovery::NodeId(43);
@@ -1189,6 +1203,50 @@ async fn recovering_cluster_rejects_readiness_and_serving_routes() {
             String::from_utf8_lossy(&body)
         );
     }
+
+    // Reads and subscriptions serve committed checkpoints, which recovery never changes.
+    let sql = |sql: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
+            .unwrap()
+    };
+    let read = app.clone().oneshot(sql("SELECT 1 AS one")).await.unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let ddl = app
+        .clone()
+        .oneshot(sql("CREATE SOURCE recovering (id BIGINT)"))
+        .await
+        .unwrap();
+    assert_eq!(ddl.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(ddl.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("server is completing coordinated recovery"));
+    let subscribe = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ws/recovering")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(subscribe.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let expedite = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/checkpoint/expedite")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expedite.status(), StatusCode::ACCEPTED);
 }
 
 #[cfg(feature = "cluster")]
@@ -1705,6 +1763,192 @@ async fn exec_sql(app: &Router, sql: &str) {
     assert_eq!(resp.status(), StatusCode::OK, "exec failed: {sql}");
 }
 
+/// POST `body` to `/api/v1/sql` and return the status and JSON response.
+async fn post_sql(app: &Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sql")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[test]
+fn read_errors_separate_deadlines_and_unreachable_sources_from_bad_requests() {
+    use super::catalog::read_status;
+    use laminar_db::{CommittedReadError, DbError};
+    for (error, status) in [
+        (
+            CommittedReadError::NotRecent {
+                latest: Some(3),
+                uncovered: vec!["orders".into()],
+            },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::DeadlineExceeded { epoch: 3 },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::NotCommitted {
+                requested: Some(4),
+                latest: Some(3),
+            },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::RecencyProbe {
+                input: "orders".into(),
+                reason: "broker unreachable".into(),
+            },
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            CommittedReadError::RecencyUnsupported {
+                input: "orders".into(),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            CommittedReadError::NotCommitted {
+                requested: None,
+                latest: None,
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            read_status(&DbError::CommittedRead(error.clone())),
+            status,
+            "{error}"
+        );
+    }
+}
+
+/// A query reads views at the request's level: latest by default, or the committed checkpoint,
+/// whose epoch, checkpoint and capture time the response reports. A recent read takes
+/// `min_epoch` as its floor, and refuses a view over a pushed source, which has no upstream to ask.
+#[tokio::test]
+async fn sql_queries_read_views_at_the_requested_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(laminar_db::LaminarConfig {
+        storage_dir: Some(dir.path().to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..laminar_core::streaming::StreamCheckpointConfig::default()
+        }),
+        ..laminar_db::LaminarConfig::default()
+    })
+    .unwrap();
+    let state = test_state_with_db(Arc::clone(&db));
+    let app = build_router(state);
+    exec_sql(&app, "CREATE SOURCE events (id BIGINT)").await;
+    exec_sql(
+        &app,
+        "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM events GROUP BY id",
+    )
+    .await;
+    db.start().await.unwrap();
+    let push = |id: i64| {
+        let batch = arrow_array::RecordBatch::try_from_iter_with_nullable(vec![(
+            "id",
+            Arc::new(arrow_array::Int64Array::from(vec![id])) as arrow_array::ArrayRef,
+            true,
+        )])
+        .unwrap();
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(batch)
+            .unwrap();
+    };
+    let query = "SELECT id FROM counts ORDER BY id";
+    let read = |level: serde_json::Value| {
+        let app = &app;
+        async move {
+            let mut body = serde_json::json!({ "sql": query });
+            body.as_object_mut()
+                .unwrap()
+                .extend(level.as_object().unwrap().clone());
+            post_sql(app, body).await
+        }
+    };
+
+    push(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (_, response) = read(serde_json::json!({})).await;
+        // Int64 values are JSON strings, which keep their precision.
+        if response["data"] == serde_json::json!([{ "id": "1" }]) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row 1 never arrived: {response}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let epoch = db.checkpoint().await.unwrap().epoch;
+    push(2);
+    while read(serde_json::json!({})).await.1["data"]
+        .as_array()
+        .unwrap()
+        .len()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row 2 never arrived"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let (status, latest) = read(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(latest.get("epoch").is_none(), "{latest}");
+    let (status, committed) = read(serde_json::json!({ "read_level": "committed" })).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(committed["data"], serde_json::json!([{ "id": "1" }]));
+    assert_eq!(committed["epoch"], epoch);
+    assert!(committed["checkpoint_id"].is_u64() && committed["taken_at_ms"].is_u64());
+
+    let (status, at_least) =
+        read(serde_json::json!({ "read_level": "committed", "min_epoch": epoch })).await;
+    assert_eq!(
+        (status, at_least["epoch"].clone()),
+        (StatusCode::OK, epoch.into())
+    );
+    for invalid in [
+        serde_json::json!({ "read_level": "eventual" }),
+        serde_json::json!({ "min_epoch": epoch }),
+    ] {
+        assert_eq!(read(invalid).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    let request: super::catalog::SqlRequest = serde_json::from_value(serde_json::json!({
+        "sql": query, "read_level": "recent", "min_epoch": epoch
+    }))
+    .unwrap();
+    assert_eq!(
+        super::catalog::read_level(&db, &request),
+        Ok(laminar_db::ReadLevel::Committed(
+            laminar_db::CommittedRead::Recent { at_least: epoch }
+        ))
+    );
+    let (status, recent) = read(serde_json::json!({ "read_level": "recent" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        recent["error"].as_str().unwrap().contains("'events'"),
+        "{recent}"
+    );
+    db.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_list_mvs_empty() {
     let state = test_state();
@@ -1734,7 +1978,7 @@ async fn test_list_mvs_after_create() {
     // required for it to be listed.
     exec_sql(
         &app,
-        "CREATE MATERIALIZED VIEW event_stats AS SELECT * FROM events",
+        "CREATE MATERIALIZED VIEW event_stats AS SELECT * FROM events WITH (retention = '1000 rows')",
     )
     .await;
 
@@ -2196,7 +2440,7 @@ async fn ws_emits_committed_checkpoint_progress() {
         .unwrap();
     state
         .db
-        .execute("CREATE MATERIALIZED VIEW visible AS SELECT id FROM events")
+        .execute("CREATE MATERIALIZED VIEW visible AS SELECT id FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap();
     state.db.start().await.unwrap();
@@ -2531,6 +2775,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/cluster"),
         ("GET", "/api/v1/cluster/nodes"),
         ("GET", "/api/v1/cluster/vnodes"),
+        ("GET", "/api/v1/cluster/vnodes/load"),
         ("GET", "/api/v1/cluster/leader"),
         ("GET", "/api/v1/cluster/checkpoints"),
         ("GET", "/api/v1/cluster/topology"),
@@ -2542,6 +2787,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/pipeline/status"),
         ("GET", "/ws/events"),
         ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/checkpoint/expedite"),
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
         ("POST", "/api/v1/pipeline/stop"),
@@ -3509,6 +3755,71 @@ async fn test_cluster_vnodes_404_when_not_cluster() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn test_cluster_vnode_load_404_when_not_cluster() {
+    let app = build_router(test_state());
+
+    let req = Request::builder()
+        .uri("/api/v1/cluster/vnodes/load")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn test_cluster_vnode_load_names_the_node_before_a_sample_or_a_commit() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+    let node = laminar_core::cluster::discovery::NodeId(52);
+    let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let snapshot_store = Arc::new(
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    );
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(
+        node,
+        control,
+        Some(Arc::clone(&snapshot_store)),
+        members_rx.clone(),
+    ));
+    let mut state = test_state();
+    Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+        controller,
+        snapshot_store,
+        membership_rx: members_rx,
+    });
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/vnodes/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "node_id": 52,
+            "live_sample_age_ms": null,
+            "committed": null,
+            "operators": [],
+        })
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn test_cluster_vnodes_fails_when_durable_snapshot_is_missing() {
@@ -3602,7 +3913,7 @@ async fn topology_status_404_when_not_cluster_and_requires_console_authorization
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_activation() {
+async fn topology_status_reads_uninitialized_and_sealed_baseline_without_activation() {
     use laminar_core::cluster::control::{
         prove_shared_object_store_namespaces, CatalogManifest, CatalogManifestEntry,
         CatalogManifestStore, CatalogObjectKind, CheckpointDecisionStore, ClusterController,
@@ -3711,43 +4022,29 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     }])
     .unwrap();
     catalog.seal(&manifest, &lease.proof()).await.unwrap();
-    let TopologyCatalogState::LegacySealed {
-        manifest: reference,
+    let TopologyCatalogState::Versioned {
+        baseline,
+        committed: None,
     } = catalog.topology_state().await.unwrap()
     else {
-        panic!("sealed inventory must be explicitly unversioned");
+        panic!("the seal must write topology one");
     };
-    let legacy = read_status(app.clone(), &token).await;
-    assert_eq!(legacy["catalog"]["state"], "legacy_sealed");
+    let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
+        .load_deployment_id()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline.deployment_id, deployment);
+    let sealed = read_status(app.clone(), &token).await;
+    assert_eq!(sealed["catalog"]["state"], "versioned");
+    assert_eq!(sealed["committed_version"], 1);
+    assert!(sealed["locally_active_version"].is_null());
+    let reference = baseline.manifest;
     assert_eq!(
-        legacy["catalog"]["manifest"],
+        sealed["catalog"]["baseline"]["manifest"],
         serde_json::to_value(&reference).unwrap()
     );
-    assert!(legacy["committed_version"].is_null());
-    assert!(legacy["locally_active_version"].is_null());
-
-    let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
-        .load_or_create_deployment_id()
-        .await
-        .unwrap();
-    catalog
-        .adopt_legacy_topology(
-            &lease.proof(),
-            uuid::Uuid::from_u128(42).try_into().unwrap(),
-            &reference,
-            &deployment,
-        )
-        .await
-        .unwrap();
-    let adopted = read_status(app.clone(), &token).await;
-    assert_eq!(adopted["catalog"]["state"], "versioned");
-    assert_eq!(adopted["committed_version"], 1);
-    assert!(adopted["locally_active_version"].is_null());
-    assert_eq!(
-        adopted["catalog"]["baseline"]["manifest"],
-        legacy["catalog"]["manifest"]
-    );
-    assert_eq!(adopted["catalog"]["baseline"]["deployment_id"], deployment);
+    assert_eq!(sealed["catalog"]["baseline"]["deployment_id"], deployment);
 
     let seed = laminar_core::cluster::control::AssignmentSnapshot::empty()
         .next_for_participants(
@@ -3767,7 +4064,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     let plan = laminar_core::cluster::control::TopologyAdmissionPlan {
         protocol_version: laminar_core::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::from_u128(43).try_into().unwrap(),
-        expected_parent: laminar_core::cluster::control::TopologyVersion::LEGACY_BASELINE,
+        expected_parent: laminar_core::cluster::control::TopologyVersion::BASELINE,
         parent_manifest: reference.clone(),
         target_manifest: target.reference().unwrap(),
         assignment: seed.assignment_fence().unwrap(),

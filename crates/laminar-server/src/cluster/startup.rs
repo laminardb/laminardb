@@ -87,6 +87,7 @@ pub(super) struct PreparedClusterBootstrap {
     pub(super) bind_host: String,
     pub(super) advertise_host: String,
     pub(super) key_groups: laminar_core::state::vnode::KeyGroupCount,
+    pub(super) shuffle_send_stall_timeout: Option<Duration>,
 }
 
 fn prepare_cluster_bootstrap(
@@ -174,6 +175,7 @@ fn prepare_cluster_bootstrap(
         bind_host: bind_host.to_string(),
         advertise_host,
         key_groups,
+        shuffle_send_stall_timeout: config.server.shuffle_send_stall_timeout,
     })
 }
 

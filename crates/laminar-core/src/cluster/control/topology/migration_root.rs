@@ -155,14 +155,16 @@ impl TopologyMigrationRoot {
                         kind: object.kind,
                         catalog_generation: object.catalog_generation,
                         compatibility_sha256: object.compatibility_sha256.clone(),
-                        state_operator_id: (object.kind == CatalogObjectKind::Stream)
-                            .then(|| format!("graph:{}", object.name)),
+                        state_operator_id: matches!(
+                            object.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
+                        .then(|| format!("graph:{}", object.name)),
                     });
                 }
                 ClusterTopologyObjectTransition::AddFutureOnly => {
                     if object.managed_state_contract.is_some()
-                        && object.initialization
-                            != super::TopologyInitialization::EmptyManagedStateAtCut
+                        && !object.initialization.starts_empty_at_cut()
                     {
                         return Err(TopologyError::Unsupported(
                             "new managed state requires an explicit empty-state cut contract"
@@ -176,6 +178,7 @@ impl TopologyMigrationRoot {
                         object.kind,
                         CatalogObjectKind::Source
                             | CatalogObjectKind::Stream
+                            | CatalogObjectKind::MaterializedView
                             | CatalogObjectKind::Sink
                     ) || object.initialization != super::TopologyInitialization::RetireAtCut
                     {
@@ -286,9 +289,8 @@ impl TopologyMigrationRoot {
                     .objects
                     .iter()
                     .find(|o| {
-                        o.kind == CatalogObjectKind::Stream
-                            && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
-                            && operator_id.strip_prefix("graph:") == Some(o.name.as_str())
+                        o.transition != ClusterTopologyObjectTransition::AddFutureOnly
+                            && o.owns_state_frame(operator_id)
                     })
                     .ok_or_else(|| {
                         TopologyError::Unsupported(format!(
@@ -310,7 +312,7 @@ impl TopologyMigrationRoot {
             if !manifests.iter().any(|m| {
                 m.state_frames.iter().any(|frame| {
                     matches!(&frame.key, StateFrameKey::Vnode { operator_id, .. }
-                    if operator_id.strip_prefix("graph:") == Some(object.name.as_str()))
+                    if object.owns_state_frame(operator_id))
                 })
             }) {
                 return Err(TopologyError::Invalid(format!(
@@ -357,7 +359,10 @@ impl TopologyMigrationRoot {
                 .iter()
                 .find(|o| {
                     o.name == parent_certificate.stream_id
-                        && o.kind == CatalogObjectKind::Stream
+                        && matches!(
+                            o.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
                         && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
                 })
                 .ok_or_else(|| {
@@ -456,7 +461,10 @@ impl TopologyMigrationRoot {
                 .iter()
                 .find(|o| {
                     o.name == certificate.stream_id
-                        && o.kind == CatalogObjectKind::Stream
+                        && matches!(
+                            o.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
                         && o.transition == ClusterTopologyObjectTransition::Preserve
                 })
                 .ok_or_else(|| {

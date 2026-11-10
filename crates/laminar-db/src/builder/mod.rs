@@ -286,13 +286,6 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Select dirty-only changelog emission for keyed running aggregates.
-    #[must_use]
-    pub fn incremental_emit(mut self, enabled: bool) -> Self {
-        self.config.incremental_emit = enabled;
-        self
-    }
-
     /// Set the deployment profile.
     ///
     /// See [`Profile`] for the available tiers. [`Profile::Cluster`] also requires a cluster
@@ -436,6 +429,14 @@ impl LaminarDbBuilder {
     #[must_use]
     pub fn materialized_view_max_bytes(mut self, bytes: usize) -> Self {
         self.config.materialized_view_max_bytes = bytes;
+        self
+    }
+
+    /// Set the byte budget of committed view state decoded for reads and cached by digest
+    /// (default 256 MiB). Zero disables the cache.
+    #[must_use]
+    pub fn materialized_view_read_cache_bytes(mut self, bytes: usize) -> Self {
+        self.config.materialized_view_read_cache_bytes = bytes;
         self
     }
 

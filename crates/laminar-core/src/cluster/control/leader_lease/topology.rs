@@ -1,9 +1,13 @@
-//! Baseline adoption shares the exact authority append with lease/checkpoint/recovery writes.
+//! The catalog seal binds topology one in the same authority append that publishes the inventory.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use super::{
-    AuthorityCreateOutcome, CheckpointDecisionStore, LeaderAuthorityRecord, LeaderLeaseStore,
+    AuthorityCreateOutcome, CatalogManifest, CatalogManifestError, CatalogManifestRef,
+    CheckpointDecisionStore, DecisionError, LeaderAuthorityRecord, LeaderLease, LeaderLeaseStore,
     LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_ADMISSION_RECORD_VERSION,
     TOPOLOGY_AUTHORITY_RECORD_VERSION, TOPOLOGY_COMMIT_RECORD_VERSION, TOPOLOGY_CUT_RECORD_VERSION,
     TOPOLOGY_INSTALLATION_RECORD_VERSION, TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION,
@@ -11,15 +15,12 @@ use super::{
     TOPOLOGY_SOURCE_ROOT_RECORD_VERSION, TOPOLOGY_SUBMISSION_RECORD_VERSION,
     TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION,
 };
+use crate::cluster::control::catalog_manifest::CatalogSealOutcome;
 use crate::cluster::control::topology::{
-    LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyCommit,
-    TopologyError, TopologyJournalUsage, TopologyOperationId, TopologyVersion,
-    MAX_TOPOLOGY_OPERATIONS, TOPOLOGY_PROTOCOL_VERSION,
+    TopologyBaseline, TopologyCatalogState, TopologyCommit, TopologyError, TopologyJournalUsage,
+    TopologyOperationId, TopologyVersion, MAX_TOPOLOGY_OPERATIONS, TOPOLOGY_PROTOCOL_VERSION,
 };
-use crate::cluster::control::CatalogManifestRef;
 
-const MAX_TOPOLOGY_CAS_ATTEMPTS: usize = 16;
-const TOPOLOGY_ADOPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const TOPOLOGY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl LeaderAuthorityRecord {
@@ -66,8 +67,7 @@ impl LeaderAuthorityRecord {
         if let Some(baseline) = self.topology_baseline.as_ref() {
             if next.version < self.version || next.topology_baseline.as_ref() != Some(baseline) {
                 return Err(LeaseError::Invalid(
-                    "authority append cannot downgrade or replace an adopted topology baseline"
-                        .into(),
+                    "authority append cannot downgrade or replace the topology baseline".into(),
                 ));
             }
         } else if let Some(baseline) = next.topology_baseline.as_ref() {
@@ -78,13 +78,18 @@ impl LeaderAuthorityRecord {
                     | TOPOLOGY_CUT_RECORD_VERSION
                     | TOPOLOGY_PREPARATION_RECORD_VERSION
             ) || baseline.authority_sequence != next.lease.seq
-                || self.lease.catalog_manifest.as_ref() != Some(&baseline.manifest)
+                || self.lease.catalog_manifest.is_some()
+                || next.lease.catalog_manifest.as_ref() != Some(&baseline.manifest)
             {
                 return Err(LeaseError::Invalid(
-                    "topology adoption must preserve the predecessor inventory at its exact append"
+                    "the topology baseline must be written by the append that seals the catalog"
                         .into(),
                 ));
             }
+        } else if self.lease.catalog_manifest.is_none() && next.lease.catalog_manifest.is_some() {
+            return Err(LeaseError::Invalid(
+                "sealing the catalog must bind topology one in the same append".into(),
+            ));
         }
         self.validate_committed_topology_successor(next)?;
         Ok(())
@@ -94,9 +99,10 @@ impl LeaderAuthorityRecord {
 impl LeaderLeaseStore {
     /// Read explicit topology metadata and validate its referenced inventory/deployment.
     ///
-    /// Missing version metadata means `LegacySealed`, never an inferred topology version. This
-    /// method never appends a topology operation or initializes a deployment identity. Existing
-    /// authority head reconciliation may finish publication of a previously created record.
+    /// A sealed catalog without topology metadata predates topology versioning and fails closed.
+    /// This method never appends a topology operation or initializes a deployment identity.
+    /// Existing authority head reconciliation may finish publication of a previously created
+    /// record.
     ///
     /// # Errors
     /// Fails closed on malformed, missing or corrupt referenced content or authority.
@@ -195,37 +201,38 @@ impl LeaderLeaseStore {
         let Some(manifest) = head.lease.catalog_manifest.as_ref() else {
             return Ok(None);
         };
+        let baseline = head.topology_baseline.as_ref().ok_or_else(|| {
+            TopologyError::Invalid(
+                "the sealed cluster catalog predates topology versioning and must be recreated"
+                    .into(),
+            )
+        })?;
         let inventory = self.load_catalog_manifest(manifest).await?;
-        let state = match head.topology_baseline.as_ref() {
-            None => TopologyCatalogState::LegacySealed {
-                manifest: manifest.clone(),
-            },
-            Some(baseline) => {
-                self.audit_topology_adoption(baseline).await?;
-                self.require_topology_deployment(&baseline.deployment_id)
-                    .await?;
-                let committed = if let Some(operation) = head.committed_topology_operation() {
-                    self.audit_topology_operation(operation).await?;
-                    operation.commit.clone()
-                } else {
-                    None
-                };
-                TopologyCatalogState::Versioned {
-                    baseline: baseline.clone(),
-                    committed,
-                }
-            }
+        self.audit_topology_baseline(baseline).await?;
+        self.require_topology_deployment(&baseline.deployment_id)
+            .await?;
+        let committed = if let Some(operation) = head.committed_topology_operation() {
+            self.audit_topology_operation(operation).await?;
+            operation.commit.clone()
+        } else {
+            None
         };
-        Ok(Some((inventory, state)))
+        Ok(Some((
+            inventory,
+            TopologyCatalogState::Versioned {
+                baseline: baseline.clone(),
+                committed,
+            },
+        )))
     }
 
-    pub(super) async fn audit_topology_adoption(
+    pub(super) async fn audit_topology_baseline(
         &self,
-        baseline: &LegacyTopologyBaseline,
+        baseline: &TopologyBaseline,
     ) -> Result<(), LeaseError> {
         let record = super::read_authority_record(self.store.as_ref(), baseline.authority_sequence)
             .await?
-            .ok_or_else(|| LeaseError::Invalid("topology adoption authority is missing".into()))?;
+            .ok_or_else(|| LeaseError::Invalid("topology baseline authority is missing".into()))?;
         if !matches!(
             record.version,
             TOPOLOGY_AUTHORITY_RECORD_VERSION
@@ -235,7 +242,7 @@ impl LeaderLeaseStore {
         ) || record.topology_baseline.as_ref() != Some(baseline)
         {
             return Err(LeaseError::Invalid(
-                "topology baseline disagrees with its retained adoption authority".into(),
+                "topology baseline disagrees with its retained authority record".into(),
             ));
         }
         Ok(())
@@ -262,129 +269,120 @@ impl LeaderLeaseStore {
         Ok(())
     }
 
-    /// Adopt the exact legacy inventory as topology one, preserving all existing authority.
+    /// Seal the complete catalog as topology one by appending it to the exact durable leader term.
     ///
-    /// Call only after a coordinated binary upgrade. The new encoding causes older authority
-    /// readers/writers to fail closed; it does not revoke already-running data-plane actors.
-    /// Adoption itself never changes the graph, opens gates, or authorizes runtime DDL.
-    ///
-    /// A timeout/cancelled request may have committed. Reread `topology_catalog_state` and retry
-    /// the same operation identity/reference. Never infer abort from a lost response.
+    /// Renewals that race this operation are retried under the same proof. A takeover either
+    /// observes and preserves the seal or wins the next sequence and fences this writer.
     ///
     /// # Errors
-    /// Rejects a stale leader proof, changed manifest/deployment, unsealed namespace, malformed
-    /// artifacts, storage errors, or bounded deadline/CAS exhaustion.
-    pub async fn adopt_legacy_topology(
+    /// Rejects malformed inventories, divergent existing inventories, stale proofs, and durable
+    /// storage failures.
+    pub(in crate::cluster::control) async fn seal_catalog(
         &self,
         proof: &LeaderProof,
-        operation_id: TopologyOperationId,
-        expected_manifest: &CatalogManifestRef,
-        expected_deployment: &str,
-    ) -> Result<TopologyAdoptionOutcome, TopologyError> {
-        tokio::time::timeout(
-            TOPOLOGY_ADOPTION_TIMEOUT,
-            self.adopt_legacy_topology_inner(
-                proof,
-                operation_id,
-                expected_manifest,
-                expected_deployment,
-            ),
-        )
-        .await
-        .map_err(|_| TopologyError::Contended)?
-    }
-
-    async fn adopt_legacy_topology_inner(
-        &self,
-        proof: &LeaderProof,
-        operation_id: TopologyOperationId,
-        expected_manifest: &CatalogManifestRef,
-        expected_deployment: &str,
-    ) -> Result<TopologyAdoptionOutcome, TopologyError> {
+        manifest: &CatalogManifest,
+    ) -> Result<CatalogSealOutcome, CatalogManifestError> {
         if !proof.is_canonical() {
-            return Err(TopologyError::Fenced);
+            return Err(CatalogManifestError::Fenced);
         }
-        expected_manifest.validate()?;
-        self.require_topology_deployment(expected_deployment)
-            .await?;
-        let initial = self.load_record().await?.ok_or(TopologyError::Fenced)?;
-        if !initial.lease.matches_proof(proof) {
-            return Err(TopologyError::Fenced);
-        }
-        if initial.lease.catalog_manifest.as_ref() != Some(expected_manifest) {
-            return Err(TopologyError::Conflict(
-                "legacy adoption requires the exact currently sealed manifest".into(),
-            ));
-        }
-        // Validate the original blob before any upgrade append. Do not re-encode or replace it.
-        self.load_catalog_manifest(expected_manifest).await?;
+        let (encoded, reference) = manifest.encode_and_reference()?;
 
-        for _ in 0..MAX_TOPOLOGY_CAS_ATTEMPTS {
+        let current = self
+            .load_record()
+            .await?
+            .ok_or(CatalogManifestError::Fenced)?;
+        if let Some(sealed) = &current.lease.catalog_manifest {
+            return self.existing_seal_outcome(sealed, manifest).await;
+        }
+        if !current.lease.matches_proof(proof) {
+            return Err(CatalogManifestError::Fenced);
+        }
+        self.ensure_catalog_manifest_blob(&encoded, &reference)
+            .await?;
+        let deployment_id = CheckpointDecisionStore::new(Arc::clone(&self.store))
+            .load_or_create_deployment_id()
+            .await
+            .map_err(|error| match error {
+                DecisionError::Io(reason) => {
+                    CatalogManifestError::Authority(LeaseError::Io(reason))
+                }
+                error => CatalogManifestError::Invalid(error.to_string()),
+            })?;
+        let operation_id = TopologyOperationId::try_from(Uuid::now_v7())
+            .map_err(|error| CatalogManifestError::Invalid(error.to_string()))?;
+
+        loop {
             let published = self
                 .load_published_authority_head()
                 .await?
-                .ok_or(TopologyError::Fenced)?;
+                .ok_or(CatalogManifestError::Fenced)?;
             let current = &published.record;
+            if let Some(sealed) = &current.lease.catalog_manifest {
+                return self.existing_seal_outcome(sealed, manifest).await;
+            }
             if !current.lease.matches_proof(proof) {
-                return Err(TopologyError::Fenced);
-            }
-            if current.lease.catalog_manifest.as_ref() != Some(expected_manifest) {
-                return Err(TopologyError::Conflict(
-                    "legacy adoption requires the exact currently sealed manifest".into(),
-                ));
-            }
-            if let Some(baseline) = current.topology_baseline.as_ref() {
-                if baseline.deployment_id != expected_deployment {
-                    return Err(TopologyError::Conflict(
-                        "the baseline belongs to another deployment".into(),
-                    ));
-                }
-                self.audit_topology_adoption(baseline).await?;
-                return Ok(TopologyAdoptionOutcome::Existing(baseline.clone()));
+                return Err(CatalogManifestError::Fenced);
             }
 
-            let sequence = current
-                .lease
-                .seq
-                .checked_add(1)
-                .ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
-            let baseline = LegacyTopologyBaseline {
-                protocol_version: TOPOLOGY_PROTOCOL_VERSION,
-                topology_version: TopologyVersion::LEGACY_BASELINE,
-                manifest: expected_manifest.clone(),
-                deployment_id: expected_deployment.to_owned(),
-                operation_id,
-                authority_sequence: sequence,
+            let base_sequence = current.lease.seq;
+            let candidate_lease = LeaderLease {
+                seq: current.lease.seq.checked_add(1).ok_or_else(|| {
+                    CatalogManifestError::Authority(LeaseError::Invalid(
+                        "lease sequence exhausted".into(),
+                    ))
+                })?,
+                renewal_sequence: current.lease.renewal_sequence,
+                token: current.lease.token,
+                owner: current.lease.owner.clone(),
+                expires_at_ms: current.lease.expires_at_ms,
+                catalog_manifest: Some(reference.clone()),
             };
-            baseline.validate()?;
-            let mut lease = current.lease.clone();
-            lease.seq = sequence;
-            let mut candidate = current.preserve_with_lease(lease);
+            let mut candidate = current.preserve_with_lease(candidate_lease);
             candidate.version = candidate.version.max(TOPOLOGY_AUTHORITY_RECORD_VERSION);
-            candidate.topology_baseline = Some(baseline.clone());
+            let baseline = TopologyBaseline {
+                protocol_version: TOPOLOGY_PROTOCOL_VERSION,
+                topology_version: TopologyVersion::BASELINE,
+                manifest: reference.clone(),
+                deployment_id: deployment_id.clone(),
+                operation_id,
+                authority_sequence: candidate.lease.seq,
+            };
+            candidate.topology_baseline = Some(baseline);
             match self
                 .create_authority_record(Some(&published), &candidate)
                 .await?
             {
-                AuthorityCreateOutcome::Created => {
-                    return Ok(TopologyAdoptionOutcome::Created(baseline));
-                }
+                AuthorityCreateOutcome::Created => return Ok(CatalogSealOutcome::Created),
                 AuthorityCreateOutcome::ExistingIdentical => {
-                    return Ok(TopologyAdoptionOutcome::Existing(baseline));
+                    return Ok(CatalogSealOutcome::ExistingIdentical);
                 }
                 AuthorityCreateOutcome::Contended(winner) => {
-                    if !winner.lease.matches_proof(proof) {
-                        return Err(TopologyError::Fenced);
+                    if let Some(sealed) = &winner.lease.catalog_manifest {
+                        return self.existing_seal_outcome(sealed, manifest).await;
                     }
-                    if winner.lease.seq <= current.lease.seq {
-                        return Err(TopologyError::Invalid(
-                            "topology adoption contention did not advance authority".into(),
-                        ));
+                    if !winner.lease.matches_proof(proof) {
+                        return Err(CatalogManifestError::Fenced);
+                    }
+                    if winner.lease.seq <= base_sequence {
+                        return Err(CatalogManifestError::Authority(LeaseError::Invalid(
+                            "catalog seal contention did not advance the authority sequence".into(),
+                        )));
                     }
                     tokio::task::yield_now().await;
                 }
             }
         }
-        Err(TopologyError::Contended)
+    }
+
+    async fn existing_seal_outcome(
+        &self,
+        sealed: &CatalogManifestRef,
+        manifest: &CatalogManifest,
+    ) -> Result<CatalogSealOutcome, CatalogManifestError> {
+        if self.load_catalog_manifest(sealed).await? == *manifest {
+            Ok(CatalogSealOutcome::ExistingIdentical)
+        } else {
+            Err(CatalogManifestError::Conflict)
+        }
     }
 }

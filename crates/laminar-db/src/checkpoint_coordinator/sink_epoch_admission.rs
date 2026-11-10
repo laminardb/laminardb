@@ -108,6 +108,22 @@ impl CheckpointCoordinator {
         Ok(true)
     }
 
+    /// Whether this process's checkpoint-committable sinks have an open epoch that no admitted
+    /// checkpoint has consumed. A checkpoint consumes the epoch at reservation, and compute waits
+    /// on the sink write gate until the leader commits it and opens the successor, so a source
+    /// drain cut that arrives in between cannot be delivered.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn sink_epoch_admits_drain(&self) -> bool {
+        match self.initial_sink_epoch_required() {
+            Ok(false) => true,
+            Ok(true) => matches!(
+                *self.allocator.sink_epoch_reservation.lock(),
+                Some(SinkEpochReservation::Ready(_))
+            ),
+            Err(_) => false,
+        }
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) async fn ensure_assignment_sink_epoch_until(
         &mut self,

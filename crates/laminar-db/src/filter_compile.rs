@@ -1,5 +1,6 @@
 //! Shared SQL filter compile + apply for sinks and SUBSCRIBE.
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -88,8 +89,13 @@ async fn compile_inner(
             "filter '{filter_sql}' did not lower to a predicate (DataFusion may have folded it away)"
         ))
     })?;
-    create_physical_expr(&expr, &df_schema, ctx.state().execution_props())
-        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (physical): {e}")))
+    create_physical_expr(
+        &expr,
+        &df_schema,
+        ctx.state().execution_props(),
+        &PhysicalPlanningContext::default(),
+    )
+    .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (physical): {e}")))
 }
 
 fn find_predicate(plan: &LogicalPlan) -> Option<Expr> {

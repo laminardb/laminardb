@@ -68,17 +68,16 @@ fn dictionary_roundtrip(checkpoint: bool) {
         let schema = plain.schema();
         let mut store = MvStore::new();
         store
-            .create_mv("m", schema.clone(), MvStorageMode::Multiset)
+            .create_mv(
+                "m",
+                schema.clone(),
+                MvStorageMode::changelog(ViewKey::MultisetByRow),
+            )
             .unwrap();
         store.update_cycle("m", &[input]).unwrap();
         if checkpoint {
-            let bytes = store.checkpoint_states().unwrap();
-            let mut restored = MvStore::new();
-            restored
-                .create_mv("m", schema.clone(), MvStorageMode::Multiset)
-                .unwrap();
-            restored.restore_from_ipc("m", &bytes["mv:m"]).unwrap();
-            store = restored;
+            let frames = store.full_view_frames("m");
+            store = store.image_from_view_frames("m", &frames).unwrap();
         }
         assert_values(
             &store,

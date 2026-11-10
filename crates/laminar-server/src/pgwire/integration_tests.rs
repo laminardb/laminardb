@@ -29,7 +29,7 @@ async fn spawn_server_with(
         .expect("create source");
     db.execute(
         "CREATE MATERIALIZED VIEW prices AS \
-         SELECT symbol, price FROM trades",
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
     )
     .await
     .expect("create mv");
@@ -252,26 +252,206 @@ async fn bounded_subscribe_with_unknown_filter_column_returns_pg_error() {
 
 #[tokio::test]
 async fn subscribe_as_of_uncommitted_returns_pg_error() {
-    // No checkpoint has committed on `prices`, so a future AS OF cut must
-    // be distinguished from pruned history.
-    let (addr, handle) = spawn_server().await;
-    let mut client = connect(addr).await;
-    let tx = client.transaction().await.expect("BEGIN");
-    let stmt = tx
-        .prepare("SUBSCRIBE prices AS OF EPOCH 1")
+    // No checkpoint has committed on the stream, so a future AS OF cut must be distinguished
+    // from pruned history. A view subscription starts from the view's rows, so it refuses AS OF.
+    let db = LaminarDB::open().expect("db opens");
+    for ddl in [
+        "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)",
+        "CREATE STREAM quotes AS SELECT symbol, price FROM trades",
+        "CREATE MATERIALIZED VIEW prices AS \
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
+    ] {
+        db.execute(ddl).await.expect("ddl");
+    }
+    db.start().await.expect("db starts");
+    let (addr, handle) = super::serve(db, "127.0.0.1:0", HashMap::new(), false, None, 256, 10)
         .await
-        .expect("prepare");
-    let portal = tx.bind(&stmt, &[]).await.expect("bind");
+        .expect("pgwire serve");
+    let mut client = connect(addr).await;
+    for (sql, code, message) in [
+        ("SUBSCRIBE quotes AS OF EPOCH 1", "22023", "not committed"),
+        (
+            "SUBSCRIBE prices AS OF EPOCH 1",
+            "0A000",
+            "subscribe from the tail",
+        ),
+    ] {
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx.prepare(sql).await.expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+        let err = tx.query_portal(&portal, 1).await.expect_err("must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), code, "{sql}: {}", db_err.message());
+        assert!(
+            db_err.message().contains(message),
+            "{sql}: {}",
+            db_err.message()
+        );
+        drop(tx);
+    }
 
-    let err = tx.query_portal(&portal, 1).await.expect_err("must fail");
-    let db_err = err.as_db_error().expect("typed PG error");
-    assert_eq!(db_err.code().code(), "22023");
-    assert!(
-        db_err.message().contains("not committed"),
-        "message: {}",
-        db_err.message()
+    handle.abort();
+}
+
+/// The first column of a simple query's rows.
+async fn simple_column(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
+    client
+        .simple_query(sql)
+        .await
+        .expect(sql)
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(row.get(0).unwrap_or_default().to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn sqlstate(error: &tokio_postgres::Error) -> &str {
+    error.as_db_error().expect("typed PG error").code().code()
+}
+
+/// `SELECT` reads views over the simple and extended protocols and joins them. A connection that
+/// sets the committed level reads only checkpointed rows, reports the epoch it read, and never
+/// reads an earlier one; the setting is the connection's alone. A recent read of a view over a
+/// pushed source is refused, because the source has no upstream to ask.
+#[tokio::test]
+async fn select_reads_views_at_the_connection_read_level() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = LaminarDB::open_with_config(laminar_db::LaminarConfig {
+        storage_dir: Some(dir.path().to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..laminar_core::streaming::StreamCheckpointConfig::default()
+        }),
+        ..laminar_db::LaminarConfig::default()
+    })
+    .expect("db opens");
+    for ddl in [
+        "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)",
+        "CREATE MATERIALIZED VIEW prices AS \
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
+        "CREATE MATERIALIZED VIEW counts AS \
+         SELECT symbol, COUNT(*) AS n FROM trades GROUP BY symbol",
+    ] {
+        db.execute(ddl).await.expect("ddl");
+    }
+    db.start().await.expect("db starts");
+    let (addr, handle) = super::serve(
+        Arc::clone(&db),
+        "127.0.0.1:0",
+        HashMap::new(),
+        false,
+        None,
+        256,
+        10,
+    )
+    .await
+    .expect("pgwire serve");
+    let client = connect(addr).await;
+    let latest = "SELECT symbol FROM prices ORDER BY symbol";
+    let wait_for = |expected: &'static [&'static str]| {
+        let client = &client;
+        async move {
+            for _ in 0..100 {
+                if simple_column(client, latest).await == expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("{latest} never returned {expected:?}");
+        }
+    };
+    push_one_trade(&db, "AAA", 1.0).await;
+    push_one_trade(&db, "BBB", 2.0).await;
+    wait_for(&["AAA", "BBB"]).await;
+
+    let joined = client
+        .query(
+            "SELECT p.symbol, p.price, c.n FROM prices p JOIN counts c ON p.symbol = c.symbol \
+             ORDER BY p.symbol",
+            &[],
+        )
+        .await
+        .expect("extended join");
+    let joined: Vec<(String, f64, i64)> = joined
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(
+        joined,
+        [("AAA".to_owned(), 1.0, 1), ("BBB".to_owned(), 2.0, 1)]
     );
 
+    client
+        .simple_query("SET laminar.read_level = 'committed'")
+        .await
+        .expect("set level");
+    let error = client
+        .simple_query(latest)
+        .await
+        .expect_err("no checkpoint");
+    assert_eq!(sqlstate(&error), "55000", "{error:?}");
+
+    let epoch = db.checkpoint().await.expect("checkpoint").epoch;
+    push_one_trade(&db, "CCC", 3.0).await;
+    let other = connect(addr).await;
+    for _ in 0..100 {
+        if simple_column(&other, latest).await.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(simple_column(&other, latest).await, ["AAA", "BBB", "CCC"]);
+    assert_eq!(simple_column(&client, latest).await, ["AAA", "BBB"]);
+    let committed = client.query(latest, &[]).await.expect("extended committed");
+    assert_eq!(committed.len(), 2);
+    assert_eq!(
+        simple_column(&client, "SHOW laminar.read_epoch").await,
+        [epoch.to_string()]
+    );
+    let shown = client
+        .query_one("SHOW laminar.read_epoch", &[])
+        .await
+        .expect("extended SHOW");
+    assert_eq!(shown.get::<_, String>(0), epoch.to_string());
+    assert_eq!(
+        simple_column(&client, "SHOW laminar.read_level").await,
+        ["committed"]
+    );
+    assert_eq!(
+        simple_column(&other, "SHOW laminar.read_level").await,
+        ["latest"]
+    );
+
+    let error = client
+        .query("SELECT symbol FROM prices WHERE price > $1", &[&1.5_f64])
+        .await
+        .expect_err("parameters");
+    assert_eq!(sqlstate(&error), "0A000", "{error:?}");
+    let error = client
+        .simple_query("SELECT * FROM missing")
+        .await
+        .expect_err("missing table");
+    assert_eq!(sqlstate(&error), "42P01", "{error:?}");
+
+    client
+        .simple_query("SET laminar.read_level = 'recent'")
+        .await
+        .expect("set recent");
+    assert_eq!(
+        simple_column(&client, "SHOW laminar.read_level").await,
+        ["recent"]
+    );
+    let error = client
+        .simple_query(latest)
+        .await
+        .expect_err("pushed source");
+    assert_eq!(sqlstate(&error), "0A000", "{error:?}");
+    assert!(
+        error.as_db_error().unwrap().message().contains("'trades'"),
+        "{error:?}"
+    );
     handle.abort();
 }
 
@@ -288,7 +468,7 @@ async fn subscribe_streams_emitted_rows_over_the_wire() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -362,7 +542,7 @@ async fn subscribe_decodes_text_array_in_binary_format() {
         .await
         .expect("create source");
     db.execute(
-        "CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed",
+        "CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed WITH (retention = '1000 rows')",
     )
     .await
     .expect("create mv");
@@ -610,7 +790,7 @@ async fn connection_cap_drops_excess_clients() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -650,7 +830,7 @@ async fn cancel_request_bypasses_full_session_cap() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -781,6 +961,16 @@ fn make_client_tls(
         tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
     )>,
 ) -> tokio_postgres_rustls::MakeRustlsConnect {
+    tokio_postgres_rustls::MakeRustlsConnect::new(client_tls_config(server_cert_path, client_auth))
+}
+
+fn client_tls_config(
+    server_cert_path: &std::path::Path,
+    client_auth: Option<(
+        Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+    )>,
+) -> tokio_rustls::rustls::ClientConfig {
     super::ensure_tls_provider();
     let cert_bytes = std::fs::read(server_cert_path).unwrap();
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
@@ -791,11 +981,10 @@ fn make_client_tls(
         roots.add(c).unwrap();
     }
     let builder = tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots);
-    let client_cfg = match client_auth {
+    match client_auth {
         Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
         None => builder.with_no_client_auth(),
-    };
-    tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg)
+    }
 }
 
 async fn assert_plaintext_startup_is_fatal(addr: std::net::SocketAddr) {
@@ -826,6 +1015,66 @@ async fn assert_plaintext_startup_is_fatal(addr: std::net::SocketAddr) {
             .any(|window| window == b"TLS is required"),
         "unexpected ErrorResponse: {body:?}"
     );
+}
+
+#[tokio::test]
+async fn plaintext_pipelined_after_ssl_request_is_refused() {
+    let (_dir, cert_path, key_path) = self_signed_pem();
+    let db = LaminarDB::open().expect("db opens");
+    db.start().await.expect("db starts");
+    let (addr, handle) = super::serve(
+        Arc::clone(&db),
+        "127.0.0.1:0",
+        HashMap::new(),
+        false,
+        Some(super::TlsPaths {
+            cert: &cert_path,
+            key: &key_path,
+            min_version: super::TlsMinVersion::V1_2,
+            client_ca: None,
+        }),
+        256,
+        10,
+    )
+    .await
+    .expect("TLS listener");
+
+    let mut startup_body = BytesMut::new();
+    startup_body.put_i32(196_608);
+    startup_body.extend_from_slice(b"user\0any\0database\0laminardb\0\0");
+    let mut injected = BytesMut::new();
+    injected.put_i32(8);
+    injected.put_i32(80_877_103);
+    injected.put_i32(i32::try_from(startup_body.len() + 4).expect("startup length"));
+    injected.extend_from_slice(&startup_body);
+    injected.extend_from_slice(&raw_frame(b'Q', b"SELECT 1\0"));
+    let mut stream = TcpStream::connect(addr).await.expect("raw connect");
+    stream
+        .write_all(&injected)
+        .await
+        .expect("write SSLRequest with pipelined plaintext");
+
+    let mut ssl_response = [0u8; 1];
+    stream
+        .read_exact(&mut ssl_response)
+        .await
+        .expect("SSLRequest response");
+    assert_eq!(ssl_response[0], b'S');
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls_config(&cert_path, None)));
+    let server_name =
+        tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let handshake = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .expect("handshake settles");
+    assert!(
+        handshake.is_err(),
+        "plaintext sent before the TLS handshake must not reach the TLS session"
+    );
+    handle.abort();
 }
 
 #[tokio::test]
@@ -1456,7 +1705,7 @@ async fn spawn_with_data() -> (
         .expect("create source");
     db.execute(
         "CREATE MATERIALIZED VIEW prices AS \
-         SELECT symbol, price FROM trades",
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
     )
     .await
     .expect("create mv");
@@ -1655,7 +1904,7 @@ async fn extended_query_emits_committed_checkpoint_progress() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -1738,7 +1987,7 @@ async fn prepared_subscribe_rejects_drop_recreate_schema_change() {
     db.execute("DROP MATERIALIZED VIEW prices")
         .await
         .expect("drop old view");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create changed view");
 

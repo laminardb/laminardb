@@ -529,13 +529,12 @@ impl LeaderLeaseStore {
             }
             let baseline = current.topology_baseline.as_ref().ok_or_else(|| {
                 TopologyError::Protocol(
-                    "explicit legacy topology adoption is required before migration admission"
-                        .into(),
+                    "the cluster catalog must be sealed before migration admission".into(),
                 )
             })?;
             if baseline.operation_id == plan.operation_id {
                 return Err(TopologyError::Conflict(
-                    "operation identity was already used for legacy adoption".into(),
+                    "operation identity was already used for the topology baseline".into(),
                 ));
             }
             if current.committed_topology_identity()
@@ -545,7 +544,7 @@ impl LeaderLeaseStore {
                     "expected topology parent does not match committed authority".into(),
                 ));
             }
-            self.audit_topology_adoption(baseline).await?;
+            self.audit_topology_baseline(baseline).await?;
             self.require_topology_deployment(&baseline.deployment_id)
                 .await?;
             if current.topology_operations.len() >= MAX_TOPOLOGY_OPERATIONS {

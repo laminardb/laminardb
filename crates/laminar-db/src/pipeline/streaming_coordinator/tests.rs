@@ -19,7 +19,7 @@ fn test_source_channel(capacity: usize) -> (SourceMsgTx, SourceMsgRx) {
 }
 
 #[tokio::test]
-async fn source_queue_charge_follows_parked_input_until_staging() {
+async fn source_queue_charge_follows_parked_and_staged_input_until_admission() {
     let (tx, rx) = source_channel::channel(8, 4096);
     let payload = vec![0; 3000];
     let batch = RecordBatch::try_from_iter([(
@@ -60,7 +60,12 @@ async fn source_queue_charge_follows_parked_input_until_staging() {
     assert_eq!(events, 1);
     assert!(coordinator.committed_offsets[0].is_none());
     assert_eq!(coordinator.source_batches_buf["test_source"].len(), 1);
-    // Staging transferred ownership: graph/cycle retention does not retain a queue reservation.
+    assert!(matches!(
+        tx.try_send(message()),
+        Err(source_channel::SourceQueueError::Full)
+    ));
+    // The cycle's graph admission releases the staged batch's queue reservation.
+    coordinator.release_staged_permits();
     tx.try_send(message()).unwrap();
 }
 
@@ -812,66 +817,130 @@ async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
 
 #[tokio::test]
 async fn checkpoint_backpressure_queues_source_input_until_a_barrier_is_in_flight() {
-    for barrier_in_flight in [false, true] {
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (source_tx, rx) = test_source_channel(4);
-        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
-        let mut coordinator = test_coordinator(
-            rx,
-            control_rx,
-            Arc::clone(&shutdown),
-            DeliveryGuarantee::AtLeastOnce,
-            None,
-        );
-        if barrier_in_flight {
-            coordinator
-                .pending_barrier
-                .reset(CheckpointAttempt::new(7, 7), 1);
+    assert_checkpoint_backpressure_releases_input_with_cut(false, |_| {}).await;
+    assert_checkpoint_backpressure_releases_input_with_cut(true, |coordinator| {
+        coordinator
+            .pending_barrier
+            .reset(CheckpointAttempt::new(7, 7), 1);
+    })
+    .await;
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_backpressure_releases_input_until_a_pending_drain_cut_is_delivered() {
+    let round = AssignmentDrainId {
+        predecessor_version: 7,
+        target_version: 8,
+        digest: [9; 32],
+    };
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: uuid::Uuid::from_u128(11),
+    };
+    let delivered = SourceDrainTaskStatus::Ready(SourceDrainReceipt {
+        round,
+        participant,
+        source_task_incarnation: uuid::Uuid::from_u128(101),
+    });
+    // `Idle` is a source actor blocked on the full FIFO before it observed the Begin command.
+    // An exited actor retains its Begin but can deliver no further input.
+    for (live, status, cut_in_flight) in [
+        (true, SourceDrainTaskStatus::Idle, true),
+        (true, SourceDrainTaskStatus::Pausing(round), true),
+        (true, delivered, false),
+        (false, SourceDrainTaskStatus::Idle, false),
+    ] {
+        let (source, _barrier_poll) =
+            source_handle_with_actor("test_source", move |mut epoch_committed_rx| async move {
+                while live && epoch_committed_rx.changed().await.is_ok() {}
+            });
+        if !live {
+            assert!(
+                source
+                    .task
+                    .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                    .await
+            );
         }
-        source_tx
-            .send(SourceMsg::Batch {
-                source_idx: 0,
-                batch: int_batch(42),
-                cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
-            })
-            .await
-            .unwrap();
-
-        let callback = MockCallback::new();
-        callback
-            .external_checkpoint_backpressure
-            .store(true, Ordering::Release);
-        let pressure = Arc::clone(&callback.external_checkpoint_backpressure);
-        let written_rows = Arc::clone(&callback.written_rows);
-        let observed_rows = Arc::clone(&written_rows);
-        let release = tokio::spawn(async move {
-            if !barrier_in_flight {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                assert_eq!(
-                    observed_rows.load(Ordering::Acquire),
-                    0,
-                    "source input ran before a checkpoint could release pending output"
-                );
-                pressure.store(false, Ordering::Release);
-            }
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while observed_rows.load(Ordering::Acquire) == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("source input did not run");
-            shutdown.notify_one();
+        let (command_tx, _command_rx) =
+            tokio::sync::watch::channel(Some(SourceDrainCommand::Begin {
+                request: SourceDrainRequest::new(round).unwrap(),
+                participant,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            }));
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(status);
+        source.task.install_drain_control(SourceDrainLeaseControl {
+            task_incarnation: uuid::Uuid::from_u128(101),
+            command_tx,
+            status_tx,
+            wake: Arc::new(tokio::sync::Notify::new()),
         });
-
-        let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
-            .await
-            .expect("coordinator did not settle checkpoint backpressure");
-        release.await.unwrap();
-        drop(source_tx);
-        assert!(matches!(exit, ExitReason::Shutdown));
-        assert_eq!(written_rows.load(Ordering::Acquire), 1);
+        assert_checkpoint_backpressure_releases_input_with_cut(cut_in_flight, |coordinator| {
+            coordinator.source_handles.push(source);
+        })
+        .await;
     }
+}
+
+async fn assert_checkpoint_backpressure_releases_input_with_cut(
+    cut_in_flight: bool,
+    install_cut: impl FnOnce(&mut StreamingCoordinator),
+) {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (source_tx, rx) = test_source_channel(4);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    install_cut(&mut coordinator);
+    source_tx
+        .send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(42),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
+        })
+        .await
+        .unwrap();
+
+    let callback = MockCallback::new();
+    callback
+        .external_checkpoint_backpressure
+        .store(true, Ordering::Release);
+    let pressure = Arc::clone(&callback.external_checkpoint_backpressure);
+    let written_rows = Arc::clone(&callback.written_rows);
+    let observed_rows = Arc::clone(&written_rows);
+    let release = tokio::spawn(async move {
+        if !cut_in_flight {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                observed_rows.load(Ordering::Acquire),
+                0,
+                "source input ran before a checkpoint could release pending output"
+            );
+            pressure.store(false, Ordering::Release);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_rows.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source input did not run");
+        shutdown.notify_one();
+    });
+
+    let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+        .await
+        .expect("coordinator did not settle checkpoint backpressure");
+    release.await.unwrap();
+    drop(source_tx);
+    assert!(matches!(exit, ExitReason::Shutdown));
+    assert_eq!(written_rows.load(Ordering::Acquire), 1);
 }
 
 fn assignment_fence(
@@ -1478,6 +1547,8 @@ impl PipelineCallback for MockCallback {
                     results
                         .iter()
                         .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
+                    false,
+                    |_| false,
                 )
                 .map_err(|error| CycleError::Recovery(error.to_string()))?;
         }
@@ -2096,6 +2167,7 @@ fn test_coordinator(
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule,
+            recent_read_checkpoints: None,
             delivery_guarantee,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -2120,6 +2192,7 @@ fn test_coordinator(
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -2134,6 +2207,7 @@ fn test_coordinator(
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     }
@@ -2605,14 +2679,25 @@ async fn intake_gate_close_after_receive_parks_fifo_message_until_reopen() {
 fn checkpoint_source_handle(
     name: &str,
 ) -> (SourceHandle, laminar_core::checkpoint::BarrierPollHandle) {
+    source_handle_with_actor(name, |_epoch_committed_rx| async {})
+}
+
+/// The actor receives the commit watch that coordinator shutdown closes to release it.
+fn source_handle_with_actor<F>(
+    name: &str,
+    actor: impl FnOnce(tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>) -> F,
+) -> (SourceHandle, laminar_core::checkpoint::BarrierPollHandle)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let barrier_injector = CheckpointBarrierInjector::new();
     let barrier_handle = barrier_injector.handle();
-    let (epoch_committed_tx, _epoch_committed_rx) = tokio::sync::watch::channel(None);
+    let (epoch_committed_tx, epoch_committed_rx) = tokio::sync::watch::channel(None);
     let (barrier_release_tx, _barrier_release_rx) = tokio::sync::watch::channel(None);
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let expected_shutdown = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Handle::current();
-    let (join, actor_terminal) = spawn_source_actor(&runtime, async {});
+    let (join, actor_terminal) = spawn_source_actor(&runtime, actor(epoch_committed_rx));
     let task = SourceTaskLease::supervise(
         Arc::from(name),
         shutdown,
@@ -3638,6 +3723,65 @@ async fn topology_submission_hold_defers_only_periodic_admission() {
         .await
         .expect("manual checkpoints must ignore the topology submission hold");
     assert!(admission.manual);
+}
+
+#[tokio::test]
+async fn a_waiting_recent_read_brings_the_periodic_checkpoint_forward() {
+    let demand =
+        Arc::new(crate::checkpoint_coordinator::committed_reads::CheckpointDemand::default());
+    let interval = Duration::from_millis(200);
+    let mut coordinator = admission_coordinator(Vec::new());
+    coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::from_secs(60));
+    coordinator.config.recent_read_checkpoints =
+        Some(crate::pipeline::config::RecentReadCheckpoints {
+            interval,
+            demand: Arc::clone(&demand),
+        });
+    coordinator.last_checkpoint = Instant::now() - interval;
+    let mut callback = MockCallback::new();
+    assert!(coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .is_none());
+
+    demand.request();
+    callback.periodic_checkpoints_held = true;
+    assert!(
+        coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none(),
+        "a topology hold defers it like any periodic cut"
+    );
+    callback.periodic_checkpoints_held = false;
+    callback.runtime.leader = false;
+    assert!(
+        coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none(),
+        "only the leader starts checkpoints"
+    );
+    callback.runtime.leader = true;
+    coordinator.last_checkpoint = Instant::now();
+    assert!(
+        coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none(),
+        "it waits its interval after the last checkpoint ended"
+    );
+
+    coordinator.last_checkpoint = Instant::now() - interval;
+    let attempt = CheckpointAttempt::new(16, 16);
+    callback.attempt_to_reserve = attempt;
+    callback.barrier_outcome = Some(BarrierOutcome::Async);
+    coordinator.maybe_checkpoint(&mut callback).await;
+    assert_eq!(callback.reserve_calls, 1);
+    assert!(
+        !demand.requested(),
+        "the reserved checkpoint's barriers follow every request so far"
+    );
 }
 
 #[tokio::test]
@@ -9813,7 +9957,7 @@ async fn mv_quota_failure_discards_source_cursors_and_faults_every_delivery_mode
             .create_mv(
                 "test_source",
                 int_batch(1).schema(),
-                crate::mv_store::MvStorageMode::Aggregate,
+                crate::mv_store::MvStorageMode::append_rows(1_000),
             )
             .unwrap();
         callback.mv_store = Some(Mutex::new(store));
@@ -10014,6 +10158,7 @@ async fn test_coordinator_direct_channel() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -10038,6 +10183,7 @@ async fn test_coordinator_direct_channel() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -10052,6 +10198,7 @@ async fn test_coordinator_direct_channel() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -10473,6 +10620,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -10497,6 +10645,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -10511,6 +10660,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -10765,6 +10915,7 @@ async fn test_barrier_excludes_post_barrier_data() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -10789,6 +10940,7 @@ async fn test_barrier_excludes_post_barrier_data() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None, None],
@@ -10803,6 +10955,7 @@ async fn test_barrier_excludes_post_barrier_data() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -10955,6 +11108,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -10979,6 +11133,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None, None],
@@ -10996,6 +11151,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -11220,26 +11376,29 @@ async fn deferred_replay_drains_before_admitting_queued_source_input() {
     }
 }
 
-struct BackpressuredCallback {
+struct HeadroomCallback {
     inner: MockCallback,
+    headroom: usize,
     cycle_count: Arc<std::sync::atomic::AtomicU32>,
     events_per_cycle: Arc<Mutex<Vec<u64>>>,
 }
 
-impl BackpressuredCallback {
+impl HeadroomCallback {
     fn new(
+        headroom: usize,
         cycle_count: Arc<std::sync::atomic::AtomicU32>,
         events_per_cycle: Arc<Mutex<Vec<u64>>>,
     ) -> Self {
         Self {
             inner: MockCallback::new(),
+            headroom,
             cycle_count,
             events_per_cycle,
         }
     }
 }
 
-impl PipelineCallback for BackpressuredCallback {
+impl PipelineCallback for HeadroomCallback {
     async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -11371,17 +11530,18 @@ impl PipelineCallback for BackpressuredCallback {
         self.inner.apply_control(msg);
     }
 
-    fn is_backpressured(&self) -> bool {
-        true // Always backpressured — drain loop should never fire.
+    fn source_port_headroom(&self, _source: &str) -> PortHeadroom {
+        PortHeadroom {
+            batches: self.headroom,
+            bytes: None,
+            empty: false,
+        }
     }
 }
 
-/// With `is_backpressured() == true`, the coordinator processes only
-/// the first wakeup message per cycle (no drain coalescing). With 5
-/// messages pre-loaded and `batch_window=0`, each cycle should see
-/// exactly 1 event, spread across multiple cycles.
-#[tokio::test]
-async fn test_drain_skip_under_backpressure() {
+/// Run a coordinator over five queued one-row messages whose source port takes `headroom`
+/// batches per cycle, for 300 ms. Returns the exit, the cycle count and the rows per cycle.
+async fn run_with_source_headroom(headroom: usize) -> (ExitReason, u32, Vec<u64>) {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
@@ -11394,6 +11554,7 @@ async fn test_drain_skip_under_backpressure() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -11418,6 +11579,7 @@ async fn test_drain_skip_under_backpressure() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -11432,6 +11594,7 @@ async fn test_drain_skip_under_backpressure() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -11462,30 +11625,40 @@ async fn test_drain_skip_under_backpressure() {
 
     let cycle_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_per_cycle = Arc::new(Mutex::new(Vec::new()));
-    let callback =
-        BackpressuredCallback::new(Arc::clone(&cycle_count), Arc::clone(&events_per_cycle));
-    coordinator.run(callback).await;
-
-    let cycles = cycle_count.load(std::sync::atomic::Ordering::SeqCst);
-    let epc = events_per_cycle.lock();
-    let total: u64 = epc.iter().sum();
-
-    // All 5 events must be processed (no data loss).
-    assert_eq!(total, 5, "all events must be processed, got {total}");
-    // Under backpressure each cycle gets only the wakeup message (1
-    // event), so we need at least 5 cycles for 5 messages. Without
-    // backpressure, cycle 1 would drain all 5 in one shot.
-    assert!(
-        cycles >= 5,
-        "expected >=5 cycles (1 event each), got {cycles} cycles with events/cycle: {epc:?}"
+    let callback = HeadroomCallback::new(
+        headroom,
+        Arc::clone(&cycle_count),
+        Arc::clone(&events_per_cycle),
     );
-    // Each cycle sees at most 1 event (the wakeup message; drain skipped).
-    for (i, &events) in epc.iter().enumerate() {
-        assert!(
-            events <= 1,
-            "cycle {i} saw {events} events, expected <=1 under backpressure"
-        );
-    }
+    let exit = coordinator.run(callback).await;
+    let cycles = cycle_count.load(std::sync::atomic::Ordering::SeqCst);
+    let events = events_per_cycle.lock().clone();
+    (exit, cycles, events)
+}
+
+/// The third message of each cycle is parked and starts the next cycle, in FIFO order.
+#[tokio::test]
+async fn test_drain_stages_only_what_source_ports_can_take() {
+    let (exit, cycles, epc) = run_with_source_headroom(2).await;
+    assert!(matches!(exit, ExitReason::Shutdown));
+    let total: u64 = epc.iter().sum();
+    assert_eq!(total, 5, "all events must be processed, got {total}");
+    let staged: Vec<u64> = epc.iter().copied().filter(|&events| events > 0).collect();
+    assert_eq!(
+        staged,
+        [2, 2, 1],
+        "{cycles} cycles with events/cycle: {epc:?}"
+    );
+}
+
+/// A parked message that cannot fit and has no runnable graph work behind it waits for a wake.
+/// On this current-thread runtime a spinning coordinator would starve the shutdown timer. The
+/// shutdown drain drops the parked message and everything behind it instead of halting.
+#[tokio::test]
+async fn parked_message_without_headroom_waits_and_is_dropped_at_shutdown() {
+    let (exit, cycles, epc) = run_with_source_headroom(0).await;
+    assert!(matches!(exit, ExitReason::Shutdown), "{exit:?}");
+    assert_eq!(cycles, 0, "{epc:?}");
 }
 
 #[tokio::test]

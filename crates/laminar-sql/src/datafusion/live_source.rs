@@ -12,10 +12,12 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -75,10 +77,6 @@ impl std::fmt::Debug for LiveSourceProvider {
 
 #[async_trait]
 impl TableProvider for LiveSourceProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -161,8 +159,11 @@ impl DisplayAs for LiveSourceExec {
 }
 
 impl ExecutionPlan for LiveSourceExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn name(&self) -> &'static str {

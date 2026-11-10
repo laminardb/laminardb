@@ -6,19 +6,19 @@ import sys
 
 
 EXPECTED_GENERATIONS = (
-    ("Arrow", r"^arrow(?:$|-)", ("58.4.0",)),
-    ("Parquet", r"^parquet$", ("58.4.0",)),
-    ("DataFusion", r"^datafusion(?:$|-)", ("53.1.0",)),
+    ("Arrow", r"^arrow(?:$|-)", ("59.3.2",)),
+    ("Parquet", r"^parquet$", ("59.3.2",)),
+    ("DataFusion", r"^datafusion(?:$|-)", ("55.2.0",)),
     ("object_store", r"^object_store$", ("0.13.2",)),
     (
         "Delta Lake",
         r"^deltalake(?:$|-)",
-        ("0.15.0", "0.16.0", "0.16.1", "0.32.4", "1.0.0"),
+        ("1.0.0", "1.1.2", "1.1.4"),
     ),
-    ("Delta kernel", r"^buoyant_kernel$", ("0.22.2",)),
-    ("Iceberg", r"^iceberg(?:$|-)", ("0.10.1",)),
-    ("OpenDAL", r"^opendal(?:$|-)", ("0.57.0",)),
-    ("SQLParser", r"^sqlparser$", ("0.61.0",)),
+    ("Delta kernel", r"^buoyant_kernel$", ("0.28.1",)),
+    ("Iceberg", r"^iceberg(?:$|-)", ("0.11.0",)),
+    ("OpenDAL", r"^opendal(?:$|-)", ("0.58.2",)),
+    ("SQLParser", r"^sqlparser$", ("0.62.0",)),
 )
 
 

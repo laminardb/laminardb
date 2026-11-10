@@ -206,9 +206,8 @@ async fn test_watermark_from_event_time() {
 
 #[tokio::test]
 async fn test_clone_multi_producer() {
-    let (source, sink) = create::<TestEvent>(16);
+    let (source, mut sink) = create::<TestEvent>(16);
     let source2 = source.clone();
-    let mut sub = sink.subscribe(); // subscribe before push
 
     source
         .push(TestEvent {
@@ -225,9 +224,8 @@ async fn test_clone_multi_producer() {
         })
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(sub.poll().is_some());
-    assert!(sub.poll().is_some());
+    assert!(sink.poll().is_some());
+    assert!(sink.poll().is_some());
 }
 
 #[tokio::test]

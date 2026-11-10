@@ -231,3 +231,43 @@ async fn checkpoint_restore_round_trip() {
     assert_eq!(evts_out(&out), vec![50_000]);
     assert_eq!(op2.state.buffered_rows(), 1);
 }
+
+#[tokio::test]
+async fn buffered_rows_charge_their_batch_until_the_last_row_leaves() {
+    let cfg = lower_strict_ttl(10_000);
+    let mut op = TemporalFilterOperator::new("tf", "SELECT * FROM events", cfg.clone(), None);
+    let s = src_schema();
+    let charged = |op: &TemporalFilterOperator| op.managed_state_accounting().unwrap().live;
+    let row = std::mem::size_of::<BufferedRow>();
+    assert_eq!(charged(&op), 0);
+
+    // One batch, rows exiting at 60_000 and 68_000.
+    op.process(&[vec![batch_evt(&s, &[50_000, 58_000])]], &[55_000])
+        .await
+        .unwrap();
+    let both = charged(&op);
+    assert!(both > 2 * row);
+
+    op.process(&[vec![]], &[60_000]).await.unwrap();
+    assert_eq!(
+        charged(&op),
+        both - row,
+        "the batch stays charged while a row remains"
+    );
+
+    let checkpoint = op.checkpoint().unwrap().expect("state present");
+    let mut restored = TemporalFilterOperator::new("tf", "SELECT * FROM events", cfg, None);
+    restored.restore(checkpoint).unwrap();
+    assert!(charged(&restored) > row);
+
+    op.process(&[vec![]], &[68_000]).await.unwrap();
+    restored.process(&[vec![]], &[68_000]).await.unwrap();
+    assert_eq!(charged(&op), 0);
+    assert_eq!(charged(&restored), 0);
+
+    // A batch whose rows have all aged out is never charged.
+    op.process(&[vec![batch_evt(&s, &[1_000])]], &[68_000])
+        .await
+        .unwrap();
+    assert_eq!(charged(&op), 0);
+}

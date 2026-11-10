@@ -177,19 +177,12 @@ async fn counts(db: &LaminarDB, view: &str) -> BTreeMap<String, i64> {
     else {
         panic!("expected a query result");
     };
-    let mut subscription = query.subscribe_raw().expect("subscribe");
-    let mut rows = BTreeMap::new();
-    // An empty view answers with no batch and closes the result stream.
-    let Ok(first) = tokio::time::timeout(CONVERGE, subscription.recv_async())
+    let rows = query.subscribe_raw().expect("subscribe");
+    let batches = tokio::time::timeout(CONVERGE, rows.read_all())
         .await
         .expect("snapshot in time")
-    else {
-        return rows;
-    };
-    let mut batches = vec![first];
-    while let Some(batch) = subscription.poll() {
-        batches.push(batch);
-    }
+        .expect("query");
+    let mut rows = BTreeMap::new();
     for batch in batches {
         let products = strings(&batch, 0);
         let trades = int64s(&batch, 1);
@@ -414,9 +407,9 @@ async fn fpml_kafka_messages_feed_sql() {
     let dir = tempfile::tempdir().expect("dir");
     let ddl = [
         format!(
-            "CREATE SOURCE messages (
-                WATERMARK FOR creation_time_utc AS creation_time_utc - INTERVAL '1' SECOND
-             ) FROM KAFKA (
+            // No watermark: the corpus documents are years out of creation order, so one that
+            // arrives in a later poll than a newer one would be dropped as late.
+            "CREATE SOURCE messages FROM KAFKA (
                 'bootstrap.servers' = '{}',
                 'topic' = 'fpml',
                 'group.id' = 'fpml-sql',

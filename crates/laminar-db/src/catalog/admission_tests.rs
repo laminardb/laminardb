@@ -76,7 +76,7 @@ async fn byte_rejection_preserves_sequence_snapshot_and_wakeup() {
     let batch = Payload("a".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     entry.push_and_buffer(batch.clone()).unwrap();
     entry.data_notify.notified().await;
     assert_eq!(
@@ -90,7 +90,7 @@ async fn byte_rejection_preserves_sequence_snapshot_and_wakeup() {
             .await
             .is_err()
     );
-    subscription.recv_async().await.unwrap();
+    ingress.poll().unwrap();
     let next = Payload("b".repeat(4096)).to_record_batch();
     entry.push_and_buffer(next.clone()).unwrap();
     assert_eq!(entry.source.sequence(), 2);
@@ -98,19 +98,19 @@ async fn byte_rejection_preserves_sequence_snapshot_and_wakeup() {
 }
 
 #[tokio::test]
-async fn snapshot_history_evicts_by_bytes_after_broadcast_releases_input() {
+async fn snapshot_history_evicts_by_bytes_after_the_bridge_receives_input() {
     let batch = Payload("a".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes * 2);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     entry.push_and_buffer(batch.clone()).unwrap();
-    subscription.recv_async().await.unwrap();
+    ingress.poll().unwrap();
     let external_snapshot = entry.snapshot();
     for value in ["b", "c", "d"] {
         entry
             .push_and_buffer(Payload(value.repeat(4096)).to_record_batch())
             .unwrap();
-        subscription.recv_async().await.unwrap();
+        ingress.poll().unwrap();
         assert!(
             entry
                 .snapshot()
@@ -134,7 +134,7 @@ async fn concurrent_db_handles_cannot_oversubscribe_or_publish_rejected_snapshot
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes * 4);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     let accepted = std::thread::scope(|scope| {
         let producers: Vec<_> = (0..16)
             .map(|index| {
@@ -158,7 +158,7 @@ async fn concurrent_db_handles_cannot_oversubscribe_or_publish_rejected_snapshot
     assert_eq!(entry.source.queued_arrow_bytes(), bytes * 4);
     let snapshot = entry.snapshot();
     for expected in snapshot {
-        assert_eq!(subscription.recv_async().await.unwrap(), expected);
+        assert_eq!(ingress.poll().unwrap(), expected);
     }
     assert_eq!(entry.source.queued_arrow_bytes(), 0);
 }
@@ -213,9 +213,10 @@ async fn query_output_has_separate_ownership_from_push_input() {
         .unwrap()
         .into_query()
         .unwrap();
-    let mut subscription = query.subscribe_raw().unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(5), subscription.recv_async())
+    let mut rows = query.subscribe_raw().unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), rows.next_batch())
         .await
+        .unwrap()
         .unwrap()
         .unwrap();
     assert!(retained_arrow_bytes(&batch) > streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES);
@@ -228,7 +229,7 @@ async fn writer_flush_and_close_do_not_release_queued_input_early() {
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     let mut writer = crate::api::Writer::new(crate::UntypedSourceHandle::new(Arc::clone(&entry)));
     writer.write(batch.clone()).unwrap();
     writer.flush().unwrap();
@@ -236,7 +237,131 @@ async fn writer_flush_and_close_do_not_release_queued_input_early() {
     assert_eq!(entry.source.queued_arrow_bytes(), bytes);
     writer.close().unwrap();
     assert_eq!(entry.source.queued_arrow_bytes(), bytes);
-    subscription.recv_async().await.unwrap();
+    ingress.poll().unwrap();
     assert_eq!(entry.source.queued_arrow_bytes(), 0);
     assert_eq!(entry.snapshot().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_burst_above_the_port_bound_waits_and_delivers_every_row() {
+    struct Row;
+    impl crate::handle::FromBatch for Row {
+        fn from_batch(_batch: &RecordBatch, _row: usize) -> Self {
+            Self
+        }
+
+        fn from_batch_all(batch: &RecordBatch) -> Vec<Self> {
+            (0..batch.num_rows()).map(|_| Self).collect()
+        }
+    }
+
+    // The bridge coalesces small pushes, so each 1,024-row batch is one FIFO message; the
+    // 64-message FIFO then holds four times what the 16-batch source port can take.
+    let db = LaminarDB::builder()
+        .pipeline_max_input_buf_batches(16)
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE input (payload VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM output AS SELECT payload FROM input")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    let mut output = db.subscribe::<Row>("output").await.unwrap();
+    let rows: Vec<String> = (0..1024).map(|i| format!("row {i}")).collect();
+    let batch =
+        RecordBatch::try_new(Payload::schema(), vec![Arc::new(StringArray::from(rows))]).unwrap();
+    let source = db.source::<Payload>("input").unwrap();
+    for _ in 0..200 {
+        source.push_arrow(batch.clone()).unwrap();
+    }
+
+    let mut delivered = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while delivered < 200 * 1024 {
+            match output.next_frame().await.unwrap() {
+                Some(crate::handle::TypedSubscriptionFrame::Rows { rows, .. }) => {
+                    delivered += rows.len();
+                }
+                Some(_) => {}
+                None => panic!(
+                    "output closed after {delivered} rows: {:?}",
+                    db.last_fault()
+                ),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{delivered} rows delivered: {:?}", db.last_fault()));
+    assert_eq!(delivered, 200 * 1024);
+    assert_eq!(db.pipeline_state(), "Running", "{:?}", db.last_fault());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_quota_halt_remains_terminal_across_public_stop_and_start() {
+    let db = LaminarDB::builder()
+        .materialized_view_max_rows(1)
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE input (payload VARCHAR)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW counts AS SELECT payload, COUNT(*) AS n FROM input GROUP BY payload",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let source = db.source::<Payload>("input").unwrap();
+    source.push(Payload("a".into())).unwrap();
+    source.push(Payload("b".into())).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while db.pipeline_state() != "Faulted" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a view over its quota must halt the running pipeline");
+    db.stop_pipeline().await.unwrap();
+    let reason = db.last_fault().expect("terminal reason");
+    assert!(reason.contains("quota exceeded"), "{reason}");
+    let error = db.start().await.unwrap_err();
+    assert!(error.requires_pipeline_halt(), "{error}");
+    assert_eq!(db.last_fault().as_deref(), Some(reason.as_str()));
+}
+
+/// A changelog view's consumers read its trailing weight at runtime, so CREATE certifies their
+/// aggregates over a changelog, as it does over an `EMIT CHANGES` stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_over_changelog_view_is_certified_over_its_changelog() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE input (k BIGINT, d INTERVAL)")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW latest AS SELECT k, MAX(d) AS d FROM input GROUP BY k")
+        .await
+        .unwrap();
+    for (kind, sql) in [
+        (
+            "view",
+            "CREATE MATERIALIZED VIEW lo AS SELECT k, MIN(d) AS lo FROM latest GROUP BY k",
+        ),
+        (
+            "stream",
+            "CREATE STREAM lo AS SELECT k, MIN(d) AS lo FROM latest GROUP BY k EMIT CHANGES",
+        ),
+    ] {
+        let error = db.execute(sql).await.unwrap_err().to_string();
+        assert!(
+            error.contains("MIN/MAX over a changelog does not support Interval"),
+            "{kind}: {error}"
+        );
+    }
+    db.execute("CREATE MATERIALIZED VIEW lo AS SELECT k, MIN(k) AS lo FROM latest GROUP BY k")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
 }

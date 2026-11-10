@@ -16,7 +16,7 @@ use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stre
 
 use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
-use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint};
 use crate::sql_analysis::FRAME_TMP_TABLE;
 
 /// Which bivariate statistic to compute over the sliding frame.
@@ -52,6 +52,7 @@ pub(crate) struct MomentFrameConfig {
 pub(crate) struct WindowFrameOperator {
     config: MomentFrameConfig,
     history: Option<RecordBatch>, // newest `config.retain` rows carried across cycles
+    history_bytes: usize,
     projection: ProjectingJoinState,
 }
 
@@ -65,6 +66,7 @@ impl WindowFrameOperator {
         Self {
             config,
             history: None,
+            history_bytes: 0,
             projection: ProjectingJoinState::new(name, ctx, Some(projection_sql), FRAME_TMP_TABLE),
         }
     }
@@ -163,6 +165,14 @@ impl GraphOperator for WindowFrameOperator {
         )
     }
 
+    // A tail slice keeps its whole concatenated buffer alive, and its memory size reports that.
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        Some(ManagedStateAccountingSnapshot {
+            live: self.history_bytes,
+            ..ManagedStateAccountingSnapshot::default()
+        })
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -189,6 +199,7 @@ impl GraphOperator for WindowFrameOperator {
         let enriched = self.enrich(&new, &buffer)?;
         let next_history = Self::tail(&buffer, self.config.retain);
         let output = self.projection.apply(vec![enriched]).await?;
+        self.history_bytes = next_history.get_array_memory_size();
         self.history = Some(next_history);
         Ok(output)
     }
@@ -205,6 +216,7 @@ impl GraphOperator for WindowFrameOperator {
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let batch = deserialize_batch_stream(&checkpoint.data)
             .map_err(|e| DbError::Checkpoint(format!("window frame: restore: {e}")))?;
+        self.history_bytes = batch.get_array_memory_size();
         self.history = Some(batch);
         Ok(())
     }
@@ -307,6 +319,25 @@ mod tests {
         let mut samp = operator_with(MomentFn::CovarSamp, 30);
         let out = samp.process(&rows, &[0]).await.unwrap();
         assert!((last_stat(&out).unwrap() - 6.0 / 4.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn retained_history_is_charged_through_restore() {
+        let mut op = operator_with(MomentFn::Corr, 2);
+        assert_eq!(op.managed_state_accounting().unwrap().live, 0);
+        op.process(
+            &[vec![batch(&[1, 2, 3], &[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0])]],
+            &[0],
+        )
+        .await
+        .unwrap();
+        let charged = op.managed_state_accounting().unwrap().live;
+        assert!(charged > 0);
+
+        let checkpoint = op.checkpoint().unwrap().expect("history present");
+        let mut restored = operator_with(MomentFn::Corr, 2);
+        restored.restore(checkpoint).unwrap();
+        assert!(restored.managed_state_accounting().unwrap().live > 0);
     }
 
     /// A single point gives no sample statistic (n < 2) — null, not a panic/NaN.

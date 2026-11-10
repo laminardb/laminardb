@@ -284,6 +284,55 @@ async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
     assert!(!graph.output_idle[output]);
 }
 
+/// An append view reports idle, and so takes no part in its committed cluster frontier, when
+/// its stream's source is idle there, as on a node holding none of the source's partitions.
+#[tokio::test]
+async fn a_sql_stream_reports_its_idle_source_frontier() {
+    let mut graph = test_graph();
+    graph.register_source_schema(
+        "events".into(),
+        Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
+    );
+    graph.add_query(
+        "positive".into(),
+        "SELECT k FROM events WHERE k > 0".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    graph.take_build_errors().unwrap();
+    let mut frontiers = FxHashMap::from_iter([(
+        Arc::from("events"),
+        InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        },
+    )]);
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.stream_frontier("positive"),
+        Some(InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        })
+    );
+
+    frontiers.get_mut("events").unwrap().idle = false;
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.stream_frontier("positive").map(|f| f.idle),
+        Some(false)
+    );
+}
+
 #[tokio::test]
 async fn all_idle_frontier_respects_operator_hold() {
     let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1289,6 +1338,174 @@ async fn alignment_harness() -> AlignmentHarness {
         fence,
         recorded,
     }
+}
+
+/// An idle interval join stage can still emit rows below the frontier its peers merged to, so a
+/// cluster window or interval join reading it never sees it idle. Other consumers keep the bit.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_windows_and_joins_wait_for_an_idle_managed_stage() {
+    let mut harness = alignment_harness().await;
+    let source = harness.graph.ensure_source_node("events");
+    let stage = harness
+        .graph
+        .place_operator_node(
+            "stage",
+            Box::new(ManagedFrontierProbe {
+                capability: OperatorCapability::bounded_interval_join(),
+                seen: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }),
+            1,
+        )
+        .unwrap();
+    harness.graph.add_edge(source, stage, 0);
+    let consumers = [
+        (
+            "core_window",
+            OperatorCapability::managed_core_window(),
+            false,
+        ),
+        (
+            "interval_join",
+            OperatorCapability::bounded_interval_join(),
+            false,
+        ),
+        (
+            "sql_aggregate",
+            OperatorCapability::keyed_sql_aggregate(),
+            true,
+        ),
+    ]
+    .map(|(name, capability, idle)| {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let node = harness
+            .graph
+            .place_operator_node(
+                name,
+                Box::new(ManagedFrontierProbe {
+                    capability,
+                    seen: Arc::clone(&seen),
+                }),
+                1,
+            )
+            .unwrap();
+        harness.graph.add_edge(stage, node, 0);
+        (name, idle, seen)
+    });
+    let idle = InputFrontier {
+        watermark: Some(900),
+        idle: true,
+    };
+    harness
+        .graph
+        .set_local_source_frontiers(&FxHashMap::from_iter([(Arc::from("events"), idle)]));
+    harness
+        .graph
+        .cap_join_source_frontiers(|name| (name == "events").then_some(900));
+    let committed = FxHashMap::from_iter([(Arc::from("events"), idle)]);
+    harness
+        .graph
+        .execute_cycle(&FxHashMap::default(), 900, Some(&committed))
+        .await
+        .unwrap();
+
+    for (name, idle, seen) in consumers {
+        assert_eq!(
+            *seen.lock(),
+            [InputFrontier {
+                watermark: Some(900),
+                idle,
+            }],
+            "{name}"
+        );
+    }
+}
+
+/// A managed port over a `UNION ALL` of two sources takes the lower of their node-local
+/// frontiers, passes over a source idle on this node, and holds while a branch has buffered rows.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn managed_port_over_a_union_takes_the_lowest_source_frontier() {
+    fn window_frontier(
+        graph: &mut OperatorGraph,
+        window: usize,
+        (left, right): (InputFrontier, InputFrontier),
+    ) -> InputFrontier {
+        graph.set_local_source_frontiers(&FxHashMap::from_iter([
+            (Arc::from("left"), left),
+            (Arc::from("right"), right),
+        ]));
+        graph.cap_join_source_frontiers(|_| Some(700));
+        graph.operator_input_frontiers(window, i64::MIN)[0]
+    }
+    let frontier = |watermark, idle| InputFrontier {
+        watermark: Some(watermark),
+        idle,
+    };
+    let mut harness = alignment_harness().await;
+    harness.graph.event_time_forwards = FxHashSet::from_iter(["merged".to_string()]);
+    let left = harness.graph.ensure_source_node("left");
+    let right = harness.graph.ensure_source_node("right");
+    let merged = harness
+        .graph
+        .place_operator_node("merged", Box::new(RichFrontierProbe(Arc::default())), 2)
+        .unwrap();
+    harness.graph.add_edge(left, merged, 0);
+    harness.graph.add_edge(right, merged, 1);
+    let window = harness
+        .graph
+        .place_operator_node(
+            "window",
+            Box::new(ManagedFrontierProbe {
+                capability: OperatorCapability::managed_core_window(),
+                seen: Arc::default(),
+            }),
+            1,
+        )
+        .unwrap();
+    harness.graph.add_edge(merged, window, 0);
+    harness.graph.compute_topo_order().unwrap();
+    let graph = &mut harness.graph;
+
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_200, false), frontier(800, false))
+        ),
+        frontier(800, false)
+    );
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_200, false), frontier(1_500, true))
+        ),
+        frontier(1_200, false),
+        "a source idle on this node does not hold the union back"
+    );
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_500, true), frontier(1_600, true))
+        ),
+        frontier(700, true),
+        "both sources idle close only to the committed cut"
+    );
+    graph.output_watermarks[merged] = 600;
+    let batches = vec![ordered_batch(650)];
+    let bytes = super::input_admission::retained_input_bytes(&batches);
+    graph.push_to_port(merged, 1, batches, bytes);
+    assert_eq!(
+        window_frontier(
+            graph,
+            window,
+            (frontier(1_200, false), frontier(800, false))
+        ),
+        frontier(600, false),
+        "rows buffered on either branch hold the frontier at the union's output"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -6106,69 +6323,64 @@ async fn test_og_reverse_order_cascading() {
 }
 
 #[test]
-fn test_pressure_zero_when_cap_disabled() {
+fn source_port_headroom_takes_the_fullest_port_of_each_source_view() {
+    use crate::pipeline::callback::PortHeadroom;
+
     let mut graph = test_graph();
-    graph.set_max_input_buf_batches(0); // unlimited
-    graph.add_query(
-        "q1".to_string(),
-        "SELECT * FROM trades".to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
+    let visible = graph.ensure_source_node("trades");
+    let positioned = graph.ensure_positioned_source_node("trades");
+    graph.compute_topo_order().unwrap();
+    assert_eq!(
+        graph.source_port_headroom("trades"),
+        PortHeadroom::UNBOUNDED
     );
-    // Push some data into the source buffer
-    if let Some(&node_id) = graph.source_map.get("trades") {
-        prefill_port(&mut graph, node_id, 0, vec![test_batch(); 10]);
-    }
-    assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
+
+    let batch = test_batch();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
+    graph.set_max_input_buf_batches(4);
+    graph.set_max_input_buf_bytes(Some(bytes * 3));
+    prefill_port(&mut graph, visible, 0, vec![batch.clone()]);
+    prefill_port(&mut graph, positioned, 0, vec![batch.clone(), batch]);
+    assert_eq!(
+        graph.source_port_headroom("trades"),
+        PortHeadroom {
+            batches: 2,
+            bytes: Some(bytes),
+            empty: false,
+        }
+    );
+    assert_eq!(graph.source_port_headroom("other"), PortHeadroom::UNBOUNDED);
+
+    graph.set_backpressure_policy(BackpressurePolicy::ShedOldest);
+    assert_eq!(
+        graph.source_port_headroom("trades"),
+        PortHeadroom::UNBOUNDED
+    );
 }
 
 #[test]
-fn test_pressure_reflects_fill_ratio() {
-    let mut graph = test_graph();
-    graph.set_max_input_buf_batches(100);
-    graph.add_query(
-        "q1".to_string(),
-        "SELECT * FROM trades".to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
-    );
-    // Fill source buffer to 50% of cap
-    if let Some(&node_id) = graph.source_map.get("trades") {
-        prefill_port(&mut graph, node_id, 0, vec![test_batch(); 50]);
-    }
-    assert!((graph.input_buf_pressure() - 0.5).abs() < f64::EPSILON);
-}
+fn port_headroom_admits_one_message_on_empty_ports_and_then_charges_each_batch() {
+    use crate::pipeline::callback::PortHeadroom;
 
-#[test]
-fn test_pressure_clamped_at_one() {
-    let mut graph = test_graph();
-    graph.set_max_input_buf_batches(10);
-    graph.add_query(
-        "q1".to_string(),
-        "SELECT * FROM trades".to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
-    );
-    // Overfill the buffer beyond cap — pressure clamps at 1.0.
-    if let Some(&node_id) = graph.source_map.get("trades") {
-        prefill_port(&mut graph, node_id, 0, vec![test_batch(); 20]);
-    }
-    assert!((graph.input_buf_pressure() - 1.0).abs() < f64::EPSILON);
-}
+    let batch = test_batch();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
+    let mut empty = PortHeadroom {
+        batches: 0,
+        bytes: Some(0),
+        empty: true,
+    };
+    assert!(empty.try_charge(&batch));
+    assert!(!empty.try_charge(&batch));
 
-#[test]
-fn test_pressure_empty_graph() {
-    let graph = test_graph();
-    assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
+    let mut room = PortHeadroom {
+        batches: 2,
+        bytes: Some(bytes + 1),
+        empty: false,
+    };
+    assert!(room.try_charge(&batch));
+    assert_eq!(room.bytes, Some(1));
+    assert!(!room.try_charge(&batch));
+    assert_eq!(room.batches, 1);
 }
 
 #[tokio::test]
@@ -6482,8 +6694,9 @@ async fn source_priming_rejects_an_oversized_batch_before_retaining_it() {
 }
 
 #[test]
-fn output_admission_rejects_near_full_fanout_before_any_publication() {
+fn output_admission_under_fail_rejects_near_full_fanout_before_any_publication() {
     let mut graph = test_graph();
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     let producer = graph
         .place_operator_node("producer", Box::new(SourcePassthrough), 1)
         .unwrap();
@@ -6594,7 +6807,7 @@ fn graph_output_admission_charges_each_fanout_port_at_the_exact_limit() {
 }
 
 #[test]
-fn graph_output_admission_enforces_prospective_count_limits() {
+fn graph_output_admission_enforces_prospective_count_limits_under_fail() {
     for byte_limit in [None, Some(usize::MAX)] {
         let mut graph = test_graph();
         let producer = graph.ensure_source_node("input");
@@ -6602,6 +6815,7 @@ fn graph_output_admission_enforces_prospective_count_limits() {
             .place_operator_node("target", Box::new(SourcePassthrough), 1)
             .unwrap();
         graph.add_edge(producer, target, 0);
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
         graph.set_max_input_buf_batches(1);
         graph.set_max_input_buf_bytes(byte_limit);
         let error = graph
@@ -6620,29 +6834,52 @@ fn graph_output_admission_enforces_prospective_count_limits() {
 }
 
 #[test]
-fn graph_output_admission_rejects_oversized_output_even_on_an_empty_port() {
-    for policy in [BackpressurePolicy::Backpressure, BackpressurePolicy::Fail] {
+fn graph_output_admission_rejects_oversized_output_even_on_an_empty_port_under_fail() {
+    let mut graph = test_graph();
+    let producer = graph.ensure_source_node("input");
+    let target = graph
+        .place_operator_node("target", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(producer, target, 0);
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
+    graph.set_max_input_buf_bytes(Some(1));
+    let error = graph
+        .route_output(producer, vec![test_batch()], &mut FxHashMap::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DbError::GraphBufferBudgetExceeded {
+            max_bytes: Some(1),
+            ..
+        }
+    ));
+    assert!(error.requires_pipeline_halt());
+    assert!(!error.requires_pipeline_recovery());
+    assert!(graph.input_bufs[target][0].is_empty());
+}
+
+#[test]
+fn graph_output_under_backpressure_overshoots_by_one_run_and_holds_the_producer() {
+    for byte_limit in [None, Some(1)] {
         let mut graph = test_graph();
-        let producer = graph.ensure_source_node("input");
+        let producer = graph
+            .place_operator_node("producer", Box::new(SourcePassthrough), 1)
+            .unwrap();
         let target = graph
             .place_operator_node("target", Box::new(SourcePassthrough), 1)
             .unwrap();
         graph.add_edge(producer, target, 0);
-        graph.set_backpressure_policy(policy);
-        graph.set_max_input_buf_bytes(Some(1));
-        let error = graph
-            .route_output(producer, vec![test_batch()], &mut FxHashMap::default())
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            DbError::GraphBufferBudgetExceeded {
-                max_bytes: Some(1),
-                ..
-            }
-        ));
-        assert!(error.requires_pipeline_halt());
-        assert!(!error.requires_pipeline_recovery());
-        assert!(graph.input_bufs[target][0].is_empty());
+        graph.set_max_input_buf_batches(2);
+        graph.set_max_input_buf_bytes(byte_limit);
+        prefill_port(&mut graph, target, 0, vec![test_batch()]);
+        graph
+            .route_output(producer, vec![test_batch(); 3], &mut FxHashMap::default())
+            .unwrap();
+        assert_eq!(graph.input_bufs[target][0].len(), 4);
+        assert!(graph.execution_poison_reason().is_none());
+        assert!(matches!(graph.gate_decision(producer), GateDecision::Skip));
+        #[cfg(debug_assertions)]
+        graph.debug_assert_byte_sums();
     }
 }
 
@@ -6917,7 +7154,7 @@ async fn graph_admission_sum_graph() -> OperatorGraph {
 }
 
 #[tokio::test]
-async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_cut() {
+async fn graph_post_mutation_admission_failure_under_fail_fences_retry_and_restores_prior_cut() {
     let mut graph = graph_admission_sum_graph().await;
     graph
         .execute_cycle(&trades_source(), 0, None)
@@ -6935,6 +7172,7 @@ async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_c
     let source_bytes = laminar_core::streaming::retained_arrow_bytes(&test_batch());
     let count = source_bytes / pending_bytes + 1;
     let limit = pending_bytes * count + 1;
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     graph.set_max_input_buf_bytes(Some(limit));
     prefill_port(&mut graph, target, 0, vec![pending; count]);
     let error = graph
@@ -6965,6 +7203,7 @@ async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_c
             u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
         )
         .unwrap();
+    restored.set_backpressure_policy(BackpressurePolicy::Fail);
     restored.set_max_input_buf_bytes(Some(limit));
     let result = restored
         .execute_cycle(&trades_source(), 0, None)
@@ -7402,7 +7641,44 @@ async fn interval_output_admission_compacts_273_batches_without_changing_aggrega
 }
 
 #[tokio::test]
-async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sensitive_plans() {
+async fn interval_output_that_compaction_cannot_fit_waits_on_a_nearly_full_aggregate_port() {
+    let query =
+        "SELECT symbol, COUNT(*) AS matches, MAX(price) AS high FROM joined GROUP BY symbol";
+    let (mut graph, producer, consumers) =
+        interval_aggregate_admission_graph(test_schema(), &[query]).await;
+    let consumer = consumers[0];
+    prefill_port(&mut graph, consumer, 0, vec![test_batch(); 255]);
+    let oversized =
+        arrow::compute::concat_batches(&test_schema(), vec![test_batch(); 513].iter()).unwrap();
+    let mut incoming = vec![test_batch(); 3];
+    incoming.push(oversized);
+    incoming.extend(vec![test_batch(); 3]);
+    graph
+        .route_output(producer, incoming, &mut FxHashMap::default())
+        .unwrap();
+    assert_eq!(graph.input_bufs[consumer][0].len(), 258);
+    assert!(graph.execution_poison_reason().is_none());
+    assert!(matches!(graph.gate_decision(producer), GateDecision::Skip));
+
+    let results = graph
+        .execute_cycle(&FxHashMap::default(), 0, None)
+        .await
+        .unwrap();
+    let aggregate = &results["aggregate_0"][0];
+    let counts = aggregate
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(aggregate.num_rows(), 2);
+    assert!((0..2).all(|row| counts.value(row) == 255 + 6 + 513));
+    assert!(graph.input_bufs[consumer][0].is_empty());
+    assert!(matches!(graph.gate_decision(producer), GateDecision::Run));
+}
+
+#[tokio::test]
+async fn interval_output_admission_under_fail_preserves_terminal_rejection_for_boundary_sensitive_plans(
+) {
     for query in [
         "SELECT SUM(price) FROM joined",
         "SELECT AVG(price) FROM joined",
@@ -7413,6 +7689,7 @@ async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sen
     ] {
         let (mut graph, producer, consumers) =
             interval_aggregate_admission_graph(test_schema(), &[query]).await;
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
         assert!(
             !graph.nodes[consumers[0]]
                 .operator
@@ -7452,13 +7729,14 @@ async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sen
 }
 
 #[tokio::test]
-async fn interval_output_admission_rejects_unsafe_fanout_atomically() {
+async fn interval_output_admission_under_fail_rejects_unsafe_fanout_atomically() {
     let queries = [
         "SELECT COUNT(*) FROM joined",
         "SELECT SUM(price) FROM joined",
     ];
     let (mut graph, producer, consumers) =
         interval_aggregate_admission_graph(test_schema(), &queries).await;
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     assert!(graph.nodes[consumers[0]]
         .operator
         .certifies_input_batch_coalescing());
@@ -7479,9 +7757,10 @@ async fn interval_output_admission_rejects_unsafe_fanout_atomically() {
 }
 
 #[tokio::test]
-async fn interval_output_admission_still_enforces_retained_bytes_after_compaction() {
+async fn interval_output_admission_under_fail_still_enforces_retained_bytes_after_compaction() {
     let (mut graph, producer, consumers) =
         interval_aggregate_admission_graph(test_schema(), &["SELECT COUNT(*) FROM joined"]).await;
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     graph.set_max_input_buf_bytes(Some(1));
     let mut results = FxHashMap::default();
     let error = graph
@@ -7502,7 +7781,7 @@ async fn interval_output_admission_still_enforces_retained_bytes_after_compactio
 }
 
 #[tokio::test]
-async fn interval_output_admission_preserves_weighted_and_oversized_boundaries() {
+async fn interval_output_admission_under_fail_preserves_weighted_and_oversized_boundaries() {
     let batch = test_batch();
     let mut fields: Vec<_> = batch
         .schema()
@@ -7524,6 +7803,7 @@ async fn interval_output_admission_preserves_weighted_and_oversized_boundaries()
         let (mut graph, producer, consumers) =
             interval_aggregate_admission_graph(batch.schema(), &["SELECT COUNT(*) FROM joined"])
                 .await;
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
         let mut results = FxHashMap::default();
         let error = graph
             .route_output(producer, vec![batch; 273], &mut results)
@@ -7536,4 +7816,92 @@ async fn interval_output_admission_preserves_weighted_and_oversized_boundaries()
         assert!(graph.input_bufs[consumers[0]][0].is_empty());
         assert!(graph.execution_poison_reason().is_some());
     }
+}
+
+#[tokio::test]
+async fn cold_metrics_publish_budget_ratio_and_vnode_spread_of_a_keyed_aggregate() {
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    let mut graph = test_graph();
+    graph.add_query(
+        "agg".to_string(),
+        "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let limit = 1 << 30;
+    graph.set_max_managed_state_bytes(limit);
+    graph.set_metrics(Arc::clone(&prom));
+    graph
+        .execute_cycle(&trades_source(), i64::MAX, None)
+        .await
+        .unwrap();
+    graph.publish_buffer_stats();
+
+    let flow = &prom.flow;
+    #[allow(clippy::cast_precision_loss)]
+    let expected_ratio = graph.managed_state_accounted_bytes() as f64 / limit as f64;
+    assert!(expected_ratio > 0.0);
+    assert!((flow.managed_state_budget_ratio.get() - expected_ratio).abs() < f64::EPSILON);
+    let max = flow.vnode_state_bytes_max.with_label_values(&["agg"]).get();
+    let mean = flow
+        .vnode_state_bytes_mean
+        .with_label_values(&["agg"])
+        .get();
+    assert!(max > 0 && mean > 0 && mean <= max, "max={max} mean={mean}");
+    assert!((1..=2).contains(&flow.vnode_groups_max.with_label_values(&["agg"]).get()));
+    assert!((0..256).contains(&flow.vnode_hottest.with_label_values(&["agg"]).get()));
+
+    #[cfg(feature = "cluster")]
+    {
+        let vnodes = flow.vnode_loads.latest_for_test("agg");
+        assert_eq!(
+            vnodes.iter().map(|load| load.applied_rows).sum::<u64>(),
+            u64::try_from(test_batch().num_rows()).unwrap()
+        );
+        assert_eq!(
+            vnodes.iter().map(|load| load.state_bytes).max(),
+            usize::try_from(max).ok()
+        );
+    }
+}
+
+#[tokio::test]
+async fn temporal_filter_rows_count_against_the_managed_state_budget() {
+    use laminar_sql::parser::EmitClause;
+    let mut graph = test_graph();
+    graph.set_max_managed_state_bytes(4 * 1024);
+    graph.add_query(
+        "recent".into(),
+        "SELECT * FROM trades WHERE ts > now() - INTERVAL '10' SECOND".into(),
+        Some(EmitClause::Changes),
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut src = FxHashMap::default();
+    src.insert(Arc::from("trades"), vec![test_batch()]);
+
+    let mut halted = None;
+    for _ in 0..64 {
+        if let Err(error) = graph.execute_cycle(&src, 5_000, None).await {
+            halted = Some(error);
+            break;
+        }
+    }
+
+    let error = halted.expect("buffered temporal-filter rows must reach the budget");
+    assert!(
+        matches!(
+            &error,
+            DbError::ManagedStateBudgetExceeded { context, limit_bytes: 4096, .. }
+                if context.contains("recent")
+        ),
+        "{error}"
+    );
+    assert!(error.requires_pipeline_halt());
 }

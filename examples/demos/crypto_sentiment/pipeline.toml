@@ -101,7 +101,8 @@ SELECT
     s.mean_sentiment  AS mean_sentiment,
     s.posts           AS posts
 FROM price_1m p
-JOIN sentiment_1m s ON p.bucket_start = s.bucket_start;
+JOIN sentiment_1m s ON p.bucket_start = s.bucket_start
+WITH (retention = '1440 rows');
 
 CREATE MATERIALIZED VIEW sentiment_price_1m AS
 SELECT
@@ -110,7 +111,8 @@ SELECT
     mean_sentiment,
     posts,
     CORR(price, mean_sentiment) OVER (ORDER BY bucket_start ROWS 29 PRECEDING) AS corr_30
-FROM sentiment_price_join;
+FROM sentiment_price_join
+WITH (retention = '1440 rows');
 """
 
 # ── AI runtime ───────────────────────────────────────────────────────────

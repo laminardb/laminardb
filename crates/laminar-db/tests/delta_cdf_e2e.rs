@@ -140,6 +140,7 @@ async fn query(path: &Path, sql: &str) -> BTreeMap<String, Vec<i64>> {
 struct Views {
     source: std::path::PathBuf,
     totals: std::path::PathBuf,
+    extremes: std::path::PathBuf,
     open: std::path::PathBuf,
     mirror: std::path::PathBuf,
 }
@@ -151,6 +152,11 @@ impl Views {
                 &self.totals,
                 "SELECT label, SUM(qty), COUNT(*) FROM t GROUP BY label",
                 "SELECT label, total, n FROM t",
+            ),
+            (
+                &self.extremes,
+                "SELECT label, MIN(qty), MAX(qty) FROM t GROUP BY label",
+                "SELECT label, low, peak FROM t",
             ),
             (
                 &self.open,
@@ -204,6 +210,7 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
     let views = Views {
         source: lake.path().join("orders"),
         totals: lake.path().join("totals"),
+        extremes: lake.path().join("extremes"),
         open: lake.path().join("open"),
         mirror: lake.path().join("mirror"),
     };
@@ -217,9 +224,13 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
         "CREATE STREAM totals AS SELECT label, SUM(qty) AS total, COUNT(*) AS n \
          FROM orders GROUP BY label EMIT CHANGES"
             .to_string(),
+        "CREATE STREAM extremes AS SELECT label, MIN(qty) AS low, MAX(qty) AS peak \
+         FROM orders GROUP BY label EMIT CHANGES"
+            .to_string(),
         "CREATE STREAM open_orders AS SELECT id, label, qty FROM orders WHERE label = 'OPEN'"
             .to_string(),
         upsert_sink("totals_sink", "totals", &views.totals, "label"),
+        upsert_sink("extremes_sink", "extremes", &views.extremes, "label"),
         upsert_sink("open_sink", "open_orders", &views.open, "id"),
         upsert_sink("mirror_sink", "orders", &views.mirror, "id"),
     ];
@@ -296,21 +307,14 @@ async fn delta_change_feed_consumers_that_cannot_retract_are_rejected() {
     let path = lake.path().join("orders");
     source_table(&path, &[(1, "OPEN", 1)]).await;
     let append = lake.path().join("append");
-    let cases = [
-        (
-            "CREATE STREAM top AS SELECT label, MAX(qty) AS m FROM orders GROUP BY label"
-                .to_string(),
-            "MIN/MAX",
-        ),
-        (
-            format!(
-                "CREATE SINK raw FROM orders INTO \"delta-lake\" ('table.path' = '{}', \
+    let cases = [(
+        format!(
+            "CREATE SINK raw FROM orders INTO \"delta-lake\" ('table.path' = '{}', \
                  'write.mode' = 'overwrite', 'auto.create' = 'true')",
-                location(&append)
-            ),
-            "retractions",
+            location(&append)
         ),
-    ];
+        "retractions",
+    )];
     for (statement, needle) in cases {
         let storage = tempfile::tempdir().unwrap();
         let db = open(storage.path()).await;

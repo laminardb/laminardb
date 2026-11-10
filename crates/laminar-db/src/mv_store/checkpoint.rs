@@ -1,4 +1,5 @@
-//! Checkpoint capture, deterministic encoding, and restore validation for materialized views.
+//! Checkpoint capture of append-only view logs, and the deterministic row encodings shared
+//! with changelog-view vnode frames.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,8 +11,11 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::row::{OwnedRow, RowConverter};
 use datafusion_common::ScalarValue;
+use laminar_core::checkpoint::{CheckpointManifest, ViewLog, MAX_VIEW_LOG_SEGMENTS};
 
-use super::{MultisetState, MvEntry, MvStorageMode, MvStore, UpsertState};
+use super::append_log::{AppendLogState, ViewLogCapture};
+use super::{MvStorageMode, MvStore};
+use crate::checkpoint_coordinator::{CapturedViewLog, CapturedViewLogSegment};
 use crate::error::DbError;
 
 const MULTISET_CHECKPOINT_COUNT_COLUMN: &str = "__laminardb_multiset_count";
@@ -19,48 +23,12 @@ const MULTISET_CHECKPOINT_FORMAT_KEY: &str = "laminardb.mv.multiset.format";
 const MULTISET_CHECKPOINT_FORMAT_VERSION: &str = "counted-v1";
 
 const CHECKPOINT_CAPTURE_ENTRY_OVERHEAD: usize = 256;
-const CHECKPOINT_CAPTURE_FIELD_OVERHEAD: usize = 128;
-const CHECKPOINT_CAPTURE_ROW_OVERHEAD: usize = 64;
+pub(super) const CHECKPOINT_CAPTURE_ROW_OVERHEAD: usize = 64;
 
-/// Prefix for materialized-view checkpoint frame identifiers.
-pub(crate) const CHECKPOINT_KEY_PREFIX: &str = "mv:";
-
-enum MvCheckpointEntryCapture {
-    Batches {
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    },
-    Upsert {
-        schema: SchemaRef,
-        rows: Vec<(OwnedRow, Vec<ScalarValue>)>,
-    },
-    Multiset {
-        schema: SchemaRef,
-        row_converter: Arc<RowConverter>,
-        counts: Vec<(OwnedRow, i64)>,
-    },
-}
-
+/// Every append view's log at one checkpoint barrier; new rows are encoded off the cycle.
 pub(crate) struct MvCheckpointCapture {
-    entries: Vec<(String, MvCheckpointEntryCapture)>,
+    logs: Vec<(String, SchemaRef, ViewLogCapture)>,
     estimated_bytes: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct EncodedMvCheckpoint {
-    states: HashMap<String, bytes::Bytes>,
-    retained_bytes: u64,
-}
-
-impl EncodedMvCheckpoint {
-    pub(crate) fn into_parts(self) -> (HashMap<String, bytes::Bytes>, u64) {
-        (self.states, self.retained_bytes)
-    }
-
-    #[cfg(test)]
-    pub(super) fn states(&self) -> &HashMap<String, bytes::Bytes> {
-        &self.states
-    }
 }
 
 impl MvCheckpointCapture {
@@ -68,61 +36,84 @@ impl MvCheckpointCapture {
         self.estimated_bytes
     }
 
-    pub(crate) fn encode(mut self, max_encoded_bytes: u64) -> Result<EncodedMvCheckpoint, DbError> {
-        self.entries
-            .sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        let mut out = HashMap::with_capacity(self.entries.len());
+    /// Whether the capture moved rows out of a view's stage, so a failed checkpoint must
+    /// recover rather than retry.
+    pub(crate) fn sealed_rows(&self) -> bool {
+        self.logs.iter().any(|(_, _, log)| log.sealed.is_some())
+    }
+
+    /// Encode each sealed segment as one Arrow IPC stream, within `max_encoded_bytes` of
+    /// retained payload. Returns the logs and the bytes their payloads retain.
+    pub(crate) fn encode(
+        self,
+        max_encoded_bytes: u64,
+    ) -> Result<(Vec<CapturedViewLog>, u64), DbError> {
         let mut retained_bytes = 0u64;
-        for (name, entry) in self.entries {
-            let remaining_bytes = max_encoded_bytes.checked_sub(retained_bytes).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "MV checkpoint serialization exceeded its staged-state budget of {max_encoded_bytes} bytes"
-                ))
-            })?;
-            let bytes = match entry {
-                MvCheckpointEntryCapture::Batches { schema, batches } => {
-                    batches_to_ipc_bounded(&schema, &batches, remaining_bytes)
-                }
-                MvCheckpointEntryCapture::Upsert { schema, mut rows } => {
-                    upsert_checkpoint_batch(&schema, &mut rows).and_then(|batch| {
-                        batches_to_ipc_bounded(&schema, std::iter::once(&batch), remaining_bytes)
-                    })
-                }
-                MvCheckpointEntryCapture::Multiset {
-                    schema,
-                    row_converter,
-                    mut counts,
-                } => multiset_counted_checkpoint_batch(&schema, &row_converter, &mut counts)
-                    .and_then(|batch| {
-                        batches_to_ipc_bounded(
-                            &batch.schema(),
-                            std::iter::once(&batch),
-                            remaining_bytes,
-                        )
-                    }),
+        let mut logs = Vec::with_capacity(self.logs.len());
+        for (view, schema, capture) in self.logs {
+            let mut segments: Vec<CapturedViewLogSegment> = capture
+                .retained
+                .iter()
+                .map(|&(partition, sequence)| CapturedViewLogSegment::Retained {
+                    partition,
+                    sequence,
+                })
+                .chain(capture.adopted.into_iter().map(|(sequence, adopted)| {
+                    CapturedViewLogSegment::Adopted {
+                        partition: super::append_log::LOG_PARTITION,
+                        sequence,
+                        adopted,
+                    }
+                }))
+                .collect();
+            if let Some(compacted) = capture.compacted {
+                retained_bytes = retained_bytes
+                    .checked_add(u64::try_from(compacted.payload.len()).unwrap_or(u64::MAX))
+                    .filter(|bytes| *bytes <= max_encoded_bytes)
+                    .ok_or_else(|| capture_size_overflow(&view))?;
+                segments.push(CapturedViewLogSegment::New {
+                    partition: compacted.meta.partition,
+                    sequence: compacted.meta.sequence,
+                    rows: compacted.meta.rows,
+                    event_time: compacted.meta.event_time,
+                    payload: compacted.payload,
+                });
             }
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "MV '{name}' checkpoint serialization failed: {error}"
-                ))
-            })?;
-            // `Bytes::from(Vec)` retains the Vec allocation, so charge capacity rather than
-            // payload length to keep the aggregate live allocation within the caller's cap.
-            let retained_entry_bytes =
-                u64::try_from(bytes.capacity()).map_err(|_| capture_size_overflow(&name))?;
-            retained_bytes = retained_bytes
-                .checked_add(retained_entry_bytes)
-                .ok_or_else(|| capture_size_overflow(&name))?;
-            debug_assert!(retained_bytes <= max_encoded_bytes);
-            out.insert(
-                format!("{CHECKPOINT_KEY_PREFIX}{name}"),
-                bytes::Bytes::from(bytes),
-            );
+            if let Some(sealed) = capture.sealed {
+                let remaining = max_encoded_bytes.checked_sub(retained_bytes).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "view-log serialization exceeded its staged-state budget of {max_encoded_bytes} bytes"
+                    ))
+                })?;
+                let payload = batches_to_ipc_bounded(&schema, &sealed.batches, remaining).map_err(
+                    |error| {
+                        DbError::Checkpoint(format!(
+                            "view '{view}' log serialization failed: {error}"
+                        ))
+                    },
+                )?;
+                // `Bytes::from(Vec)` retains the Vec allocation, so charge its capacity.
+                retained_bytes = retained_bytes
+                    .checked_add(u64::try_from(payload.capacity()).unwrap_or(u64::MAX))
+                    .filter(|bytes| *bytes <= max_encoded_bytes)
+                    .ok_or_else(|| capture_size_overflow(&view))?;
+                segments.push(CapturedViewLogSegment::New {
+                    partition: sealed.partition,
+                    sequence: sealed.sequence,
+                    rows: sealed.rows,
+                    event_time: sealed.event_time,
+                    payload: bytes::Bytes::from(payload),
+                });
+            }
+            logs.push(CapturedViewLog {
+                view,
+                next_sequence: capture.next_sequence,
+                frontier: capture.frontier,
+                idle: capture.idle,
+                segments,
+            });
         }
-        Ok(EncodedMvCheckpoint {
-            states: out,
-            retained_bytes,
-        })
+        Ok((logs, retained_bytes))
     }
 }
 
@@ -141,7 +132,8 @@ pub(super) fn multiset_checkpoint_schema(schema: &SchemaRef) -> SchemaRef {
     Arc::new(Schema::new_with_metadata(fields, metadata))
 }
 
-fn upsert_checkpoint_batch(
+/// Rows sorted by key, so equal state always encodes to equal bytes.
+pub(super) fn upsert_checkpoint_batch(
     schema: &SchemaRef,
     rows: &mut Vec<(OwnedRow, Vec<ScalarValue>)>,
 ) -> Result<RecordBatch, DbError> {
@@ -174,7 +166,8 @@ fn upsert_checkpoint_batch(
         .map_err(|error| DbError::Storage(format!("upsert MV batch assembly: {error}")))
 }
 
-fn multiset_counted_checkpoint_batch(
+/// Distinct rows sorted by their encoding, each with its positive multiplicity.
+pub(super) fn multiset_counted_checkpoint_batch(
     schema: &SchemaRef,
     row_converter: &RowConverter,
     counts: &mut [(OwnedRow, i64)],
@@ -201,209 +194,203 @@ fn multiset_counted_checkpoint_batch(
         .map_err(|error| DbError::Storage(format!("multiset MV checkpoint assembly: {error}")))
 }
 
-impl MvEntry {
-    fn checkpoint_capture_estimate(&self, name: &str) -> Result<u64, DbError> {
-        let mut bytes = 0;
-        add_capture_estimate(&mut bytes, CHECKPOINT_CAPTURE_ENTRY_OVERHEAD, name)?;
-        add_capture_estimate(&mut bytes, name.len(), name)?;
-        for field in self.schema.fields() {
-            add_capture_estimate(&mut bytes, CHECKPOINT_CAPTURE_FIELD_OVERHEAD, name)?;
-            add_capture_estimate(&mut bytes, field.name().len(), name)?;
-        }
-        for (key, value) in self.schema.metadata() {
-            add_capture_estimate(&mut bytes, key.len(), name)?;
-            add_capture_estimate(&mut bytes, value.len(), name)?;
-        }
+impl MvStore {
+    fn append_logs(&mut self) -> impl Iterator<Item = (&String, &SchemaRef, &mut AppendLogState)> {
+        self.entries
+            .iter_mut()
+            .filter_map(|(name, entry)| Some((name, &entry.schema, entry.log.as_mut()?)))
+    }
 
-        match &self.mode {
-            MvStorageMode::Aggregate | MvStorageMode::Append { .. } => {
-                for batch in &self.batches {
-                    add_capture_estimate(&mut bytes, std::mem::size_of::<RecordBatch>(), name)?;
-                    add_capture_estimate(&mut bytes, batch.get_array_memory_size(), name)?;
-                }
-            }
-            MvStorageMode::Upsert { .. } => {
-                let upsert = self.upsert.as_ref().ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "MV '{name}' is missing its upsert checkpoint state"
-                    ))
-                })?;
-                for (key, row) in &upsert.rows {
-                    add_capture_estimate(&mut bytes, CHECKPOINT_CAPTURE_ROW_OVERHEAD, name)?;
-                    add_capture_estimate(&mut bytes, key.row().data().len(), name)?;
-                    add_capture_estimate(
-                        &mut bytes,
-                        std::mem::size_of::<ScalarValue>()
-                            .checked_mul(row.len())
-                            .ok_or_else(|| capture_size_overflow(name))?,
-                        name,
-                    )?;
-                    for value in row {
-                        add_capture_estimate(&mut bytes, value.size(), name)?;
-                    }
-                }
-            }
-            MvStorageMode::Multiset => {
-                let multiset = self.multiset.as_ref().ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "MV '{name}' is missing its multiset checkpoint state"
-                    ))
-                })?;
-                for key in multiset.counts.keys() {
-                    add_capture_estimate(&mut bytes, CHECKPOINT_CAPTURE_ROW_OVERHEAD, name)?;
-                    add_capture_estimate(&mut bytes, key.row().data().len(), name)?;
-                }
+    /// Seal every append view's staged rows for checkpoint `checkpoint_id`, with the prepared
+    /// merges when they fit within `max_bytes` as well. Nothing changes when the capture does
+    /// not fit.
+    pub(crate) fn capture_view_logs(
+        &mut self,
+        checkpoint_id: u64,
+        max_bytes: u64,
+    ) -> Result<MvCheckpointCapture, DbError> {
+        let (mut estimated_bytes, mut merged_bytes) = (0u64, 0u64);
+        for (name, entry) in &self.entries {
+            if let Some(log) = &entry.log {
+                let bytes = CHECKPOINT_CAPTURE_ENTRY_OVERHEAD
+                    .saturating_add(name.len())
+                    .saturating_add(log.staged_bytes());
+                estimated_bytes = estimated_bytes
+                    .checked_add(u64::try_from(bytes).map_err(|_| capture_size_overflow(name))?)
+                    .ok_or_else(|| capture_size_overflow(name))?;
+                merged_bytes = merged_bytes
+                    .saturating_add(u64::try_from(log.prepared_bytes()).unwrap_or(u64::MAX));
             }
         }
-        Ok(bytes.max(u64::try_from(self.approx_bytes).map_err(|_| capture_size_overflow(name))?))
+        if estimated_bytes > max_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "view-log capture estimate {estimated_bytes} bytes exceeds the staged-state cap of {max_bytes} bytes"
+            )));
+        }
+        let compact = estimated_bytes.saturating_add(merged_bytes) <= max_bytes;
+        if compact {
+            estimated_bytes += merged_bytes;
+        }
+        let captured: Result<Vec<_>, DbError> = self
+            .append_logs()
+            .map(|(name, schema, log)| {
+                let capture = log.capture(checkpoint_id, compact)?;
+                Ok((name.clone(), Arc::clone(schema), capture))
+            })
+            .collect();
+        match captured.and_then(within_segment_limit) {
+            Ok(logs) => {
+                self.log_capture = Some(checkpoint_id);
+                Ok(MvCheckpointCapture {
+                    logs,
+                    estimated_bytes,
+                })
+            }
+            Err(error) => {
+                self.abort_view_logs(checkpoint_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Install the segments checkpoint `checkpoint_id` committed; its sealed rows leave memory.
+    pub(crate) fn commit_view_logs(&mut self, checkpoint_id: u64) {
+        if self
+            .log_capture
+            .take_if(|capture| *capture == checkpoint_id)
+            .is_none()
+        {
+            return;
+        }
+        for (_, _, log) in self.append_logs() {
+            log.commit(checkpoint_id);
+        }
+        self.log_checkpoint = Some(checkpoint_id);
+        self.recount_log_bytes();
+    }
+
+    /// Return the rows a failed checkpoint sealed to their views' stages.
+    pub(crate) fn abort_view_logs(&mut self, checkpoint_id: u64) {
+        self.log_capture
+            .take_if(|capture| *capture == checkpoint_id);
+        for (_, _, log) in self.append_logs() {
+            log.abort(checkpoint_id);
+        }
+    }
+
+    fn recount_log_bytes(&mut self) {
+        for entry in self.entries.values_mut() {
+            if let Some(log) = &entry.log {
+                entry.approx_bytes = log.bytes;
+            }
+        }
+    }
+
+    /// List the segments of logs adopted from participants that left in each view's next
+    /// capture.
+    pub(crate) fn adopt_view_logs(
+        &mut self,
+        logs: &[laminar_core::checkpoint::AdoptedViewLog],
+    ) -> Result<(), DbError> {
+        if let Some(view) = logs.iter().find(|log| {
+            self.entries
+                .get(&log.view)
+                .is_none_or(|entry| entry.log.is_none())
+        }) {
+            return Err(DbError::Checkpoint(format!(
+                "a departed participant's log names '{}', which is not an append-only view",
+                view.view
+            )));
+        }
+        for log in logs {
+            if let Some(state) = self
+                .entries
+                .get_mut(&log.view)
+                .and_then(|entry| entry.log.as_mut())
+            {
+                state.adopt(log.segments.iter().cloned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore every append view `restores` names from the log `manifest` retains; with no
+    /// manifest, every append view starts empty. The other views start empty, and their logs
+    /// in `manifest` are left behind.
+    pub(super) fn restore_view_logs(
+        &mut self,
+        manifest: Option<&CheckpointManifest>,
+        restores: impl Fn(&str) -> bool,
+    ) -> Result<(), DbError> {
+        let Some(manifest) = manifest else {
+            return Ok(());
+        };
+        let mut logs: HashMap<&str, &ViewLog> = manifest
+            .view_logs
+            .iter()
+            .filter(|log| restores(&log.view))
+            .map(|log| (log.view.as_str(), log))
+            .collect();
+        for (name, entry) in &mut self.entries {
+            let MvStorageMode::AppendLog { retention } = &entry.mode else {
+                continue;
+            };
+            if !restores(name) {
+                continue;
+            }
+            let log = logs.remove(name.as_str()).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "checkpoint holds no log for append-only view '{name}'"
+                ))
+            })?;
+            entry.log = Some(AppendLogState::restored(
+                retention.clone(),
+                log,
+                manifest.checkpoint_id,
+            ));
+        }
+        if let Some(view) = logs.keys().next() {
+            return Err(DbError::Checkpoint(format!(
+                "checkpoint holds a log for '{view}', which is not an append-only view"
+            )));
+        }
+        self.log_checkpoint = Some(manifest.checkpoint_id);
+        Ok(())
     }
 }
 
-impl MvStore {
-    pub(super) fn checkpoint_capture_estimated_bytes(&self) -> Result<u64, DbError> {
-        self.entries.iter().try_fold(0u64, |total, (name, entry)| {
-            total
-                .checked_add(entry.checkpoint_capture_estimate(name)?)
-                .ok_or_else(|| capture_size_overflow(name))
-        })
+/// The captured logs, unless they retain more segments than one manifest admits.
+fn within_segment_limit(
+    logs: Vec<(String, SchemaRef, ViewLogCapture)>,
+) -> Result<Vec<(String, SchemaRef, ViewLogCapture)>, DbError> {
+    let segments = |capture: &ViewLogCapture| {
+        capture.retained.len()
+            + capture.adopted.len()
+            + usize::from(capture.compacted.is_some())
+            + usize::from(capture.sealed.is_some())
+    };
+    let total = logs
+        .iter()
+        .map(|(_, _, capture)| segments(capture))
+        .sum::<usize>();
+    if total <= MAX_VIEW_LOG_SEGMENTS {
+        return Ok(logs);
     }
-
-    /// Capture an immutable point-in-time image without materializing Arrow output.
-    pub fn capture_checkpoint(&self, max_bytes: u64) -> Result<MvCheckpointCapture, DbError> {
-        let estimated_bytes = self.checkpoint_capture_estimated_bytes()?;
-        if estimated_bytes > max_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "MV checkpoint capture estimate {estimated_bytes} bytes exceeds the staged-state cap of {max_bytes} bytes"
-            )));
-        }
-
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for (name, entry) in &self.entries {
-            let captured = match &entry.mode {
-                MvStorageMode::Aggregate | MvStorageMode::Append { .. } => {
-                    MvCheckpointEntryCapture::Batches {
-                        schema: Arc::clone(&entry.schema),
-                        batches: entry.batches.iter().cloned().collect(),
-                    }
-                }
-                MvStorageMode::Upsert { .. } => {
-                    let upsert = entry.upsert.as_ref().ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "MV '{name}' is missing its upsert checkpoint state"
-                        ))
-                    })?;
-                    MvCheckpointEntryCapture::Upsert {
-                        schema: Arc::clone(&entry.schema),
-                        rows: upsert
-                            .rows
-                            .iter()
-                            .map(|(key, values)| (key.clone(), values.clone()))
-                            .collect(),
-                    }
-                }
-                MvStorageMode::Multiset => {
-                    let multiset = entry.multiset.as_ref().ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "MV '{name}' is missing its multiset checkpoint state"
-                        ))
-                    })?;
-                    MvCheckpointEntryCapture::Multiset {
-                        schema: Arc::clone(&entry.schema),
-                        row_converter: Arc::clone(&multiset.row_converter),
-                        counts: multiset
-                            .counts
-                            .iter()
-                            .map(|(key, count)| (key.clone(), *count))
-                            .collect(),
-                    }
-                }
-            };
-            entries.push((name.clone(), captured));
-        }
-        Ok(MvCheckpointCapture {
-            entries,
-            estimated_bytes,
-        })
-    }
-
-    #[cfg(test)]
-    pub fn checkpoint_states(&self) -> Result<HashMap<String, bytes::Bytes>, DbError> {
-        self.capture_checkpoint(u64::MAX)?
-            .encode(u64::MAX)
-            .map(|encoded| encoded.into_parts().0)
-    }
-
-    pub(super) fn restore_from_ipc(&mut self, name: &str, bytes: &[u8]) -> Result<(), DbError> {
-        let Some(entry) = self.entries.get_mut(name) else {
-            return Err(DbError::Storage(format!("MV '{name}' is not registered")));
-        };
-        let (checkpoint_schema, batches) = ipc_to_schema_and_batches(bytes)
-            .map_err(|e| DbError::Storage(format!("MV restore '{name}': {e}")))?;
-
-        if matches!(&entry.mode, MvStorageMode::Multiset) {
-            if checkpoint_schema != multiset_checkpoint_schema(&entry.schema) {
-                return Err(DbError::Storage(format!(
-                    "MV '{name}' multiset checkpoint schema or format mismatch on restore"
-                )));
-            }
-            let mut restored = MultisetState::new(&entry.schema)?;
-            for batch in &batches {
-                restored.load_counted_snapshot(name, batch, self.limits)?;
-            }
-            entry.approx_bytes = restored.approx_bytes;
-            entry.multiset = Some(restored);
-            return Ok(());
-        }
-
-        // COMPAT: reject stale checkpoints from before a schema change rather than admitting
-        // data that will fail or be misinterpreted during a later materialization.
-        if checkpoint_schema != entry.schema {
-            return Err(DbError::Storage(format!(
-                "MV '{name}' schema mismatch on restore"
-            )));
-        }
-
-        if let MvStorageMode::Upsert { key_cols } = &entry.mode {
-            let mut restored = UpsertState::new(&entry.schema, key_cols)?;
-            for batch in &batches {
-                restored.load_snapshot(name, batch, self.limits)?;
-            }
-            entry.approx_bytes = restored.approx_bytes;
-            entry.upsert = Some(restored);
-            return Ok(());
-        }
-        let (rows, restored_bytes) = super::admission::batch_usage(batches.iter())?;
-        self.limits.validate(name, rows, restored_bytes)?;
-        // Restore rejects over-limit state instead of silently evicting committed rows.
-        if let MvStorageMode::Append { max_batches } = entry.mode {
-            if batches.iter().filter(|batch| batch.num_rows() > 0).count() > max_batches.max(1) {
-                return Err(DbError::Storage(format!(
-                    "MV '{name}' checkpoint exceeds append batch retention"
-                )));
-            }
-        }
-        entry.batches = batches
-            .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .collect();
-        entry.rows = rows;
-        entry.approx_bytes = restored_bytes;
-        Ok(())
-    }
+    let (view, held) = logs
+        .iter()
+        .map(|(view, _, capture)| (view.as_str(), segments(capture)))
+        .max_by_key(|(_, held)| *held)
+        .unwrap_or_default();
+    Err(DbError::Checkpoint(format!(
+        "append-only views retain {total} log segments, above the {MAX_VIEW_LOG_SEGMENTS} one \
+         checkpoint admits; view '{view}' retains {held}"
+    )))
 }
 
 fn capture_size_overflow(name: &str) -> DbError {
     DbError::Checkpoint(format!(
         "MV '{name}' checkpoint capture size estimate overflowed"
     ))
-}
-
-fn add_capture_estimate(total: &mut u64, bytes: usize, name: &str) -> Result<(), DbError> {
-    let bytes = u64::try_from(bytes).map_err(|_| capture_size_overflow(name))?;
-    *total = total
-        .checked_add(bytes)
-        .ok_or_else(|| capture_size_overflow(name))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -425,7 +412,7 @@ where
     Ok(buf)
 }
 
-fn batches_to_ipc_bounded<'a, I>(
+pub(super) fn batches_to_ipc_bounded<'a, I>(
     schema: &SchemaRef,
     batches: I,
     max_bytes: u64,

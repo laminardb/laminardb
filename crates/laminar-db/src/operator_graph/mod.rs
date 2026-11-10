@@ -27,8 +27,7 @@ use crate::operator::capability::{OperatorCapability, OperatorImplementation, Op
 use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
     apply_topk_filter, detect_stream_join_query, detect_unbounded_join_steps,
-    extract_table_references, has_join_clause, join_clause_count, temporal_projection_sql,
-    StreamJoinDetection,
+    extract_table_references, has_join_clause, temporal_projection_sql, StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -36,9 +35,13 @@ use laminar_sql::translator::{
 };
 
 mod catalog_context;
+mod cold_metrics;
 mod input_admission;
 mod process;
+#[cfg(feature = "cluster")]
+mod seeding;
 mod state_restore;
+mod views;
 
 #[cfg(test)]
 use input_admission::retained_input_bytes;
@@ -48,6 +51,8 @@ mod execution_poison;
 mod subscription_output;
 #[cfg(feature = "cluster")]
 mod vnode_transition;
+
+pub(crate) use cold_metrics::VnodeStateLoad;
 
 /// Cached retained managed-state accounting reported by one operator.
 ///
@@ -343,6 +348,12 @@ pub(crate) trait GraphOperator: Send {
         None
     }
 
+    /// The operator's accounted state per vnode, from cached counters under the same rule as
+    /// [`Self::managed_state_accounting`]. `None` means no per-vnode state.
+    fn vnode_loads(&self) -> Option<Vec<VnodeStateLoad>> {
+        None
+    }
+
     /// Drop reconstructible retained state before the graph rejects the global managed-state cap.
     ///
     /// Implementations must leave required/checkpointed state unchanged and return the bytes that
@@ -598,6 +609,23 @@ pub(crate) trait GraphOperator: Send {
     /// Force the next capture to include full bytes for every requested vnode. This is required
     /// after a destructive dirty capture fails before the checkpoint commits.
     fn force_full_vnode_capture(&mut self) {}
+
+    /// Hand over view slices restored by [`Self::restore_vnode`] for the recovery image.
+    fn take_restored_view(&mut self) -> Option<crate::mv_store::RestoredView> {
+        None
+    }
+
+    /// Point a view's result node at the store readers query; a migration compiles its graph
+    /// against a private candidate's store.
+    #[cfg(feature = "cluster")]
+    fn bind_view_store(&mut self, _store: &Arc<parking_lot::RwLock<crate::mv_store::MvStore>>) {}
+
+    /// The consolidated changelog this operator holds at the restored cut, one `+1` row per row
+    /// it holds, or `None` when it keeps none.
+    #[cfg(feature = "cluster")]
+    fn changelog_at_cut(&self) -> Option<Result<Vec<RecordBatch>, DbError>> {
+        None
+    }
 }
 
 /// One authoritative full vnode image prepared for a managed operator.
@@ -710,7 +738,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 7;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 9;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
@@ -1052,6 +1080,8 @@ pub(crate) struct OperatorGraph {
     source_list: Vec<SourceRoute>,
     source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
+    // Changelog views in this store get a result node beside their stream node.
+    view_store: Option<Arc<parking_lot::RwLock<crate::mv_store::MvStore>>>,
     // Reverse of `output_map` (node id → is an output); rebuilt in `compute_topo_order`.
     output_node_ids: FxHashSet<usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
@@ -1139,7 +1169,7 @@ pub(crate) struct OperatorGraph {
     #[cfg(feature = "cluster")]
     event_time_forwards: FxHashSet<String>,
     #[cfg(feature = "cluster")]
-    event_time_roots: Vec<usize>,
+    event_time_chains: Vec<input_admission::SourceFrontierChain>,
     #[cfg(feature = "cluster")]
     remote_exchange_depth: u64,
     // One immutable assignment transition, consumed only after complete lifecycle success.
@@ -1175,6 +1205,7 @@ impl OperatorGraph {
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
+            view_store: None,
             output_node_ids: FxHashSet::default(),
             input_bufs: Vec::new(),
             input_buf_bytes: Vec::new(),
@@ -1212,7 +1243,7 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             event_time_forwards: FxHashSet::default(),
             #[cfg(feature = "cluster")]
-            event_time_roots: Vec::new(),
+            event_time_chains: Vec::new(),
             #[cfg(feature = "cluster")]
             remote_exchange_depth: 0,
             #[cfg(feature = "cluster")]
@@ -1297,9 +1328,13 @@ impl OperatorGraph {
                 ))
                 .into());
             }
+            let bound = self.output_map.contains_key(node.name.as_ref())
+                || node
+                    .name
+                    .strip_suffix(laminar_core::mv::VIEW_RESULT_OPERATOR_SUFFIX)
+                    .is_some_and(|view| self.output_map.contains_key(view));
             if node.capability.state_class != OperatorStateClass::Stateless
-                && (node.capability.managed_state.is_none()
-                    || !self.output_map.contains_key(node.name.as_ref()))
+                && (node.capability.managed_state.is_none() || !bound)
             {
                 return Err(TopologyError::Unsupported(format!(
                     "retained-state operator '{}' lacks a catalog-bound managed state mapping",
@@ -1317,6 +1352,11 @@ impl OperatorGraph {
                     TopologyError::Invalid(format!("output '{name}' has no live planned operator"))
                 })?;
             contracts.insert(name.to_string(), node.capability);
+        }
+        for node in self.nodes.iter().filter(|node| {
+            !node.removed && node.capability.implementation == OperatorImplementation::ViewResult
+        }) {
+            contracts.insert(node.name.to_string(), node.capability);
         }
         Ok(contracts)
     }
@@ -1360,39 +1400,6 @@ impl OperatorGraph {
     pub fn set_metrics(&mut self, m: Arc<EngineMetrics>) {
         self.prom = Some(m);
         self.publish_buffer_stats();
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    pub fn input_buf_pressure(&self) -> f64 {
-        let cap = self.max_input_buf_batches;
-        let max_bytes = self.max_input_buf_bytes;
-
-        let count_ratio = if cap > 0 {
-            let max_len = self
-                .input_bufs
-                .iter()
-                .flat_map(|ports| ports.iter())
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0);
-            max_len as f64 / cap as f64
-        } else {
-            0.0
-        };
-
-        let bytes_ratio = if let Some(max) = max_bytes {
-            let max_bytes_used = self
-                .input_buf_bytes
-                .iter()
-                .flat_map(|ports| ports.iter().copied())
-                .max()
-                .unwrap_or(0);
-            max_bytes_used as f64 / max as f64
-        } else {
-            0.0
-        };
-
-        count_ratio.max(bytes_ratio).min(1.0)
     }
 
     pub(crate) fn has_deferred_work(&self) -> bool {
@@ -1886,6 +1893,26 @@ impl OperatorGraph {
             })
     }
 
+    fn validate_post_process_state_budget(&mut self, node_id: usize) -> Result<(), DbError> {
+        if self.nodes[node_id]
+            .operator
+            .managed_state_accounting()
+            .is_none()
+        {
+            return Ok(());
+        }
+        let context = format!("operator '{}' record processing", self.nodes[node_id].name);
+        self.validate_managed_state_budget(context).map_err(|error| {
+            if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+                error
+            } else {
+                DbError::StatefulOperatorPartialApply(format!(
+                    "managed state changed before the post-process budget check; recovery from the committed checkpoint is required: {error}"
+                ))
+            }
+        })
+    }
+
     fn validate_managed_state_budget(&mut self, context: impl Into<String>) -> Result<(), DbError> {
         let mut accounted_bytes = self.managed_state_accounted_bytes();
         if accounted_bytes > self.max_managed_state_bytes {
@@ -2153,13 +2180,6 @@ impl OperatorGraph {
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
 
-        if join_clause_count(&sql) > 1 {
-            self.build_errors.push(DbError::InvalidOperation(
-                "multi-way streaming joins require explicitly named two-way stages".to_string(),
-            ));
-            return;
-        }
-
         let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
         if ai_calls.len() > 1 {
             self.build_errors.push(DbError::InvalidOperation(
@@ -2407,9 +2427,9 @@ impl OperatorGraph {
             self.order_configs.insert(node_id, oc);
         }
         self.output_map.insert(Arc::from(name.as_str()), node_id);
-        if incremental || ordered_interval {
-            self.changelog_tables.insert(name.clone());
-        }
+        self.attach_view_result(&name);
+        self.changelog_tables
+            .extend((incremental || ordered_interval).then(|| name.clone()));
         self.topo_dirty = true;
     }
 
@@ -3098,25 +3118,10 @@ impl OperatorGraph {
             .process_with_frontiers(if accept { inputs.as_slice() } else { &[][..] }, &frontiers)
             .await;
         drop(process_timer);
-        let output_result = match output_result {
-            Ok(batches) if self.nodes[node_id].capability.managed_state.is_some() => {
-                let budget_context =
-                    format!("operator '{}' record processing", self.nodes[node_id].name);
-                self.validate_managed_state_budget(budget_context)
-                    .map_err(|error| {
-                        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
-                            error
-                        } else {
-                            DbError::StatefulOperatorPartialApply(format!(
-                                "managed state changed before the post-process budget check; recovery from the committed checkpoint is required: {error}"
-                            ))
-                        }
-                    })
-                    .map(|()| batches)
-            }
-            Ok(batches) => Ok(batches),
-            Err(error) => Err(error),
-        };
+        let output_result = output_result.and_then(|batches| {
+            self.validate_post_process_state_budget(node_id)
+                .map(|()| batches)
+        });
 
         let batches = match output_result {
             Ok(b) => {
@@ -3275,8 +3280,12 @@ impl OperatorGraph {
             )
         })?;
         let _rotation_guard = Arc::clone(rotation_fence).read_owned().await;
+        // An ownerless process never binds the replayed topology generation its graph was built
+        // for, and its zero-owner transition requires that inactive transport.
         if let Some(scope) = &self.cluster_shuffle {
-            scope.ensure_topology_current()?;
+            if !vnode_transition::shuffle_transport_is_inactive(scope) {
+                scope.ensure_topology_current()?;
+            }
         }
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
@@ -3303,11 +3312,7 @@ impl OperatorGraph {
                     }
                     Some(version)
                 } else {
-                    if config.sender.assignment_version() != 0
-                        || config.receiver.assignment_version() != 0
-                        || config.sender.active_assignment_digest().is_some()
-                        || config.receiver.active_assignment_digest().is_some()
-                    {
+                    if !vnode_transition::shuffle_transport_is_inactive(config) {
                         return Err(DbError::ShuffleNotReady(
                             "zero-owner vnode transition requires inactive shuffle transport"
                                 .into(),
@@ -3728,71 +3733,6 @@ impl OperatorGraph {
             break;
         }
         Ok(())
-    }
-
-    fn sample_buffer_stats(&mut self) {
-        self.stats_tick = self.stats_tick.wrapping_add(1);
-        if !self.stats_tick.is_multiple_of(STATS_SAMPLE_INTERVAL) {
-            return;
-        }
-        self.publish_buffer_stats();
-    }
-
-    fn publish_buffer_stats(&mut self) {
-        if let Some(ref prom) = self.prom {
-            for (id, ports) in self.input_buf_bytes.iter().enumerate() {
-                if self.nodes[id].removed {
-                    continue;
-                }
-                let total: usize = ports.iter().sum();
-                prom.input_buf_bytes
-                    .with_label_values(&[&self.nodes[id].name])
-                    .set(i64::try_from(total).unwrap_or(i64::MAX));
-            }
-            for (id, node) in self.nodes.iter().enumerate() {
-                if node.removed {
-                    for phase in ["live", "prepared", "retired"] {
-                        let _ = prom
-                            .managed_state_accounted_bytes
-                            .remove_label_values(&[&node.name, phase]);
-                    }
-                    self.managed_state_accounting_peaks[id] =
-                        ManagedStateAccountingSnapshot::default();
-                    continue;
-                }
-                let Some(mut accounting) = node.operator.managed_state_accounting() else {
-                    continue;
-                };
-                let peaks = std::mem::take(&mut self.managed_state_accounting_peaks[id]);
-                accounting.prepared = accounting.prepared.max(peaks.prepared);
-                accounting.retired = accounting.retired.max(peaks.retired);
-                for (phase, bytes) in [
-                    ("live", accounting.live),
-                    ("prepared", accounting.prepared),
-                    ("retired", accounting.retired),
-                ] {
-                    prom.managed_state_accounted_bytes
-                        .with_label_values(&[&node.name, phase])
-                        .set(i64::try_from(bytes).unwrap_or(i64::MAX));
-                }
-            }
-        }
-    }
-
-    /// Retain transient managed-state ownership until the next cold metrics sample.
-    ///
-    /// This performs no Prometheus work and is called only from vnode lifecycle paths.
-    #[cfg(feature = "cluster")]
-    fn observe_managed_state_accounting(&mut self, node_indices: &[usize]) {
-        for &node_idx in node_indices {
-            let node = &self.nodes[node_idx];
-            if node.removed {
-                continue;
-            }
-            if let Some(accounting) = node.operator.managed_state_accounting() {
-                self.managed_state_accounting_peaks[node_idx].observe_transient(accounting);
-            }
-        }
     }
 
     #[cfg(feature = "cluster")]

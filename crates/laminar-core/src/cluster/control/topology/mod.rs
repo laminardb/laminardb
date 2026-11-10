@@ -1,7 +1,7 @@
-//! Control-path identities and explicit adoption of a legacy sealed catalog.
+//! Control-path identities for versioned cluster catalogs.
 //!
-//! Adoption changes the authority encoding, not the processing graph. Runtime migrations must
-//! still establish a checkpoint cut, validate state mappings and commit coordinated release.
+//! The catalog seal records topology one. Runtime migrations must still establish a checkpoint
+//! cut, validate state mappings and commit coordinated release.
 
 use std::num::NonZeroU64;
 
@@ -57,7 +57,7 @@ pub use target_preparation::{
     TopologyTargetPreparationReceipt, TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
 };
 
-/// Version of the topology adoption protocol understood by this binary.
+/// Version of the topology baseline protocol understood by this binary.
 pub const TOPOLOGY_PROTOCOL_VERSION: u16 = 1;
 
 /// Logical topology version, independent of catalog/checkpoint serialization versions.
@@ -66,8 +66,8 @@ pub const TOPOLOGY_PROTOCOL_VERSION: u16 = 1;
 pub struct TopologyVersion(NonZeroU64);
 
 impl TopologyVersion {
-    /// The explicitly adopted legacy inventory is topology one.
-    pub const LEGACY_BASELINE: Self = Self(NonZeroU64::MIN);
+    /// The sealed bootstrap inventory is topology one.
+    pub const BASELINE: Self = Self(NonZeroU64::MIN);
 
     /// Construct a nonzero logical version.
     ///
@@ -123,28 +123,28 @@ impl TopologyOperationId {
     }
 }
 
-/// Immutable identity of the existing inventory at the authority format upgrade.
+/// Immutable identity of the sealed bootstrap inventory.
 ///
 /// This record always represents the original topology one. Later Commit decisions carry the
-/// current catalog separately, retaining this exact adoption and all historical identities.
+/// current catalog separately, retaining this exact baseline and all historical identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LegacyTopologyBaseline {
-    /// Protocol the upgrading binary must understand.
+pub struct TopologyBaseline {
+    /// Protocol the reading binary must understand.
     pub protocol_version: u16,
-    /// Explicitly assigned baseline version, always one.
+    /// Baseline version, always one.
     pub topology_version: TopologyVersion,
-    /// Original manifest reference; bytes, hash and object generations are not rewritten.
+    /// Sealed manifest reference; bytes, hash and object generations are never rewritten.
     pub manifest: CatalogManifestRef,
-    /// Existing checkpoint/control deployment identity.
+    /// Checkpoint/control deployment identity.
     pub deployment_id: String,
-    /// Idempotency identity of the successful upgrade request.
+    /// Identity of the request that wrote this baseline.
     pub operation_id: TopologyOperationId,
     /// The exact shared authority append that admitted this baseline.
     pub authority_sequence: u64,
 }
 
-impl LegacyTopologyBaseline {
+impl TopologyBaseline {
     pub(super) fn validate(&self) -> Result<(), TopologyError> {
         if self.protocol_version != TOPOLOGY_PROTOCOL_VERSION {
             return Err(TopologyError::Protocol(format!(
@@ -152,10 +152,10 @@ impl LegacyTopologyBaseline {
                 self.protocol_version
             )));
         }
-        if self.topology_version != TopologyVersion::LEGACY_BASELINE || self.authority_sequence == 0
-        {
+        if self.topology_version != TopologyVersion::BASELINE || self.authority_sequence == 0 {
             return Err(TopologyError::Invalid(
-                "legacy adoption must bind topology one to a nonzero authority sequence".into(),
+                "the topology baseline must bind topology one to a nonzero authority sequence"
+                    .into(),
             ));
         }
         let deployment = Uuid::parse_str(&self.deployment_id)
@@ -171,20 +171,16 @@ impl LegacyTopologyBaseline {
 }
 
 /// Durable catalog state; missing version metadata is never an implicit current version.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TopologyCatalogState {
     /// No catalog inventory has been sealed.
     Uninitialized,
-    /// A sealed inventory exists, but the format upgrade has not been admitted.
-    LegacySealed {
-        /// Exact existing inventory, with no inferred logical topology version.
-        manifest: CatalogManifestRef,
-    },
-    /// Explicitly adopted inventory. Runtime activation is separate evidence.
+    /// Sealed inventory and its topology baseline. Runtime activation is separate evidence.
     Versioned {
         /// Durable baseline identity.
-        baseline: LegacyTopologyBaseline,
+        baseline: TopologyBaseline,
         /// Latest irreversible catalog decision, absent while topology one remains committed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         committed: Option<TopologyCommit>,
@@ -204,18 +200,9 @@ impl TopologyCatalogState {
                     .as_ref()
                     .map_or(baseline.topology_version, |commit| commit.topology_version),
             ),
-            Self::Uninitialized | Self::LegacySealed { .. } => None,
+            Self::Uninitialized => None,
         }
     }
-}
-
-/// Result of one explicit format upgrade, including the original winner on an identical retry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TopologyAdoptionOutcome {
-    /// This request admitted the baseline.
-    Created(LegacyTopologyBaseline),
-    /// The same baseline was already admitted, possibly by another request.
-    Existing(LegacyTopologyBaseline),
 }
 
 /// Typed, stable control-path failures. No error authorizes a topology or state fallback.

@@ -34,6 +34,8 @@ use laminar_sql::translator::TemporalJoinTranslatorConfig;
 use crate::error::DbError;
 use crate::operator::capability::OperatorCapability;
 #[cfg(feature = "cluster")]
+use crate::operator::shuffle_send::ShuffleSend;
+#[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::operator::ProjectingJoinState;
 #[cfg(feature = "cluster")]
@@ -805,17 +807,11 @@ struct ClusterInputPlan {
 }
 
 #[cfg(feature = "cluster")]
-type TemporalSendTask = tokio::task::JoinHandle<(
-    Result<(), DbError>,
-    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
-)>;
-
-#[cfg(feature = "cluster")]
 struct PendingTemporalClusterInput {
     routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]>,
     outbound: Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
     local_frontiers: [InputFrontier; 2],
-    send: Option<TemporalSendTask>,
+    send: Option<ShuffleSend>,
     accounted_bytes: usize,
 }
 
@@ -824,15 +820,6 @@ enum PendingTemporalCompletion {
     Waiting,
     RetryLater,
     Applied(Vec<RecordBatch>),
-}
-
-#[cfg(feature = "cluster")]
-impl Drop for PendingTemporalClusterInput {
-    fn drop(&mut self) {
-        if let Some(send) = &self.send {
-            send.abort();
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4139,62 +4126,62 @@ impl ManagedTemporalJoinOperator {
         Ok(output)
     }
 
+    /// Starts the pending plan's send unless one is running, and joins its local rows when the
+    /// send finishes in this cycle. `after_replay` marks a cycle that already applied deferred or
+    /// peer work, which a failure here can no longer undo.
     #[cfg(feature = "cluster")]
-    fn start_pending_cluster_send(
+    async fn send_pending_cluster_input(
         &mut self,
         config: &ClusterShuffleConfig,
-        assignment_version: u64,
-    ) {
+        assignment: &VnodeAssignmentSnapshot,
+        after_replay: bool,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let pending = self
             .pending_cluster_input
             .as_mut()
             .expect("temporal send plan must be installed before it starts");
-        debug_assert!(pending.send.is_none());
+        if pending.send.is_some() {
+            return Ok(Vec::new());
+        }
         let outbound = pending
             .outbound
             .take()
             .expect("idle temporal send plan must retain its outbound cut");
-        let topology = config.topology;
-        let sender = Arc::clone(&config.sender);
-        let wake = config.receiver.work_ready_notify();
         let context = format!("temporal join [{}] shuffle", self.name);
-        pending.send = Some(tokio::spawn(async move {
-            let result = crate::operator::send_shuffle_plan_retaining(
-                &sender,
-                topology,
-                assignment_version,
-                outbound,
-                &context,
-            )
-            .await;
-            if !matches!(&result.0, Err(error) if error.is_shuffle_not_ready()) {
-                wake.notify_one();
+        pending.send =
+            Some(ShuffleSend::start(config, assignment.version(), outbound, context).await);
+        match self.finish_pending_cluster_input().await {
+            Ok(PendingTemporalCompletion::Applied(output)) => Ok(output),
+            Ok(PendingTemporalCompletion::Waiting | PendingTemporalCompletion::RetryLater) => {
+                Ok(Vec::new())
             }
-            result
-        }));
+            Err(error) if after_replay => Err(self.remote_replay_error(error)),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(feature = "cluster")]
     async fn finish_pending_cluster_input(&mut self) -> Result<PendingTemporalCompletion, DbError> {
         let finished = self
             .pending_cluster_input
-            .as_ref()
-            .and_then(|pending| pending.send.as_ref())
-            .is_some_and(tokio::task::JoinHandle::is_finished);
-        if !finished {
-            return Ok(PendingTemporalCompletion::Waiting);
-        }
+            .as_mut()
+            .and_then(|pending| ShuffleSend::take_finished(&mut pending.send));
+        let outcome = match finished {
+            None => return Ok(PendingTemporalCompletion::Waiting),
+            Some(Ok(outcome)) => outcome,
+            Some(Err(reason)) => {
+                drop(self.pending_cluster_input.take());
+                return Err(DbError::ShufflePartialSend(format!(
+                    "temporal join [{}] {reason}",
+                    self.name
+                )));
+            }
+        };
         let mut pending = self
             .pending_cluster_input
             .take()
             .expect("finished temporal send plan");
-        let send = pending.send.take().expect("pending temporal send task");
-        let (result, outbound) = send.await.map_err(|error| {
-            DbError::ShufflePartialSend(format!(
-                "temporal join [{}] send task ended without a delivery outcome: {error}",
-                self.name
-            ))
-        })?;
+        let (result, outbound) = outcome;
         if let Err(error) = result {
             if error.is_shuffle_not_ready() {
                 pending.outbound = Some(outbound.ok_or_else(|| {
@@ -4307,13 +4294,10 @@ impl ManagedTemporalJoinOperator {
                     ))),
                 );
             }
-            if self
-                .pending_cluster_input
-                .as_ref()
-                .is_some_and(|pending| pending.send.is_none())
-            {
-                self.start_pending_cluster_send(&config, assignment.version());
-            }
+            deferred_output.extend(
+                self.send_pending_cluster_input(&config, &assignment, processed_deferred_work)
+                    .await?,
+            );
             return Ok(deferred_output);
         }
         if processed_deferred_work {
@@ -4347,8 +4331,9 @@ impl ManagedTemporalJoinOperator {
                 send: None,
                 accounted_bytes,
             });
-            self.start_pending_cluster_send(&config, assignment.version());
-            return Ok(Vec::new());
+            return self
+                .send_pending_cluster_input(&config, &assignment, false)
+                .await;
         }
         let output = self.execute_routed(&plan.routed, plan.effective_frontiers)?;
         let output = self

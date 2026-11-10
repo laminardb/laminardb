@@ -163,6 +163,7 @@ impl DeltaLakeSink {
         }
 
         if table.version().is_some() {
+            delta_io::reject_column_mapped_table(&table)?;
             super::super::schema_resolution::verify_identity(
                 self.schema_binding.as_ref(),
                 &super::super::schema_resolution::delta_native(&table)?,

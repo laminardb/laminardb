@@ -570,7 +570,7 @@ async fn group_vnode_matches_shuffle_row_vnode() {
     let vnode_count = NonZeroU32::new(u32::from(key_groups.get())).unwrap();
     let rows = state.row_converter.convert_columns(keys.columns()).unwrap();
     let group_vnodes: Vec<u32> = (0..keys.num_rows())
-        .map(|row| IncrementalAggState::vnode_for_group_key(2, &rows.row(row).owned(), vnode_count))
+        .map(|row| IncrementalAggState::vnode_for_group_key(2, rows.row(row).data(), vnode_count))
         .collect();
     let routed =
         crate::operator::sql_query::hash_rows_to_vnodes(&keys, 2, vnode_count.get()).unwrap();
@@ -985,7 +985,7 @@ async fn global_partials_merge_exactly_like_their_batches() {
     }
     let partial = folder.global_partial_batch(&batches).unwrap();
     assert_eq!(partial.num_rows(), batches.len());
-    assert_eq!(partial.schema(), folder.global_partial_schema().unwrap());
+    assert_eq!(partial.schema(), folder.global_partial_schema());
     merged.merge_global_partials(&partial, 10).unwrap();
 
     assert_eq!(checkpoint_bytes(&mut merged), checkpoint_bytes(&mut direct));
@@ -1109,7 +1109,7 @@ async fn local_keyed_state_routes_across_common_vnodes() {
         .map(|row| {
             IncrementalAggState::vnode_for_group_key(
                 state.num_group_cols,
-                &rows.row(row).owned(),
+                rows.row(row).data(),
                 state.routing_vnode_count(),
             )
         })
@@ -1723,6 +1723,31 @@ async fn test_group_by_simple_column_still_works() {
     );
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn vnode_transition_over_the_group_cap_halts() {
+    let (_, mut state) =
+        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+    state.set_max_groups_for_test(2);
+    state
+        .process_batch(&sum_pre_agg_batch(&["a", "b"], &[10.0, 20.0]), 1)
+        .unwrap();
+
+    let error = state
+        .preflight_vnode_transition_cardinality(
+            u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
+            &[(0, 2)],
+            &rustc_hash::FxHashSet::default(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, crate::DbError::GroupLimitExceeded { limit: 2, .. }),
+        "{error}"
+    );
+    assert!(error.requires_pipeline_halt());
+}
+
 #[tokio::test]
 async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     let (_, mut state) =
@@ -1737,7 +1762,18 @@ async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     let over_limit = sum_pre_agg_batch(&["a", "c"], &[5.0, 100.0]);
     for _ in 0..2 {
         let error = state.process_batch(&over_limit, 2).unwrap_err();
-        assert!(error.to_string().contains("group limit exceeded"));
+        assert!(
+            matches!(
+                error,
+                crate::DbError::GroupLimitExceeded {
+                    groups: 3,
+                    limit: 2,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.requires_pipeline_halt());
         assert_eq!(checkpoint_bytes(&mut state), before);
     }
 }
@@ -2005,32 +2041,83 @@ async fn test_cascaded_agg_retract_batch() {
     }
 }
 
+/// Retracting a group's extreme reveals the next value, and a restored state retracts exactly the
+/// row the original emitted.
 #[tokio::test]
-async fn weighted_min_and_max_are_rejected_at_admission() {
+async fn changelog_min_and_max_retract_to_the_next_extreme_across_a_restore() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
         Field::new("price", DataType::Int64, false),
         Field::new(WEIGHT_COLUMN, DataType::Int64, false),
     ]));
-    let batch = RecordBatch::try_new(
+    let raw = |symbols: &[&str], prices: &[i64], weights: &[i64]| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(symbols.to_vec())),
+                Arc::new(arrow::array::Int64Array::from(prices.to_vec())),
+                Arc::new(arrow::array::Int64Array::from(weights.to_vec())),
+            ],
+        )
+        .unwrap()
+    };
+    let table = datafusion::datasource::MemTable::try_new(
         Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
+        vec![vec![raw(&["X"], &[1], &[1])]],
     )
     .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
+    ctx.register_table("upstream", Arc::new(table)).unwrap();
+    let sql = "SELECT symbol, MIN(price) AS lo, MAX(price) AS hi FROM upstream GROUP BY symbol";
+    let apply = |state: &mut IncrementalAggState, batch: RecordBatch, watermark: i64| {
+        let projected = state
+            .compiled_projection()
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap();
+        state.process_batch(&projected, watermark).unwrap();
+    };
+    let emitted = |state: &mut IncrementalAggState| {
+        let output = arrow::util::pretty::pretty_format_batches(&state.emit().unwrap())
+            .unwrap()
+            .to_string();
+        let mut rows = output
+            .lines()
+            .filter(|line| line.starts_with("| ") && !line.contains("symbol"))
+            .map(|line| line.split_whitespace().collect::<String>())
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
 
-    for sql in [
-        "SELECT symbol, MIN(price) AS value FROM upstream GROUP BY symbol",
-        "SELECT symbol, MAX(price) AS value FROM upstream GROUP BY symbol",
-    ] {
-        assert!(try_from_sql_local(&ctx, sql, false).await.is_err(), "{sql}");
+    let mut original = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
+    let empty = original.accounted_state_bytes();
+    apply(
+        &mut original,
+        raw(&["X", "X", "X", "Y"], &[5, 3, 9, 1], &[1, 1, 1, 1]),
+        10,
+    );
+    assert_eq!(emitted(&mut original), ["|X|3|9|1|", "|Y|1|1|1|"]);
+    let four_values = original.accounted_state_bytes();
+    apply(&mut original, raw(&["X", "X"], &[3, 9], &[-1, -1]), 20);
+    assert!(original.cached_usage_matches_structural_recompute());
+    assert!(empty < original.accounted_state_bytes());
+    assert!(original.accounted_state_bytes() < four_values);
+    let checkpoints = capture_all_vnodes(&mut original).unwrap();
+    let mut restored = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
+    let vnode_count = u32::from(restored.key_group_count().get());
+    for (vnode, checkpoint) in checkpoints {
+        restored
+            .restore_vnode(vnode, vnode_count, checkpoint)
+            .unwrap();
     }
+
+    let next = raw(&["X", "Y", "X"], &[5, 1, 7], &[-1, -1, 1]);
+    apply(&mut original, next.clone(), 30);
+    apply(&mut restored, next, 30);
+    let expected = ["|X|3|9|-1|", "|X|7|7|1|", "|Y|1|1|-1|"];
+    assert_eq!(emitted(&mut original), expected);
+    assert_eq!(emitted(&mut restored), expected);
 }
 
 #[tokio::test]
@@ -2297,6 +2384,46 @@ async fn pending_group_deletion_survives_vnode_checkpoint() {
 }
 
 #[tokio::test]
+async fn a_restored_changelog_retracts_exactly_the_values_it_emitted() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let key_groups = KeyGroupCount::try_from(1_u32).unwrap();
+    let (_, mut original) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    original
+        .process_batch(&sum_pre_agg_batch(&["a", "b", "c"], &[1.0, 2.0, 3.0]), 10)
+        .unwrap();
+    original.emit().unwrap();
+    original
+        .process_batch(&sum_pre_agg_batch(&["d"], &[4.0]), 20)
+        .unwrap();
+    let checkpoints = capture_all_vnodes(&mut original).unwrap();
+    let (_, mut restored) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    for (vnode, checkpoint) in checkpoints {
+        restored.restore_vnode(vnode, 1, checkpoint).unwrap();
+    }
+
+    let next = sum_pre_agg_batch(&["a", "d"], &[10.0, 1.0]);
+    let sorted_lines = |state: &mut IncrementalAggState| {
+        state.process_batch(&next, 30).unwrap();
+        let output = arrow::util::pretty::pretty_format_batches(&state.emit().unwrap())
+            .unwrap()
+            .to_string();
+        let mut lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
+        lines.sort();
+        lines
+    };
+    let expected = sorted_lines(&mut original);
+    assert_eq!(sorted_lines(&mut restored), expected);
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|line| line.starts_with("| "))
+            .count(),
+        4,
+        "a header, a's retraction and insertion, and d's first insertion"
+    );
+}
+
+#[tokio::test]
 async fn test_cascaded_avg_over_changelog() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
@@ -2373,59 +2500,6 @@ async fn test_cascaded_avg_over_changelog() {
         (avg2.value(0) - 25.0).abs() < 0.001,
         "avg should be 25.0 after retraction"
     );
-}
-
-fn round_trip(sv: &ScalarValue) -> ScalarValue {
-    let bytes = scalars_to_ipc(std::slice::from_ref(sv)).unwrap();
-    let back = ipc_to_scalars(&bytes).unwrap();
-    assert_eq!(back.len(), 1);
-    back.into_iter().next().unwrap()
-}
-
-#[test]
-fn scalar_ipc_round_trip() {
-    // Arrow IPC preserves exact type — no widening, unlike the old JSON path.
-    assert_eq!(round_trip(&ScalarValue::Null), ScalarValue::Null);
-    assert_eq!(
-        round_trip(&ScalarValue::Boolean(Some(true))),
-        ScalarValue::Boolean(Some(true)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Int64(Some(-42))),
-        ScalarValue::Int64(Some(-42)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Float64(Some(2.72))),
-        ScalarValue::Float64(Some(2.72)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Utf8(Some("hello".into()))),
-        ScalarValue::Utf8(Some("hello".into())),
-    );
-    let tz: Option<Arc<str>> = Some(Arc::from("UTC"));
-    assert_eq!(
-        round_trip(&ScalarValue::TimestampNanosecond(
-            Some(1_000_000),
-            tz.clone()
-        )),
-        ScalarValue::TimestampNanosecond(Some(1_000_000), tz),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Date32(Some(19000))),
-        ScalarValue::Date32(Some(19000)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Date64(Some(1_700_000_000_000))),
-        ScalarValue::Date64(Some(1_700_000_000_000)),
-    );
-}
-
-#[test]
-fn binary_scalar_roundtrips_exactly() {
-    // Under the old serde_json path, Binary was string-coerced via the
-    // "STR" fallback. Arrow IPC preserves Binary natively.
-    let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
-    assert_eq!(round_trip(&sv), sv);
 }
 
 /// Registers `fills (symbol, kind, qty DECIMAL(18, 8), px DOUBLE)` and returns three rows:

@@ -60,9 +60,11 @@ fn symbol_for_vnode(state: &IncrementalAggState, vnode: u32, start: u32) -> Stri
             .row_converter
             .convert_columns(&[Arc::clone(input.column(0))])
             .unwrap();
-        let key = rows.row(0).owned();
-        if IncrementalAggState::vnode_for_group_key(state.num_group_cols, &key, vnode_count)
-            == vnode
+        if IncrementalAggState::vnode_for_group_key(
+            state.num_group_cols,
+            rows.row(0).data(),
+            vnode_count,
+        ) == vnode
         {
             return symbol;
         }

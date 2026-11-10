@@ -2,19 +2,19 @@
 //!
 //! One `IncrementalAggState` per operator; grouped accumulators are partitioned by stable vnodes.
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
+use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{Array, ArrayRef};
-use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
-use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::AggregateUDF;
 use laminar_core::state::{KeyGroupCount, PartitionKeyCodecV1};
 
@@ -30,17 +30,23 @@ mod compile;
 mod concrete;
 mod emission;
 mod global;
+mod group_map;
+mod grouping;
+#[cfg(all(feature = "cluster", any(test, feature = "benchmark-internals")))]
+pub(crate) mod keyed_partial;
 mod keys;
+mod output_column;
 #[cfg(feature = "cluster")]
 mod output_sequence;
-mod scalar_ipc;
+#[cfg(feature = "cluster")]
+mod seeding;
 mod vnode_state;
 pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
 #[cfg(feature = "cluster")]
 pub(crate) use checkpoints::AggStateRestorePreflight;
 pub(crate) use checkpoints::{
-    query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
-    GroupCheckpoint, WindowCheckpoint,
+    arrays_to_ipc_bounded, encode_accumulator_states, encode_group_keys, query_fingerprint,
+    query_fingerprint_with_config, AggStateCheckpoint, EncodeBudget,
 };
 #[cfg(test)]
 pub(crate) use compile::expr_to_sql;
@@ -49,82 +55,15 @@ pub(crate) use compile::{
     find_aggregate, find_post_aggregate_projection,
     post_aggregate_projection_is_positional_identity, CompiledProjection, PreAggBuilder,
 };
-pub(crate) use concrete::{ConcreteAggregateState, ConcreteInputMode};
+pub(crate) use concrete::{AggregateInput, ConcreteAggregateState, ConcreteInputMode};
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
-pub(crate) use keys::{
-    global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
-};
-#[cfg(test)]
-pub(crate) use scalar_ipc::scalars_to_ipc;
-pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc_bounded};
+use group_map::{GroupKey, GroupMap};
+use grouping::BatchGroups;
+pub(crate) use grouping::{EncodedKeys, FixedWidthKeyGrouper};
+pub(crate) use keys::global_aggregate_key;
+pub(crate) use output_column::OutputColumn;
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
-
-/// Builds the per-window result batch for one closed window.
-/// Output schema: `[group_cols..., agg_outputs...]`.
-pub(crate) fn emit_window_batch(
-    groups: FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
-    row_converter: &arrow::row::RowConverter,
-    num_group_cols: usize,
-    agg_specs: &[AggFuncSpec],
-    output_schema: &SchemaRef,
-) -> Result<Option<RecordBatch>, DbError> {
-    let num_rows = groups.len();
-    if num_rows == 0 {
-        return Ok(None);
-    }
-
-    // Collect keys and evaluate accumulators in a single drain pass.
-    let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
-    let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..agg_specs.len())
-        .map(|_| Vec::with_capacity(num_rows))
-        .collect();
-
-    for (key, mut accs) in groups {
-        row_keys.push(key);
-        for (i, acc) in accs.iter_mut().enumerate() {
-            let sv = acc
-                .evaluate()
-                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
-            agg_scalars[i].push(sv);
-        }
-    }
-
-    let group_arrays = if num_group_cols == 0 {
-        Vec::new()
-    } else {
-        row_converter
-            .convert_rows(row_keys.iter().map(arrow::row::OwnedRow::row))
-            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
-    };
-
-    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
-    for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
-        let spec = &agg_specs[agg_idx];
-        let array = ScalarValue::iter_to_array(scalars)
-            .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
-        if array.data_type() == &spec.return_type {
-            agg_arrays.push(array);
-        } else {
-            let casted = arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "window aggregate '{}' result cast failed: {error}",
-                    spec.output_name
-                ))
-            })?;
-            agg_arrays.push(casted);
-        }
-    }
-
-    let mut all_arrays = Vec::with_capacity(group_arrays.len() + agg_arrays.len());
-    all_arrays.extend(group_arrays);
-    all_arrays.extend(agg_arrays);
-
-    let batch = RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
-        .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
-
-    Ok(Some(batch))
-}
 
 pub(crate) struct AggFuncSpec {
     pub(crate) udf: Arc<AggregateUDF>,
@@ -134,48 +73,6 @@ pub(crate) struct AggFuncSpec {
     pub(crate) return_type: DataType,
     pub(crate) is_count_star: bool,
     pub(crate) filter_col_index: Option<usize>,
-}
-
-impl AggFuncSpec {
-    pub(crate) fn create_accumulator(
-        &self,
-    ) -> Result<Box<dyn datafusion_expr::Accumulator>, DbError> {
-        let return_field = Arc::new(Field::new(
-            &self.output_name,
-            self.return_type.clone(),
-            true,
-        ));
-        let schema = Schema::new(
-            self.input_types
-                .iter()
-                .enumerate()
-                .map(|(i, dt)| Field::new(format!("col_{i}"), dt.clone(), true))
-                .collect::<Vec<_>>(),
-        );
-        let expr_fields: Vec<Arc<Field>> = self
-            .input_types
-            .iter()
-            .enumerate()
-            .map(|(i, dt)| Arc::new(Field::new(format!("col_{i}"), dt.clone(), true)))
-            .collect();
-        let args = AccumulatorArgs {
-            return_field,
-            schema: &schema,
-            ignore_nulls: false,
-            order_bys: &[],
-            is_reversed: false,
-            name: self.udf.name(),
-            is_distinct: false,
-            exprs: &[],
-            expr_fields: &expr_fields,
-        };
-        self.udf.accumulator(args).map_err(|e| {
-            DbError::Pipeline(format!(
-                "accumulator creation failed for '{}': {e}",
-                self.udf.name()
-            ))
-        })
-    }
 }
 
 fn decimal_fits_managed_checkpoint_ipc(precision: u8, scale: i8, maximum: u8) -> bool {
@@ -263,29 +160,10 @@ fn require_managed_checkpoint_scalar_type(
     }
 }
 
-fn arrays_to_ipc_bounded(arrays: &[ArrayRef], max_bytes: usize) -> Result<Vec<u8>, DbError> {
-    if arrays.is_empty() {
-        return Ok(Vec::new());
-    }
-    let fields: Vec<Arc<Field>> = arrays
-        .iter()
-        .enumerate()
-        .map(|(i, a)| Arc::new(Field::new(format!("c{i}"), a.data_type().clone(), true)))
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, arrays.to_vec())
-        .map_err(|e| DbError::Pipeline(format!("columnar batch build: {e}")))?;
-    laminar_core::serialization::serialize_batches_stream_bounded(
-        batch.schema().as_ref(),
-        std::iter::once(&batch),
-        max_bytes,
-    )
-    .map_err(|e| DbError::Pipeline(format!("columnar IPC encode: {e}")))
-}
-
 struct CapturedAggregateGroup {
     key: arrow::row::OwnedRow,
     accumulator_states: Vec<Vec<ScalarValue>>,
+    last_emitted: Option<Vec<ScalarValue>>,
     input_weight: i64,
     last_updated_ms: i64,
 }
@@ -296,7 +174,6 @@ pub(crate) struct AggregateVnodeCheckpointCapture {
     group_types: Arc<[DataType]>,
     row_converter: Arc<arrow::row::RowConverter>,
     groups: Vec<CapturedAggregateGroup>,
-    last_emitted: Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>,
     retained_bytes: u64,
 }
 
@@ -306,7 +183,7 @@ impl AggregateVnodeCheckpointCapture {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.next_output_sequence == 0 && self.groups.is_empty() && self.last_emitted.is_empty()
+        self.next_output_sequence == 0 && self.groups.is_empty()
     }
 
     fn calculate_retained_bytes(&self) -> u64 {
@@ -348,220 +225,72 @@ impl AggregateVnodeCheckpointCapture {
                         .saturating_mul(std::mem::size_of::<ScalarValue>()),
                 );
             }
-        }
-        add(
-            &mut retained,
-            self.last_emitted
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(arrow::row::OwnedRow, Vec<ScalarValue>)>()),
-        );
-        for (key, values) in &self.last_emitted {
-            add(&mut retained, key.as_ref().len());
-            for value in values {
-                add(&mut retained, value.size());
+            if let Some(values) = &group.last_emitted {
+                for value in values {
+                    add(&mut retained, value.size());
+                }
+                add(
+                    &mut retained,
+                    values
+                        .capacity()
+                        .saturating_sub(values.len())
+                        .saturating_mul(std::mem::size_of::<ScalarValue>()),
+                );
             }
-            add(
-                &mut retained,
-                values
-                    .capacity()
-                    .saturating_sub(values.len())
-                    .saturating_mul(std::mem::size_of::<ScalarValue>()),
-            );
         }
         retained
     }
 
-    pub(crate) fn encode(self, max_working_bytes: usize) -> Result<AggStateCheckpoint, DbError> {
-        fn checked_product(left: usize, right: usize, component: &str) -> Result<usize, DbError> {
-            left.checked_mul(right).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} checkpoint accounting overflow"
-                ))
-            })
-        }
-
-        fn checked_sum(
-            values: impl IntoIterator<Item = usize>,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            values.into_iter().try_fold(0usize, |total, value| {
-                total.checked_add(value).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "aggregate {component} checkpoint accounting overflow"
-                    ))
-                })
-            })
-        }
-
-        fn array_scratch_bytes<'a>(
-            values: impl IntoIterator<Item = &'a ScalarValue>,
-            rows: usize,
-            columns: usize,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            let payload = checked_sum(values.into_iter().map(ScalarValue::size), component)?;
-            let copied_payload = checked_product(payload, 2, component)?;
-            let cell_overhead = checked_product(rows, columns, component)
-                .and_then(|cells| checked_product(cells, 32, component))?;
-            checked_sum(
-                [
-                    copied_payload,
-                    cell_overhead,
-                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
-                ],
-                component,
-            )
-        }
-
-        fn row_scratch_bytes(
-            payload_bytes: usize,
-            rows: usize,
-            columns: usize,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            checked_sum(
-                [
-                    checked_product(payload_bytes, 2, component)?,
-                    checked_product(rows, columns, component)
-                        .and_then(|cells| checked_product(cells, 32, component))?,
-                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
-                ],
-                component,
-            )
-        }
-
-        fn transient_limit(
-            remaining: usize,
-            scratch: usize,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            remaining.checked_sub(scratch).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} scratch space exceeded its cumulative checkpoint byte limit"
-                ))
-            })
-        }
-
-        fn retain_roster<T>(
-            remaining: &mut usize,
-            capacity: usize,
-            component: &str,
-        ) -> Result<(), DbError> {
-            let bytes = checked_product(capacity, std::mem::size_of::<T>(), component)?;
-            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} exceeded its cumulative checkpoint byte limit"
-                ))
-            })?;
-            Ok(())
-        }
-
-        fn retain_encoded(
-            remaining: &mut usize,
-            encoded: Vec<u8>,
-            component: &str,
-        ) -> Result<Vec<u8>, DbError> {
-            *remaining = remaining.checked_sub(encoded.capacity()).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} exceeded its cumulative checkpoint byte limit"
-                ))
-            })?;
-            Ok(encoded)
-        }
-
-        let mut remaining = max_working_bytes;
-        let keys_ipc = if self.groups.is_empty() || self.group_types.is_empty() {
-            Vec::new()
-        } else {
-            let key_payload = checked_sum(
-                self.groups.iter().map(|group| group.key.as_ref().len()),
-                "group keys",
-            )?;
-            let scratch = row_scratch_bytes(
-                key_payload,
-                self.groups.len(),
-                self.group_types.len(),
-                "group keys",
-            )?;
-            let encode_limit = transient_limit(remaining, scratch, "group keys")?;
-            let arrays = self
-                .row_converter
-                .convert_rows(self.groups.iter().map(|group| group.key.row()))
-                .map_err(|error| {
-                    DbError::Checkpoint(format!("aggregate group key array build: {error}"))
-                })?;
-            let encoded = arrays_to_ipc_bounded(&arrays, encode_limit)?;
-            retain_encoded(&mut remaining, encoded, "group keys")?
-        };
-
-        let accumulator_count = self
-            .groups
-            .first()
-            .map_or(0, |group| group.accumulator_states.len());
-        if self
-            .groups
-            .iter()
-            .any(|group| group.accumulator_states.len() != accumulator_count)
-        {
-            return Err(DbError::Checkpoint(
-                "aggregate checkpoint capture has inconsistent accumulator arity".into(),
-            ));
-        }
-
-        retain_roster::<Vec<u8>>(
-            &mut remaining,
-            accumulator_count,
-            "accumulator state roster",
-        )?;
-        let mut acc_state_ipc = Vec::with_capacity(accumulator_count);
-        for accumulator_index in 0..accumulator_count {
-            let arity = self
-                .groups
-                .first()
-                .map_or(0, |group| group.accumulator_states[accumulator_index].len());
-            if self
-                .groups
-                .iter()
-                .any(|group| group.accumulator_states[accumulator_index].len() != arity)
-            {
+    /// The rows of the groups holding last emitted values, and those values as columns.
+    fn emitted_columns(&self, arity: usize) -> Result<(Vec<u32>, Vec<ArrayRef>), DbError> {
+        let mut rows = Vec::new();
+        for (row, group) in self.groups.iter().enumerate() {
+            let Some(values) = &group.last_emitted else {
+                continue;
+            };
+            if values.len() != arity {
                 return Err(DbError::Checkpoint(
-                    "aggregate checkpoint capture has inconsistent state arity".into(),
+                    "aggregate checkpoint capture has inconsistent changelog arity".into(),
                 ));
             }
-            let scratch = array_scratch_bytes(
-                self.groups
-                    .iter()
-                    .flat_map(|group| group.accumulator_states[accumulator_index].iter()),
-                self.groups.len(),
-                arity,
-                "accumulator state",
-            )?;
-            let encode_limit = transient_limit(remaining, scratch, "accumulator state")?;
-            let mut columns = Vec::with_capacity(arity);
-            for column in 0..arity {
-                columns.push(
-                    ScalarValue::iter_to_array(
-                        self.groups.iter().map(|group| {
-                            group.accumulator_states[accumulator_index][column].clone()
-                        }),
-                    )
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate accumulator state array build: {error}"
-                        ))
-                    })?,
-                );
-            }
-            let encoded = arrays_to_ipc_bounded(&columns, encode_limit)?;
-            acc_state_ipc.push(retain_encoded(
-                &mut remaining,
-                encoded,
-                "accumulator state",
-            )?);
+            rows.push(u32::try_from(row).map_err(|_| {
+                DbError::Checkpoint(format!("aggregate checkpoint group row {row} exceeds u32"))
+            })?);
         }
+        let columns = (0..arity)
+            .map(|column| {
+                ScalarValue::iter_to_array(
+                    self.groups
+                        .iter()
+                        .filter_map(|group| group.last_emitted.as_ref())
+                        .map(|values| values[column].clone()),
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("aggregate changelog value array build: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((rows, columns))
+    }
 
-        retain_roster::<i64>(&mut remaining, self.groups.len(), "last-updated roster")?;
-        retain_roster::<i64>(&mut remaining, self.groups.len(), "input-weight roster")?;
+    pub(crate) fn encode(self, max_working_bytes: usize) -> Result<AggStateCheckpoint, DbError> {
+        let mut budget = EncodeBudget::new(max_working_bytes, "aggregate");
+        let keys_ipc = encode_group_keys(
+            &self.row_converter,
+            self.group_types.len(),
+            self.groups.iter().map(|group| &group.key),
+            &mut budget,
+        )?;
+        let acc_state_ipc = encode_accumulator_states(
+            &self
+                .groups
+                .iter()
+                .map(|group| group.accumulator_states.as_slice()),
+            &mut budget,
+        )?;
+
+        budget.retain_roster::<i64>(self.groups.len(), "last-updated roster")?;
+        budget.retain_roster::<i64>(self.groups.len(), "input-weight roster")?;
         let input_weights = self
             .groups
             .iter()
@@ -573,30 +302,24 @@ impl AggregateVnodeCheckpointCapture {
             .map(|group| group.last_updated_ms)
             .collect::<Vec<_>>();
 
-        retain_roster::<EmittedCheckpoint>(
-            &mut remaining,
-            self.last_emitted.len(),
-            "changelog roster",
+        let emitted = || {
+            self.groups
+                .iter()
+                .filter_map(|group| group.last_emitted.as_ref())
+        };
+        let emitted_count = emitted().count();
+        let emitted_arity = emitted().next().map_or(0, Vec::len);
+        budget.retain_roster::<u32>(emitted_count, "changelog roster")?;
+        let payload = budget.sum(
+            emitted().flatten().map(ScalarValue::size),
+            "changelog values",
         )?;
-        let mut last_emitted = Vec::with_capacity(self.last_emitted.len());
-        for (key, values) in self.last_emitted {
-            let key_scratch = row_scratch_bytes(
-                key.as_ref().len(),
-                1,
-                self.group_types.len(),
-                "changelog key",
-            )?;
-            let key_limit = transient_limit(remaining, key_scratch, "changelog key")?;
-            let key = row_to_scalar_key_with_types(&self.row_converter, &key, &self.group_types)?;
-            let key = scalars_to_ipc_bounded(&key, key_limit)?;
-            let key = retain_encoded(&mut remaining, key, "changelog key")?;
-            let value_scratch =
-                array_scratch_bytes(values.iter(), 1, values.len(), "changelog values")?;
-            let value_limit = transient_limit(remaining, value_scratch, "changelog values")?;
-            let values = scalars_to_ipc_bounded(&values, value_limit)?;
-            let values = retain_encoded(&mut remaining, values, "changelog values")?;
-            last_emitted.push(EmittedCheckpoint { key, values });
-        }
+        let scratch =
+            budget.array_scratch(payload, emitted_count, emitted_arity, "changelog values")?;
+        let encode_limit = budget.transient_limit(scratch, "changelog values")?;
+        let (emitted_groups, emitted_columns) = self.emitted_columns(emitted_arity)?;
+        let emitted_values_ipc = arrays_to_ipc_bounded(&emitted_columns, encode_limit)?;
+        let emitted_values_ipc = budget.retain_encoded(emitted_values_ipc, "changelog values")?;
 
         let checkpoint = AggStateCheckpoint {
             fingerprint: self.fingerprint,
@@ -605,7 +328,8 @@ impl AggregateVnodeCheckpointCapture {
             acc_state_ipc,
             input_weights,
             last_updated_ms,
-            last_emitted,
+            emitted_groups,
+            emitted_values_ipc,
         };
         debug_assert_checkpoint_within(&checkpoint, max_working_bytes);
         Ok(checkpoint)
@@ -629,7 +353,7 @@ struct DecodedAggMutation {
 
 /// A decoded vnode image built off-side before publication.
 struct StagedAggMutation {
-    groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+    groups: GroupMap,
     last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
 }
 
@@ -736,7 +460,7 @@ fn decode_columnar_state_scalars(
     Ok(out)
 }
 
-fn build_concrete_states_from_checkpoint(
+pub(crate) fn build_concrete_states_from_checkpoint(
     templates: &[ConcreteAggregateState],
     checkpoint: &[Vec<ScalarValue>],
 ) -> Result<Vec<ConcreteAggregateState>, DbError> {
@@ -767,7 +491,8 @@ fn validate_columnar_acc_shape(
         if !checkpoint.keys_ipc.is_empty()
             || !checkpoint.acc_state_ipc.is_empty()
             || !checkpoint.input_weights.is_empty()
-            || !checkpoint.last_emitted.is_empty()
+            || !checkpoint.emitted_groups.is_empty()
+            || !checkpoint.emitted_values_ipc.is_empty()
         {
             return Err(DbError::Pipeline(
                 "non-canonical empty aggregate checkpoint contains state payloads".into(),
@@ -810,6 +535,9 @@ pub(crate) struct IncrementalAggState {
     aggregate_templates: Vec<ConcreteAggregateState>,
     vnode_states: AggregateVnodeSlots,
     row_converter: Arc<arrow::row::RowConverter>,
+    fixed_key_grouper: Option<FixedWidthKeyGrouper>,
+    /// Distinct keys in the last grouped batch, which sizes the next batch's grouping table.
+    previous_batch_groups: usize,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -840,6 +568,21 @@ impl IncrementalAggState {
     #[must_use]
     pub(crate) fn num_group_cols(&self) -> usize {
         self.num_group_cols
+    }
+
+    fn admit_group_count(
+        &self,
+        groups: usize,
+        context: impl FnOnce() -> String,
+    ) -> Result<(), DbError> {
+        if groups > self.max_groups {
+            return Err(DbError::GroupLimitExceeded {
+                context: context(),
+                groups,
+                limit: self.max_groups,
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -922,13 +665,9 @@ impl IncrementalAggState {
         )?;
         let final_lower_bound =
             checked_vnode_transition_capacity(retained_group_count, replacement_lower_bound)?;
-        if final_lower_bound > self.max_groups {
-            return Err(DbError::Pipeline(format!(
-                "aggregate group limit exceeded during vnode transition preflight: retained={retained_group_count}, replacement_lower_bound={replacement_lower_bound}, limit={}",
-                self.max_groups
-            )));
-        }
-        Ok(())
+        self.admit_group_count(final_lower_bound, || {
+            format!("aggregate vnode transition preflight (retained={retained_group_count}, replacement_lower_bound={replacement_lower_bound})")
+        })
     }
 
     /// Deterministic inline roster bytes allocated while one all-vnode replacement is prepared.
@@ -1050,39 +789,23 @@ fn build_weighted_batch(
     agg_specs: &[AggFuncSpec],
     output_schema: &SchemaRef,
 ) -> Result<RecordBatch, DbError> {
-    let group_arrays = if num_group_cols > 0 {
+    let mut all_arrays = if num_group_cols > 0 {
         row_converter
             .convert_rows(keys.iter().map(arrow::row::OwnedRow::row))
             .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
     } else {
         Vec::new()
     };
-
-    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
     for (agg_idx, spec) in agg_specs.iter().enumerate() {
-        let scalars: Vec<ScalarValue> = vals.iter().map(|v| v[agg_idx].clone()).collect();
-        let array = ScalarValue::iter_to_array(scalars)
-            .map_err(|e| DbError::Pipeline(format!("agg array: {e}")))?;
-        if array.data_type() == &spec.return_type {
-            agg_arrays.push(array);
-        } else {
-            let casted = arrow::compute::cast(&array, &spec.return_type).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "weighted aggregate '{}' result cast failed: {error}",
-                    spec.output_name
-                ))
-            })?;
-            agg_arrays.push(casted);
+        let mut column = OutputColumn::with_capacity(vals.len());
+        for values in vals {
+            column.push(Cow::Borrowed(&values[agg_idx]))?;
         }
+        all_arrays.push(column.finish(spec)?);
     }
-
-    let weight_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+    all_arrays.push(Arc::new(arrow::array::Int64Array::from_iter_values(
         weights.iter().copied(),
-    ));
-
-    let mut all_arrays = group_arrays;
-    all_arrays.extend(agg_arrays);
-    all_arrays.push(weight_array);
+    )));
 
     RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
         .map_err(|e| DbError::Pipeline(format!("weighted batch: {e}")))
@@ -1350,13 +1073,7 @@ impl IncrementalAggState {
         for (aggregate_index, (spec, template)) in
             agg_specs.iter().zip(&aggregate_templates).enumerate()
         {
-            let checkpoint_state = template.checkpoint_state().map_err(|error| {
-                DbError::Unsupported(format!(
-                    "[{}] managed aggregate checkpoint state {aggregate_index} ('{}') cannot expose its initialization shape: {error}",
-                    laminar_core::error_codes::SQL_UNSUPPORTED,
-                    spec.output_name
-                ))
-            })?;
+            let checkpoint_state = template.checkpoint_state();
             for (state_index, scalar) in checkpoint_state.iter().enumerate() {
                 require_managed_checkpoint_scalar_type(
                     &scalar.data_type(),
@@ -1412,8 +1129,12 @@ impl IncrementalAggState {
         } else if agg_info.where_predicate.is_none() {
             // Changelog source, no WHERE: append the `__weight` passthrough. A WHERE over a
             // changelog needs retraction-aware filtering — fall back to the cached plan.
-            match create_physical_expr(&datafusion_expr::col(WEIGHT_COLUMN), input_df_schema, props)
-            {
+            match create_physical_expr(
+                &datafusion_expr::col(WEIGHT_COLUMN),
+                input_df_schema,
+                props,
+                &PhysicalPlanningContext::default(),
+            ) {
                 Ok(weight_expr) => {
                     let mut exprs = compiled_exprs;
                     let mut fields = proj_fields;
@@ -1467,6 +1188,7 @@ impl IncrementalAggState {
             arrow::row::RowConverter::new(sort_fields)
                 .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?,
         );
+        let fixed_key_grouper = FixedWidthKeyGrouper::for_key(&group_types);
         let vnode_states = AggregateVnodeSlots::try_new(key_group_count)?;
         let vnode_count = usize::from(key_group_count.get());
         let checkpoint_dirty_vnodes = vec![false; vnode_count].into_boxed_slice();
@@ -1490,6 +1212,8 @@ impl IncrementalAggState {
             aggregate_templates,
             vnode_states,
             row_converter,
+            fixed_key_grouper,
+            previous_batch_groups: 0,
             output_schema,
             compiled_projection,
             cached_pre_agg_physical,
@@ -1522,15 +1246,11 @@ impl IncrementalAggState {
     /// The aggregate hot path already owns these bytes, so this deliberately uses the
     /// codec's static mapping rather than constructing another codec or re-encoding the key.
     /// Global aggregate state is pinned to vnode zero.
-    fn vnode_for_group_key(
-        num_group_cols: usize,
-        key: &arrow::row::OwnedRow,
-        vnode_count: NonZeroU32,
-    ) -> u32 {
+    fn vnode_for_group_key(num_group_cols: usize, key: &[u8], vnode_count: NonZeroU32) -> u32 {
         if num_group_cols == 0 || vnode_count.get() == 1 {
             0
         } else {
-            PartitionKeyCodecV1::vnode_for_encoded(key.as_ref(), vnode_count)
+            PartitionKeyCodecV1::vnode_for_encoded(key, vnode_count)
         }
     }
 
@@ -1655,47 +1375,64 @@ impl IncrementalAggState {
             return self.process_batch_no_groups(batch, watermark_ms);
         }
 
-        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-            .map(|i| Arc::clone(batch.column(i)))
-            .collect();
-
-        let rows = self
-            .row_converter
-            .convert_columns(&group_cols)
-            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-
-        // One OwnedRow alloc per unique group, not per row.
-        let estimated_groups = (batch.num_rows() / 4).max(16);
+        let keys = self.encode_group_keys(batch)?;
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
-        let mut group_indices: FxHashMap<arrow::row::Row<'_>, (Vec<u32>, i64)> =
-            FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
-        for row_idx in 0..batch.num_rows() {
-            let row_weight = input_weights.map_or(1, |weights| weights.value(row_idx));
-            let grouped = group_indices
-                .entry(rows.row(row_idx))
-                .or_insert_with(|| (Vec::new(), 0));
-            #[allow(clippy::cast_possible_truncation)]
-            grouped.0.push(row_idx as u32);
-            grouped.1 = grouped
-                .1
-                .checked_add(row_weight)
-                .ok_or_else(|| DbError::Pipeline("aggregate input weight overflow".into()))?;
-        }
+        let inputs = AggregateInput::resolve_all(
+            batch,
+            &self.agg_specs,
+            &self.aggregate_templates,
+            input_weights,
+        )?;
+        let groups = BatchGroups::try_new(&keys, input_weights, self.previous_batch_groups)?;
+        self.previous_batch_groups = groups.len();
+        self.apply_keyed_groups(
+            &groups,
+            |accs, indices| Self::update_concrete_accumulators(accs, &inputs, indices),
+            watermark_ms,
+            uniform_vnode,
+        )
+    }
 
-        // Allocate each unique key once, then reject the whole batch before touching an
-        // accumulator if its new keys would exceed the cardinality bound. Partial application is
-        // not retry-safe: an existing group updated before the error would be counted twice.
-        let mut grouped_rows = Vec::with_capacity(group_indices.len());
+    /// Row-encode the batch's leading group columns: once per group for a single fixed-width
+    /// key, once per row otherwise.
+    fn encode_group_keys(&self, batch: &RecordBatch) -> Result<EncodedKeys, DbError> {
+        if let Some(grouper) = &self.fixed_key_grouper {
+            return grouper.encode(
+                batch.column(0),
+                &self.row_converter,
+                self.previous_batch_groups,
+            );
+        }
+        self.row_converter
+            .convert_columns(&batch.columns()[..self.num_group_cols])
+            .map(EncodedKeys::PerRow)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))
+    }
+
+    /// Preflight the group limit for `batch_groups`, then fold each group's rows into its
+    /// accumulators with `update`.
+    fn apply_keyed_groups(
+        &mut self,
+        batch_groups: &BatchGroups<'_>,
+        update: impl Fn(&mut [ConcreteAggregateState], &[u32]) -> Result<(), DbError>,
+        watermark_ms: i64,
+        uniform_vnode: Option<u32>,
+    ) -> Result<(), DbError> {
+        let vnode_count = self.routing_vnode_count();
+
+        // Reject the whole batch before touching an accumulator if its new keys would exceed the
+        // cardinality bound. Partial application is not retry-safe: an existing group updated
+        // before the error would be counted twice. Only new groups allocate an owned key.
+        let mut grouped_rows = Vec::with_capacity(batch_groups.len());
         let mut incoming_new_groups = 0usize;
-        for (row_ref, (indices, input_weight_delta)) in group_indices {
-            let key = row_ref.owned();
+        for (key, indices, input_weight_delta) in batch_groups.iter() {
             let vnode = uniform_vnode.unwrap_or_else(|| {
-                Self::vnode_for_group_key(self.num_group_cols, &key, vnode_count)
+                Self::vnode_for_group_key(self.num_group_cols, key.bytes(), vnode_count)
             });
             let existing = self
                 .vnode_states
                 .get(vnode)
-                .and_then(|state| state.groups.get(&key));
+                .and_then(|state| state.groups.get(key));
             let input_weight = Self::next_group_input_weight(
                 existing.map_or(0, |entry| entry.input_weight),
                 input_weight_delta,
@@ -1708,36 +1445,25 @@ impl IncrementalAggState {
         }
         let current_groups = self.vnode_states.resident_group_count();
         let required_groups = current_groups.saturating_add(incoming_new_groups);
-        if required_groups > self.max_groups {
-            return Err(DbError::Pipeline(format!(
-                "aggregate group limit exceeded: current={}, incoming_new={}, limit={}",
-                current_groups, incoming_new_groups, self.max_groups
-            )));
-        }
+        self.admit_group_count(required_groups, || {
+            format!("aggregate record processing (current={current_groups}, incoming_new={incoming_new_groups})")
+        })?;
 
-        let agg_specs = &self.agg_specs;
         let aggregate_templates = &self.aggregate_templates;
-        let weight_col_idx = self.weight_col_idx;
         let emit_changelog = self.emit_changelog;
-        for (vnode, owned_key, indices, input_weight, is_new) in grouped_rows {
+        for (vnode, key, indices, input_weight, is_new) in grouped_rows {
+            self.vnode_states.count_applied_rows(vnode, indices.len());
             if is_new {
                 let mut entry = GroupEntry::new(aggregate_templates.clone(), 0, watermark_ms);
-                Self::update_concrete_accumulators(
-                    &mut entry.accs,
-                    batch,
-                    &indices,
-                    agg_specs,
-                    weight_col_idx,
-                )?;
+                update(&mut entry.accs, indices)?;
                 entry.input_weight = input_weight;
                 entry.last_updated_ms = watermark_ms;
                 entry.refresh_accumulator_usage();
 
-                let emit_key = emit_changelog.then(|| owned_key.clone());
                 let vnode_state = self.vnode_states.get_or_insert(vnode);
-                vnode_state.insert_new_group(owned_key, entry);
-                if let Some(emit_key) = emit_key {
-                    vnode_state.insert_emit_dirty_key(emit_key);
+                vnode_state.insert_new_group(key, entry);
+                if emit_changelog {
+                    vnode_state.insert_emit_dirty_key(key.owned());
                 }
                 self.vnode_states.increment_resident_groups();
                 Self::mark_checkpoint_vnode_dirty_parts(
@@ -1755,15 +1481,9 @@ impl IncrementalAggState {
             let (update_result, previous_usage, current_usage) = {
                 let entry = vnode_state
                     .groups
-                    .get_mut(&owned_key)
+                    .get_mut(key)
                     .expect("preflighted aggregate group must remain resident");
-                let update_result = Self::update_concrete_accumulators(
-                    &mut entry.accs,
-                    batch,
-                    &indices,
-                    agg_specs,
-                    weight_col_idx,
-                );
+                let update_result = update(&mut entry.accs, indices);
                 if update_result.is_ok() {
                     entry.input_weight = input_weight;
                     entry.last_updated_ms = watermark_ms;
@@ -1773,7 +1493,7 @@ impl IncrementalAggState {
             };
             vnode_state.reconcile_accumulator_usage(previous_usage, current_usage);
             if update_result.is_ok() && emit_changelog {
-                vnode_state.insert_emit_dirty_key(owned_key.clone());
+                vnode_state.insert_emit_dirty_key(key.owned());
             }
             update_result?;
             Self::mark_checkpoint_vnode_dirty_parts(
@@ -1827,140 +1547,22 @@ impl IncrementalAggState {
         Ok(next)
     }
 
-    fn update_concrete_accumulators(
+    pub(crate) fn update_concrete_accumulators(
         states: &mut [ConcreteAggregateState],
-        batch: &RecordBatch,
-        indices: &[u32],
-        agg_specs: &[AggFuncSpec],
-        weight_col_idx: Option<usize>,
+        inputs: &[AggregateInput<'_>],
+        rows: &[u32],
     ) -> Result<(), DbError> {
-        if states.len() != agg_specs.len() {
+        if states.len() != inputs.len() {
             return Err(DbError::Pipeline(format!(
-                "aggregate state arity mismatch: {} states vs {} specifications",
+                "aggregate state arity mismatch: {} states vs {} inputs",
                 states.len(),
-                agg_specs.len()
+                inputs.len()
             )));
         }
-        Self::for_each_aggregate_input(
-            batch,
-            indices,
-            agg_specs,
-            weight_col_idx,
-            |index, values| states[index].update_batch(values),
-        )
-    }
-
-    /// Temporary adapter for window state until it adopts the concrete vnode representation.
-    pub(crate) fn update_group_accumulators(
-        accs: &mut [Box<dyn datafusion_expr::Accumulator>],
-        batch: &RecordBatch,
-        indices: &[u32],
-        agg_specs: &[AggFuncSpec],
-        weight_col_idx: Option<usize>,
-    ) -> Result<(), DbError> {
-        if accs.len() != agg_specs.len() {
-            return Err(DbError::Pipeline(format!(
-                "window aggregate state arity mismatch: {} accumulators vs {} specifications",
-                accs.len(),
-                agg_specs.len()
-            )));
-        }
-        Self::for_each_aggregate_input(
-            batch,
-            indices,
-            agg_specs,
-            weight_col_idx,
-            |index, values| {
-                accs[index]
-                    .update_batch(values)
-                    .map_err(|error| DbError::Pipeline(format!("accumulator update: {error}")))
-            },
-        )
-    }
-
-    fn for_each_aggregate_input(
-        batch: &RecordBatch,
-        indices: &[u32],
-        agg_specs: &[AggFuncSpec],
-        weight_col_idx: Option<usize>,
-        mut update: impl FnMut(usize, &[ArrayRef]) -> Result<(), DbError>,
-    ) -> Result<(), DbError> {
-        let index_array = arrow::array::UInt32Array::from(indices.to_vec());
-
-        let weight_arr = if let Some(w_idx) = weight_col_idx {
-            let weight = batch.columns().get(w_idx).ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "aggregate weight column {w_idx} is outside a {}-column batch",
-                    batch.num_columns()
-                ))
-            })?;
-            Some(
-                compute::take(weight, &index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("weight take: {e}")))?,
-            )
-        } else {
-            None
-        };
-
-        for (i, spec) in agg_specs.iter().enumerate() {
-            let input_capacity = spec.input_col_indices.len() + usize::from(weight_arr.is_some());
-            let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(input_capacity);
-            for &col_idx in &spec.input_col_indices {
-                let column = batch.columns().get(col_idx).ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "aggregate input column {col_idx} is outside a {}-column batch",
-                        batch.num_columns()
-                    ))
-                })?;
-                let arr = compute::take(column, &index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("array take failed: {e}")))?;
-                input_arrays.push(arr);
-            }
-
-            let filtered_weight = if let Some(filter_idx) = spec.filter_col_index {
-                let filter_column = batch.columns().get(filter_idx).ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "aggregate filter column {filter_idx} is outside a {}-column batch",
-                        batch.num_columns()
-                    ))
-                })?;
-                let filter_arr = compute::take(filter_column, &index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
-                let mask = filter_arr
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                    .ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "aggregate FILTER must be Boolean, got {:?}",
-                            filter_arr.data_type()
-                        ))
-                    })?;
-                let mut filtered = Vec::with_capacity(input_capacity);
-                for arr in &input_arrays {
-                    filtered.push(
-                        compute::filter(arr, mask)
-                            .map_err(|e| DbError::Pipeline(format!("filter apply: {e}")))?,
-                    );
-                }
-                input_arrays = filtered;
-                weight_arr
-                    .as_ref()
-                    .map(|weight| {
-                        compute::filter(weight, mask)
-                            .map_err(|e| DbError::Pipeline(format!("weight filter: {e}")))
-                    })
-                    .transpose()?
-            } else {
-                weight_arr.clone()
-            };
-
-            if let Some(w) = &filtered_weight {
-                input_arrays.push(Arc::clone(w));
-            }
-
-            update(i, &input_arrays)?;
-        }
-        Ok(())
+        states
+            .iter_mut()
+            .zip(inputs)
+            .try_for_each(|(state, input)| state.update_rows(input, rows))
     }
 
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
@@ -2022,47 +1624,62 @@ impl IncrementalAggState {
             .cached_usage_matches_structural_recompute()
     }
 
-    /// Decode the per-entry changelog `last_emitted` checkpoint into the live map.
+    /// Pair each changelog entry with its group's key. `groups` must still be in encoded order.
     fn decode_last_emitted(
         &self,
-        entries: &[EmittedCheckpoint],
+        checkpoint: &AggStateCheckpoint,
+        groups: &[DecodedGroupState],
     ) -> Result<Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>, DbError> {
+        let rows = &checkpoint.emitted_groups;
+        if rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
+                .last()
+                .is_some_and(|&last| last as usize >= groups.len())
+        {
+            return Err(DbError::Pipeline(
+                "aggregate checkpoint changelog groups are not strictly ascending group rows"
+                    .into(),
+            ));
+        }
+        let values = (!checkpoint.emitted_values_ipc.is_empty())
+            .then(|| {
+                laminar_core::serialization::deserialize_batch_stream(
+                    &checkpoint.emitted_values_ipc,
+                )
+            })
+            .transpose()
+            .map_err(|e| DbError::Pipeline(format!("changelog values IPC decode: {e}")))?;
+        let value_rows = values.as_ref().map_or(rows.len(), RecordBatch::num_rows);
+        let saved_types = values.as_ref().map_or_else(Vec::new, |batch| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect()
+        });
+        let query_types = self.agg_specs.iter().map(|spec| &spec.return_type);
+        if value_rows != rows.len() || (!rows.is_empty() && !saved_types.iter().eq(query_types)) {
+            return Err(DbError::Pipeline(format!(
+                "aggregate checkpoint changelog holds {value_rows} rows of {saved_types:?} for {} groups",
+                rows.len()
+            )));
+        }
+
         let mut out = Vec::new();
-        out.try_reserve_exact(entries.len()).map_err(|error| {
+        out.try_reserve_exact(rows.len()).map_err(|error| {
             DbError::Pipeline(format!(
                 "aggregate checkpoint could not reserve changelog decode roster: {error}"
             ))
         })?;
-        for ec in entries {
-            let sv_key = ipc_to_scalars(&ec.key)?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-            let vals = ipc_to_scalars(&ec.values)?;
-            if vals.len() != self.agg_specs.len() {
-                return Err(DbError::Pipeline(format!(
-                    "aggregate checkpoint changelog arity mismatch: saved={}, expected={}",
-                    vals.len(),
-                    self.agg_specs.len()
-                )));
-            }
-            for (index, (value, spec)) in vals.iter().zip(&self.agg_specs).enumerate() {
-                let saved_type = value.data_type();
-                if saved_type != spec.return_type {
-                    return Err(DbError::Pipeline(format!(
-                        "aggregate checkpoint changelog type mismatch at {index}: saved={saved_type}, expected={}",
-                        spec.return_type
-                    )));
-                }
-            }
-            out.push((row_key, vals));
-        }
-        out.sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
-        if out
-            .windows(2)
-            .any(|pair| pair[0].0.as_ref() == pair[1].0.as_ref())
-        {
-            return Err(DbError::Pipeline(
-                "aggregate checkpoint contains a duplicate changelog key".into(),
-            ));
+        for (value_row, &group_row) in rows.iter().enumerate() {
+            let emitted = values
+                .iter()
+                .flat_map(RecordBatch::columns)
+                .map(|column| ScalarValue::try_from_array(column, value_row))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DbError::Pipeline(format!("changelog value scalar: {e}")))?;
+            out.push((groups[group_row as usize].0.clone(), emitted));
         }
         Ok(out)
     }
@@ -2075,7 +1692,6 @@ impl IncrementalAggState {
         row_converter: Arc<arrow::row::RowConverter>,
     ) -> Result<AggregateVnodeCheckpointCapture, DbError> {
         let mut groups = Vec::new();
-        let mut last_emitted = Vec::new();
         let mut next_output_sequence = 0;
         if let Some(state) = self.vnode_states.get(vnode) {
             next_output_sequence = state.next_output_sequence;
@@ -2089,29 +1705,28 @@ impl IncrementalAggState {
             for (key, entry) in &state.groups {
                 let mut accumulator_states = Vec::with_capacity(entry.accs.len());
                 for aggregate in &entry.accs {
-                    accumulator_states.push(aggregate.checkpoint_state()?);
+                    accumulator_states.push(aggregate.checkpoint_state());
                 }
+                let last_emitted = self
+                    .emit_changelog
+                    .then(|| state.last_emitted.get(key).cloned())
+                    .flatten();
                 groups.push(CapturedAggregateGroup {
                     key: key.clone(),
                     accumulator_states,
+                    last_emitted,
                     input_weight: entry.input_weight,
                     last_updated_ms: entry.last_updated_ms,
                 });
             }
-            if self.emit_changelog {
-                last_emitted
-                    .try_reserve_exact(state.last_emitted.len())
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate vnode {vnode} checkpoint changelog roster: {error}"
-                        ))
-                    })?;
-                last_emitted.extend(
-                    state
-                        .last_emitted
-                        .iter()
-                        .map(|(key, values)| (key.clone(), values.clone())),
-                );
+            let emitted = groups
+                .iter()
+                .filter(|group| group.last_emitted.is_some())
+                .count();
+            if self.emit_changelog && emitted != state.last_emitted.len() {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate vnode {vnode} holds changelog state for a missing group"
+                )));
             }
         }
         let mut capture = AggregateVnodeCheckpointCapture {
@@ -2120,7 +1735,6 @@ impl IncrementalAggState {
             group_types,
             row_converter,
             groups,
-            last_emitted,
             retained_bytes: 0,
         };
         capture.retained_bytes = capture.calculate_retained_bytes();
@@ -2269,7 +1883,6 @@ impl IncrementalAggState {
             )));
         }
         validate_columnar_acc_shape(checkpoint, &self.agg_specs)?;
-        let last_emitted = self.decode_last_emitted(&checkpoint.last_emitted)?;
         let mut groups = decode_columnar_state_scalars(
             &self.row_converter,
             self.num_group_cols,
@@ -2278,6 +1891,7 @@ impl IncrementalAggState {
             &checkpoint.input_weights,
             &checkpoint.last_updated_ms,
         )?;
+        let last_emitted = self.decode_last_emitted(checkpoint, &groups)?;
         canonicalize_decoded_group_keys(&mut groups)?;
         Ok(DecodedAggMutation {
             groups,
@@ -2304,18 +1918,7 @@ impl IncrementalAggState {
                 ));
             }
         }
-        for (row_key, values) in mutation.last_emitted {
-            if !staged.groups.contains_key(&row_key) {
-                return Err(DbError::Pipeline(
-                    "aggregate checkpoint contains changelog state for a missing group".into(),
-                ));
-            }
-            if staged.last_emitted.insert(row_key, values).is_some() {
-                return Err(DbError::Pipeline(
-                    "aggregate checkpoint contains a duplicate changelog key".into(),
-                ));
-            }
-        }
+        staged.last_emitted.extend(mutation.last_emitted);
         Ok(next_output_sequence)
     }
 
@@ -2385,20 +1988,24 @@ impl IncrementalAggState {
                 transitioned_vnodes.insert(position, vnode);
             }
 
-            let mut staged_groups = FxHashMap::default();
+            let mut staged_groups = GroupMap::default();
             staged_groups
                 .try_reserve(state.last_updated_ms.len().min(self.max_groups))
-                .map_err(|error| reserve_error("staged groups", error))?;
+                .map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "aggregate vnode transition could not reserve staged groups: {error:?}"
+                    ))
+                })?;
             let mut staged_last_emitted = FxHashMap::default();
             staged_last_emitted
-                .try_reserve(state.last_emitted.len().min(self.max_groups))
+                .try_reserve(state.emitted_groups.len().min(self.max_groups))
                 .map_err(|error| reserve_error("staged changelog state", error))?;
             let mut staged = StagedAggMutation {
                 groups: staged_groups,
                 last_emitted: staged_last_emitted,
             };
             let belongs_to_vnode = |key: &arrow::row::OwnedRow| {
-                Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == vnode
+                Self::vnode_for_group_key(self.num_group_cols, key.as_ref(), vnode_count) == vnode
             };
 
             let decoded = self.decode_recovery_mutation(&state, "vnode transition", current_fp)?;
@@ -2407,35 +2014,18 @@ impl IncrementalAggState {
                 .groups
                 .iter()
                 .any(|(key, _, _, _)| !belongs_to_vnode(key))
-                || decoded
-                    .last_emitted
-                    .iter()
-                    .any(|(key, _)| !belongs_to_vnode(key))
             {
                 return Err(DbError::Pipeline(format!(
                     "authoritative vnode {vnode} checkpoint contains a key for another vnode"
                 )));
             }
             let next_output_sequence = self.stage_recovery_base(&mut staged, decoded)?;
-            if staged
-                .last_emitted
-                .keys()
-                .any(|key| !staged.groups.contains_key(key))
-            {
-                return Err(DbError::Pipeline(
-                    "aggregate vnode transition contains changelog state for a missing group"
-                        .into(),
-                ));
-            }
 
             replacement_group_count =
                 checked_vnode_transition_capacity(replacement_group_count, staged.groups.len())?;
-            if replacement_group_count > self.max_groups {
-                return Err(DbError::Pipeline(format!(
-                    "aggregate replacement group limit exceeded during vnode transition: replacement={}, limit={}",
-                    replacement_group_count, self.max_groups
-                )));
-            }
+            self.admit_group_count(replacement_group_count, || {
+                "aggregate vnode transition replacement".into()
+            })?;
             let replacement = AggregateVnodeState::try_from_recovered(
                 staged.groups,
                 staged.last_emitted,
@@ -2469,13 +2059,9 @@ impl IncrementalAggState {
         )?;
         let final_group_count =
             checked_vnode_transition_capacity(retained_group_count, replacement_group_count)?;
-        if final_group_count > self.max_groups {
-            return Err(DbError::Pipeline(format!(
-                "aggregate group limit exceeded during vnode transition: retained={retained_group_count}, replacement={}, limit={}",
-                replacement_group_count,
-                self.max_groups
-            )));
-        }
+        self.admit_group_count(final_group_count, || {
+            format!("aggregate vnode transition (retained={retained_group_count}, replacement={replacement_group_count})")
+        })?;
 
         let mut replacements = Vec::new();
         replacements

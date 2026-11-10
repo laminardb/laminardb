@@ -6,6 +6,7 @@
 //! one vnode (partial rows in cluster mode).
 
 mod derivation;
+mod event_time;
 mod properties;
 #[cfg(all(debug_assertions, feature = "cluster"))]
 mod shadow;
@@ -16,9 +17,12 @@ use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub(crate) use derivation::derive;
+pub(crate) use derivation::{
+    carried_window_boundary, closes_windows, derive, window_retention_column,
+};
+pub(crate) use event_time::{EventTime, EventTimeOrigin, JoinSide, WindowBoundary};
 pub(crate) use properties::{
-    ChangelogKind, Distribution, EventTime, InputPort, KeyColumn, PartitionKey, PortExchange,
+    ChangelogKind, Distribution, InputPort, KeyColumn, PartitionKey, PortExchange,
     StreamProperties, GLOBAL_VNODE,
 };
 
@@ -66,15 +70,15 @@ impl ExchangePlan {
             .collect()
     }
 
-    /// Streams that keep one input's rows and event time unchanged (a stateless projection that
-    /// forwards the event-time column), so a managed consumer may take that input's frontier.
+    /// Streams that keep their inputs' rows and event time unchanged (a stateless projection or a
+    /// `UNION ALL` that forwards the event-time column), so a managed consumer may take the
+    /// lowest of those inputs' frontiers.
     #[cfg(feature = "cluster")]
     pub(crate) fn event_time_forwards(&self) -> FxHashSet<String> {
         self.streams
             .iter()
             .filter(|(_, plan)| {
                 plan.output.event_time.is_some()
-                    && plan.inputs.len() == 1
                     && plan
                         .inputs
                         .values()
@@ -162,6 +166,7 @@ pub(crate) fn source_event_time(source: &crate::catalog::SourceEntry) -> Option<
     Some(EventTime {
         column: source.watermark_column.clone()?,
         max_out_of_orderness: source.max_out_of_orderness,
+        origin: EventTimeOrigin::Source,
     })
 }
 

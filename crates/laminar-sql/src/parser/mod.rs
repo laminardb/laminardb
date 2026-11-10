@@ -20,6 +20,7 @@ mod source_parser;
 mod statements;
 mod subscribe_parser;
 mod tokenizer;
+mod view_options;
 mod window_rewriter;
 
 pub use lookup_table::CreateLookupTableStatement;
@@ -28,6 +29,7 @@ pub use statements::{
     FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, SubscribeStatement,
     WatermarkDef, WindowFunction,
 };
+pub use view_options::MaterializedViewRetention;
 pub use window_rewriter::WindowRewriter;
 
 use dialect::LaminarDialect;
@@ -283,12 +285,19 @@ fn convert_standard_statement(stmt: sqlparser::ast::Statement) -> StreamingState
         // Extract table name from TableObject
         if let sqlparser::ast::TableObject::TableName(ref name) = insert.table {
             let table_name = name.clone();
-            let columns = insert.columns.clone();
+            let columns = insert
+                .columns
+                .iter()
+                .map(|column| match column.0.as_slice() {
+                    [part] => part.as_ident().cloned(),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
 
             // Try to extract VALUES rows from source query
-            if let Some(ref source) = insert.source {
+            if let (Some(columns), Some(source)) = (columns, insert.source.as_ref()) {
                 if let sqlparser::ast::SetExpr::Values(ref values) = *source.body {
-                    let rows = values.rows.clone();
+                    let rows = values.rows.iter().map(|row| row.content.clone()).collect();
                     return StreamingStatement::InsertInto {
                         table_name,
                         columns,
@@ -395,7 +404,8 @@ fn parse_drop_materialized_view(
 
 /// Parse a CREATE STREAM statement.
 ///
-/// Syntax: `CREATE [OR REPLACE] STREAM [IF NOT EXISTS] name AS <select_query> [EMIT <strategy>]`
+/// Syntax: `CREATE [OR REPLACE] STREAM [IF NOT EXISTS] name AS <select_query>
+/// [EMIT <strategy> [ALLOW LATENESS <interval>]] [WITH (...)]`
 ///
 /// # Errors
 ///
@@ -468,13 +478,7 @@ fn parse_create_stream(
     };
     let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
-    let emit_clause = if emit_tokens.is_empty() {
-        None
-    } else {
-        let mut emit_parser =
-            sqlparser::parser::Parser::new(&stream_dialect).with_tokens_with_locations(emit_tokens);
-        emit_parser::parse_emit_clause(&mut emit_parser)?
-    };
+    let (emit_clause, late_data) = emit_parser::parse_emit_trailer(emit_tokens)?;
 
     let retention_bytes = match with_tokens {
         None => None,
@@ -490,6 +494,7 @@ fn parse_create_stream(
         name,
         query: Box::new(query_stmt),
         emit_clause,
+        late_data,
         or_replace,
         if_not_exists,
         query_sql,
@@ -819,7 +824,8 @@ fn parse_explain(
 /// ```sql
 /// CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name
 /// AS <select_query>
-/// [EMIT <strategy>]
+/// [EMIT <strategy> [ALLOW LATENESS <interval>]]
+/// [WITH (...)]
 /// ```
 ///
 /// # Errors
@@ -859,10 +865,19 @@ fn parse_create_materialized_view(
         .expect_keyword(sqlparser::keywords::Keyword::AS)
         .map_err(ParseError::SqlParseError)?;
 
-    // Collect remaining tokens and split at EMIT boundary (same strategy as continuous query)
     let remaining = collect_remaining_tokens(parser);
-    let (query_tokens, emit_tokens) = split_at_emit(&remaining);
-    let raw_query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
+    let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
+    let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
+    let raw_query_sql = query_body_sql(
+        original_sql,
+        &query_tokens,
+        &emit_tokens,
+        with_tokens.as_deref(),
+    );
+    let options = with_tokens
+        .map(view_options::parse_view_options)
+        .transpose()?
+        .unwrap_or_default();
 
     let mv_dialect = LaminarDialect::default();
 
@@ -891,21 +906,18 @@ fn parse_create_materialized_view(
     };
     let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
-    let emit_clause = if emit_tokens.is_empty() {
-        None
-    } else {
-        let mut emit_parser =
-            sqlparser::parser::Parser::new(&mv_dialect).with_tokens_with_locations(emit_tokens);
-        emit_parser::parse_emit_clause(&mut emit_parser)?
-    };
+    let (emit_clause, late_data) = emit_parser::parse_emit_trailer(emit_tokens)?;
 
     Ok(StreamingStatement::CreateMaterializedView {
         name,
         query: Box::new(query_stmt),
         emit_clause,
+        late_data,
         or_replace,
         if_not_exists,
         query_sql,
+        retention: options.retention,
+        freshness: options.freshness,
     })
 }
 

@@ -325,8 +325,11 @@ fn map_topology_subscription_predecessors(
     if current.iter().any(|output| {
         let name = &output.manifest.distribution_certificate.stream_id;
         !root.preserved_objects.iter().any(|object| {
-            object.kind == laminar_core::cluster::control::CatalogObjectKind::Stream
-                && &object.name == name
+            matches!(
+                object.kind,
+                laminar_core::cluster::control::CatalogObjectKind::Stream
+                    | laminar_core::cluster::control::CatalogObjectKind::MaterializedView
+            ) && &object.name == name
         }) && root.future_only_objects.binary_search(name).is_err()
     }) {
         return Err(DbError::Checkpoint(
@@ -337,8 +340,11 @@ fn map_topology_subscription_predecessors(
     // retain their historical output, but have no target continuity mapping.
     outputs.retain(|output| {
         root.preserved_objects.iter().any(|object| {
-            object.kind == laminar_core::cluster::control::CatalogObjectKind::Stream
-                && object.name == output.manifest.distribution_certificate.stream_id
+            matches!(
+                object.kind,
+                laminar_core::cluster::control::CatalogObjectKind::Stream
+                    | laminar_core::cluster::control::CatalogObjectKind::MaterializedView
+            ) && object.name == output.manifest.distribution_certificate.stream_id
         })
     });
     for output in outputs.iter_mut() {

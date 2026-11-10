@@ -311,6 +311,39 @@ fn test_parse_create_materialized_view_with_emit() {
 }
 
 #[test]
+fn test_parse_create_materialized_view_with_retention() {
+    let stmt = parse_one(
+        "CREATE MATERIALIZED VIEW recent AS SELECT * FROM events EMIT ON WINDOW CLOSE \
+         WITH (retention = '2 hours')",
+    );
+    let StreamingStatement::CreateMaterializedView {
+        query_sql,
+        emit_clause,
+        retention,
+        ..
+    } = stmt
+    else {
+        panic!("Expected CreateMaterializedView, got {stmt:?}");
+    };
+    assert_eq!(query_sql, "SELECT * FROM events");
+    assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+    assert_eq!(
+        retention,
+        Some(crate::parser::MaterializedViewRetention::Interval(
+            std::time::Duration::from_secs(7200)
+        ))
+    );
+
+    let error = StreamingParser::parse_sql(
+        "CREATE MATERIALIZED VIEW recent AS SELECT * FROM events WITH (keep = '1 hour')",
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unknown CREATE MATERIALIZED VIEW option 'keep'"));
+}
+
+#[test]
 fn test_parse_create_or_replace_materialized_view() {
     let stmt =
         parse_one("CREATE OR REPLACE MATERIALIZED VIEW live_stats AS SELECT COUNT(*) FROM events");
@@ -473,6 +506,54 @@ fn create_stream_with_retain_history_after_emit() {
     };
     assert_eq!(retention_bytes, Some(8 * 1024 * 1024));
     assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+}
+
+#[test]
+fn create_stream_and_view_parse_allow_lateness_after_emit() {
+    for sql in [
+        "CREATE STREAM w AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE \
+         ALLOW LATENESS INTERVAL '30' SECOND WITH ('retain_history' = '8mb')",
+        "CREATE MATERIALIZED VIEW w AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE \
+         ALLOW LATENESS INTERVAL '30' SECOND;",
+    ] {
+        let (emit_clause, late_data) = match parse_one(sql) {
+            StreamingStatement::CreateStream {
+                emit_clause,
+                late_data,
+                ..
+            }
+            | StreamingStatement::CreateMaterializedView {
+                emit_clause,
+                late_data,
+                ..
+            } => (emit_clause, late_data),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+        let late_data = late_data.unwrap();
+        assert_eq!(
+            late_data.to_allowed_lateness().unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(late_data.to_string(), "ALLOW LATENESS INTERVAL '30' SECOND");
+    }
+}
+
+#[test]
+fn create_stream_rejects_text_after_the_emit_clause() {
+    parse_one("CREATE STREAM s AS SELECT COUNT(*) FROM e EMIT CHANGES;");
+    for trailer in [
+        "GARBAGE",
+        "EMIT FINAL",
+        "ALLOW LATENESS INTERVAL '1' SECOND FOO",
+    ] {
+        let sql = format!("CREATE STREAM s AS SELECT COUNT(*) FROM e EMIT CHANGES {trailer}");
+        let error = parse_streaming_sql(&sql).expect_err(&sql);
+        assert!(
+            error.to_string().contains("after the EMIT clause"),
+            "{sql}: {error}"
+        );
+    }
 }
 
 #[test]

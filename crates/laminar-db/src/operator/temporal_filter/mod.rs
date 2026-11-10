@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
-use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint};
 use crate::sql_analysis::TemporalFilterConfig;
 
 /// Live buffer encoded as one Arrow IPC batch.
@@ -30,16 +30,28 @@ pub(crate) struct TemporalFilterCheckpoint {
 struct BufferedRow {
     batch: Arc<RecordBatch>,
     row_idx: u32,
+    batch_slot: u32,
     enter_key: i64,
     exit_key: i64,
 }
 
-// `len` is maintained at every push/remove so the per-cycle buffered-row metric is O(1).
+// Rows of one ingested batch share its allocation, so the whole batch stays charged until its
+// last buffered row leaves.
+struct BatchCharge {
+    rows: u32,
+    bytes: usize,
+}
+
+// `len` and `batch_bytes` are maintained at every push/remove so the per-cycle buffered-row
+// metric and the managed-state accounting are O(1).
 struct TfState {
     by_enter: BTreeMap<i64, Vec<BufferedRow>>,
     by_exit: BTreeMap<i64, Vec<BufferedRow>>,
     last_frontier: i64, // i64::MIN = no frontier seen yet
     len: usize,
+    batches: Vec<BatchCharge>,
+    free_slots: Vec<u32>,
+    batch_bytes: usize,
 }
 
 impl Default for TfState {
@@ -49,6 +61,9 @@ impl Default for TfState {
             by_exit: BTreeMap::new(),
             last_frontier: i64::MIN,
             len: 0,
+            batches: Vec::new(),
+            free_slots: Vec::new(),
+            batch_bytes: 0,
         }
     }
 }
@@ -58,15 +73,52 @@ impl TfState {
     fn buffered_rows(&self) -> usize {
         self.len
     }
+    fn accounted_bytes(&self) -> usize {
+        self.batch_bytes
+            .saturating_add(self.len.saturating_mul(std::mem::size_of::<BufferedRow>()))
+    }
+    fn open_batch(&mut self, bytes: usize) -> Result<u32, DbError> {
+        let charge = BatchCharge { rows: 0, bytes };
+        if let Some(slot) = self.free_slots.pop() {
+            self.batches[slot as usize] = charge;
+            return Ok(slot);
+        }
+        let slot = u32::try_from(self.batches.len())
+            .map_err(|_| DbError::Pipeline("temporal filter batch roster overflow".into()))?;
+        self.batches.push(charge);
+        Ok(slot)
+    }
+    fn close_batch_if_empty(&mut self, slot: u32) {
+        if self.batches[slot as usize].rows == 0 {
+            self.free_slots.push(slot);
+        }
+    }
+    fn charge(&mut self, slot: u32) {
+        let charge = &mut self.batches[slot as usize];
+        charge.rows += 1;
+        if charge.rows == 1 {
+            self.batch_bytes = self.batch_bytes.saturating_add(charge.bytes);
+        }
+        self.len += 1;
+    }
+    fn release(&mut self, row: &BufferedRow) {
+        let charge = &mut self.batches[row.batch_slot as usize];
+        charge.rows -= 1;
+        if charge.rows == 0 {
+            self.batch_bytes = self.batch_bytes.saturating_sub(charge.bytes);
+            self.free_slots.push(row.batch_slot);
+        }
+        self.len -= 1;
+    }
     #[inline]
     fn push_enter(&mut self, key: i64, row: BufferedRow) {
+        self.charge(row.batch_slot);
         self.by_enter.entry(key).or_default().push(row);
-        self.len += 1;
     }
     #[inline]
     fn push_exit(&mut self, key: i64, row: BufferedRow) {
+        self.charge(row.batch_slot);
         self.by_exit.entry(key).or_default().push(row);
-        self.len += 1;
     }
     #[inline]
     fn remove_from(map: &mut BTreeMap<i64, Vec<BufferedRow>>, k: i64) -> Vec<BufferedRow> {
@@ -351,6 +403,7 @@ impl TemporalFilterOperator {
                 .project(&self.proj_indices)
                 .map_err(|e| DbError::Pipeline(format!("temporal filter project: {e}")))?
         };
+        let batch_slot = self.state.open_batch(projected.get_array_memory_size())?;
         let shared = Arc::new(projected);
         for (r, t) in t_ms.iter().enumerate() {
             let Some(t) = *t else {
@@ -369,6 +422,7 @@ impl TemporalFilterOperator {
             let row = BufferedRow {
                 batch: Arc::clone(&shared),
                 row_idx: u32::try_from(r).unwrap_or(u32::MAX),
+                batch_slot,
                 enter_key,
                 exit_key,
             };
@@ -379,6 +433,7 @@ impl TemporalFilterOperator {
                 self.state.push_enter(enter_key, row);
             }
         }
+        self.state.close_batch_if_empty(batch_slot);
         Ok(())
     }
 
@@ -394,7 +449,7 @@ impl TemporalFilterOperator {
             for row in TfState::remove_from(&mut self.state.by_enter, k) {
                 if w >= row.exit_key {
                     *dropped += 1;
-                    self.state.len -= 1;
+                    self.state.release(&row);
                     continue;
                 }
                 inserts.push(row.clone());
@@ -408,7 +463,9 @@ impl TemporalFilterOperator {
         let exited: Vec<i64> = self.state.by_exit.range(..=w).map(|(k, _)| *k).collect();
         for k in exited {
             let drained = TfState::remove_from(&mut self.state.by_exit, k);
-            self.state.len -= drained.len();
+            for row in &drained {
+                self.state.release(row);
+            }
             retracts.extend(drained);
         }
         self.state.last_frontier = w;
@@ -449,10 +506,12 @@ impl TemporalFilterOperator {
             last_frontier,
             ..TfState::default()
         };
+        let batch_slot = state.open_batch(shared.get_array_memory_size())?;
         for r in 0..batch.num_rows() {
             let row = BufferedRow {
                 batch: Arc::clone(&shared),
                 row_idx: u32::try_from(r).unwrap_or(u32::MAX),
+                batch_slot,
                 enter_key: enter.value(r),
                 exit_key: exit.value(r),
             };
@@ -472,6 +531,13 @@ impl GraphOperator for TemporalFilterOperator {
         crate::operator::capability::OperatorCapability::fixed(
             crate::operator::capability::OperatorImplementation::TemporalFilter,
         )
+    }
+
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        Some(ManagedStateAccountingSnapshot {
+            live: self.state.accounted_bytes(),
+            ..ManagedStateAccountingSnapshot::default()
+        })
     }
 
     async fn process(

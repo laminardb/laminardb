@@ -208,20 +208,26 @@ fn ws_data_suffix(
 }
 
 fn ws_cluster_data_fields(cluster: Option<&ClusterSubscriptionFrameMetadata>) -> String {
-    let Some(ClusterSubscriptionFrameMetadata::Data {
-        stream_generation,
-        partition,
-        partition_sequence,
-        committed_epoch,
-    }) = cluster
-    else {
-        return String::new();
-    };
-    format!(
-        ",\"stream_generation\":\"{stream_generation}\",\"partition\":\"{}\",\"partition_sequence\":\"{}\",\"committed_epoch\":\"{committed_epoch}\"",
-        partition.get(),
-        partition_sequence.get(),
-    )
+    match cluster {
+        Some(ClusterSubscriptionFrameMetadata::Data {
+            stream_generation,
+            partition,
+            partition_sequence,
+            committed_epoch,
+        }) => format!(
+            ",\"stream_generation\":\"{stream_generation}\",\"partition\":\"{}\",\"partition_sequence\":\"{}\",\"committed_epoch\":\"{committed_epoch}\"",
+            partition.get(),
+            partition_sequence.get(),
+        ),
+        Some(ClusterSubscriptionFrameMetadata::ViewRows { epoch, snapshot }) => {
+            format!(",\"committed_epoch\":\"{epoch}\",\"snapshot\":{snapshot}")
+        }
+        Some(
+            ClusterSubscriptionFrameMetadata::Progress { .. }
+            | ClusterSubscriptionFrameMetadata::ViewProgress { .. },
+        )
+        | None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +333,7 @@ pub(super) fn next_ws_data_frame_with_metadata(
 }
 
 async fn ws_send(socket: &mut WebSocket, message: Message, state: &AppState) -> bool {
-    if state.serving_rejection().is_some() {
+    if state.authority_rejection().is_some() {
         return false;
     }
     tokio::select! {
@@ -500,7 +506,7 @@ pub(super) async fn ws_upgrade(
             .into_response();
         }
     };
-    if let Some(reason) = state.serving_rejection() {
+    if let Some(reason) = state.authority_rejection() {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
     }
 
@@ -568,7 +574,7 @@ async fn ws_client(
             }
         }
     }
-    if state.serving_rejection().is_none() {
+    if state.authority_rejection().is_none() {
         let _ = ws_send(&mut socket, Message::Close(None), &state).await;
     }
 }

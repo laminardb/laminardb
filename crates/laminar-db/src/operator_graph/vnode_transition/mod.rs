@@ -17,6 +17,7 @@ use super::{
 };
 use crate::error::DbError;
 use crate::operator::capability::ManagedStateContract;
+use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::recovery_manager::RecoveredStateFrame;
 use crate::vnode_transition_staging::{
     validate_recovered_transition_frames, InstalledVnodeStateBinding, InstalledVnodeStateHandle,
@@ -163,6 +164,14 @@ fn exact_pending_slot<'a>(
     Err(DbError::ShuffleNotReady(format!(
         "[LDB-6051] pending vnode transition changed during {phase} before publication"
     )))
+}
+
+/// Endpoints that never activated an assignment cannot send and carry no topology generation.
+pub(super) fn shuffle_transport_is_inactive(config: &ClusterShuffleConfig) -> bool {
+    config.sender.assignment_version() == 0
+        && config.receiver.assignment_version() == 0
+        && config.sender.active_assignment_digest().is_none()
+        && config.receiver.active_assignment_digest().is_none()
 }
 
 impl OperatorGraph {
@@ -499,8 +508,12 @@ impl OperatorGraph {
                 }
             };
         let mut installed = installed_state.lock();
+        // Adoption is the last fallible step, so the logs are adopted only by a transition that
+        // then publishes.
         let validation = if Self::installed_state_matches_pending(&pending, installed.as_ref()) {
-            authority.revalidate_for_publication()
+            authority
+                .revalidate_for_publication()
+                .and_then(|()| self.adopt_view_logs(pending.adopted_view_logs()))
         } else {
             Err(DbError::Checkpoint(
                 "[LDB-6051] installed predecessor binding changed before vnode publication".into(),

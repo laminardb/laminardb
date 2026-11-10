@@ -844,6 +844,46 @@ mod tests {
         canonicalize_data_files_avro(&generated, &fingerprints).unwrap()
     }
 
+    const UPGRADE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/upgrade");
+
+    fn upgrade_fixture_schema() -> iceberg::spec::Schema {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        Schema::builder()
+            .with_fields([
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn data_files_staged_by_iceberg_0_10_1_keep_their_fingerprint() {
+        const FINGERPRINT: &str =
+            "34564044312d3f4bd82dd767a20c752f0c263dfe4e478b9c3c3702d0894ddf47";
+        for (name, version) in [("v2", FormatVersion::V2), ("v3", FormatVersion::V3)] {
+            let staged = std::fs::read(format!(
+                "{UPGRADE_FIXTURES}/iceberg_data_files_{name}_0_10_1.avro"
+            ))
+            .unwrap();
+            let decoded = iceberg::spec::read_data_files_from_avro(
+                &mut staged.as_slice(),
+                &upgrade_fixture_schema(),
+                0,
+                &StructType::new(Vec::new()),
+                version,
+            )
+            .unwrap();
+            let [file] = decoded.as_slice() else {
+                panic!("the fixture staged one file");
+            };
+            assert_eq!(
+                data_file_fingerprint(file).unwrap().metadata_sha256,
+                FINGERPRINT
+            );
+        }
+    }
+
     fn descriptor() -> IcebergCommitDescriptorV1 {
         IcebergCommitDescriptorV1 {
             version: DESCRIPTOR_VERSION,

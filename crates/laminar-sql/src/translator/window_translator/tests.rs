@@ -68,14 +68,13 @@ fn test_with_emit_clause() {
 fn test_with_late_data_clause_side_output_rejected() {
     let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
 
-    // Side output is not yet wired in pipeline mode — must be rejected
     let late_clause = LateDataClause::side_output_only("late_events".to_string());
     let result = config.with_late_data_clause(&late_clause);
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("not yet supported"));
+        .contains("LATE DATA TO is not supported"));
 }
 
 #[test]

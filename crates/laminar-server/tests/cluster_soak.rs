@@ -18,10 +18,11 @@
 //! an independent snapshot oracle requires the main frozen output exactly once. All four join legs
 //! phase the matrix across faults and require connector-visible keyed aggregate results that combine
 //! pre-fault retained state with post-fault input. That phased source also closes direct TUMBLE,
-//! HOP, and SESSION state after recovery. After its kills, the three-node exact leg pauses the
-//! leader inside a checkpoint and resumes it once survivors fail over; the stale leader must fence
-//! itself without publishing (`paused_leader`). The local exact leg separately validates
-//! finite-source and retained-state recovery.
+//! HOP, and SESSION state, and TUMBLE windows over an interval join and over a three-way interval
+//! join chain, after recovery. After its kills, the three-node exact leg pauses the leader inside
+//! a checkpoint and resumes it once survivors fail over; the stale leader must fence itself
+//! without publishing (`paused_leader`). The local exact leg separately validates finite-source
+//! and retained-state recovery.
 //!
 //! Ignored by default — spawns processes and runs for minutes:
 //!
@@ -32,6 +33,8 @@
 //!   --test cluster_soak single_node_alo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3,iceberg \
 //!   --test cluster_soak three_node_eo_join_kill9_soak -- --ignored --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3 \
+//!   --test cluster_soak three_node_eo_view_read_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,kafka,delta-lake-s3 \
 //!   --test cluster_soak single_node_eo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster \
@@ -41,6 +44,8 @@
 //! Environment knobs:
 //! - `LAMINAR_SOAK_SECONDS`      steady-soak duration after fault rounds (default 90)
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; minimum 100)
+//! - `LAMINAR_SOAK_RECENT_READ_INTERVAL_MS`  optional cluster `[checkpoint] recent_read_interval`:
+//!   a waiting recent view read brings the next checkpoint forward to this gap
 //! - `LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS`  optional bounded end-to-end checkpoint-attempt timeout;
 //!   it must remain below the configured recovery ceiling
 //! - `LAMINAR_SOAK_CHECKPOINT_SLO_MODE`  `certify` (default) enforces the checkpoint latency
@@ -108,13 +113,16 @@ mod iceberg_table;
 mod paused_leader;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology.rs"]
-mod topology_adoption;
+mod topology_baseline;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology_cut.rs"]
 mod topology_cut;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology_migration.rs"]
 mod topology_migration;
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/view_reads.rs"]
+mod view_reads;
 #[cfg(feature = "kafka")]
 mod workload_qualification;
 
@@ -260,6 +268,9 @@ const RECOVERY_PREPARE_HANDOFF_LOG: &str =
 #[cfg(feature = "kafka")]
 const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
 #[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_YIELDED_LOG: &str =
+    "recovery fault inventory changed after stopped quorum; yielding stale Prepare";
+#[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_WITHOUT_START_LOG: &str =
     "Release observed without restoring its exact Start";
 #[cfg(feature = "kafka")]
@@ -370,7 +381,7 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 112] = [
     ("recovery_prepare_handoff", RECOVERY_PREPARE_HANDOFF_LOG),
     (
         "recovery_fault_inventory_changed_after_stop",
-        "recovery fault inventory changed after stopped quorum; yielding stale Prepare",
+        RECOVERY_PREPARE_YIELDED_LOG,
     ),
     ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
     (
@@ -818,30 +829,77 @@ const MATRIX_OUTPUT_PIPELINES: [&str; 8] = [
 struct CoreWindowCanary {
     kind: &'static str,
     pipeline: &'static str,
+    input: &'static str,
     expression: &'static str,
     emit: &'static str,
 }
 
+/// An inner interval join of the matrix sources that carries the left time column.
 #[cfg(feature = "kafka")]
-const CORE_WINDOW_CANARIES: [CoreWindowCanary; 3] = [
+const JOIN_WINDOW_INPUT: &str = "soak_window_join_input";
+
+/// A window over `JOIN_WINDOW_INPUT`. Of the canary's left ids, -101, -104 and -105 have an inner
+/// match and -102 has none.
+#[cfg(feature = "kafka")]
+const JOIN_WINDOW_CANARY: CoreWindowCanary = CoreWindowCanary {
+    kind: "join_tumble",
+    pipeline: "soak_window_over_join",
+    input: JOIN_WINDOW_INPUT,
+    expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
+    emit: "EMIT ON WINDOW CLOSE",
+};
+#[cfg(feature = "kafka")]
+const JOIN_WINDOW_ROWS: u64 = 3;
+#[cfg(feature = "kafka")]
+const JOIN_WINDOW_ID_SUM: i64 = -310;
+
+/// The matrix's right rows as a stream, the third input of `CHAIN_WINDOW_INPUT`.
+#[cfg(feature = "kafka")]
+const CHAIN_WINDOW_RIGHT: &str = "soak_window_chain_right";
+
+/// `JOIN_WINDOW_INPUT`'s join, then an interval join with `CHAIN_WINDOW_RIGHT` on the right id. It
+/// splits into a stage for the first join and an owner that runs the second, reading
+/// `CHAIN_WINDOW_RIGHT` directly; the second join repartitions on another key.
+#[cfg(feature = "kafka")]
+const CHAIN_WINDOW_INPUT: &str = "soak_window_chain_input";
+
+/// A window over `CHAIN_WINDOW_INPUT`. Each matched pair meets its right row again in the third
+/// input, so it closes the same window as `JOIN_WINDOW_CANARY`. Left -105 arrives after the faults
+/// and matches -205 in the stage's restored right state, then in the owner's.
+#[cfg(feature = "kafka")]
+const CHAIN_WINDOW_CANARY: CoreWindowCanary = CoreWindowCanary {
+    kind: "chain_tumble",
+    pipeline: "soak_window_over_chain",
+    input: CHAIN_WINDOW_INPUT,
+    expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
+    emit: "EMIT ON WINDOW CLOSE",
+};
+
+#[cfg(feature = "kafka")]
+const CORE_WINDOW_CANARIES: [CoreWindowCanary; 5] = [
     CoreWindowCanary {
         kind: "tumble",
         pipeline: "soak_window_tumble",
+        input: "soak_matrix_lhs",
         expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
         emit: "EMIT ON WINDOW CLOSE",
     },
     CoreWindowCanary {
         kind: "hop",
         pipeline: "soak_window_hop",
+        input: "soak_matrix_lhs",
         expression: "HOP(event_time, INTERVAL '500' MILLISECOND, INTERVAL '1' SECOND)",
         emit: "EMIT FINAL",
     },
     CoreWindowCanary {
         kind: "session",
         pipeline: "soak_window_session",
+        input: "soak_matrix_lhs",
         expression: "SESSION(event_time, INTERVAL '1' SECOND)",
         emit: "EMIT ON WINDOW CLOSE",
     },
+    JOIN_WINDOW_CANARY,
+    CHAIN_WINDOW_CANARY,
 ];
 
 #[cfg(feature = "kafka")]
@@ -3216,7 +3274,38 @@ impl Drop for Node {
 struct ProducerGuard {
     stop: Arc<AtomicBool>,
     enqueued: Arc<AtomicU64>,
+    acknowledged: Arc<AcknowledgedIds>,
     handle: Option<JoinHandle<ProducedPrefix>>,
+}
+
+/// The highest `join_left` id the broker has acknowledged on each Kafka partition.
+#[cfg(feature = "kafka")]
+struct AcknowledgedIds {
+    /// Per partition, that id plus one; zero while none is acknowledged.
+    next: Vec<AtomicU64>,
+}
+
+#[cfg(feature = "kafka")]
+impl AcknowledgedIds {
+    fn new(partitions: i32) -> Self {
+        let partitions = usize::try_from(partitions).expect("positive Kafka partition count");
+        Self {
+            next: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, partition: i32, id: u64) {
+        let partition = usize::try_from(partition).expect("non-negative Kafka partition");
+        self.next[partition].fetch_max(id + 1, Ordering::AcqRel);
+    }
+
+    /// Each partition's highest acknowledged id, in the shape of a view read's prefix.
+    fn snapshot(&self) -> Vec<Option<u64>> {
+        self.next
+            .iter()
+            .map(|next| next.load(Ordering::Acquire).checked_sub(1))
+            .collect()
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -5189,8 +5278,10 @@ impl ProducerGuard {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let enqueued = Arc::new(AtomicU64::new(0));
+        let acknowledged = Arc::new(AcknowledgedIds::new(partitions));
         let producer_stop = Arc::clone(&stop);
         let producer_enqueued = Arc::clone(&enqueued);
+        let producer_acknowledged = Arc::clone(&acknowledged);
         let handle = std::thread::spawn(move || {
             produce_join_inputs(
                 &brokers,
@@ -5203,17 +5294,23 @@ impl ProducerGuard {
                 timestamp_floor_ms,
                 &producer_stop,
                 &producer_enqueued,
+                &producer_acknowledged,
             )
         });
         Self {
             stop,
             enqueued,
+            acknowledged,
             handle: Some(handle),
         }
     }
 
     fn enqueued(&self) -> u64 {
         self.enqueued.load(Ordering::Acquire)
+    }
+
+    fn acknowledged(&self) -> Arc<AcknowledgedIds> {
+        Arc::clone(&self.acknowledged)
     }
 
     fn assert_running(&mut self) {
@@ -5562,7 +5659,12 @@ fn run_cluster_subscription_observer(
             .checked_add(1)
             .ok_or_else(|| "subscription gateway cursor overflow".to_string())?;
         let resume_epoch = load_subscription_progress(progress_path)?;
-        let Some(mut socket) = connect_cluster_subscription_gateway(gateway, resume_epoch)? else {
+        let Some(mut socket) = connect_cluster_subscription_gateway(
+            CLUSTER_SUBSCRIPTION_SOAK_STREAM,
+            gateway,
+            resume_epoch,
+        )?
+        else {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
@@ -5592,6 +5694,7 @@ fn run_cluster_subscription_observer(
 
 #[cfg(feature = "kafka")]
 fn connect_cluster_subscription_gateway(
+    name: &str,
     gateway: usize,
     resume_epoch: Option<u64>,
 ) -> Result<Option<tungstenite::WebSocket<TcpStream>>, String> {
@@ -5613,9 +5716,7 @@ fn connect_cluster_subscription_gateway(
         .set_nodelay(true)
         .map_err(|error| format!("set subscription socket nodelay: {error}"))?;
     let replay = resume_epoch.map_or_else(String::new, |epoch| format!("&as_of_epoch={epoch}"));
-    let request = format!(
-        "ws://127.0.0.1:{port}/ws/{CLUSTER_SUBSCRIPTION_SOAK_STREAM}?token={SOAK_CONSOLE_TOKEN}{replay}"
-    );
+    let request = format!("ws://127.0.0.1:{port}/ws/{name}?token={SOAK_CONSOLE_TOKEN}{replay}");
     match tungstenite::client(request, stream) {
         Ok((socket, response)) if response.status().as_u16() == 101 => Ok(Some(socket)),
         Ok((_, response)) => Err(format!(
@@ -6405,6 +6506,18 @@ fn expected_core_window_outputs(event_time_ms: u64) -> BTreeMap<CoreWindowOutput
             window_start_ms: event_time_ms,
             row_count: 4,
             id_sum: -412,
+        },
+        CoreWindowOutput {
+            kind: JOIN_WINDOW_CANARY.kind.to_owned(),
+            window_start_ms: tumble_start,
+            row_count: JOIN_WINDOW_ROWS,
+            id_sum: JOIN_WINDOW_ID_SUM,
+        },
+        CoreWindowOutput {
+            kind: CHAIN_WINDOW_CANARY.kind.to_owned(),
+            window_start_ms: tumble_start,
+            row_count: JOIN_WINDOW_ROWS,
+            id_sum: JOIN_WINDOW_ID_SUM,
         },
     ]
     .into_iter()
@@ -9492,6 +9605,7 @@ fn validate_recovery_checkpoint_failure_totals(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryPrepareSequence {
     abandoned_rounds: u32,
+    yielded_rounds: u32,
     applied_rounds: u32,
 }
 
@@ -9500,15 +9614,49 @@ fn validate_fenced_prepare_replacement(
     leader_lines: &[&str],
     first: usize,
     second: usize,
-) -> Result<(), String> {
+) -> Result<RecoveryPrepareSequence, String> {
     let between = &leader_lines[first + 1..second];
-    let superseded = between
-        .iter()
-        .position(|line| line.contains(RECOVERY_SUPERSEDED_LOG))
-        .ok_or_else(|| {
-            "two recovery Prepare records have no intervening superseded-round fence".to_string()
-        })?;
-    if !between[superseded + 1..]
+    let position = |marker: &str| between.iter().position(|line| line.contains(marker));
+    let (fence, expected_retry_holds, sequence) = match (
+        position(RECOVERY_SUPERSEDED_LOG),
+        position(RECOVERY_PREPARE_YIELDED_LOG),
+    ) {
+        (Some(superseded), None) => (
+            superseded,
+            1,
+            RecoveryPrepareSequence {
+                abandoned_rounds: 1,
+                yielded_rounds: 0,
+                applied_rounds: 1,
+            },
+        ),
+        // A cascade fault reported after the stopped quorum: the driver yields its own Prepare
+        // without failure accounting or a retry hold, and the next round covers the late fault.
+        (None, Some(yielded)) => (
+            yielded,
+            0,
+            RecoveryPrepareSequence {
+                abandoned_rounds: 0,
+                yielded_rounds: 1,
+                applied_rounds: 1,
+            },
+        ),
+        (None, None) => {
+            return Err(
+                "two recovery Prepare records have no intervening yielded-Prepare or \
+                 superseded-round fence"
+                    .into(),
+            );
+        }
+        (Some(_), Some(_)) => {
+            return Err(
+                "two recovery Prepare records are fenced by both a superseded round and \
+                 a yielded Prepare"
+                    .into(),
+            );
+        }
+    };
+    if !between[fence + 1..]
         .iter()
         .any(|line| line.contains(RECOVERY_PREPARE_HANDOFF_LOG))
     {
@@ -9518,12 +9666,13 @@ fn validate_fenced_prepare_replacement(
         .iter()
         .filter(|line| line.contains(RECOVERY_RETRY_HOLD_LOG))
         .count();
-    if retry_holds != 1 {
+    if retry_holds != expected_retry_holds {
         return Err(format!(
-            "fenced recovery replacement recorded {retry_holds} retry holds; expected exactly one"
+            "fenced recovery replacement recorded {retry_holds} retry holds; expected \
+             {expected_retry_holds}"
         ));
     }
-    Ok(())
+    Ok(sequence)
 }
 
 #[cfg(feature = "kafka")]
@@ -9619,19 +9768,17 @@ fn validate_recovery_prepare_sequence(
     match (total_prepares, driver_handoffs, prepares.as_slice()) {
         (1, 0, [_]) => Ok(RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 1,
         }),
         (2, 0, [first, second]) => {
-            validate_fenced_prepare_replacement(&leader_lines, *first, *second)?;
-            Ok(RecoveryPrepareSequence {
-                abandoned_rounds: 1,
-                applied_rounds: 1,
-            })
+            validate_fenced_prepare_replacement(&leader_lines, *first, *second)
         }
         (2, 1, [_, ..]) => {
             validate_post_start_leadership_handoff(fault_logs, &leader_lines, &prepares)?;
             Ok(RecoveryPrepareSequence {
                 abandoned_rounds: 0,
+                yielded_rounds: 0,
                 applied_rounds: 2,
             })
         }
@@ -9819,11 +9966,13 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         .map(|log| log.matches(RECOVERY_STOPPED_LOG).count())
         .sum::<usize>();
     let applied_stopped_reports = (nodes.len() - 1) * prepare_sequence.applied_rounds as usize;
-    let maximum_stopped_reports =
-        applied_stopped_reports + (nodes.len() - 1) * prepare_sequence.abandoned_rounds as usize;
+    // The driver itself also stops for the Prepare it yielded before handing it off.
+    let maximum_stopped_reports = applied_stopped_reports
+        + (nodes.len() - 1) * prepare_sequence.abandoned_rounds as usize
+        + nodes.len() * prepare_sequence.yielded_rounds as usize;
     assert!(
         (applied_stopped_reports..=maximum_stopped_reports).contains(&stopped_reports),
-        "explicit fault recorded {stopped_reports} follower stops; expected {applied_stopped_reports} exact-quorum stops plus at most {} from a fenced abandoned round",
+        "explicit fault recorded {stopped_reports} stops; expected {applied_stopped_reports} exact-quorum stops plus at most {} from a fenced abandoned or yielded round",
         maximum_stopped_reports - applied_stopped_reports
     );
     let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
@@ -10629,30 +10778,74 @@ fn delta_core_window_sink_config(
 }
 
 #[cfg(feature = "kafka")]
+fn core_window_canary_query(canary: &CoreWindowCanary) -> String {
+    format!(
+        "SELECT '{kind}' AS window_kind, {expression} AS window_start,
+       COUNT(*) AS row_count, SUM(id) AS id_sum
+FROM {input}
+WHERE id IN (-101, -102, -104, -105)
+GROUP BY {expression}
+{emit}",
+        kind = canary.kind,
+        input = canary.input,
+        expression = canary.expression,
+        emit = canary.emit,
+    )
+}
+
+#[cfg(feature = "kafka")]
 fn core_window_canary_pipeline_config() -> String {
+    let join_interval_ms = join_interval_ms();
+    let join = format!(
+        "SELECT l.id AS id, l.event_time AS event_time
+FROM soak_matrix_lhs l
+JOIN soak_matrix_rhs r
+  ON l.join_key = r.join_key_2
+ AND l.join_key_2 = r.join_key
+ AND r.event_time BETWEEN l.event_time
+                          AND l.event_time + INTERVAL '{join_interval_ms}' MILLISECOND"
+    );
+    let inputs = format!(
+        r#"
+[[pipeline]]
+name = "{JOIN_WINDOW_INPUT}"
+sql = """
+{join}
+"""
+
+[[pipeline]]
+name = "{CHAIN_WINDOW_RIGHT}"
+sql = """
+SELECT id, event_time FROM soak_matrix_rhs
+"""
+
+[[pipeline]]
+name = "{CHAIN_WINDOW_INPUT}"
+sql = """
+{join}
+JOIN {CHAIN_WINDOW_RIGHT} c
+  ON r.id = c.id
+ AND c.event_time BETWEEN l.event_time
+                          AND l.event_time + INTERVAL '{join_interval_ms}' MILLISECOND
+"""
+"#
+    );
     CORE_WINDOW_CANARIES
         .iter()
-        .map(|canary| {
-            format!(
+        .fold(inputs, |mut config, canary| {
+            config.push_str(&format!(
                 r#"
 [[pipeline]]
 name = "{pipeline}"
 sql = """
-SELECT '{kind}' AS window_kind, {expression} AS window_start,
-       COUNT(*) AS row_count, SUM(id) AS id_sum
-FROM soak_matrix_lhs
-WHERE id IN (-101, -102, -104, -105)
-GROUP BY {expression}
-{emit}
+{query}
 """
 "#,
-                kind = canary.kind,
                 pipeline = canary.pipeline,
-                expression = canary.expression,
-                emit = canary.emit,
-            )
+                query = core_window_canary_query(canary),
+            ));
+            config
         })
-        .collect()
 }
 
 #[cfg(feature = "kafka")]
@@ -11165,9 +11358,10 @@ fn write_config(
     sink: &str,
     matrix_sinks: &str,
     extra_workload: &str,
+    root: &str,
 ) -> PathBuf {
     let toml = format!(
-        r#"{node}
+        r#"{root}{node}
 # Guaranteed delivery uses engine-owned vnode assignment. The group ID below is only the
 # advisory broker-offset namespace; LaminarDB checkpoints remain the recovery authority.
 {workload}
@@ -11199,6 +11393,19 @@ fn write_config(
     let path = dir.join(format!("node{id}.toml"));
     std::fs::write(&path, toml).unwrap();
     path
+}
+
+/// `[checkpoint] recent_read_interval` for cluster members, when the soak sets one.
+#[cfg(feature = "kafka")]
+fn soak_recent_read_interval() -> Option<Duration> {
+    // CI jobs without the matrix field pass an empty value.
+    let value = std::env::var("LAMINAR_SOAK_RECENT_READ_INTERVAL_MS")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let millis = value.parse().unwrap_or_else(|error| {
+        panic!("LAMINAR_SOAK_RECENT_READ_INTERVAL_MS={value:?} is not a valid u64: {error}")
+    });
+    Some(Duration::from_millis(millis))
 }
 
 /// The `[server]`, `[discovery]`, and `[checkpoint]` sections of one three-node soak member.
@@ -11244,6 +11451,10 @@ fn cluster_node_config(
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
 
+    let recent_read_interval = soak_recent_read_interval()
+        .map(|interval| format!("recent_read_interval = \"{}ms\"\n", interval.as_millis()))
+        .unwrap_or_default();
+
     format!(
         r#"
 node_id = "n{id}"
@@ -11251,6 +11462,7 @@ node_id = "n{id}"
 [server]
 mode = "cluster"
 bind = "127.0.0.1:{http}"
+pgwire_bind = "127.0.0.1:{pgwire}"
 delivery = "{delivery}"
 key_groups = {key_groups}
 console_token = "{SOAK_CONSOLE_TOKEN}"
@@ -11266,13 +11478,14 @@ advertise_host = "127.0.0.1"
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
-timeout = "{checkpoint_timeout}"
+{recent_read_interval}timeout = "{checkpoint_timeout}"
 
 [checkpoint.storage]
 {storage}
 
 "#,
         seeds = seeds.join(", "),
+        pgwire = view_reads::pgwire_port(id),
         url = checkpoint_url,
         delivery = delivery.server_value(),
         source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
@@ -13802,16 +14015,16 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false, None);
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, ReaderLeg::None, None);
 }
 
 #[test]
-#[ignore = "spawns 3 real processes with Kafka/S3, adopts legacy authority, and restarts all nodes"]
+#[ignore = "spawns 3 real processes with Kafka/S3, checks the sealed topology baseline, and restarts all nodes"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
-fn three_node_alo_legacy_topology_adoption_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(
+fn three_node_alo_topology_baseline_restart_soak() {
+    run_three_node_join_kill9_soak_with_topology(
         JoinDelivery::AtLeastOnce,
-        false,
+        ReaderLeg::None,
         None,
         true,
         false,
@@ -13823,9 +14036,9 @@ fn three_node_alo_legacy_topology_adoption_restart_soak() {
 #[ignore = "spawns 3 real Kafka/S3 processes, prepares an old-graph cut, aborts by restart, and checks stateful output oracles"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
 fn three_node_alo_topology_cut_abort_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(
+    run_three_node_join_kill9_soak_with_topology(
         JoinDelivery::AtLeastOnce,
-        false,
+        ReaderLeg::None,
         None,
         true,
         true,
@@ -13837,9 +14050,9 @@ fn three_node_alo_topology_cut_abort_restart_soak() {
 #[ignore = "spawns 3 real Kafka/S3 processes; public additions/replacement/reset, paused-input oracle, post-settlement kill resharding and rejoin, full namespace restart and a migration after rescaling"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
 fn three_node_alo_public_topology_migration_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(
+    run_three_node_join_kill9_soak_with_topology(
         JoinDelivery::AtLeastOnce,
-        false,
+        ReaderLeg::None,
         None,
         true,
         false,
@@ -13851,32 +14064,54 @@ fn three_node_alo_public_topology_migration_restart_soak() {
 #[ignore = "spawns 3 real laminardb processes with a durable WebSocket subscription"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_cluster_subscription_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, true, None);
+    run_three_node_join_kill9_soak(
+        JoinDelivery::AtLeastOnce,
+        ReaderLeg::StreamSubscription,
+        None,
+    );
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka and Delta S3; run with --ignored"]
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn three_node_eo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, false, None);
+    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, ReaderLeg::None, None);
+}
+
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka and Delta S3, reading materialized views through every fault"]
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn three_node_eo_view_read_kill9_soak() {
+    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, ReaderLeg::Views, None);
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes and injects a follower checkpoint fault"]
 #[cfg(feature = "kafka")]
 fn three_node_follower_checkpoint_fault_recovery_release_regression() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false, Some("follower"));
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, ReaderLeg::None, Some("follower"));
+}
+
+/// The reader a three-node soak runs beside its fault rounds.
+#[cfg(feature = "kafka")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReaderLeg {
+    None,
+    /// A durable WebSocket subscription to `soak_subscription_aggregate`.
+    StreamSubscription,
+    /// Committed reads of materialized views and a view subscription (`view_reads`).
+    Views,
 }
 
 #[cfg(feature = "kafka")]
 fn run_three_node_join_kill9_soak(
     delivery: JoinDelivery,
-    subscription_soak: bool,
+    reader: ReaderLeg,
     forced_fault_role: Option<&str>,
 ) {
-    run_three_node_join_kill9_soak_with_adoption(
+    run_three_node_join_kill9_soak_with_topology(
         delivery,
-        subscription_soak,
+        reader,
         forced_fault_role,
         false,
         false,
@@ -13885,11 +14120,11 @@ fn run_three_node_join_kill9_soak(
 }
 
 #[cfg(feature = "kafka")]
-fn run_three_node_join_kill9_soak_with_adoption(
+fn run_three_node_join_kill9_soak_with_topology(
     delivery: JoinDelivery,
-    subscription_soak: bool,
+    reader: ReaderLeg,
     forced_fault_role: Option<&str>,
-    adopt_legacy: bool,
+    check_baseline: bool,
     prepare_topology_cut: bool,
     migrate_topology: bool,
 ) {
@@ -14146,9 +14381,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
     let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
     std::fs::create_dir(&log_dir).expect("create exclusive cluster soak log directory");
     eprintln!("soak: node logs in {}", log_dir.display());
-    let subscription_workload = subscription_soak
+    let subscription_workload = (reader == ReaderLeg::StreamSubscription)
         .then(cluster_subscription_workload_config)
         .unwrap_or_default();
+    let views_config = if reader == ReaderLeg::Views {
+        view_reads::views_config(kafka_partitions)
+    } else {
+        String::new()
+    };
 
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
@@ -14174,6 +14414,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 &sink_config,
                 &matrix_sink_config,
                 subscription_workload,
+                &views_config,
             ),
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
@@ -14254,12 +14495,8 @@ fn run_three_node_join_kill9_soak_with_adoption(
         cluster_metric(&nodes, "laminardb_events_ingested_total"),
         commit_oracle.committed_offset_sum().unwrap_or(0)
     );
-    let adopted_topology = adopt_legacy.then(|| {
-        if migrate_topology {
-            topology_migration::adopt_inventory(&checkpoint_url, &mut nodes)
-        } else {
-            topology_adoption::adopt_inventory(&checkpoint_url, &mut nodes, recovery_ceiling)
-        }
+    let sealed_topology = check_baseline.then(|| {
+        topology_baseline::sealed_inventory(&checkpoint_url, &mut nodes, recovery_ceiling)
     });
     exact_timing_evidence.capture_nodes_unbound(
         &nodes,
@@ -14285,12 +14522,23 @@ fn run_three_node_join_kill9_soak_with_adoption(
         Instant::now() + Duration::from_secs(10),
         "stable startup",
     );
-    let mut subscription_observer = subscription_soak.then(|| {
+    let mut subscription_observer = (reader == ReaderLeg::StreamSubscription).then(|| {
         let mut observer = ClusterSubscriptionObserver::spawn(
             dir.path().join("cluster-subscription-progress.log"),
         );
         observer.wait_until_attached(Duration::from_secs(30));
         observer
+    });
+    let mut view_soak = (reader == ReaderLeg::Views).then(|| {
+        view_reads::ViewSoak::start(
+            kafka_partitions,
+            join_keys,
+            zipf_milli,
+            producer.acknowledged(),
+            Duration::from_millis(interval_ms),
+            soak_recent_read_interval(),
+            recovery_ceiling,
+        )
     });
     latest_checkpoint = assert_temporal_idle_checkpoint(
         &mut nodes,
@@ -14569,6 +14817,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
         let prior_release = migration_probe
             .as_ref()
             .and_then(topology_migration::MigrationProbe::recovery_release);
+        if let Some(views) = view_soak.as_mut() {
+            views.before_fault(victim);
+        }
         let paused = fault.deliver(&mut nodes[victim]);
         if paused.is_some() {
             pauses += 1;
@@ -14763,6 +15014,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
             "soak round {round}: node {victim} rejoined and resumed durable work with exact local assignment evidence in {rejoin_elapsed:?}"
         );
         local_convergence = rejoined_convergence;
+        if let Some(views) = view_soak.as_mut() {
+            views.after_round(latest_checkpoint.epoch, recovery_ceiling);
+        }
         if let Some(probe) = migration_probe.as_mut() {
             probe.assert_rescaled_output(
                 &mut nodes[..],
@@ -14799,7 +15053,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
         );
     }
 
-    if let Some(baseline) = adopted_topology.as_ref() {
+    if let Some(baseline) = sealed_topology.as_ref() {
         let restart_fence = local_convergence
             .snapshot
             .assignment_fence()
@@ -14842,7 +15096,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
             probe.restart_all(&mut nodes, recovery_ceiling);
             probe.change_after_rescale(&mut nodes, recovery_ceiling);
         } else {
-            topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+            topology_baseline::restart_all(&mut nodes, baseline, recovery_ceiling);
         }
         if let Some(cut) = old_cut.as_ref() {
             topology_cut::assert_aborted_after_restart(
@@ -14858,20 +15112,20 @@ fn run_three_node_join_kill9_soak_with_adoption(
             Some(&mut producer),
             Some(&commit_oracle),
             recovery_ceiling,
-            "full restart after legacy topology adoption",
+            "full restart after the sealed topology baseline",
             Some(latest_checkpoint),
         );
         local_convergence = wait_for_local_assignment_convergence(
             &mut nodes,
             &all_live_nodes,
             Instant::now() + recovery_ceiling,
-            "local assignment after adopted-catalog full restart",
+            "local assignment after sealed-catalog full restart",
         );
         exact_timing_evidence.capture_nodes_bound(
             &nodes,
             &local_convergence,
             Instant::now() + Duration::from_secs(10),
-            "adopted-catalog full restart",
+            "sealed-catalog full restart",
         );
     }
     let steady_deadline = Instant::now() + Duration::from_secs(soak_secs);
@@ -15248,6 +15502,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
             observation.last_progress_epoch,
             observation.used_gateways,
             observation.observed_partitions.len(),
+        );
+    }
+    if let Some(views) = view_soak.take() {
+        views.finish(
+            &nodes,
+            latest_checkpoint.epoch,
+            &produced_prefix,
+            recovery_ceiling,
         );
     }
     #[cfg(feature = "delta-lake-s3")]
@@ -16124,6 +16386,7 @@ fn produce_join_inputs(
     timestamp_floor_ms: u64,
     stop: &AtomicBool,
     enqueued_count: &AtomicU64,
+    acknowledged: &AcknowledgedIds,
 ) -> ProducedPrefix {
     use futures::stream::{FuturesUnordered, StreamExt as _};
     use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -16258,7 +16521,13 @@ fn produce_join_inputs(
                         .partition(partition),
                 )
                 .unwrap_or_else(|(error, _)| panic!("right Kafka enqueue failed: {error}"));
-            left_deliveries.push(left_delivery);
+            left_deliveries.push(async move {
+                let delivery = left_delivery.await;
+                if let Ok(Ok(delivery)) = &delivery {
+                    acknowledged.record(delivery.partition, n);
+                }
+                delivery
+            });
             right_deliveries.push(right_delivery);
             inputs.push(JoinInput {
                 id: n,
@@ -16965,6 +17234,7 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&one, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 1,
         }
     );
@@ -16980,6 +17250,7 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&replacement, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 1,
+            yielded_rounds: 0,
             applied_rounds: 1,
         }
     );
@@ -16995,6 +17266,7 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&same_process_successor, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 2,
         }
     );
@@ -17007,9 +17279,62 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&different_process_successor, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 2,
         }
     );
+
+    let yielded = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_QUORUM_LOG}\n\
+             {RECOVERY_PREPARE_YIELDED_LOG} gen=1\n{RECOVERY_STOPPED_LOG} gen=1\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG} gen=1\n{RECOVERY_PREPARE_LOG} gen=2"
+        ),
+        String::new(),
+    ];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&yielded, 0).unwrap(),
+        RecoveryPrepareSequence {
+            abandoned_rounds: 0,
+            yielded_rounds: 1,
+            applied_rounds: 1,
+        }
+    );
+
+    let yielded_with_retry_hold = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_YIELDED_LOG}\n{RECOVERY_RETRY_HOLD_LOG}\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(
+        validate_recovery_prepare_sequence(&yielded_with_retry_hold, 0)
+            .unwrap_err()
+            .contains("retry holds")
+    );
+
+    let yielded_without_handoff = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_YIELDED_LOG}\n{RECOVERY_PREPARE_LOG}"),
+        String::new(),
+    ];
+    assert!(
+        validate_recovery_prepare_sequence(&yielded_without_handoff, 0)
+            .unwrap_err()
+            .contains("direct handoff fence")
+    );
+
+    let doubly_fenced = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
+             {RECOVERY_PREPARE_YIELDED_LOG}\n{RECOVERY_RETRY_HOLD_LOG}\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&doubly_fenced, 0)
+        .unwrap_err()
+        .contains("both"));
 
     let unfenced = vec![
         format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_LOG}"),
@@ -19247,8 +19572,36 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
         "",
         "",
         "",
+        &view_reads::views_config(4),
     );
     let config = std::fs::read_to_string(path).unwrap();
+    let parsed: toml::Table = config.parse().unwrap();
+    let views = parsed["sql"].as_str().unwrap();
+    assert!(views.contains("CREATE MATERIALIZED VIEW soak_view_rows"));
+    assert!(
+        views.contains("CREATE MATERIALIZED VIEW soak_view_join_windows AS\nSELECT 'join_tumble'")
+    );
+    assert!(views
+        .contains("CREATE MATERIALIZED VIEW soak_view_chain_windows AS\nSELECT 'chain_tumble'"));
+    let pipelines = parsed["pipeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pipeline| pipeline["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    for name in [
+        JOIN_WINDOW_INPUT,
+        JOIN_WINDOW_CANARY.pipeline,
+        CHAIN_WINDOW_RIGHT,
+        CHAIN_WINDOW_INPUT,
+        CHAIN_WINDOW_CANARY.pipeline,
+    ] {
+        assert!(pipelines.contains(&name), "{name}: {pipelines:?}");
+    }
+    assert_eq!(
+        parsed["server"]["pgwire_bind"].as_str(),
+        Some(format!("127.0.0.1:{}", view_reads::pgwire_port(0)).as_str())
+    );
     let (_, checkpoint_and_later) = config.split_once("[checkpoint]").unwrap();
     let (checkpoint, _) = checkpoint_and_later
         .split_once("[checkpoint.storage]")
@@ -19535,6 +19888,14 @@ fn recovery_canary_event_time_holds_ordered_and_window_cuts_open() {
             window_start_ms: hop_start,
             row_count: 4,
             id_sum: -412,
+        }));
+    }
+    for kind in ["join_tumble", "chain_tumble"] {
+        assert!(expected.contains_key(&CoreWindowOutput {
+            kind: kind.to_owned(),
+            window_start_ms: 12_000,
+            row_count: 3,
+            id_sum: -101 - 104 - 105,
         }));
     }
 }

@@ -40,7 +40,12 @@ impl CheckpointCoordinator {
             usize::try_from(config.max_node_data_bytes).unwrap_or(usize::MAX);
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
         let (gc_requests, gc_receiver) = tokio::sync::watch::channel(None);
-        let gc_task = tokio::spawn(run_gc_worker(Arc::clone(&store), gc_receiver));
+        let read_pins = Arc::<super::committed_reads::ReadPins>::default();
+        let gc_task = tokio::spawn(run_gc_worker(
+            Arc::clone(&store),
+            gc_receiver,
+            Arc::clone(&read_pins),
+        ));
         Ok(Self {
             allocator: Arc::new(EpochAllocator::new()),
             config,
@@ -57,8 +62,9 @@ impl CheckpointCoordinator {
             active_sink_artifact_intents: None,
             prepared: HashMap::new(),
             last_committed_manifest: None,
+            view_log_predecessor: None,
             last_committed_ref: None,
-            last_committed_source_watermarks: None,
+            last_committed_frontiers: None,
             failure_requires_recovery: false,
             local_watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             #[cfg(feature = "cluster")]
@@ -73,6 +79,10 @@ impl CheckpointCoordinator {
             prom: None,
             gc_requests,
             gc_task,
+            committed_cut: tokio::sync::watch::Sender::new(None),
+            #[cfg(feature = "cluster")]
+            head_follower: None,
+            read_pins,
         })
     }
 
@@ -286,6 +296,10 @@ impl std::fmt::Debug for CheckpointCoordinator {
 impl Drop for CheckpointCoordinator {
     fn drop(&mut self) {
         self.gc_task.abort();
+        #[cfg(feature = "cluster")]
+        if let Some(follower) = &self.head_follower {
+            follower.abort();
+        }
     }
 }
 
@@ -347,7 +361,7 @@ impl CheckpointCoordinator {
 
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn set_last_committed_ref_for_test(&mut self, reference: CommittedCheckpointRef) {
-        self.last_committed_source_watermarks = None;
+        self.last_committed_frontiers = None;
         self.last_committed_ref = Some(reference);
     }
 

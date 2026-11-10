@@ -1,20 +1,28 @@
-use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, Decimal128Type, Float64Type};
+use std::borrow::Cow;
+
+use arrow::datatypes::{DataType, Decimal128Type};
 use datafusion::functions_aggregate::average::Avg;
 use datafusion::functions_aggregate::count::Count;
-use datafusion::functions_aggregate::min_max::{Max, MaxAccumulator, Min, MinAccumulator};
+use datafusion::functions_aggregate::min_max::{Max, Min};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion_common::ScalarValue;
-use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 
 use super::AggFuncSpec;
 use crate::error::DbError;
 
+mod input;
+mod min_max;
+mod retractable;
 mod sum;
 
+pub(crate) use input::AggregateInput;
+use min_max::{Extremum, ExtremumState};
+use retractable::RetractableExtremumState;
+#[cfg(feature = "cluster")]
+use sum::sum_rows;
 pub(crate) use sum::SumState;
-use sum::{merge_sum_scalar, require_array_type, sum_array, weighted_f64_delta};
+use sum::{add_rows_sum, merge_sum_scalar, require_array_type, weighted_f64_delta};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcreteInputMode {
@@ -27,8 +35,12 @@ pub(crate) enum ConcreteAggregateState {
     Count(CountState),
     Sum(SumState),
     Avg(AvgState),
-    Min(MinAccumulator),
-    Max(MaxAccumulator),
+    Min(ExtremumState),
+    Max(ExtremumState),
+    /// MIN over a changelog.
+    RetractableMin(RetractableExtremumState),
+    /// MAX over a changelog.
+    RetractableMax(RetractableExtremumState),
 }
 
 impl ConcreteAggregateState {
@@ -37,7 +49,7 @@ impl ConcreteAggregateState {
             return Err(unsupported(spec, "exactly one aggregate input is required"));
         }
 
-        let implementation = spec.udf.inner().as_any();
+        let implementation = spec.udf.inner();
         if implementation.is::<Count>() {
             if spec.return_type != DataType::Int64 {
                 return Err(unsupported(spec, "COUNT must return Int64"));
@@ -62,17 +74,28 @@ impl ConcreteAggregateState {
                 mode,
             )?));
         }
+        let (input_type, output_type) = (&spec.input_types[0], &spec.return_type);
         if implementation.is::<Min>() {
-            require_append_only(spec, mode)?;
-            return MinAccumulator::try_new(&spec.return_type)
-                .map(Self::Min)
-                .map_err(|error| aggregate_error("MIN state creation", error));
+            return match mode {
+                ConcreteInputMode::AppendOnly => {
+                    ExtremumState::try_new(input_type, output_type).map(Self::Min)
+                }
+                ConcreteInputMode::Weighted => {
+                    RetractableExtremumState::try_new(input_type, output_type)
+                        .map(Self::RetractableMin)
+                }
+            };
         }
         if implementation.is::<Max>() {
-            require_append_only(spec, mode)?;
-            return MaxAccumulator::try_new(&spec.return_type)
-                .map(Self::Max)
-                .map_err(|error| aggregate_error("MAX state creation", error));
+            return match mode {
+                ConcreteInputMode::AppendOnly => {
+                    ExtremumState::try_new(input_type, output_type).map(Self::Max)
+                }
+                ConcreteInputMode::Weighted => {
+                    RetractableExtremumState::try_new(input_type, output_type)
+                        .map(Self::RetractableMax)
+                }
+            };
         }
 
         Err(unsupported(
@@ -81,85 +104,83 @@ impl ConcreteAggregateState {
         ))
     }
 
-    pub(crate) fn update_batch(&mut self, values: &[ArrayRef]) -> Result<(), DbError> {
+    /// Rejects an input column of a type this aggregate's states do not take.
+    fn check_input(&self, input: &AggregateInput<'_>) -> Result<(), DbError> {
         match self {
-            Self::Count(state) => state.update_batch(values),
-            Self::Sum(state) => state.update_batch(values),
-            Self::Avg(state) => state.update_batch(values),
-            Self::Min(state) => {
-                let value = append_value(values)?;
-                state
-                    .update_batch(std::slice::from_ref(value))
-                    .map_err(|error| aggregate_error("MIN update", error))
-            }
-            Self::Max(state) => {
-                let value = append_value(values)?;
-                state
-                    .update_batch(std::slice::from_ref(value))
-                    .map_err(|error| aggregate_error("MAX update", error))
-            }
+            Self::Count(_) => Ok(()),
+            Self::Sum(state) => state.check_input(input),
+            Self::Avg(state) => state.check_input(input),
+            Self::Min(state) => state.check_input(Extremum::Min, input),
+            Self::Max(state) => state.check_input(Extremum::Max, input),
+            Self::RetractableMin(state) => state.check_input(Extremum::Min, input),
+            Self::RetractableMax(state) => state.check_input(Extremum::Max, input),
         }
     }
 
-    /// One batch's contribution in `checkpoint_state` form, independent of accumulated values.
-    /// `merge_checkpoint_state` applies it with the same checks `update_batch` makes, so a delta
-    /// may be negative where the state it merges into may not.
-    // PERF: deltas repeat `update_batch` arithmetic; routing `update_batch` through them cost the
-    // keyed update benchmark about 4%.
+    /// Fold the admitted values of `rows`, in row order, into the state. `input` must have
+    /// passed this aggregate's `check_input`.
+    pub(crate) fn update_rows(
+        &mut self,
+        input: &AggregateInput<'_>,
+        rows: &[u32],
+    ) -> Result<(), DbError> {
+        match self {
+            Self::Count(state) => state.update_rows(input, rows),
+            Self::Sum(state) => state.update_rows(input, rows),
+            Self::Avg(state) => state.update_rows(input, rows),
+            Self::Min(state) => state.update_rows(Extremum::Min, input, rows),
+            Self::Max(state) => state.update_rows(Extremum::Max, input, rows),
+            Self::RetractableMin(state) => state.update_rows(Extremum::Min, input, rows),
+            Self::RetractableMax(state) => state.update_rows(Extremum::Max, input, rows),
+        }
+    }
+
+    /// The contribution of `rows` in `checkpoint_state` form, independent of accumulated values.
+    /// `merge_checkpoint_state` applies it with the same checks `update_rows` makes, so a delta
+    /// may be negative where the state it merges into may not. `input` must have passed
+    /// `check_input`.
+    // PERF: SUM and AVG deltas repeat `update_rows` arithmetic; routing their updates through
+    // `Vec<ScalarValue>` deltas cost the keyed update benchmark about 4%.
     #[cfg(feature = "cluster")]
-    pub(crate) fn batch_delta(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+    pub(crate) fn batch_delta(
+        &self,
+        input: &AggregateInput<'_>,
+        rows: &[u32],
+    ) -> Result<Vec<ScalarValue>, DbError> {
         match self {
-            Self::Count(state) => Ok(vec![ScalarValue::Int64(Some(state.batch_delta(values)?))]),
-            Self::Sum(state) => state.batch_delta(values),
-            Self::Avg(state) => state.batch_delta(values),
-            Self::Min(_) => {
-                let value = append_value(values)?;
-                let mut delta = MinAccumulator::try_new(value.data_type())
-                    .map_err(|error| aggregate_error("MIN delta creation", error))?;
-                delta
-                    .update_batch(std::slice::from_ref(value))
-                    .and_then(|()| delta.state())
-                    .map_err(|error| aggregate_error("MIN delta", error))
-            }
-            Self::Max(_) => {
-                let value = append_value(values)?;
-                let mut delta = MaxAccumulator::try_new(value.data_type())
-                    .map_err(|error| aggregate_error("MAX delta creation", error))?;
-                delta
-                    .update_batch(std::slice::from_ref(value))
-                    .and_then(|()| delta.state())
-                    .map_err(|error| aggregate_error("MAX delta", error))
-            }
+            Self::Count(state) => Ok(vec![ScalarValue::Int64(Some(
+                state.rows_delta(input, rows)?,
+            ))]),
+            Self::Sum(state) => state.batch_delta(input, rows),
+            Self::Avg(state) => state.batch_delta(input, rows),
+            Self::Min(state) => state.batch_delta(Extremum::Min, input, rows),
+            Self::Max(state) => state.batch_delta(Extremum::Max, input, rows),
+            Self::RetractableMin(_) | Self::RetractableMax(_) => Err(DbError::Pipeline(
+                "MIN/MAX over a changelog has no partial form; its rows go to the owner".into(),
+            )),
         }
     }
 
-    pub(crate) fn evaluate(&mut self) -> Result<ScalarValue, DbError> {
+    /// The aggregate's value. MIN, MAX and append-only SUM lend the value they hold, so emitting
+    /// it copies it into the output column once, without an intermediate clone.
+    pub(crate) fn evaluate(&self) -> Result<Cow<'_, ScalarValue>, DbError> {
         match self {
-            Self::Count(state) => Ok(ScalarValue::Int64(Some(state.count))),
+            Self::Count(state) => Ok(Cow::Owned(ScalarValue::Int64(Some(state.count)))),
             Self::Sum(state) => state.evaluate(),
-            Self::Avg(state) => state.evaluate(),
-            Self::Min(state) => state
-                .evaluate()
-                .map_err(|error| aggregate_error("MIN evaluation", error)),
-            Self::Max(state) => state
-                .evaluate()
-                .map_err(|error| aggregate_error("MAX evaluation", error)),
+            Self::Avg(state) => state.evaluate().map(Cow::Owned),
+            Self::Min(state) | Self::Max(state) => Ok(Cow::Borrowed(state.value())),
+            Self::RetractableMin(state) => state.evaluate(Extremum::Min).map(Cow::Owned),
+            Self::RetractableMax(state) => state.evaluate(Extremum::Max).map(Cow::Owned),
         }
     }
 
-    pub(crate) fn checkpoint_state(&self) -> Result<Vec<ScalarValue>, DbError> {
+    pub(crate) fn checkpoint_state(&self) -> Vec<ScalarValue> {
         match self {
-            Self::Count(state) => Ok(vec![ScalarValue::Int64(Some(state.count))]),
-            Self::Sum(state) => Ok(state.checkpoint_state()),
-            Self::Avg(state) => Ok(state.checkpoint_state()),
-            Self::Min(state) => state
-                .clone()
-                .state()
-                .map_err(|error| aggregate_error("MIN checkpoint state", error)),
-            Self::Max(state) => state
-                .clone()
-                .state()
-                .map_err(|error| aggregate_error("MAX checkpoint state", error)),
+            Self::Count(state) => vec![ScalarValue::Int64(Some(state.count))],
+            Self::Sum(state) => state.checkpoint_state(),
+            Self::Avg(state) => state.checkpoint_state(),
+            Self::Min(state) | Self::Max(state) => state.checkpoint_state(),
+            Self::RetractableMin(state) | Self::RetractableMax(state) => state.checkpoint_state(),
         }
     }
 
@@ -171,15 +192,19 @@ impl ConcreteAggregateState {
             Self::Count(state) => state.merge_checkpoint_state(checkpoint),
             Self::Sum(state) => state.merge_checkpoint_state(checkpoint),
             Self::Avg(state) => state.merge_checkpoint_state(checkpoint),
-            Self::Min(state) => merge_extremum_checkpoint(state, checkpoint, "MIN"),
-            Self::Max(state) => merge_extremum_checkpoint(state, checkpoint, "MAX"),
+            Self::Min(state) => state.merge_checkpoint_state(Extremum::Min, checkpoint),
+            Self::Max(state) => state.merge_checkpoint_state(Extremum::Max, checkpoint),
+            Self::RetractableMin(state) => state.merge_checkpoint_state(Extremum::Min, checkpoint),
+            Self::RetractableMax(state) => state.merge_checkpoint_state(Extremum::Max, checkpoint),
         }
     }
 
     pub(crate) fn nested_retained_bytes(&self) -> usize {
         match self {
-            Self::Min(state) => state.size().saturating_sub(std::mem::size_of_val(state)),
-            Self::Max(state) => state.size().saturating_sub(std::mem::size_of_val(state)),
+            Self::Min(state) | Self::Max(state) => state.nested_retained_bytes(),
+            Self::RetractableMin(state) | Self::RetractableMax(state) => {
+                state.nested_retained_bytes()
+            }
             Self::Count(_) | Self::Sum(_) | Self::Avg(_) => 0,
         }
     }
@@ -193,56 +218,8 @@ fn unsupported(spec: &AggFuncSpec, reason: &str) -> DbError {
     ))
 }
 
-fn require_append_only(spec: &AggFuncSpec, mode: ConcreteInputMode) -> Result<(), DbError> {
-    if mode == ConcreteInputMode::Weighted {
-        return Err(unsupported(spec, "MIN/MAX require append-only input"));
-    }
-    Ok(())
-}
-
 fn aggregate_error(context: &str, error: impl std::fmt::Display) -> DbError {
     DbError::Pipeline(format!("{context}: {error}"))
-}
-
-fn append_value(values: &[ArrayRef]) -> Result<&ArrayRef, DbError> {
-    let [value] = values else {
-        return Err(DbError::Pipeline(format!(
-            "append-only aggregate expected one input array, got {}",
-            values.len()
-        )));
-    };
-    Ok(value)
-}
-
-fn weighted_values(values: &[ArrayRef]) -> Result<(&ArrayRef, &arrow::array::Int64Array), DbError> {
-    let [value, weight] = values else {
-        return Err(DbError::Pipeline(format!(
-            "weighted aggregate expected value and weight arrays, got {} inputs",
-            values.len()
-        )));
-    };
-    if value.len() != weight.len() {
-        return Err(DbError::Pipeline(format!(
-            "weighted aggregate value/weight length mismatch: {} vs {}",
-            value.len(),
-            weight.len()
-        )));
-    }
-    let weights = weight
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .ok_or_else(|| {
-            DbError::Pipeline(format!(
-                "weighted aggregate requires Int64 weights, got {:?}",
-                weight.data_type()
-            ))
-        })?;
-    if weights.null_count() != 0 {
-        return Err(DbError::Pipeline(
-            "weighted aggregate does not accept NULL weights".into(),
-        ));
-    }
-    Ok((value, weights))
 }
 
 #[derive(Clone, Debug)]
@@ -253,28 +230,8 @@ pub(crate) struct CountState {
 }
 
 impl CountState {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<(), DbError> {
-        let delta = if self.weighted {
-            let (value, weights) = weighted_values(values)?;
-            weights
-                .values()
-                .iter()
-                .enumerate()
-                .filter(|(row, _)| self.count_star || !value.is_null(*row))
-                .try_fold(0_i64, |total, (_, weight)| total.checked_add(*weight))
-                .ok_or_else(|| DbError::Pipeline("COUNT weight overflow".into()))?
-        } else {
-            let value = append_value(values)?;
-            let rows = if self.count_star {
-                value.len()
-            } else {
-                value.len().checked_sub(value.null_count()).ok_or_else(|| {
-                    DbError::Pipeline("COUNT null count exceeds array length".into())
-                })?
-            };
-            i64::try_from(rows)
-                .map_err(|_| DbError::Pipeline("COUNT batch row count exceeds Int64".into()))?
-        };
+    fn update_rows(&mut self, input: &AggregateInput<'_>, rows: &[u32]) -> Result<(), DbError> {
+        let delta = self.rows_delta(input, rows)?;
         let next = self
             .count
             .checked_add(delta)
@@ -286,6 +243,23 @@ impl CountState {
         }
         self.count = next;
         Ok(())
+    }
+
+    /// Admitted rows, each counted by its weight in weighted mode.
+    fn rows_delta(&self, input: &AggregateInput<'_>, rows: &[u32]) -> Result<i64, DbError> {
+        let weights = if self.weighted {
+            Some(input.weights()?)
+        } else {
+            None
+        };
+        let nulls = input.nulls;
+        input
+            .selected(rows)
+            .filter(|&row| self.count_star || nulls.is_none_or(|nulls| nulls.is_valid(row)))
+            .try_fold(0_i64, |total, row| {
+                total.checked_add(weights.map_or(1, |weights| weights.value(row)))
+            })
+            .ok_or_else(|| DbError::Pipeline("COUNT weight overflow".into()))
     }
 
     fn merge_checkpoint_state(&mut self, checkpoint: &[ScalarValue]) -> Result<(), DbError> {
@@ -359,35 +333,31 @@ impl AvgState {
         })
     }
 
-    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<(), DbError> {
+    fn check_input(&self, input: &AggregateInput<'_>) -> Result<(), DbError> {
+        let name = match self.mode {
+            AvgMode::AppendOnly { .. } => "AVG",
+            AvgMode::Weighted { .. } => "weighted AVG",
+        };
+        require_array_type(input.value, &self.input_type, name)
+    }
+
+    fn update_rows(&mut self, input: &AggregateInput<'_>, rows: &[u32]) -> Result<(), DbError> {
         match &mut self.mode {
             AvgMode::AppendOnly { count } => {
-                let value = append_value(values)?;
-                require_array_type(value, &self.input_type, "AVG")?;
-                let non_null = value.len().checked_sub(value.null_count()).ok_or_else(|| {
-                    DbError::Pipeline("AVG null count exceeds array length".into())
-                })?;
-                let delta_count = u64::try_from(non_null)
-                    .map_err(|_| DbError::Pipeline("AVG batch count exceeds UInt64".into()))?;
                 let next_count = count
-                    .checked_add(delta_count)
+                    .checked_add(non_null_rows(input, rows)?)
                     .ok_or_else(|| DbError::Pipeline("AVG count overflow".into()))?;
-                let delta = sum_array(value, &self.sum.data_type())?;
-                merge_sum_scalar(&mut self.sum, &delta)?;
+                add_rows_sum(&mut self.sum, input, rows)?;
                 *count = next_count;
                 Ok(())
             }
             AvgMode::Weighted { non_null_weight } => {
-                let (value, weights) = weighted_values(values)?;
-                require_array_type(value, &self.input_type, "weighted AVG")?;
                 let ScalarValue::Float64(Some(sum)) = &mut self.sum else {
                     return Err(DbError::Pipeline(
                         "weighted AVG has an invalid concrete state shape".into(),
                     ));
                 };
-                let values = value.as_primitive::<Float64Type>();
-                let (delta_sum, delta_weight) =
-                    weighted_f64_delta(values, weights, "weighted AVG")?;
+                let (delta_sum, delta_weight) = weighted_f64_delta(input, rows, "weighted AVG")?;
                 let next_weight = non_null_weight
                     .checked_add(delta_weight)
                     .ok_or_else(|| DbError::Pipeline("weighted AVG weight overflow".into()))?;
@@ -481,57 +451,19 @@ impl AvgState {
 }
 
 #[cfg(feature = "cluster")]
-impl CountState {
-    fn batch_delta(&self, values: &[ArrayRef]) -> Result<i64, DbError> {
-        if self.weighted {
-            let (value, weights) = weighted_values(values)?;
-            weights
-                .values()
-                .iter()
-                .enumerate()
-                .filter(|(row, _)| self.count_star || !value.is_null(*row))
-                .try_fold(0_i64, |total, (_, weight)| total.checked_add(*weight))
-                .ok_or_else(|| DbError::Pipeline("COUNT weight overflow".into()))
-        } else {
-            let value = append_value(values)?;
-            let rows = if self.count_star {
-                value.len()
-            } else {
-                value.len().checked_sub(value.null_count()).ok_or_else(|| {
-                    DbError::Pipeline("COUNT null count exceeds array length".into())
-                })?
-            };
-            i64::try_from(rows)
-                .map_err(|_| DbError::Pipeline("COUNT batch row count exceeds Int64".into()))
-        }
-    }
-}
-
-#[cfg(feature = "cluster")]
 impl AvgState {
-    fn batch_delta(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+    fn batch_delta(
+        &self,
+        input: &AggregateInput<'_>,
+        rows: &[u32],
+    ) -> Result<Vec<ScalarValue>, DbError> {
         match self.mode {
-            AvgMode::AppendOnly { .. } => {
-                let value = append_value(values)?;
-                require_array_type(value, &self.input_type, "AVG")?;
-                let non_null = value.len().checked_sub(value.null_count()).ok_or_else(|| {
-                    DbError::Pipeline("AVG null count exceeds array length".into())
-                })?;
-                let count = u64::try_from(non_null)
-                    .map_err(|_| DbError::Pipeline("AVG batch count exceeds UInt64".into()))?;
-                Ok(vec![
-                    ScalarValue::UInt64(Some(count)),
-                    sum_array(value, &self.sum.data_type())?,
-                ])
-            }
+            AvgMode::AppendOnly { .. } => Ok(vec![
+                ScalarValue::UInt64(Some(non_null_rows(input, rows)?)),
+                sum_rows(input, rows, &self.sum.data_type())?,
+            ]),
             AvgMode::Weighted { .. } => {
-                let (value, weights) = weighted_values(values)?;
-                require_array_type(value, &self.input_type, "weighted AVG")?;
-                let (sum, weight) = weighted_f64_delta(
-                    value.as_primitive::<Float64Type>(),
-                    weights,
-                    "weighted AVG",
-                )?;
+                let (sum, weight) = weighted_f64_delta(input, rows, "weighted AVG")?;
                 Ok(vec![
                     ScalarValue::Float64(Some(sum)),
                     ScalarValue::Int64(Some(weight)),
@@ -539,6 +471,15 @@ impl AvgState {
             }
         }
     }
+}
+
+fn non_null_rows(input: &AggregateInput<'_>, rows: &[u32]) -> Result<u64, DbError> {
+    let nulls = input.nulls;
+    let count = input
+        .selected(rows)
+        .filter(|&row| nulls.is_none_or(|nulls| nulls.is_valid(row)))
+        .count();
+    u64::try_from(count).map_err(|_| DbError::Pipeline("AVG batch count exceeds UInt64".into()))
 }
 
 fn validate_weighted_avg_state(sum: f64, non_null_weight: i64) -> Result<(), DbError> {
@@ -626,24 +567,6 @@ fn append_average(
             sum.data_type()
         ))),
     }
-}
-
-fn merge_extremum_checkpoint<T: Accumulator>(
-    state: &mut T,
-    checkpoint: &[ScalarValue],
-    name: &str,
-) -> Result<(), DbError> {
-    let [value] = checkpoint else {
-        return Err(DbError::Pipeline(format!(
-            "{name} checkpoint state must contain one scalar"
-        )));
-    };
-    let array = value
-        .to_array()
-        .map_err(|error| aggregate_error(&format!("{name} checkpoint scalar"), error))?;
-    state
-        .merge_batch(&[array])
-        .map_err(|error| aggregate_error(&format!("{name} checkpoint merge"), error))
 }
 
 #[cfg(test)]

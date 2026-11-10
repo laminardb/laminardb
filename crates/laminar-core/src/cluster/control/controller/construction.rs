@@ -74,7 +74,7 @@ impl ClusterController {
             )),
             committed_watermark_publication: parking_lot::Mutex::new(()),
             #[cfg(feature = "cluster")]
-            topology_admission_waiters: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_gap_waiters: std::sync::atomic::AtomicUsize::new(0),
             draining: Arc::new(AtomicBool::new(false)),
             recovering: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),

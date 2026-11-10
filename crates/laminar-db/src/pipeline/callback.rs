@@ -20,6 +20,51 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const CHECKPOINT_CONTROL_DIRECT_FALLBACK: Duration = Duration::from_millis(250);
 const CHECKPOINT_CONTROL_POLL_FALLBACK: Duration = Duration::from_millis(25);
 
+/// Room left on the graph input ports a source's batches are primed into.
+///
+/// The coordinator stages a source message only when it fits, so a full port makes source
+/// intake wait instead of halting the pipeline.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortHeadroom {
+    /// Batches the fullest port can still take.
+    pub batches: usize,
+    /// Retained Arrow bytes the fullest port can still take, when ports have a byte bound.
+    pub bytes: Option<usize>,
+    /// Every port is empty. One message is then staged whatever its size, so the graph rejects a
+    /// batch no port could ever hold instead of the drain waiting for it forever.
+    pub empty: bool,
+}
+
+impl PortHeadroom {
+    /// Ports without a bound, or ports that shed instead of waiting.
+    pub const UNBOUNDED: Self = Self {
+        batches: usize::MAX,
+        bytes: None,
+        empty: true,
+    };
+
+    /// Charge one source message's batch if it fits, leaving the headroom unchanged otherwise.
+    pub(crate) fn try_charge(&mut self, batch: &RecordBatch) -> bool {
+        let bytes = self
+            .bytes
+            .map(|_| laminar_core::streaming::retained_arrow_bytes(batch));
+        let fits = self.empty
+            || (self.batches > 0
+                && bytes
+                    .zip(self.bytes)
+                    .is_none_or(|(bytes, left)| bytes <= left));
+        if fits {
+            self.empty = false;
+            self.batches = self.batches.saturating_sub(1);
+            if let (Some(left), Some(bytes)) = (self.bytes.as_mut(), bytes) {
+                *left = left.saturating_sub(bytes);
+            }
+        }
+        fits
+    }
+}
+
 /// Bounded-output pressure reported to the pipeline coordinator.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,9 +73,9 @@ pub enum ExternalOutputPressure {
     Normal,
     /// Accelerate the next configured periodic checkpoint without pausing compute.
     CheckpointDue,
-    /// Stop compute intake until the next checkpoint's barriers are in flight. With no prepared
-    /// cut, only a new checkpoint can release the open output, and a topology hold can keep one
-    /// from starting.
+    /// Stop compute intake until the next checkpoint's barriers or a local assignment drain cut
+    /// are in flight. With no prepared cut, only a new checkpoint can release the open output, and
+    /// a topology hold can keep one from starting.
     CheckpointBackpressured,
     /// Stop compute intake while a prepared checkpoint cut completes.
     CommitBackpressured,
@@ -42,12 +87,14 @@ impl ExternalOutputPressure {
         matches!(self, Self::CheckpointDue | Self::CheckpointBackpressured)
     }
 
-    /// Whether compute intake must stop. Checkpoint barriers reach the coordinator through the
-    /// same source FIFO as data, so checkpoint backpressure releases intake while one is in flight.
-    pub(crate) const fn pauses_intake(self, barrier_in_flight: bool) -> bool {
+    /// Whether compute intake must stop. Checkpoint barriers and assignment drain cuts reach the
+    /// coordinator through the same source FIFO as data, and an active drain defers every
+    /// checkpoint until its cut arrives, so checkpoint backpressure releases intake while either
+    /// is in flight.
+    pub(crate) fn pauses_intake(self, cut_in_flight: impl FnOnce() -> bool) -> bool {
         match self {
             Self::Normal | Self::CheckpointDue => false,
-            Self::CheckpointBackpressured => !barrier_in_flight,
+            Self::CheckpointBackpressured => !cut_in_flight(),
             Self::CommitBackpressured => true,
         }
     }
@@ -631,8 +678,8 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
-    /// `true` while a local topology submission waits for a gap between checkpoint artifact
-    /// reservations; periodic admission yields and manual requests proceed. Default `false`.
+    /// `true` while a local topology submission or assignment drain waits for a gap between
+    /// checkpoint cuts; periodic admission yields and manual requests proceed. Default `false`.
     fn periodic_checkpoints_held(&self) -> bool {
         false
     }
@@ -800,10 +847,13 @@ pub trait PipelineCallback: Send + 'static {
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
 
-    /// `true` when internal buffers are near capacity.
-    fn is_backpressured(&self) -> bool {
-        false
+    /// Room left on the graph ports that `source`'s batches are primed into.
+    fn source_port_headroom(&self, _source: &str) -> PortHeadroom {
+        PortHeadroom::UNBOUNDED
     }
+
+    /// Count a cycle whose source intake waited for graph port headroom.
+    fn note_source_backpressure(&self) {}
 
     /// Pressure from bounded checkpoint-committable output. A due checkpoint accelerates the next
     /// periodic cut without stopping compute. Checkpoint and commit backpressure keep checkpoint

@@ -1,7 +1,7 @@
 //! Coordinated-storage configuration and log-store validation.
 
 use super::{
-    ConnectorError, DeltaTable, HashMap, StorageProvider, COORDINATED_CONNECT_TIMEOUT,
+    ConnectorError, DeltaTable, HashMap, StorageProvider, Url, COORDINATED_CONNECT_TIMEOUT,
     COORDINATED_HTTP_MAX_RETRIES, COORDINATED_MAX_BACKOFF, COORDINATED_REQUEST_TIMEOUT,
     COORDINATED_RETRY_TIMEOUT,
 };
@@ -106,12 +106,7 @@ where
                 .into(),
         ));
     }
-    if has_effective_value(
-        options,
-        &["s3_locking_provider", "aws_s3_locking_provider"],
-        &["AWS_S3_LOCKING_PROVIDER"],
-        environment,
-    ) || effective_values(
+    if effective_values(
         options,
         &["allow_unsafe_rename", "aws_s3_allow_unsafe_rename"],
         &["AWS_S3_ALLOW_UNSAFE_RENAME"],
@@ -121,7 +116,42 @@ where
     .any(|value| is_truthy(value))
     {
         return Err(ConnectorError::ConfigurationError(
-            "Delta exactly-once requires the native conditional-put log store; locking-provider and unsafe-rename modes are not certified"
+            "Delta exactly-once requires the native conditional-put log store; unsafe-rename mode is not certified"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// delta-rs 1.0 removed its `DynamoDB` log store, and a `dynamodb` locking provider now selects an
+/// unsafe rename with no mutual exclusion between writers.
+#[cfg(feature = "delta-lake")]
+pub(super) fn reject_removed_s3_locking<F>(
+    table_url: &Url,
+    options: &HashMap<String, String>,
+    environment: &F,
+) -> Result<(), ConnectorError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if !matches!(table_url.scheme(), "s3" | "s3a") {
+        return Ok(());
+    }
+    if has_effective_value(
+        options,
+        &["s3_locking_provider", "aws_s3_locking_provider"],
+        &["AWS_S3_LOCKING_PROVIDER"],
+        environment,
+    ) || has_effective_value(
+        options,
+        &["dynamodb_table_name", "delta_dynamo_table_name"],
+        &["DELTA_DYNAMO_TABLE_NAME"],
+        environment,
+    ) {
+        return Err(ConnectorError::ConfigurationError(
+            "S3 DynamoDB locking is no longer supported: Delta S3 commits use native conditional \
+             put. Remove storage.s3_locking_provider and storage.dynamodb_table_name, and unset \
+             AWS_S3_LOCKING_PROVIDER and DELTA_DYNAMO_TABLE_NAME"
                 .into(),
         ));
     }

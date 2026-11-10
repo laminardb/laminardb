@@ -2,9 +2,9 @@
 
 use super::ipc::preflight_scalar_ipc_restore;
 use super::{
-    AggStateCheckpoint, ArchivedAggStateCheckpoint, ArchivedEmittedCheckpoint, EmittedCheckpoint,
-    IpcRestorePreflight, MAX_ACCUMULATOR_STATE_COLUMNS, RESTORE_CELL_SCRATCH_CHARGE,
-    RESTORE_IPC_EXPANSION_FACTOR, RESTORE_ROW_SCRATCH_CHARGE,
+    AggStateCheckpoint, ArchivedAggStateCheckpoint, IpcRestorePreflight,
+    MAX_ACCUMULATOR_STATE_COLUMNS, RESTORE_CELL_SCRATCH_CHARGE, RESTORE_IPC_EXPANSION_FACTOR,
+    RESTORE_ROW_SCRATCH_CHARGE,
 };
 use crate::error::DbError;
 
@@ -117,7 +117,8 @@ impl AggStateArchiveRestoreProfile {
         if !archived.keys_ipc.is_empty()
             || !archived.acc_state_ipc.is_empty()
             || !archived.input_weights.is_empty()
-            || !archived.last_emitted.is_empty()
+            || !archived.emitted_groups.is_empty()
+            || !archived.emitted_values_ipc.is_empty()
         {
             return Err(DbError::Pipeline(format!(
                 "{context} contains a non-canonical empty aggregate checkpoint"
@@ -176,15 +177,38 @@ impl AggStateArchiveRestoreProfile {
                 )));
             }
         }
-        if archived.last_emitted.len() > group_count {
-            return Err(DbError::Pipeline(format!(
-                "{context} aggregate checkpoint contains {} changelog entries for {group_count} groups",
-                archived.last_emitted.len()
-            )));
-        }
-        if !self.emit_changelog && !archived.last_emitted.is_empty() {
+        self.validate_emitted_groups(archived, group_count, context)
+    }
+
+    fn validate_emitted_groups(
+        self,
+        archived: &ArchivedAggStateCheckpoint,
+        group_count: usize,
+        context: std::fmt::Arguments<'_>,
+    ) -> Result<(), DbError> {
+        let emitted = archived.emitted_groups.as_slice();
+        if !self.emit_changelog && !emitted.is_empty() {
             return Err(DbError::Pipeline(format!(
                 "{context} aggregate checkpoint contains changelog state for a non-changelog query"
+            )));
+        }
+        let values_expected = !emitted.is_empty() && self.output_columns != 0;
+        if values_expected == archived.emitted_values_ipc.is_empty() {
+            return Err(DbError::Pipeline(format!(
+                "{context} aggregate checkpoint has {} changelog groups but {} changelog value bytes",
+                emitted.len(),
+                archived.emitted_values_ipc.len()
+            )));
+        }
+        let ascending = emitted
+            .windows(2)
+            .all(|pair| pair[0].to_native() < pair[1].to_native());
+        let in_range = emitted.last().is_none_or(|last| {
+            usize::try_from(last.to_native()).is_ok_and(|last| last < group_count)
+        });
+        if !ascending || !in_range {
+            return Err(DbError::Pipeline(format!(
+                "{context} aggregate checkpoint changelog groups are not strictly ascending group rows"
             )));
         }
         Ok(())
@@ -219,45 +243,18 @@ impl AggStateArchiveRestoreProfile {
             )?;
             accounting.add(bytes, ipc, context)?;
         }
-        for (index, emitted) in archived.last_emitted.iter().enumerate() {
-            self.preflight_emitted(index, emitted, context, accounting)?;
-        }
-        Ok(())
-    }
-
-    fn preflight_emitted(
-        self,
-        index: usize,
-        emitted: &ArchivedEmittedCheckpoint,
-        context: std::fmt::Arguments<'_>,
-        accounting: &mut IpcRestoreAccounting,
-    ) -> Result<(), DbError> {
-        if self.group_columns == 0 {
-            if !emitted.key.is_empty() {
-                return Err(DbError::Pipeline(format!(
-                    "{context} global aggregate changelog entry {index} contains key bytes"
-                )));
-            }
-        } else {
-            let bytes = emitted.key.as_slice();
+        let bytes = archived.emitted_values_ipc.as_slice();
+        if !bytes.is_empty() {
             let ipc = preflight_scalar_ipc_restore(
                 bytes,
-                1,
-                self.group_columns,
-                self.group_columns,
-                format_args!("{context} aggregate changelog key {index}"),
+                archived.emitted_groups.len(),
+                self.output_columns,
+                self.output_columns,
+                format_args!("{context} aggregate changelog values"),
             )?;
             accounting.add(bytes, ipc, context)?;
         }
-        let bytes = emitted.values.as_slice();
-        let ipc = preflight_scalar_ipc_restore(
-            bytes,
-            1,
-            self.output_columns,
-            self.output_columns,
-            format_args!("{context} aggregate changelog values {index}"),
-        )?;
-        accounting.add(bytes, ipc, context)
+        Ok(())
     }
 }
 
@@ -453,7 +450,7 @@ fn archived_owned_state_bytes(
     for roster_bytes in [
         roster::<i64>(archived.input_weights.len()),
         roster::<i64>(archived.last_updated_ms.len()),
-        roster::<EmittedCheckpoint>(archived.last_emitted.len()),
+        roster::<u32>(archived.emitted_groups.len()),
     ] {
         bytes = bytes
             .checked_add(roster_bytes.ok_or_else(|| {
@@ -467,15 +464,11 @@ fn archived_owned_state_bytes(
                 ))
             })?;
     }
-    for emitted in archived.last_emitted.iter() {
-        bytes = bytes
-            .checked_add(emitted.key.len())
-            .and_then(|bytes| bytes.checked_add(emitted.values.len()))
-            .ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "{context} aggregate owned checkpoint accounting overflow"
-                ))
-            })?;
-    }
-    Ok(bytes)
+    bytes
+        .checked_add(archived.emitted_values_ipc.len())
+        .ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "{context} aggregate owned checkpoint accounting overflow"
+            ))
+        })
 }

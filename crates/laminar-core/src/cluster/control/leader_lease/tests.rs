@@ -1,3 +1,4 @@
+use super::super::catalog_manifest::CatalogSealOutcome;
 use super::super::controller::{RecoveryFault, RecoveryRound};
 use super::super::snapshot::AssignmentSnapshot;
 use super::*;
@@ -439,6 +440,7 @@ async fn committed_checkpoint_with_predecessor(
         channel_progress: Vec::new(),
         source_watermarks: std::collections::BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     decisions.create_committed_checkpoint(&index).await.unwrap()
 }

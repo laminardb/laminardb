@@ -4,7 +4,7 @@ use pgwire::api::Type;
 use pgwire::error::PgWireError;
 use sqlparser::ast::Statement;
 
-use super::dispatch::standard_response;
+use super::dispatch::{is_read, standard_response};
 use super::encoding::pg_text_array_literal;
 use super::subscription::{
     encode_subscription_batch_row, encode_subscription_progress_row,
@@ -189,11 +189,14 @@ async fn driver_select_builtins_dispatch() {
     }
 }
 
-#[tokio::test]
-async fn select_with_from_is_rejected() {
-    let db = LaminarDB::open().unwrap();
-    let err = standard_response(&db, standard("SELECT 1 FROM foo")).unwrap_err();
-    assert!(err.to_string().contains("limited to literals"));
+#[test]
+fn queries_beyond_driver_probes_read_the_database() {
+    for sql in ["SELECT 1 FROM foo", "SELECT 1 + 1", "SELECT now()"] {
+        assert!(is_read(&standard(sql)), "{sql}");
+    }
+    for sql in ["SELECT 1", "SELECT 'x'", "SELECT version()"] {
+        assert!(!is_read(&standard(sql)), "{sql}");
+    }
 }
 
 #[tokio::test]

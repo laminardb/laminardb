@@ -6,6 +6,7 @@
 //! - Simple single-source -> compiled `PhysicalExpr` projection
 //! - Complex non-aggregate -> cached physical plan (`LiveSourceExec` reads fresh data)
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -39,12 +40,14 @@ use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
+use crate::operator::shuffle_send::ShuffleSend;
+#[cfg(feature = "cluster")]
 use crate::operator_graph::{
     merge_input_frontier_iter, ManagedVnodeTransition, ManagedVnodeTransitionMode,
 };
 use crate::operator_graph::{
     try_evaluate_compiled, CapturedVnodeState, EncodedStateFrame, GraphOperator, InputFrontier,
-    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture,
+    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture, VnodeStateLoad,
 };
 use crate::sql_analysis::{
     extract_projection_filter, projection_sql_preserving_weight, single_source_table,
@@ -56,8 +59,10 @@ mod batch_coalescing;
 mod cluster_frontiers;
 #[cfg(feature = "cluster")]
 mod routing;
+mod state_accounting;
 #[cfg(feature = "cluster")]
 mod subscription_output;
+mod union_all;
 
 use apply_failure::stateful_apply_outcome_unknown;
 pub(crate) use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
@@ -333,28 +338,12 @@ struct AggClusterInputPlan {
 }
 
 #[cfg(feature = "cluster")]
-type AggSendOutcome = (Result<(), DbError>, Option<Vec<(u64, ShuffleMessage)>>);
-
-#[cfg(feature = "cluster")]
-type AggSendTask = tokio::task::JoinHandle<()>;
-
-#[cfg(feature = "cluster")]
 struct PendingAggClusterInput {
     local_batches: Vec<(RecordBatch, Option<u32>)>,
     outbound: Option<Vec<(u64, ShuffleMessage)>>,
     local_frontier: InputFrontier,
-    send: Option<AggSendTask>,
-    completion: Option<tokio::sync::oneshot::Receiver<AggSendOutcome>>,
+    send: Option<ShuffleSend>,
     accounted_bytes: usize,
-}
-
-#[cfg(feature = "cluster")]
-impl Drop for PendingAggClusterInput {
-    fn drop(&mut self) {
-        if let Some(send) = &self.send {
-            send.abort();
-        }
-    }
 }
 
 #[cfg(feature = "cluster")]
@@ -677,7 +666,7 @@ pub(crate) fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> Operat
         return OperatorCapability::unclassified_sql_query();
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return OperatorCapability::unclassified_sql_query();
+        return union_all::classify_union_all(query, ctx);
     };
 
     let function_registry = ctx.state();
@@ -1135,9 +1124,13 @@ impl SqlQueryOperator {
         let mut proj_fields = Vec::with_capacity(info.proj_exprs.len());
 
         for expr in &info.proj_exprs {
-            let phys =
-                datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
-                    .ok()?;
+            let phys = datafusion::physical_expr::create_physical_expr(
+                expr,
+                &info.input_df_schema,
+                props,
+                &PhysicalPlanningContext::default(),
+            )
+            .ok()?;
             let dt = phys.data_type(info.input_df_schema.as_arrow()).ok()?;
             let nullable = phys
                 .nullable(info.input_df_schema.as_arrow())
@@ -1153,8 +1146,13 @@ impl SqlQueryOperator {
 
         let compiled_filter = if let Some(ref pred) = info.filter_predicate {
             Some(
-                datafusion::physical_expr::create_physical_expr(pred, &info.input_df_schema, props)
-                    .ok()?,
+                datafusion::physical_expr::create_physical_expr(
+                    pred,
+                    &info.input_df_schema,
+                    props,
+                    &PhysicalPlanningContext::default(),
+                )
+                .ok()?,
             )
         } else {
             None
@@ -1944,42 +1942,36 @@ impl SqlQueryOperator {
         Ok(output)
     }
 
+    /// Starts the pending plan's send unless one is running, and applies its local rows when the
+    /// send finishes in this cycle. `after_replay` marks a cycle that already applied a peer's
+    /// event, which a failure here can no longer undo.
     #[cfg(feature = "cluster")]
-    fn start_pending_cluster_send(
+    async fn send_pending_cluster_input(
         &mut self,
         config: &ClusterShuffleConfig,
-        assignment_version: u64,
-    ) {
+        assignment: &VnodeAssignmentSnapshot,
+        after_replay: bool,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let pending = self
             .pending_cluster_input
             .as_mut()
             .expect("aggregate send plan must be installed before it starts");
-        debug_assert!(pending.send.is_none());
-        debug_assert!(pending.completion.is_none());
+        if pending.send.is_some() {
+            return Ok(Vec::new());
+        }
         let outbound = pending
             .outbound
             .take()
             .expect("idle aggregate send plan must retain its outbound cut");
-        let topology = config.topology;
-        let sender = Arc::clone(&config.sender);
-        let wake = config.receiver.work_ready_notify();
         let context = format!("aggregate [{}] shuffle", self.op_name);
-        let (completion_tx, completion) = tokio::sync::oneshot::channel();
-        pending.completion = Some(completion);
-        pending.send = Some(tokio::spawn(async move {
-            let outcome = crate::operator::send_shuffle_plan_retaining(
-                &sender,
-                topology,
-                assignment_version,
-                outbound,
-                &context,
-            )
-            .await;
-            let should_wake = !matches!(&outcome.0, Err(error) if error.is_shuffle_not_ready());
-            if completion_tx.send(outcome).is_ok() && should_wake {
-                wake.notify_one();
-            }
-        }));
+        pending.send =
+            Some(ShuffleSend::start(config, assignment.version(), outbound, context).await);
+        match self.finish_pending_cluster_input() {
+            Ok(PendingAggCompletion::Applied(output)) => Ok(output),
+            Ok(PendingAggCompletion::Waiting | PendingAggCompletion::RetryLater) => Ok(Vec::new()),
+            Err(error) if after_replay => Err(self.remote_replay_error(error)),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -1996,27 +1988,14 @@ impl SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn finish_pending_cluster_input(&mut self) -> Result<PendingAggCompletion, DbError> {
-        let outcome = {
-            let Some(pending) = self.pending_cluster_input.as_mut() else {
-                return Ok(PendingAggCompletion::Waiting);
-            };
-            match (pending.send.as_ref(), pending.completion.as_mut()) {
-                (None, None) => return Ok(PendingAggCompletion::Waiting),
-                (Some(_), Some(completion)) => match completion.try_recv() {
-                    Ok(outcome) => Ok(outcome),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                        return Ok(PendingAggCompletion::Waiting);
-                    }
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                        Err("send task ended without a delivery outcome")
-                    }
-                },
-                _ => Err("send task lost its completion channel"),
-            }
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(reason) => {
+        let finished = self
+            .pending_cluster_input
+            .as_mut()
+            .and_then(|pending| ShuffleSend::take_finished(&mut pending.send));
+        let outcome = match finished {
+            None => return Ok(PendingAggCompletion::Waiting),
+            Some(Ok(outcome)) => outcome,
+            Some(Err(reason)) => {
                 drop(self.pending_cluster_input.take());
                 return Err(DbError::ShufflePartialSend(format!(
                     "aggregate '{}' {reason}",
@@ -2028,11 +2007,6 @@ impl SqlQueryOperator {
             .pending_cluster_input
             .take()
             .expect("finished aggregate send plan");
-        pending.send.take().expect("completed aggregate send task");
-        pending
-            .completion
-            .take()
-            .expect("completed aggregate send outcome");
         let (result, outbound) = outcome;
         if let Err(error) = result {
             if error.is_shuffle_not_ready() {
@@ -2121,13 +2095,10 @@ impl SqlQueryOperator {
                     ))),
                 );
             }
-            if self
-                .pending_cluster_input
-                .as_ref()
-                .is_some_and(|pending| pending.send.is_none())
-            {
-                self.start_pending_cluster_send(&config, assignment.version());
-            }
+            output.extend(
+                self.send_pending_cluster_input(&config, &assignment, drained_remote)
+                    .await?,
+            );
             return Ok(output);
         }
         if drained_remote {
@@ -2168,11 +2139,11 @@ impl SqlQueryOperator {
                 outbound: Some(outbound),
                 local_frontier,
                 send: None,
-                completion: None,
                 accounted_bytes,
             });
-            self.start_pending_cluster_send(&config, assignment.version());
-            return Ok(Vec::new());
+            return self
+                .send_pending_cluster_input(&config, &assignment, false)
+                .await;
         }
         let output = if plan.local_batches.is_empty() {
             Vec::new()
@@ -2483,7 +2454,7 @@ impl GraphOperator for SqlQueryOperator {
                     && projection
                         .exprs
                         .iter()
-                        .all(|expr| expr.as_any().is::<Column>() || expr.as_any().is::<Literal>())
+                        .all(|expr| expr.is::<Column>() || expr.is::<Literal>())
             })
     }
 
@@ -2496,64 +2467,29 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn changelog_at_cut(&self) -> Option<Result<Vec<RecordBatch>, DbError>> {
+        match &self.state {
+            QueryState::Agg(aggregate) if self.emit_changelog => {
+                Some(aggregate.emitted_changelog())
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
     fn checkpoint_aligned_replay_pending(&self) -> bool {
         self.pending_cluster_input.is_some() || self.queued_remote_events != 0
     }
 
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
-        let QueryState::Agg(aggregate) = &self.state else {
-            return None;
-        };
+        self.retained_state_accounting()
+    }
 
-        #[cfg(feature = "cluster")]
-        let (prepared_bytes, retired_bytes) = {
-            let staged_transition = self
-                .prepared_vnode_transition
-                .as_ref()
-                .map_or(0, |prepared| {
-                    prepared
-                        .aggregate
-                        .accounted_state_bytes()
-                        .saturating_add(prepared.topology.accounted_state_bytes())
-                });
-            let staged =
-                staged_transition.saturating_add(self.prepared_subscription_output_bytes());
-            match self.vnode_transition_cleanup.as_ref() {
-                Some(SqlVnodeTransitionCleanup::Aborted(prepared)) => (
-                    staged
-                        .saturating_add(prepared.aggregate.accounted_state_bytes())
-                        .saturating_add(prepared.topology.accounted_state_bytes()),
-                    0,
-                ),
-                Some(SqlVnodeTransitionCleanup::Published {
-                    aggregate,
-                    topology,
-                }) => (
-                    staged,
-                    aggregate
-                        .accounted_state_bytes()
-                        .saturating_add(topology.accounted_state_bytes()),
-                ),
-                None => (staged, 0),
-            }
-        };
-        #[cfg(not(feature = "cluster"))]
-        let (prepared_bytes, retired_bytes) = (0, 0);
-
-        #[cfg(feature = "cluster")]
-        let live = self.checked_live_state_bytes().unwrap_or(usize::MAX);
-        #[cfg(not(feature = "cluster"))]
-        let live = aggregate
-            .accounted_state_bytes()
-            .saturating_add(self.local_aggregate_output_cache_bytes());
-        #[cfg(feature = "cluster")]
-        let _ = aggregate;
-
-        Some(ManagedStateAccountingSnapshot {
-            live,
-            prepared: prepared_bytes,
-            retired: retired_bytes,
-        })
+    fn vnode_loads(&self) -> Option<Vec<VnodeStateLoad>> {
+        match &self.state {
+            QueryState::Agg(aggregate) => Some(aggregate.vnode_loads()),
+            _ => None,
+        }
     }
 
     fn evict_optional_managed_state(&mut self) -> usize {
@@ -2677,17 +2613,17 @@ impl GraphOperator for SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         #[cfg(feature = "cluster")]
         if self.cluster_shuffle.is_some() {
-            if frontiers.len() != 1 {
-                return Err(DbError::InvalidOperation(format!(
-                    "aggregate '{}' requires one input frontier",
-                    self.op_name
-                )));
-            }
             if matches!(self.state, QueryState::Uninit) {
                 self.lazy_init().await?;
             }
             if matches!(self.state, QueryState::Agg(_)) {
-                return self.process_cluster(inputs, frontiers[0]).await;
+                let [frontier] = frontiers else {
+                    return Err(DbError::InvalidOperation(format!(
+                        "aggregate '{}' requires one input frontier",
+                        self.op_name
+                    )));
+                };
+                return self.process_cluster(inputs, *frontier).await;
             }
         }
         let watermarks = frontiers

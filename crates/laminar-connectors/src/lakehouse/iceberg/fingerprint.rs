@@ -32,7 +32,10 @@ pub(super) fn data_file_fingerprint(
     hash_optional_i64_slice(&mut hash, file.split_offsets())?;
     let equality_ids = file.equality_ids();
     hash_optional_i32_slice(&mut hash, equality_ids.as_deref())?;
-    hash_optional_i64(&mut hash, file.first_row_id());
+    // A staged file never carries a first row id; a manifest read inherits one from the commit
+    // on format-v3 tables, so the value cannot identify the file. Hashing its absence keeps the
+    // digest of descriptors staged before manifest reads started inheriting it.
+    hash_optional_i64(&mut hash, None);
     hash_optional_i32(&mut hash, file.sort_order_id());
     let referenced_data_file = file.referenced_data_file();
     hash_optional_bytes(
@@ -330,6 +333,32 @@ mod tests {
         assert_eq!(
             forward.metadata_sha256,
             "ec2f81c6169ad02ea023db0a4dee228686fe12489352441070dbdce65919c61a"
+        );
+    }
+
+    #[test]
+    fn first_row_id_inherited_at_commit_does_not_change_the_fingerprint() {
+        let staged = data_file(false, "eu", 10);
+        let mut committed = DataFileBuilder::default();
+        committed
+            .content(staged.content_type())
+            .file_path(staged.file_path().to_string())
+            .file_format(staged.file_format())
+            .partition(staged.partition().clone())
+            .record_count(staged.record_count())
+            .file_size_in_bytes(staged.file_size_in_bytes())
+            .column_sizes(staged.column_sizes().clone())
+            .value_counts(staged.value_counts().clone())
+            .null_value_counts(staged.null_value_counts().clone())
+            .lower_bounds(staged.lower_bounds().clone())
+            .upper_bounds(staged.upper_bounds().clone())
+            .key_metadata(staged.key_metadata().map(<[u8]>::to_vec))
+            .split_offsets(staged.split_offsets().map(<[i64]>::to_vec))
+            .sort_order_id(3)
+            .first_row_id(Some(1_000));
+        assert_eq!(
+            data_file_fingerprint(&committed.build().unwrap()).unwrap(),
+            data_file_fingerprint(&staged).unwrap()
         );
     }
 

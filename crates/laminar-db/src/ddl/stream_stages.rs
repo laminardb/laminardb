@@ -1,11 +1,12 @@
-//! Split streams in the catalog: an owner and its internal stages are created and dropped as one
-//! object. Only the owner stores DDL, so replay re-splits the owner's statement.
+//! Split statements in the catalog: an owner stream or materialized view and its internal stages
+//! are created and dropped as one object. Only the owner stores DDL, so replay re-splits the
+//! owner's statement.
 //!
 //! INVARIANT: an owner exists only after all of its stages; a stage without its owner is left by a
 //! cancelled create and is dropped before the owner's name is created again.
 
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_sql::parser::{EmitClause, StreamingStatement};
+use laminar_sql::parser::{EmitClause, LateDataClause, StreamingStatement};
 use sqlparser::ast::Ident;
 
 use crate::connector_manager::StreamRegistration;
@@ -36,30 +37,40 @@ impl LaminarDB {
         reservation: CatalogNameReservation<'_>,
     ) -> Result<(), DbError> {
         let owner_name = crate::db::canonical_object_name(owner.name)?;
-        self.drop_stream_stages(&owner_name).await?;
-        let Err(error) = self
-            .create_stages_then_owner(owner, split, reservation)
-            .await
-        else {
-            return Ok(());
+        let created = match self.create_stages(&owner_name, split).await {
+            Ok(()) => self.create_split_owner(owner, split, reservation).await,
+            Err(error) => Err(error),
         };
-        match self.drop_stream_stages(&owner_name).await {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(DbError::Pipeline(format!(
-                "{error}; dropping the stages of '{owner_name}' also failed: {cleanup}"
-            ))),
-        }
+        self.drop_stages_on_failure(&owner_name, created).await
     }
 
-    async fn create_stages_then_owner(
+    async fn create_split_owner(
         &self,
         owner: StreamDefinition<'_>,
         split: &SplitQuery,
         reservation: CatalogNameReservation<'_>,
     ) -> Result<(), DbError> {
+        let owner_name = crate::db::canonical_object_name(owner.name)?;
+        let (query, query_sql) = parse_split_owner(&owner_name, split, owner.emit_clause)?;
+        self.validate_stream_query_text(&owner_name, &query_sql)?;
+        let definition = StreamDefinition {
+            query: &query,
+            query_sql: &query_sql,
+            ..owner
+        };
+        self.create_stream_object(definition, reservation).await
+    }
+
+    /// Creates `owner`'s stages in order, after dropping any that a cancelled create left.
+    pub(super) async fn create_stages(
+        &self,
+        owner: &str,
+        split: &SplitQuery,
+    ) -> Result<(), DbError> {
+        self.drop_stream_stages(owner).await?;
         for stage in &split.stages {
             let emit = stage.changelog.then_some(EmitClause::Changes);
-            let statement = parse_stage(&stage.name, &stage.sql, emit.as_ref())?;
+            let statement = parse_stage(&stage.name, &stage.sql, emit.as_ref(), None)?;
             let StreamingStatement::CreateStream {
                 name,
                 query,
@@ -77,26 +88,30 @@ impl LaminarDB {
                 name,
                 query,
                 emit_clause: emit_clause.as_ref(),
+                late_data: None,
                 query_sql,
                 retention_bytes: None,
             };
             self.create_stream_object(definition, reservation).await?;
         }
-        let owner_name = crate::db::canonical_object_name(owner.name)?;
-        let statement = parse_stage(&owner_name, &split.query_sql, owner.emit_clause)?;
-        let StreamingStatement::CreateStream {
-            query, query_sql, ..
-        } = &statement
-        else {
-            return Err(stage_parse_error(&owner_name));
+        Ok(())
+    }
+
+    /// `created`, after dropping `owner`'s stages when it failed.
+    pub(super) async fn drop_stages_on_failure(
+        &self,
+        owner: &str,
+        created: Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        let Err(error) = created else {
+            return Ok(());
         };
-        self.validate_stream_query_text(&owner_name, query_sql)?;
-        let definition = StreamDefinition {
-            query,
-            query_sql,
-            ..owner
-        };
-        self.create_stream_object(definition, reservation).await
+        match self.drop_stream_stages(owner).await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(DbError::Pipeline(format!(
+                "{error}; dropping the stages of '{owner}' also failed: {cleanup}"
+            ))),
+        }
     }
 
     /// The registrations CREATE would give each stage and then the owner, for planning a split
@@ -106,19 +121,26 @@ impl LaminarDB {
         owner: &str,
         split: &SplitQuery,
         owner_emit: Option<&EmitClause>,
+        owner_late: Option<&LateDataClause>,
     ) -> Result<Vec<StreamRegistration>, DbError> {
         let stages = split.stages.iter().map(|stage| {
             let emit = stage.changelog.then_some(EmitClause::Changes);
-            (stage.name.as_str(), stage.sql.as_str(), emit)
+            (stage.name.as_str(), stage.sql.as_str(), emit, None)
         });
-        let owner = (owner, split.query_sql.as_str(), owner_emit.cloned());
+        let owner = (
+            owner,
+            split.query_sql.as_str(),
+            owner_emit.cloned(),
+            owner_late,
+        );
         let mut candidates = Vec::with_capacity(split.stages.len() + 1);
-        for (name, sql, emit) in stages.chain(std::iter::once(owner)) {
-            let statement = parse_stage(name, sql, emit.as_ref())?;
+        for (name, sql, emit, late) in stages.chain(std::iter::once(owner)) {
+            let statement = parse_stage(name, sql, emit.as_ref(), late)?;
             let StreamingStatement::CreateStream {
                 name: object,
                 query,
                 emit_clause,
+                late_data,
                 query_sql,
                 ..
             } = &statement
@@ -126,7 +148,13 @@ impl LaminarDB {
                 return Err(stage_parse_error(name));
             };
             let planned = self
-                .plan_streaming_query(object, query, emit_clause.clone(), query_sql)
+                .plan_streaming_query(
+                    object,
+                    query,
+                    emit_clause.clone(),
+                    late_data.clone(),
+                    query_sql,
+                )
                 .await?;
             candidates.push(planned.candidate_registration(name, query_sql));
         }
@@ -143,7 +171,7 @@ impl LaminarDB {
     }
 
     /// `owner`'s stages, latest first so each is dropped before the stage it reads.
-    pub(super) fn stream_stage_targets(&self, owner: &str) -> Vec<CatalogDropTarget> {
+    pub(crate) fn stream_stage_targets(&self, owner: &str) -> Vec<CatalogDropTarget> {
         let namespace = self.catalog_namespace.lock();
         let streams = namespace
             .iter()
@@ -160,14 +188,30 @@ impl LaminarDB {
     }
 }
 
+/// The owner's query over its stages and that query's text, parsed as CREATE parses a query.
+pub(super) fn parse_split_owner(
+    owner: &str,
+    split: &SplitQuery,
+    emit: Option<&EmitClause>,
+) -> Result<(StreamingStatement, String), DbError> {
+    match parse_stage(owner, &split.query_sql, emit, None)? {
+        StreamingStatement::CreateStream {
+            query, query_sql, ..
+        } => Ok((*query, query_sql)),
+        _ => Err(stage_parse_error(owner)),
+    }
+}
+
 fn parse_stage(
     name: &str,
     sql: &str,
     emit: Option<&EmitClause>,
+    late_data: Option<&LateDataClause>,
 ) -> Result<StreamingStatement, DbError> {
     let emit = emit.map_or_else(String::new, |emit| format!(" {emit}"));
+    let late_data = late_data.map_or_else(String::new, |late_data| format!(" {late_data}"));
     let ddl = format!(
-        "CREATE STREAM {} AS {sql}{emit}",
+        "CREATE STREAM {} AS {sql}{emit}{late_data}",
         Ident::with_quote('"', name)
     );
     let mut statements = laminar_sql::parse_streaming_sql(&ddl)?;
@@ -276,7 +320,7 @@ mod tests {
             ("DROP STREAM \"out$stage1\"", "drop 'out' instead"),
             (
                 "CREATE STREAM \"x$stage1\" AS SELECT k FROM orders",
-                "reserved for an internal stage of stream 'x'",
+                "reserved for an internal stage of 'x'",
             ),
             (
                 "CREATE STREAM y AS SELECT \"o_k\" FROM \"out$stage1\"",
@@ -308,25 +352,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_owner_drops_the_stages_it_created() {
-        let db = db(&[]).await;
-        // The inner stage admits; MIN cannot consume its weighted changelog.
-        let error = error(
-            &db,
-            "CREATE STREAM out AS SELECT MIN(n) AS lo FROM \
-             (SELECT k, COUNT(*) AS n FROM orders GROUP BY k) EMIT CHANGES",
-        )
-        .await;
-        assert!(
-            error.contains("MIN/MAX require append-only input"),
-            "{error}"
+    async fn split_view_is_one_catalog_object() {
+        const VIEW: &str = "CREATE MATERIALIZED VIEW hist AS SELECT n, COUNT(*) AS keys FROM \
+             (SELECT k, COUNT(*) AS n FROM orders GROUP BY k) GROUP BY n";
+        let db = db(&[VIEW]).await;
+        assert_eq!(
+            catalog_names(&db),
+            ["hist", "hist$stage1", "orders", "payments"]
         );
+        assert_eq!(
+            db.connector_manager.lock().ordered_ddl()[2],
+            ("hist".into(), VIEW.into(), 1)
+        );
+        assert_eq!(
+            db.mv_registry.lock().get("hist").unwrap().sources,
+            ["orders"]
+        );
+        for (sql, expected) in [
+            ("DROP STREAM \"hist$stage1\"", "drop 'hist' instead"),
+            ("DROP SOURCE orders", "depended on by hist; use CASCADE"),
+        ] {
+            let error = error(&db, sql).await;
+            assert!(error.contains(expected), "{sql}: {error}");
+        }
+
+        db.execute("DROP MATERIALIZED VIEW hist").await.unwrap();
         assert_eq!(catalog_names(&db), ["orders", "payments"]);
         assert!(db.connector_manager.lock().streams().is_empty());
         assert!(!db
             .ctx
-            .table_exist(exact_table_reference("out$stage1"))
+            .table_exist(exact_table_reference("hist$stage1"))
             .unwrap());
+
+        db.execute(VIEW).await.unwrap();
+        db.execute("DROP SOURCE orders CASCADE").await.unwrap();
+        assert_eq!(catalog_names(&db), ["payments"]);
+        assert!(db.connector_manager.lock().streams().is_empty());
+        assert!(db.mv_registry.lock().get("hist").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_owner_drops_the_stages_it_created() {
+        let db = db(&[]).await;
+        // The inner stage admits; STDDEV has no managed state for its weighted changelog.
+        for sql in [
+            "CREATE STREAM out AS SELECT STDDEV(n) AS sd FROM \
+             (SELECT k, COUNT(*) AS n FROM orders GROUP BY k) EMIT CHANGES",
+            "CREATE MATERIALIZED VIEW out AS SELECT STDDEV(n) AS sd FROM \
+             (SELECT k, COUNT(*) AS n FROM orders GROUP BY k)",
+        ] {
+            let error = error(&db, sql).await;
+            assert!(
+                error.contains("only built-in COUNT, SUM, AVG, MIN, and MAX are supported"),
+                "{sql}: {error}"
+            );
+            assert_eq!(catalog_names(&db), ["orders", "payments"]);
+            assert!(db.connector_manager.lock().streams().is_empty());
+            assert!(!db
+                .ctx
+                .table_exist(exact_table_reference("out$stage1"))
+                .unwrap());
+        }
     }
 
     /// Consolidated `(n, keys)` changes until they equal `expected` or the deadline passes.
@@ -362,11 +448,12 @@ mod tests {
         changes
     }
 
-    #[tokio::test]
-    async fn stage_state_survives_a_checkpoint_restart() {
-        let storage = tempfile::tempdir().unwrap();
+    const HISTOGRAM: &str = "SELECT n, COUNT(*) AS keys FROM \
+         (SELECT k, COUNT(*) AS n FROM events GROUP BY k) GROUP BY n";
+
+    async fn checkpointed_db(storage: &std::path::Path, ddl: &str) -> Arc<LaminarDB> {
         let db = LaminarDB::open_with_config(crate::LaminarConfig {
-            storage_dir: Some(storage.path().to_path_buf()),
+            storage_dir: Some(storage.to_path_buf()),
             checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
                 interval_ms: None,
                 ..Default::default()
@@ -377,30 +464,37 @@ mod tests {
         db.execute("CREATE SOURCE events (k BIGINT, v BIGINT)")
             .await
             .unwrap();
-        db.execute(
-            "CREATE STREAM out AS SELECT n, COUNT(*) AS keys FROM \
-             (SELECT k, COUNT(*) AS n FROM events GROUP BY k) GROUP BY n EMIT CHANGES",
-        )
-        .await
+        db.execute(ddl).await.unwrap();
+        db
+    }
+
+    fn push(db: &LaminarDB, keys: &[i64]) {
+        let column = Arc::new(arrow::array::Int64Array::from(keys.to_vec())) as _;
+        let batch = arrow::array::RecordBatch::try_from_iter_with_nullable(vec![
+            ("k", Arc::clone(&column), true),
+            ("v", column, true),
+        ])
         .unwrap();
-        let push = |keys: &[i64]| {
-            let column = Arc::new(arrow::array::Int64Array::from(keys.to_vec())) as _;
-            let batch = arrow::array::RecordBatch::try_from_iter_with_nullable(vec![
-                ("k", Arc::clone(&column), true),
-                ("v", column, true),
-            ])
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(batch)
             .unwrap();
-            db.source_untyped("events")
-                .unwrap()
-                .push_arrow(batch)
-                .unwrap();
-        };
+    }
+
+    #[tokio::test]
+    async fn stage_state_survives_a_checkpoint_restart() {
+        let storage = tempfile::tempdir().unwrap();
+        let db = checkpointed_db(
+            storage.path(),
+            &format!("CREATE STREAM out AS {HISTOGRAM} EMIT CHANGES"),
+        )
+        .await;
         db.start().await.unwrap();
         let mut portal = db
             .open_subscription("out", None, crate::subscription::SubscribeStart::Tail)
             .await
             .unwrap();
-        push(&[1, 2, 3]);
+        push(&db, &[1, 2, 3]);
         let expected = std::collections::BTreeMap::from([((1, 3), 1)]);
         assert_eq!(consolidated_changes(&mut portal, &expected).await, expected);
         assert!(db.checkpoint().await.unwrap().success);
@@ -413,10 +507,125 @@ mod tests {
             .await
             .unwrap();
         // Key 1 moves from one to two rows only if its stage count was restored.
-        push(&[1]);
+        push(&db, &[1]);
         let expected = std::collections::BTreeMap::from([((1, 2), 1), ((1, 3), -1), ((2, 1), 1)]);
         assert_eq!(consolidated_changes(&mut portal, &expected).await, expected);
         db.shutdown().await.unwrap();
+    }
+
+    /// View `hist`'s `(n, keys)` rows once they equal `expected` or the deadline passes.
+    async fn view_rows(
+        db: &LaminarDB,
+        expected: &std::collections::BTreeMap<i64, i64>,
+    ) -> std::collections::BTreeMap<i64, i64> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let batch = crate::mv_store::read_views(&db.mv_store, &["hist".to_owned()])
+                .await
+                .unwrap()
+                .remove("hist")
+                .unwrap();
+            let column = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .clone()
+            };
+            let (n, keys) = (column("n"), column("keys"));
+            let rows = (0..batch.num_rows())
+                .map(|row| (n.value(row), keys.value(row)))
+                .collect();
+            if &rows == expected || tokio::time::Instant::now() >= deadline {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn split_view_state_survives_a_checkpoint_restart() {
+        let storage = tempfile::tempdir().unwrap();
+        let db = checkpointed_db(
+            storage.path(),
+            &format!("CREATE MATERIALIZED VIEW hist AS {HISTOGRAM}"),
+        )
+        .await;
+        db.start().await.unwrap();
+        push(&db, &[1, 2, 3]);
+        let expected = std::collections::BTreeMap::from([(1, 3)]);
+        assert_eq!(view_rows(&db, &expected).await, expected);
+        assert!(db.checkpoint().await.unwrap().success);
+        db.stop_pipeline().await.unwrap();
+
+        db.start().await.unwrap();
+        // Key 1 moves from one to two rows only if its stage count and the view were restored.
+        push(&db, &[1]);
+        let expected = std::collections::BTreeMap::from([(1, 2), (2, 1)]);
+        assert_eq!(view_rows(&db, &expected).await, expected);
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explain_lists_a_join_chain_stage_by_stage() {
+        let db = db(&[
+            "CREATE SOURCE refunds (k BIGINT NOT NULL, v BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND)",
+        ])
+        .await;
+        let explained = metadata(
+            db.execute(
+                "EXPLAIN CREATE STREAM out AS SELECT r.k AS k, COUNT(*) AS n FROM orders o \
+                 JOIN payments p ON o.k = p.k \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+                 JOIN refunds r ON p.v = r.v \
+                 AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '30' MILLISECOND \
+                 GROUP BY r.k EMIT CHANGES",
+            )
+            .await
+            .unwrap(),
+        );
+        let exchanges: Vec<_> = explained
+            .iter()
+            .filter(|(key, _)| key.starts_with("stage.") && key.contains(".exchange."))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        // The first stage carries `o.ts`, which the second join bounds by, and each join and
+        // the aggregate repartition on their own key: three remote exchanges.
+        assert_eq!(
+            exchanges,
+            [
+                (
+                    "stage.out$stage1.exchange.input.left:orders",
+                    "repartition on (k Int64) from arbitrary, append-only, event time ts"
+                ),
+                (
+                    "stage.out$stage1.exchange.input.right:payments",
+                    "repartition on (k Int64) from arbitrary, append-only, event time ts"
+                ),
+                (
+                    "stage.out$stage1.exchange.output",
+                    "arbitrary, append-only, event time o_ts"
+                ),
+                (
+                    "stage.out$stage2.exchange.input.left:out$stage1",
+                    "repartition on (p_v Int64) from arbitrary, append-only, event time o_ts"
+                ),
+                (
+                    "stage.out$stage2.exchange.input.right:refunds",
+                    "repartition on (v Int64) from arbitrary, append-only, event time ts"
+                ),
+                ("stage.out$stage2.exchange.output", "arbitrary, append-only"),
+                (
+                    "stage.out.exchange.input.out$stage2",
+                    "repartition on (r_k Int64) from arbitrary, append-only"
+                ),
+                (
+                    "stage.out.exchange.output",
+                    "hash(k Int64), weighted changelog"
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

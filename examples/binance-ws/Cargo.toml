@@ -2,7 +2,7 @@
 
 [package]
 name = "binance-ws"
-version = "0.33.0"
+version = "0.40.0"
 edition = "2021"
 publish = false
 description = "Binance VWAP signals: minimal LaminarDB streaming example"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 laminar-db = { path = "../../crates/laminar-db", default-features = false, features = ["websocket"] }
 laminar-derive = { path = "../../crates/laminar-derive" }
-arrow = "=58.4.0"
+arrow = "=59.3.2"
 tokio = { version = "1.50", features = ["full"] }
 crossterm = "0.29"
 ratatui = { version = "0.30", features = ["all-widgets"] }

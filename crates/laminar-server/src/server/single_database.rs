@@ -35,7 +35,6 @@ pub(super) async fn build(config: &ServerConfig) -> Result<Arc<LaminarDB>, Serve
         builder = builder.http_auth_token(token.expose());
     }
     builder = builder.restart_policy(config.supervision.to_policy());
-    builder = builder.incremental_emit(config.server.incremental_emit);
     builder = config.server.apply_memory_limits(builder);
     if let Some(retention) = config.server.temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);

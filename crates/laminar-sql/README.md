@@ -41,9 +41,8 @@ CREATE LOOKUP TABLE instruments (
     PRIMARY KEY (symbol)
 ) WITH ('connector' = 'postgres', 'connection' = '...', 'table' = 'instruments')
 
--- Late data handling
-SELECT ... ALLOW LATENESS INTERVAL '10' SECOND
-SELECT ... LATE DATA TO <side_output_sink>
+-- Late data handling (LATE DATA TO is rejected)
+SELECT ... GROUP BY tumble(...) EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '10' SECOND
 
 -- Window functions
 SELECT ..., LAG(price, 1) OVER (PARTITION BY symbol ORDER BY ts) FROM trades

@@ -9,6 +9,7 @@ use laminar_core::checkpoint::{
 };
 use tracing::warn;
 
+use super::committed_reads::ReadPins;
 #[cfg(feature = "cluster")]
 use super::subscription_output;
 use super::{CheckpointCoordinator, MAX_RETENTION_IO_CONCURRENCY};
@@ -16,7 +17,7 @@ use crate::error::DbError;
 
 mod inventory;
 pub(super) use inventory::live_chunk_inventory;
-pub(super) use inventory::load_index_manifests;
+pub(crate) use inventory::load_index_manifests;
 
 const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[cfg(feature = "cluster")]
@@ -60,6 +61,7 @@ pub(super) struct LiveChunkInventory {
     references: BTreeSet<StateChunkId>,
     pinned: BTreeSet<StateChunkId>,
     subscription_segments: BTreeSet<String>,
+    view_logs: BTreeSet<StateChunkId>,
 }
 
 pub(super) async fn delete_retired_data(
@@ -82,6 +84,19 @@ pub(super) async fn delete_retired_data(
         .filter(|chunk| !live.pinned.contains(chunk) && !live.references.contains(chunk));
     let results = futures::stream::iter(deletions)
         .map(|chunk| async move { store.delete_node_data(chunk).await })
+        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        result.map_err(DbError::from)?;
+    }
+    let view_log_candidates = manifests
+        .iter()
+        .flat_map(inventory::view_log_chunks)
+        .filter(|chunk| !live.view_logs.contains(chunk))
+        .collect::<BTreeSet<_>>();
+    let results = futures::stream::iter(view_log_candidates)
+        .map(|chunk| async move { store.delete_view_log(chunk).await })
         .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
@@ -283,6 +298,7 @@ fn local_retention_update_state(
 async fn run_local_gc_request(
     store: &dyn CheckpointStore,
     request: &GcRequest,
+    read_pins: &ReadPins,
 ) -> Result<(), DbError> {
     use laminar_core::checkpoint_decision::CheckpointRetentionState;
 
@@ -292,6 +308,7 @@ async fn run_local_gc_request(
     let (_, requested) = requested
         .encode_and_reference()
         .map_err(DbError::Checkpoint)?;
+    let requested = read_pins.reserve_floor(requested);
     let mut state = local_retention_update_state(
         request
             .decision_store
@@ -594,6 +611,7 @@ async fn run_cluster_gc_request(
 pub(super) async fn run_gc_request(
     store: Arc<dyn CheckpointStore>,
     request: GcRequest,
+    read_pins: &ReadPins,
 ) -> Result<(), DbError> {
     match request.authority.clone() {
         GcAuthority::Local
@@ -602,7 +620,7 @@ pub(super) async fn run_gc_request(
                 .as_ref()
                 .is_some_and(|index| index.scope == CheckpointScope::Local) =>
         {
-            run_local_gc_request(store.as_ref(), &request).await
+            run_local_gc_request(store.as_ref(), &request, read_pins).await
         }
         #[cfg(feature = "cluster")]
         GcAuthority::Cluster {
@@ -623,13 +641,14 @@ pub(super) async fn run_gc_request(
 pub(super) async fn run_gc_worker(
     store: Arc<dyn CheckpointStore>,
     mut requests: tokio::sync::watch::Receiver<Option<GcRequest>>,
+    read_pins: Arc<ReadPins>,
 ) {
     while requests.changed().await.is_ok() {
         let Some(mut request) = requests.borrow_and_update().clone() else {
             continue;
         };
         loop {
-            match run_gc_request(Arc::clone(&store), request.clone()).await {
+            match run_gc_request(Arc::clone(&store), request.clone(), &read_pins).await {
                 Ok(()) => break,
                 Err(error) => {
                     warn!(%error, retry_delay = ?RETENTION_RETRY_DELAY, "checkpoint retention paused at its durable cursor");

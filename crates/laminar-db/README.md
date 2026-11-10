@@ -33,9 +33,9 @@ runtime. Connector I/O, checkpoint persistence and sink publication run on the m
 This model applies to embedded, single-node and cluster execution.
 
 See the [cluster SQL boundary](../../docs/SQL_REFERENCE.md#cluster-sql-boundary) for
-mode-specific admission. Cluster plans deliberately reject local materialized views and
-reference-table enrichment; managed final windows and certified interval/temporal joins
-have their own admitted paths. Feature flags and checkpoints
+mode-specific admission. Cluster plans deliberately reject reference-table enrichment;
+materialized views, managed final windows and certified interval/temporal joins have their
+own admitted paths. Feature flags and checkpoints
 alone do not imply exactly-once delivery.
 
 ## Stateful process functions
@@ -106,8 +106,9 @@ users set `PipelineConfig::source_queue_max_bytes`. Zero and values above
 
 Admission charges retained Arrow array capacity and batch/column descriptors, including
 backing buffers of slices, nested arrays and views. Shared buffers are charged independently
-for each queued batch/column. A message retains its charge while parked by an intake fence;
-staging or discard releases it. A single oversized batch faults the source without settling
+for each queued batch/column. A message retains its charge while parked and while staged, until
+its graph port admits it or the cycle discards it; the shutdown drain releases it at staging.
+A single oversized batch faults the source without settling
 its cursor. Full queues backpressure producers; shutdown-tail sends use the same byte limit.
 Barriers share the ordered FIFO but do not consume data-byte capacity.
 
@@ -120,15 +121,19 @@ limit does not establish a whole-process RSS envelope.
 
 ## Embedded push source limits
 
-Each registered in-process source has a **64 MiB** Arrow-byte cap shared by its input ring
-and queued broadcast references. Set `LaminarConfig::push_source_max_bytes` or
+Each registered in-process source has a **64 MiB** Arrow-byte cap for batches queued until
+the pipeline receives them. Set `LaminarConfig::push_source_max_bytes` or
 `LaminarDB::builder().push_source_max_bytes(bytes)` to change it. Zero and values above
 `laminar_core::streaming::MAX_SOURCE_QUEUED_BYTES` fail DB construction. This covers typed
 `SourceHandle` pushes after Arrow conversion, raw pushes, SQL inserts and API writers.
 Multiple handles for the same source share the cap; separate sources have separate caps.
 The setting does not change cluster SQL or delivery admission.
 
-Pushes reject immediately on count or byte saturation (`StreamingError::ChannelFull`),
+Accepted pushes are never dropped from the queue. They wait there until the running pipeline
+reads them, including pushes made before `start()` or while the pipeline is stopped, so a source
+that no running pipeline reads fills its queue and then rejects. Rows the pipeline has already
+read follow its delivery guarantee: this source is not replayable, so a restart can lose them. Pushes reject immediately on count
+or byte saturation (`StreamingError::ChannelFull`),
 or reject a batch larger than the entire budget (`BatchTooLarge`). Rejected batches do not
 advance the source sequence or change snapshot history. Typed `push_batch` reports the number
 of records admitted before its first failed conversion chunk. `is_backpressured` includes
@@ -136,9 +141,9 @@ byte saturation. Writer `flush` remains a no-op; it does not drain or release qu
 
 Each source's snapshot history has an **independent cap of the same size** plus its existing
 batch-count limit. Successful pushes evict the oldest history until both bounds fit; this
-does not discard queued input. Arrow reservations follow broadcast retention until delivery,
-eviction or subscriber drop. Snapshot readers take ownership of their returned batch references,
-which can outlive history eviction. Existing broadcast lag semantics are unchanged.
+does not discard queued input. Queue reservations last until the pipeline receives the batch.
+Snapshot readers take ownership of their returned batch references, which can outlive history
+eviction.
 
 The two caps measure retained Arrow storage using the
 [core admission contract](../laminar-core/README.md#in-process-source-admission). Each concurrent
@@ -163,17 +168,26 @@ including aliases. These conservative per-port charges are not a process-wide me
 Caller/staged inputs, operator execution scratch, result/subscription ownership, schema metadata,
 allocator overhead and vector spare capacity remain separate owners.
 
+Source input waits for room: the coordinator stages a source message only when it fits the
+ports of that source, counting what the cycle has already staged. The first message that does not
+fit waits in the coordinator's single parked slot and every later message waits behind it in the
+FIFO, so one full source port holds intake for all sources. A source batch that cannot fit even
+an empty port raises `GraphBufferBudgetExceeded`.
+
 `Backpressure` retains input and withholds source progress when a producer can be deferred before
 execution. Cached SQL retries read that retained input. Multiple streaming inputs have distinct
 ports and provider bindings, with at most 256 dynamic inputs per query; reference/lookup tables
-remain separate providers. An oversized source admission, or an already-executed result that
-cannot fit, raises `GraphBufferBudgetExceeded`. The pipeline halts before publishing the rejected
-admission to graph destinations, and its possibly mutated graph cannot run or checkpoint again.
-Reduce batch size or raise
-the configured limit and resolve the terminal fault before restoring a committed cut. Ordinary
-retry/stop/start cannot reuse that graph; cluster terminal fault authority survives process restarts.
-`Fail` also halts at the existing
-pre-execution capacity gate. Best-effort `ShedOldest` evicts the oldest existing/incoming batches
+remain separate providers. An operator runs only while each port it feeds is below its limit, and
+its output, which exists once it has run, is admitted whole: a port can exceed its limit by one
+run's output, and the gate holds the producer until the consumer drains it.
+
+Source intake waits under both `Backpressure` and `Fail`. `Fail` keeps operator ports exact: it
+halts at the pre-execution capacity gate, and an already-executed result that cannot fit raises
+`GraphBufferBudgetExceeded`. The pipeline halts before publishing the
+rejected admission to graph destinations, and its possibly mutated graph cannot run or checkpoint
+again. Reduce batch size or raise the configured limit and resolve the terminal fault before
+restoring a committed cut. Ordinary retry/stop/start cannot reuse that graph; cluster terminal
+fault authority survives process restarts. Best-effort `ShedOldest` evicts the oldest existing/incoming batches
 before admitting the retained suffix, including dropping a batch that cannot fit by itself;
 `shed_records_total` records discarded rows. Durable delivery still rejects `ShedOldest`.
 
@@ -216,17 +230,17 @@ These owners must be included when sizing process memory; the table quota does n
 
 Embedded and single-node databases default to **1,000,000 live rows / 256 MiB per MV**.
 Set `materialized_view_max_rows` and `materialized_view_max_bytes` through `LaminarConfig`
-or the builder. Both must be nonzero. Cluster materialized views remain rejected.
+or the builder. Both must be nonzero. A cluster node applies them to its part of each view.
 
 Aggregate snapshots and keyed upserts reject a final state above either limit. Multisets
 count distinct stored rows; their charge includes the complete encoded row and count.
-Append views retain the newest complete batches within their batch, row and byte limits,
-evicting oldest batches as before. A single oversized append batch fails admission.
+Append views count the rows waiting for the next checkpoint (the whole retained log without
+checkpointing), and a cycle that would exceed a limit fails instead of dropping rows.
 Checkpoint restore rejects over-limit images without dropping committed rows to make them fit.
 
 All affected views pass quota and multiplicity validation before a cycle changes any MV or
-publishes MV subscription output. Failure faults the pipeline and leaves source cursors
-uncommitted. Multiset cycle publication also preflights the existing snapshot expansion
+publishes MV subscription output. A quota failure halts the pipeline and leaves source cursors
+uncommitted: recovery would replay the same rows into the same view and reach the limit again. Multiset cycle publication also preflights the existing snapshot expansion
 guards (1,000,000 expanded rows and a 256 MiB encoded-row estimate), regardless of whether
 a subscriber is currently attached. Counted checkpoints retain multiplicities without
 expanding them; reads continue to enforce those snapshot guards.
@@ -255,6 +269,67 @@ well. It does not clone live row maps or old append batches. Recovery may hold o
 checkpoint batches and private quota-checked replacement stores together. Query/subscriber
 materialization and pinned checkpoint captures
 need additional headroom and retain their existing separate guards.
+
+## Flow control and backpressure
+
+Every buffer between a source and a sink or subscriber is bounded, and each one has a single
+response when it is full. A slow consumer makes its producer wait. Rows are shed only under
+best-effort delivery and are counted. State budgets fail closed, and external readers are
+disconnected. Accepted input is never dropped silently. Metric names below are as registered;
+the server's `/metrics` endpoint adds the `laminardb_` prefix.
+
+| Boundary | Modes | Bound (default) | When full | Metrics |
+|---|---|---|---|---|
+| In-process push queue (`insert`, source handles, writers) | embedded, single-node | per source: `default_buffer_size` messages (65,536) and `push_source_max_bytes` (64 MiB) | the push returns `ChannelFull` | `SourceMetrics::is_backpressured` |
+| Connector-to-coordinator FIFO | all | shared: 64 messages and `source_queue_max_bytes` (64 MiB) | the source task waits | `source_queue_wait_seconds_total{source}`, `source_queue_messages`, `source_queue_reserved_bytes` |
+| Coordinator drain | all | 10,000 messages or 1 ms per cycle, and the room left on each source's graph ports | the first message that does not fit waits in a parked slot and the FIFO waits behind it | `intake_paused_seconds_total{reason="port_backpressure"}`, `cycles_backpressured_total` |
+| Intake fences (recovery, vnode transition, handoff) | all | — | intake waits | `intake_paused_seconds_total{reason="fence"}` |
+| Graph input ports | all | `pipeline_max_input_buf_batches` (256); `pipeline_max_input_buf_bytes` (unset) | the producer waits; under the default `Backpressure` policy one run's output may exceed the limit, and a source batch larger than an empty port halts the pipeline (see [graph input limits](#graph-input-limits)) | `input_buf_bytes{stream}`, `shed_records_total{stream}` |
+| Operator state | all | `pipeline_max_managed_state_bytes` (256 MiB, a lower-bound charge) over aggregates, windows, joins, process functions, temporal filters and analytic window frames; 1,000,000 groups per aggregate or window | the budget and the group cap halt the pipeline (LDB-4008) | `managed_state_accounted_bytes`, `managed_state_budget_ratio`, `vnode_state_bytes_max`, `vnode_state_bytes_mean`, `vnode_groups_max`, `vnode_hottest` |
+| Shuffle between nodes | cluster | 256 frames, 32 MiB per peer and 128 MiB per node, each direction | the sending operator waits; gRPC flow control pushes back | `shuffle_send_wait_seconds_total{peer}`, `shuffle_sent_bytes_total{peer}`, `shuffle_sent_rows_total{peer}`, `shuffle_budget_used_bytes{direction}`, `aggregate_shuffle_rows_total{operator,form}` |
+| Materialized views | all | 1,000,000 rows and 256 MiB per view | the pipeline halts (LDB-8003), leaving source cursors uncommitted (see [materialized-view memory limits](#materialized-view-memory-limits)) | — |
+| Sink command queue and epoch gate | all | 32 commands per sink; a checkpoint-committable sink accepts writes only in an open epoch | the coordinator waits; the write timeout starts once the epoch is open | `sink_command_queue_depth{sink}`, `sink_epoch_gate_wait_seconds{sink}` |
+| Local subscriptions | embedded, single-node | per-log byte caps; 256 MiB per process | a slow reader gets `Lagged` and is closed | `subscription_log_bytes` |
+| Cluster subscription output | cluster | 256 MiB pending per node | at half, a checkpoint is requested; at three quarters, intake pauses | `cluster_subscription_pending_bytes`, `intake_paused_seconds_total{reason="output"}` |
+
+Waits have no default deadline: under load or skew a slow peer or sink is expected to make its
+producer wait, and a deadline would turn that wait into a recovery round. Two opt-in limits fail
+a wait that stops making progress as a recoverable fault instead, recovering from the last
+checkpoint. `StreamCheckpointConfig::sink_epoch_gate_stall_timeout_ms` applies in every mode to a
+write waiting for a checkpoint-committable sink's epoch, and fires when the epoch stays in one
+state that long. The server's `[server] shuffle_send_stall_timeout` applies to a cluster shuffle
+send waiting for a byte budget or a stream queue slot. Each must exceed the checkpoint interval
+plus the checkpoint timeout, since a healthy epoch can stay closed for that long.
+
+None of these budgets bounds process memory. On its first `start`, a database logs a warning if
+its per-node budgets add up to more than the process's cgroup memory limit. Attached engine
+metrics export each budget as `memory_budget_bytes{area}`, and the limit as
+`cgroup_memory_max_bytes`. A process without a cgroup memory limit is not checked. An embedded
+database's default per-node budgets add up to 1,088 MiB, or 1,600 MiB with checkpointing. The
+server README's "Memory limits and production tuning" section lists the areas.
+
+`intake_paused_seconds_total` reasons are exclusive: a fence takes precedence over output
+pressure, and both over port pressure. `source_queue_messages` is sampled at each coordinator
+wake. `sink_epoch_gate_wait_seconds` observes only waits; a write into an open epoch is not
+recorded.
+
+Aggregates and managed windows report the `vnode_*` gauges. Each summarises one operator's
+accounted state over the vnodes this node holds state for, refreshed every 32 cycles. `vnode_state_bytes_max` against `vnode_state_bytes_mean`
+shows imbalance within a node. Comparing `sum by (instance)` of `managed_state_accounted_bytes`
+across nodes shows imbalance between nodes. `vnode_hottest` is the id of the largest vnode, with
+ties going to the lowest id. Window operators count a key once per open window or session. In a
+cluster, `GET /api/v1/cluster/vnodes/load` lists each vnode's live state, applied rows and
+committed frame bytes (see the server README, "Reading skew").
+`aggregate_shuffle_rows_total` counts, per aggregate, the rows owned by another node
+(`form="input"`) and the rows sent for them (`form="sent"`). They are equal for keyed
+aggregates; a global aggregate sends one partial row per batch.
+
+`shuffle_send_wait_seconds_total` is the time sends to a peer waited for byte budget or a queue
+slot. Sends to one peer take turns and the turn is not counted, so the series tracks how long the
+peer's stream was blocked. The sent series count Arrow IPC data frames queued to the peer;
+frontiers and barriers are excluded. `shuffle_budget_used_bytes` reads the node's 128 MiB data
+budget in each direction. Inbound bytes stay held until the operator reading the frame has
+consumed it, so a value near the cap means this node consumes slower than its peers send.
 
 ## Feature Flags
 

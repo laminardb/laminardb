@@ -193,7 +193,7 @@ impl LeaderLeaseStore {
                 if inventory.pipeline_identity != descriptor.parent_pipeline {
                     return Err(TopologyError::Conflict("cut pipeline differs from the certified parent".into()));
                 }
-                let baseline = current.topology_baseline.as_ref().ok_or_else(|| TopologyError::Invalid("cut has no adopted parent".into()))?;
+                let baseline = current.topology_baseline.as_ref().ok_or_else(|| TopologyError::Invalid("cut has no sealed parent".into()))?;
                 if inventory.deployment_id != baseline.deployment_id || inventory.assignment_fence.as_ref() != Some(&plan.assignment)
                     || current.committed_topology_identity() != Some((plan.expected_parent, &plan.parent_manifest))
                 {
@@ -243,6 +243,7 @@ impl LeaderLeaseStore {
         attempt: CheckpointAttempt,
         assignment: Option<&CheckpointAssignmentFence>,
         flags: u64,
+        phase: crate::cluster::control::Phase,
     ) -> Result<(), LeaseError> {
         let current = self
             .load_record()
@@ -272,14 +273,16 @@ impl LeaderLeaseStore {
         let cut = operation.cut.as_ref().ok_or_else(|| {
             LeaseError::Invalid("topology barrier has no bound checkpoint".into())
         })?;
-        if flags != crate::checkpoint::flags::TOPOLOGY_CUT
-            || operation.phase != TopologyAdmissionPhase::Quiescing
-            || operation.admitted_by != *proof
-            || cut.inventory.attempt != attempt
-            || assignment.is_none()
-            || cut.inventory.assignment_fence.as_ref() != assignment
-            || cut.committed.is_some()
-        {
+        let exact = flags == crate::checkpoint::flags::TOPOLOGY_CUT
+            && operation.admitted_by == *proof
+            && cut.inventory.attempt == attempt
+            && assignment.is_some()
+            && cut.inventory.assignment_fence.as_ref() == assignment;
+        // The leader records the cut's Commit before announcing it, and its tail can complete the
+        // cut while a resume gate still reads Aligned; that Aligned releases nothing Commit does not.
+        let live = (phase == crate::cluster::control::Phase::Aligned && cut.committed.is_some())
+            || (operation.phase == TopologyAdmissionPhase::Quiescing && cut.committed.is_none());
+        if !exact || !live {
             return Err(LeaseError::Invalid(
                 "topology barrier differs from its exact live cut".into(),
             ));

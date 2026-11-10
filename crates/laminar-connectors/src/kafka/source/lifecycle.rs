@@ -36,6 +36,15 @@ impl SourceConnector for KafkaSource {
         Some(self.task_tracker.clone())
     }
 
+    fn recency(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Arc<dyn crate::connector::SourceRecency>>, ConnectorError> {
+        Ok(super::recency::kafka_recency(
+            &KafkaSourceConfig::from_config(config)?,
+        ))
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         let format = if config.properties().is_empty() {
             self.config.validate()?;

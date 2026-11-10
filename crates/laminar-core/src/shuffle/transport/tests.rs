@@ -813,6 +813,10 @@ async fn superseded_scope_cancels_blocked_outbound_budget_without_switching_scop
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     assert!(is_scope_cancelled(&error));
+    assert!(
+        sender.peer_flow()[0].send_wait > std::time::Duration::ZERO,
+        "a cancelled admission wait still counts"
+    );
 
     sender
         .send_to_for_assignment(
@@ -824,6 +828,99 @@ async fn superseded_scope_cancels_blocked_outbound_budget_without_switching_scop
         .unwrap();
     let received = receiver.recv().await.unwrap();
     assert_eq!(received.assignment_version(), 2);
+    drop(held_budget);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_flow_counts_admission_waits_and_sent_data_and_budgets_drain() {
+    let wait = std::time::Duration::from_millis(20);
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1);
+    sender.register_peer(2, receiver.local_addr());
+    assert!(sender.peer_flow().is_empty());
+    let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
+    let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
+    let mut blocked = Box::pin(sender.send_to(2, &message));
+    assert!(tokio::time::timeout(wait, &mut blocked).await.is_err());
+    tokio::time::sleep(wait).await;
+    assert_eq!(
+        sender.peer_flow()[0].sent_rows,
+        0,
+        "a waiting send is not sent"
+    );
+    drop(held_budget);
+    blocked.await.unwrap();
+
+    let received = receiver.recv().await.unwrap();
+    assert!(
+        receiver.inbound_budget_used_bytes() > 0,
+        "a received frame holds inbound budget until the graph admits it"
+    );
+    drop(received);
+    wait_until(|| receiver.inbound_budget_used_bytes() == 0).await;
+    wait_until(|| sender.outbound_budget_used_bytes() == 0).await;
+    let [flow] = sender.peer_flow()[..] else {
+        panic!("one peer was sent to");
+    };
+    assert_eq!(flow.peer, 2);
+    assert!(flow.send_wait >= wait, "{flow:?}");
+    assert_eq!(flow.sent_rows, 1);
+    assert!(flow.sent_bytes > 0);
+
+    send_barrier(&sender, &[2], CheckpointBarrier::new(1, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        sender.peer_flow()[0].sent_bytes,
+        flow.sent_bytes,
+        "control frames are excluded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_fails_as_stalled_only_when_its_budget_wait_lasts_the_stall_timeout() {
+    let stall = std::time::Duration::from_millis(200);
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1).with_send_stall_timeout(Some(stall));
+    sender.register_peer(2, receiver.local_addr());
+    let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
+
+    let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
+    let mut granted = Box::pin(sender.send_to(2, &message));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut granted)
+            .await
+            .is_err()
+    );
+    drop(held_budget);
+    granted
+        .await
+        .expect("a wait granted before the stall timeout sends");
+    drop(receiver.recv().await.unwrap());
+    wait_until(|| sender.outbound_budget_used_bytes() == 0).await;
+
+    let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sender.send_to(2, &message),
+    )
+    .await
+    .expect("a stalled send stays blocked")
+    .unwrap_err();
+    assert!(started.elapsed() >= stall);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(is_shuffle_send_stalled(&error), "{error}");
+    assert!(!is_scope_cancelled(&error));
+    assert_eq!(
+        sender.peer_flow()[0].sent_rows,
+        1,
+        "the stalled frame is not sent"
+    );
+
+    send_barrier(&sender, &[2], CheckpointBarrier::new(1, 1))
+        .await
+        .expect("a barrier does not use the held data budget");
     drop(held_budget);
 }
 

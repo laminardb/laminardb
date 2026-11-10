@@ -262,6 +262,9 @@ impl ClusterHandle {
         };
         let mut authority_lost = shutdown_trigger != ClusterShutdownTrigger::Signal;
         self.serving_gate.fence();
+        if let Some(pgwire) = &self.pgwire_handle {
+            pgwire.abort();
+        }
 
         if let Some(error) = runtime_failure {
             self.rebalance_shutdown.cancel();
@@ -582,6 +585,9 @@ impl Drop for ClusterHandle {
         self.membership_handle.abort();
         if let Some(watcher) = &self.watcher_handle {
             watcher.abort();
+        }
+        if let Some(pgwire) = &self.pgwire_handle {
+            pgwire.abort();
         }
         self.api_handle.abort();
     }

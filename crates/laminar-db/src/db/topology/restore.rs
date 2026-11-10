@@ -371,7 +371,7 @@ impl LaminarDB {
                 };
                 scope.topology = scope.sender.topology_fence();
                 scope.ensure_topology_current()?;
-                let parent_topology = if input.plan().expected_parent == TopologyVersion::LEGACY_BASELINE {
+                let parent_topology = if input.plan().expected_parent == TopologyVersion::BASELINE {
                     None
                 } else {
                     Some(laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
@@ -654,8 +654,7 @@ impl LaminarDB {
                 .ok_or_else(|| {
                     TopologyError::Invalid("new subscription has no descriptor".into())
                 })?;
-            if object.initialization
-                != super::planning::TopologyInitialization::EmptyManagedStateAtCut
+            if !object.initialization.starts_empty_at_cut()
                 || object.catalog_generation != stream.catalog_generation
                 || input
                     .root()
@@ -712,8 +711,7 @@ fn validate_subscription_frontiers(
         else {
             let initialized = input.descriptor().objects.iter().any(|object| {
                 object.name == capture.certificate.stream_id
-                    && object.initialization
-                        == super::planning::TopologyInitialization::EmptyManagedStateAtCut
+                    && object.initialization.starts_empty_at_cut()
                     && object.catalog_generation == capture.certificate.catalog_generation
                     && input
                         .root()

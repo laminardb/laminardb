@@ -91,6 +91,7 @@ async fn committed_checkpoint() -> Fixture {
         channel_progress: manifest.channel_progress.clone(),
         source_watermarks: BTreeMap::from([("source".into(), 1_000)]),
         checkpoint_watermark: Some(1_000),
+        view_frontiers: Default::default(),
     };
     let (_, reference) = committed.encode_and_reference().unwrap();
     let outcome = CheckpointOutcome {
@@ -277,6 +278,7 @@ async fn cluster_recovery_selects_exact_and_newer_target_frames() {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let (_, committed_ref) = committed.encode_and_reference().unwrap();
     let outcome = CheckpointOutcome {
@@ -508,4 +510,34 @@ async fn outcome_cannot_authorize_a_different_valid_index() {
     assert!(error
         .to_string()
         .contains("does not bind the supplied committed checkpoint index"));
+}
+
+/// A cut bound to another pipeline identity, such as one written under an earlier state frame
+/// ABI, fails closed.
+#[tokio::test]
+async fn a_cut_bound_to_another_pipeline_identity_fails_closed() {
+    let fixture = committed_checkpoint().await;
+    let runtime_identity = laminar_core::checkpoint::PipelineIdentity {
+        canonical_version: fixture.manifest.pipeline_identity.canonical_version,
+        sha256: "ab".repeat(32),
+    };
+    assert_ne!(runtime_identity, fixture.committed.pipeline_identity);
+    let manager = RecoveryManager::new(
+        &fixture.store,
+        &runtime_identity,
+        DEPLOYMENT_ID,
+        CheckpointScope::Local,
+    );
+
+    let error = manager
+        .recover_committed(&fixture.outcome, &fixture.committed)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not match runtime identity"),
+        "{error}"
+    );
 }

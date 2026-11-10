@@ -1,5 +1,120 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Event time flows through interval joins and closed windows, in every mode. An interval join's
+  output carries the time column of a side every output row has, when it projects that column
+  unchanged: the left one for `INNER` (else the right), the left one for `LEFT`, `LEFT SEMI` and
+  `LEFT ANTI`, the right one for the `RIGHT` kinds, and none for `FULL`. A closed `TUMBLE` or
+  `HOP` window carries its projected end marker, or else its start marker. `EXPLAIN` shows the
+  column.
+- An interval join can read another interval join's stream on that stream's event-time column,
+  in every mode.
+- Cluster mode admits a window over an interval join stream and a window over a closed window
+  stream, on the event-time column the input carries.
+- An append-only view over an interval join keeps an interval on the join's event-time column, so
+  it no longer has to declare `retention = '<n> rows'`.
+- A `UNION ALL` carries its inputs' event-time column, in every mode, when every branch forwards it
+  unchanged to the same column from the same kind of operator; its watermark is the lowest of its
+  inputs' watermarks, and `EXPLAIN` shows the column. An interval join may read such a union, and
+  an append-only view over it keeps an interval on the column instead of declaring a row count.
+- Cluster mode admits a `UNION ALL` whose every branch forwards one source event-time column
+  through projections and filters, and windows, interval joins, aggregates and views over it.
+  Each node unions the rows it holds, and a window or join over the union closes on the lowest of
+  its sources' node-local watermarks. A union over a join or window stream, or one without the
+  event-time column, is still rejected.
+- A chain of interval joins over three or more named inputs (`a JOIN b ON .. JOIN c ON ..`, each
+  `ON` with a `BETWEEN` bound) runs in every mode, in a stream or a materialized view. It is split
+  into one internal stage per join, each admitted as a two-way join over the stage before it, so
+  each later join must bound its time by the event-time column the earlier joins carry; `CREATE`
+  names the column otherwise. In cluster mode the chain counts toward the three-exchange depth
+  limit like named stages.
+
+- `MIN` and `MAX` work over changelog inputs: an `EMIT CHANGES` aggregate, a changelog
+  materialized view, a CDC or change-feed source, and the second stage of a salted aggregate.
+  Each group keeps every value it holds with its net weight, so retracting the current extreme
+  falls back to the next one; the values count toward `managed_state_bytes` and the memory
+  budgets, in every mode, with or without `GROUP BY`. In cluster mode a global (ungrouped) one
+  has every node send its rows to the owner of vnode 0 (`EXPLAIN` shows `gather to vnode 0`).
+
+### Changed
+
+- A multi-way join that is not a chain of interval joins over named inputs (with a lookup or
+  temporal table, `USING`, a subquery input, or no interval bound) is still rejected, with a
+  message that says which multi-way joins split. Cluster mode reports a window over a join that
+  cannot be split with the one-input window message instead of the windowed-join message.
+- `CREATE` rejects a window over a window stream that groups by any column other than the one the
+  upstream carries (for example its start when it projects its end), and a window over a session
+  window or over a window that projects no boundary. Such a window could close before the
+  upstream emitted into it. The check runs whenever the DDL runs, so after upgrading, an embedded
+  or single-node pipeline with such a window fails to start until it windows on the carried
+  column. Cluster mode never admitted these windows.
+- `TUMBLE`, `HOP` and `SESSION` windows keep their `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` state
+  in the same form as non-windowed aggregates, in every mode. A windowed `SUM` or `AVG` whose
+  state would overflow now fails the operator's cycle with an error, as a non-windowed one does,
+  instead of wrapping. A floating-point `SUM` or `AVG` adds its values in row order, so a result
+  can differ in its last bits from earlier releases.
+- Cluster mode: an aggregate, window, interval join or temporal join applies a cycle's local rows,
+  and a window closes, in the cycle that sends its rows and watermark to the other nodes when the
+  shuffle accepts them without waiting. Before, every cycle that advanced the watermark applied
+  its local rows on the following cycle and held new input until then, even when nothing went to
+  another node. A send that has to wait (a new connection, a full send budget) still finishes in
+  the background, and the rows apply on a later cycle as before.
+- Arrow and Parquet 59.3.2, DataFusion 55.2.0, Delta Lake 1.1 (Delta kernel 0.28.1) and Iceberg
+  0.11.0. Iceberg is published as the `laminardb-iceberg*` crates, the upstream 0.11.0 sources on
+  Arrow 59, until an upstream release shares Delta Lake's Arrow version.
+- A string compared with a number now converts the string to a number, in every mode:
+  `int_col = 'hello'` fails with a cast error instead of matching no rows, and
+  `str_col IN ('a', 1)` is rejected. In a `UNION ALL`, a computed column needs an alias when
+  another column in the same branch would share its output name.
+- The Iceberg sink writes a partition value containing `/`, `\` or `?` URL-encoded inside one
+  path segment instead of refusing it.
+- The Delta sink refuses a table that uses column mapping when it opens.
+
+### Fixed
+
+- In cluster mode a `UNION ALL` that reads one source twice passed `CREATE` and was then refused
+  when the pipeline started (`[LDB-6066]`, "SQL execution shape has not been classified"); it now
+  runs.
+- In every mode, `CREATE` certifies an aggregate over a changelog materialized view in its
+  changelog form, as it already did over an `EMIT CHANGES` stream. One whose changelog state
+  cannot hold its input (for example `MIN` or `MAX` over an `INTERVAL` column) is now rejected at
+  `CREATE`; before, it was admitted and the pipeline failed to start.
+- A window over another window's output no longer drops the upstream's rows. A window stream's
+  watermark now trails the watermark its windows close at: by the allowed lateness when it
+  projects `tumble_end` or `hop_end`, and by the lateness plus the window size otherwise.
+  Downstream windows, append-view retention and `stream_watermark_ms` see the held watermark.
+  Session windows are not held. This applies in every mode.
+- An append-only view that projects a window's end but not its start (`tumble_end` or `hop_end`
+  grouped with `tumble` or `hop`) keeps an interval on the end column. `CREATE` used to fail for
+  lack of an event-time column. A `TUMBLE` or `HOP` view now keeps a window while the window's end
+  is within the interval of the watermark its windows close at, less the allowed lateness,
+  whichever boundary it projects.
+- An append-only session view keeps a session while its start is within the interval plus the gap
+  and the allowed lateness. A session view whose `ALLOW LATENESS` exceeded its retention used to
+  drop every session as it closed.
+- `ALLOW LATENESS` is applied. It used to be parsed after the `EMIT` clause and then ignored. It
+  now keeps windows open in embedded and single-node mode. It must follow `EMIT ON WINDOW CLOSE`,
+  and `CREATE` rejects it with `EMIT FINAL`, with other `EMIT` modes, on a query without a
+  window, and in cluster mode. Any other text after the `EMIT` clause is now a parse error.
+
+### Upgrade
+
+- A stream or view whose DDL already carried `ALLOW LATENESS` gets a new pipeline identity, so its
+  existing checkpoints fail closed; it restarts from its sources.
+- The state frame ABI is now 9, for the window state change above. Every checkpoint written by an
+  earlier release fails closed at startup, in every pipeline and mode, and the pipeline restarts
+  from its sources.
+- Delta tables on S3 no longer accept DynamoDB locking: `storage.s3_locking_provider`,
+  `storage.dynamodb_table_name`, `AWS_S3_LOCKING_PROVIDER` and `DELTA_DYNAMO_TABLE_NAME` are
+  rejected for reads and writes. delta-rs 1.0 removed its DynamoDB log store; S3 commits use
+  conditional put. Remove these settings before upgrading.
+- Cluster nodes admit only peers of the same version, so a cluster moves to 0.40.0 by restarting
+  every node. Checkpoints written by 0.34.0 restore.
+- Applications embedding `laminar-db` move to Arrow 59 and DataFusion 55 with it.
+
 ## [0.33.0]
 
 ### Added
