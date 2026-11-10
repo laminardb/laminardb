@@ -77,10 +77,6 @@ impl Hash for WatermarkUdf {
 }
 
 impl ScalarUDFImpl for WatermarkUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "watermark"
     }

@@ -289,6 +289,11 @@ fn missing_local_delta_directory(path: &str) -> Result<Option<std::path::PathBuf
 #[cfg(feature = "delta-lake")]
 fn validate_delta_creation_schema(schema: &SchemaRef) -> Result<(), ConnectorError> {
     use deltalake::kernel::engine::arrow_conversion::{TryIntoArrow as _, TryIntoKernel as _};
+    super::delta_io::validate_delta_timestamp_precision(schema).map_err(|reason| {
+        ConnectorError::SchemaMismatch(format!(
+            "Delta cannot represent the query schema: {reason}; cast in CREATE STREAM"
+        ))
+    })?;
     let normalized = super::delta_io::widen_millisecond_timestamps(schema);
     let kernel: deltalake::kernel::StructType =
         normalized.as_ref().try_into_kernel().map_err(|error| {

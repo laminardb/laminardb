@@ -13,6 +13,9 @@
 //!                  LookupSnapshot (pre-indexed RecordBatch)
 //! ```
 
+use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use arrow::row::{RowConverter, SortField};
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -32,6 +35,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::Expr;
 use futures::StreamExt;
 use laminar_core::lookup::lookup_cache::LookupMemoryCache;
@@ -335,8 +339,11 @@ impl DisplayAs for LookupJoinExec {
 }
 
 impl ExecutionPlan for LookupJoinExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn name(&self) -> &'static str {
@@ -605,7 +612,8 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(lookup_node) = node.as_any().downcast_ref::<LookupJoinNode>() else {
             return Ok(None);
@@ -710,7 +718,7 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
 fn apply_pushdown_predicates(
     batch: &RecordBatch,
     predicates: &[Expr],
-    session_state: &SessionState,
+    session_state: &dyn Session,
 ) -> Result<RecordBatch> {
     use arrow::compute::filter_record_batch;
     use datafusion::physical_expr::create_physical_expr;
@@ -720,7 +728,12 @@ fn apply_pushdown_predicates(
 
     let mut mask = None::<arrow_array::BooleanArray>;
     for pred in predicates {
-        let phys_expr = create_physical_expr(pred, &df_schema, session_state.execution_props())?;
+        let phys_expr = create_physical_expr(
+            pred,
+            &df_schema,
+            session_state.execution_props(),
+            &PhysicalPlanningContext::default(),
+        )?;
         let result = phys_expr.evaluate(batch)?;
         let bool_arr = result
             .into_array(batch.num_rows())?

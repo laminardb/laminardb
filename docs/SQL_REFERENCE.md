@@ -15,8 +15,8 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 | `ts - INTERVAL '10' SECOND` | `ts - INTERVAL '10' SECOND` | Native on `TIMESTAMP` columns since v0.20.1 |
 | `CASE WHEN ... THEN vol ELSE 0` | `CASE WHEN ... THEN vol ELSE CAST(0 AS BIGINT)` | ELSE branch must match column type |
 | `SHOW TABLES` | `SHOW SOURCES` / `SHOW STREAMS` | LaminarDB uses source/stream terminology |
-| `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion 52 built-ins |
-| `UNNEST(array_col)` | `UNNEST(array_col)` | Available via DataFusion 52 built-ins |
+| `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion built-ins |
+| `UNNEST(array_col)` | `UNNEST(array_col)` | Available via DataFusion built-ins |
 
 ---
 
@@ -1080,6 +1080,13 @@ SELECT account, SUM(qty) AS qty FROM fills GROUP BY account
 WITH (freshness = '10 seconds');
 ```
 
+### 9. Mixed string and number comparisons
+
+A string compared with a number converts the string to a number, so `int_col > '100'` is numeric
+and `int_col = 'hello'` fails with a cast error instead of matching no rows. `str_col IN ('a', 1)`
+is also rejected. Cast explicitly when you want a text comparison. In a `UNION ALL`, give a computed
+column an alias when another column in the same branch would otherwise share its output name.
+
 ---
 
 ## Tested Combinations
@@ -1129,4 +1136,4 @@ window functions compose correctly against any precision.
 
 ---
 
-*Tracks LaminarDB 0.22 on DataFusion 52.x / Arrow 57.x. Corrections welcome: open an issue or PR.*
+*Tracks LaminarDB 0.40 on DataFusion 55.x / Arrow 59.x. Corrections welcome: open an issue or PR.*

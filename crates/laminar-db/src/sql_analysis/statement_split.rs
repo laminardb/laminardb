@@ -340,6 +340,9 @@ impl<'a> JoinColumns<'a> {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
                     return Err(columns.unsupported("list the output columns instead of '*'"));
                 }
+                SelectItem::ExprWithAliases { .. } => {
+                    return Err(columns.unsupported("use one alias per output column"));
+                }
             }
             if let SelectItem::ExprWithAlias { alias, .. } = item {
                 columns.output_names.push(alias.value.clone());

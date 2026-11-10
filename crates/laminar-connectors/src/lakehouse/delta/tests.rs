@@ -1892,6 +1892,34 @@ fn existing_table_types_must_match_without_lossy_casts() {
     }
 }
 
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn column_mapped_tables_are_rejected_before_any_write() {
+    use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "mapped");
+    let columns: deltalake::kernel::StructType = test_schema().as_ref().try_into_kernel().unwrap();
+    super::super::delta_io::open_or_create_table(&path, std::collections::HashMap::new(), None)
+        .await
+        .unwrap()
+        .create()
+        .with_columns(columns.fields().cloned())
+        .with_configuration_property(deltalake::TableProperty::ColumnMappingMode, Some("name"))
+        .await
+        .unwrap();
+
+    for config in [coordinated_config(&path), DeltaLakeSinkConfig::new(&path)] {
+        let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+        let error = sink
+            .open(&ConnectorConfig::new("delta-lake"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("column-mapped"), "{error}");
+    }
+}
+
 /// Coordinated append stages rows without delta-rs row validation, so a table with CHECK
 /// constraints is rejected before staging, while at-least-once append still enforces them.
 #[cfg(feature = "delta-lake")]

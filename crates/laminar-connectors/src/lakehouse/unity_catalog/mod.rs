@@ -99,6 +99,11 @@ pub(crate) fn arrow_to_uc_columns(
 ) -> Result<Vec<ColumnInfo>, ConnectorError> {
     use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
 
+    super::delta_io::validate_delta_timestamp_precision(schema).map_err(|reason| {
+        ConnectorError::SchemaMismatch(format!(
+            "Unity Catalog registration cannot represent the Delta schema: {reason}"
+        ))
+    })?;
     let normalized = super::delta_io::widen_millisecond_timestamps(schema);
     let kernel: StructType = normalized.as_ref().try_into_kernel().map_err(|error| {
         ConnectorError::SchemaMismatch(format!(
@@ -165,6 +170,13 @@ fn column_type_name(data_type: &KernelType) -> Result<ColumnTypeName, ConnectorE
             PrimitiveType::Timestamp => ColumnTypeName::Timestamp,
             PrimitiveType::TimestampNtz => ColumnTypeName::TimestampNtz,
             PrimitiveType::Decimal(_) => ColumnTypeName::Decimal,
+            PrimitiveType::Void
+            | PrimitiveType::IntervalYearMonth
+            | PrimitiveType::IntervalDayTime => {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "Unity Catalog column registration does not support the {primitive} type"
+                )))
+            }
         },
         KernelType::Array(_) => ColumnTypeName::Array,
         KernelType::Struct(_) => ColumnTypeName::Struct,
@@ -201,6 +213,13 @@ fn catalog_string(data_type: &KernelType, depth: usize) -> Result<String, Connec
             PrimitiveType::TimestampNtz => "timestamp_ntz".into(),
             PrimitiveType::Decimal(decimal) => {
                 format!("decimal({},{})", decimal.precision(), decimal.scale())
+            }
+            PrimitiveType::Void
+            | PrimitiveType::IntervalYearMonth
+            | PrimitiveType::IntervalDayTime => {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "Unity Catalog column registration does not support the {primitive} type"
+                )))
             }
         },
         KernelType::Array(array) => {

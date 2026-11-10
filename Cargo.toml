@@ -9,6 +9,9 @@ members = [
 ]
 exclude = [
     "tools/*",
+    "vendor/iceberg",
+    "vendor/iceberg-catalog-rest",
+    "vendor/iceberg-storage-opendal",
     "vendor/libxml2-ffi",
     "vendor/pgwire",
     "vendor/pgwire-replication",
@@ -25,7 +28,7 @@ quick-xml = { path = "vendor/quick-xml" }
 rdkafka-sys = { path = "vendor/rdkafka-sys" }
 
 [workspace.package]
-version = "0.34.0"
+version = "0.40.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -82,26 +85,26 @@ globset = "0.4"
 
 # Arrow row encoding participates in the partitioning ABI. Upgrade these exact
 # pins only with an ABI version bump and updated golden vectors.
-arrow = { version = "=58.4.1", default-features = true }
-arrow-array = "=58.4.1"
-arrow-avro = "=58.4.1"
-arrow-schema = { version = "=58.4.1", features = ["serde"] }
-arrow-cast = "=58.4.1"
-arrow-csv = "=58.4.1"
-arrow-ipc = { version = "=58.4.1", features = ["lz4"] }
-arrow-json = "=58.4.1"
-arrow-row = "=58.4.1"
-arrow-select = "=58.4.1"
-parquet = { version = "=58.4.1", default-features = false }
-datafusion = "=53.1.0"
-datafusion-common = "=53.1.0"
-datafusion-expr = "=53.1.0"
-datafusion-functions-aggregate-common = "=53.1.0"
-datafusion-sql = "=53.1.0"
-datafusion-optimizer = "=53.1.0"
+arrow = { version = "=59.3.2", default-features = true }
+arrow-array = "=59.3.2"
+arrow-avro = "=59.3.2"
+arrow-schema = { version = "=59.3.2", features = ["serde"] }
+arrow-cast = "=59.3.2"
+arrow-csv = "=59.3.2"
+arrow-ipc = { version = "=59.3.2", features = ["lz4"] }
+arrow-json = "=59.3.2"
+arrow-row = "=59.3.2"
+arrow-select = "=59.3.2"
+parquet = { version = "=59.3.2", default-features = false }
+datafusion = "=55.2.0"
+datafusion-common = "=55.2.0"
+datafusion-expr = "=55.2.0"
+datafusion-functions-aggregate-common = "=55.2.0"
+datafusion-sql = "=55.2.0"
+datafusion-optimizer = "=55.2.0"
 # `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used
 # to collect referenced columns for lookup projection pushdown.
-sqlparser = { version = "=0.61.0", features = ["visitor"] }
+sqlparser = { version = "=0.62.0", features = ["visitor"] }
 
 # Async
 tokio-stream = "0.1"
@@ -134,19 +137,23 @@ object_store = "=0.13.2"
 # client pinned and inject Google's refreshable WIF credential provider.
 google-cloud-auth = { version = "=1.16.0", default-features = false, features = ["default-rustls-provider"] }
 
-# Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
-deltalake = { version = "=0.32.4", default-features = false }
-deltalake-catalog-glue = { version = "=0.16.0", default-features = false }
+# Delta 1.1 aligns with Arrow 59, DataFusion 55, and object_store 0.13.
+deltalake = { version = "=1.1.2", default-features = false }
+# `deltalake` asks for `deltalake-core` ^1.1; published crates resolve it fresh, so name the tested patch.
+deltalake-core = { version = "=1.1.4", default-features = false }
+deltalake-catalog-glue = { version = "=1.0.0", default-features = false }
 # Named directly only to map Azure/GCS vended Unity Catalog credentials; deltalake's
 # `unity-experimental` already links this exact version.
-deltalake-catalog-unity = { version = "=0.16.1", default-features = false }
+deltalake-catalog-unity = { version = "=1.0.0", default-features = false }
 aws-sdk-glue = { version = "=1.163.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
-delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-features = false, features = ["arrow-58", "internal-api"] }
+delta_kernel = { package = "buoyant_kernel", version = "=0.28.1", default-features = false, features = ["arrow-59", "internal-api"] }
 
 # Apache Iceberg
-iceberg = "=0.11.0"
-iceberg-catalog-rest = "=0.11.0"
-iceberg-storage-opendal = { version = "=0.11.0", default-features = false }
+# Upstream 0.11.0 requires Arrow 58 and Delta 1.1 requires Arrow 59; provenance and removal in
+# vendor/iceberg/VENDORED.md.
+iceberg = { package = "laminardb-iceberg", path = "vendor/iceberg", version = "=0.40.0" }
+iceberg-catalog-rest = { package = "laminardb-iceberg-catalog-rest", path = "vendor/iceberg-catalog-rest", version = "=0.40.0" }
+iceberg-storage-opendal = { package = "laminardb-iceberg-storage-opendal", path = "vendor/iceberg-storage-opendal", version = "=0.40.0", default-features = false }
 apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)

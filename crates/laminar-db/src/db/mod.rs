@@ -5402,7 +5402,7 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &datafusion::logical_expr::LogicalPlan,
-        session_state: &datafusion::execution::SessionState,
+        session_state: &dyn datafusion::catalog::Session,
     ) -> datafusion_common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         use datafusion::physical_planner::PhysicalPlanner;
         let planner =
