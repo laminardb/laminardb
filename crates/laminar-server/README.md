@@ -9,7 +9,7 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 - **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
 - **Hot reload**: edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
-- **Platform allocators**: jemalloc on Linux, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
+- **Platform allocators**: jemalloc on Linux and macOS, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
 - **Docker and Helm** deployment with multi-arch images
 
 ## CLI
@@ -568,6 +568,8 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto
 
 - `background_thread:true` spawns an auxiliary thread that purges freed pages back to the OS asynchronously. Without this, decay only fires on alloc/free events; a server that settles into a steady rhythm can end up holding pages indefinitely and RSS drifts upward. **This is the single most impactful setting for a long-running streaming process.**
 - `metadata_thp:auto` backs jemalloc's internal metadata with transparent huge pages where available, reducing TLB pressure.
+
+Linux builds already enable `background_thread` by default. jemalloc has no background threads on macOS, where the option makes its initialisation fail and the server abort at startup, so macOS builds leave it off.
 
 ### When you're specifically trying to minimize RSS
 
