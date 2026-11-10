@@ -10,11 +10,11 @@ use crate::lakehouse::iceberg_config::{
 use crate::storage::StorageProvider;
 
 const MOR_MISSING_ACTIONS: &str =
-    "[LDB-ICEBERG-MOR-UNSUPPORTED] iceberg.write.merge-on-read: iceberg-rust 0.10.1 has no public atomic RowDelta action or position-delete writer";
+    "[LDB-ICEBERG-MOR-UNSUPPORTED] iceberg.write.merge-on-read: iceberg-rust 0.11.0 has no public atomic RowDelta action or position-delete writer";
 const COW_MISSING_ACTIONS: &str =
-    "[LDB-ICEBERG-COW-UNSUPPORTED] iceberg.write.copy-on-write: iceberg-rust 0.10.1 has no public atomic RewriteFiles, OverwriteFiles, ReplacePartitions, or DeleteFiles action";
+    "[LDB-ICEBERG-COW-UNSUPPORTED] iceberg.write.copy-on-write: iceberg-rust 0.11.0 has no public atomic RewriteFiles, OverwriteFiles, ReplacePartitions, or DeleteFiles action";
 const CHANGELOG_MISSING_RECONCILIATION: &str =
-    "[LDB-ICEBERG-CHANGELOG-UNSUPPORTED] iceberg.read.changelog: iceberg-rust 0.10.1 does not expose complete scan-side delete reconciliation and identifier semantics";
+    "[LDB-ICEBERG-CHANGELOG-UNSUPPORTED] iceberg.read.changelog: iceberg-rust 0.11.0 does not expose complete scan-side delete reconciliation and identifier semantics";
 pub(crate) const REST_REMOTE_SIGNING_ENABLED: &str = "s3.remote-signing-enabled";
 
 pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorError> {
@@ -34,7 +34,7 @@ pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorE
     config.validate_writer_limits()?;
     if config.table_ref != "main" {
         return Err(ConnectorError::FeatureUnsupported(format!(
-            "iceberg.write.table-ref: FastAppend in iceberg-rust 0.10.1 only publishes the main branch; requested '{}'",
+            "iceberg.write.table-ref: FastAppend in iceberg-rust 0.11.0 only publishes the main branch; requested '{}'",
             config.table_ref
         )));
     }
@@ -129,7 +129,7 @@ pub(crate) fn validate_catalog_session(
     }
     if catalog.access_delegation {
         return Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.rest.access-delegation: iceberg-rust 0.10.1 does not provide refreshable vended credentials or remote signing"
+            "iceberg.catalog.rest.access-delegation: iceberg-rust 0.11.0 does not provide refreshable vended credentials or remote signing"
                 .into(),
         ));
     }
@@ -143,7 +143,7 @@ pub(crate) fn validate_rest_properties(
         let normalized = key.to_ascii_lowercase();
         if normalized == REST_REMOTE_SIGNING_ENABLED && value.eq_ignore_ascii_case("true") {
             return Err(ConnectorError::FeatureUnsupported(
-                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] iceberg-rust 0.10.1 OpenDAL storage does not support REST remote signing"
+                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] iceberg-rust 0.11.0 OpenDAL storage does not support REST remote signing"
                     .into(),
             ));
         }

@@ -144,9 +144,9 @@ aws-sdk-glue = { version = "=1.163.0", default-features = false, features = ["be
 delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-features = false, features = ["arrow-58", "internal-api"] }
 
 # Apache Iceberg
-iceberg = "=0.10.1"
-iceberg-catalog-rest = "=0.10.1"
-iceberg-storage-opendal = { version = "=0.10.1", default-features = false }
+iceberg = "=0.11.0"
+iceberg-catalog-rest = "=0.11.0"
+iceberg-storage-opendal = { version = "=0.11.0", default-features = false }
 apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)

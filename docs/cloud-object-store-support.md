@@ -109,7 +109,7 @@ The existing `aws`, `azure`, and `gcs` DB/server features remain aliases for che
 wiring for backward compatibility. They do not imply that Delta, Iceberg, or Files is enabled.
 The lower-level `iceberg-storage-*` features remain available in `laminar-connectors`; applications
 should normally use the provider-specific public features above. The pinned
-`iceberg-storage-opendal` 0.10.1 provider features are used directly; the broad OpenDAL service set
+`iceberg-storage-opendal` 0.11.0 provider features are used directly; the broad OpenDAL service set
 is not enabled.
 
 ## Credentials and endpoints

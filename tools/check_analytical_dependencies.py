@@ -16,8 +16,8 @@ EXPECTED_GENERATIONS = (
         ("0.15.0", "0.16.0", "0.16.1", "0.32.4", "1.0.0"),
     ),
     ("Delta kernel", r"^buoyant_kernel$", ("0.22.2",)),
-    ("Iceberg", r"^iceberg(?:$|-)", ("0.10.1",)),
-    ("OpenDAL", r"^opendal(?:$|-)", ("0.57.0",)),
+    ("Iceberg", r"^iceberg(?:$|-)", ("0.11.0",)),
+    ("OpenDAL", r"^opendal(?:$|-)", ("0.58.2",)),
     ("SQLParser", r"^sqlparser$", ("0.61.0",)),
 )
 
