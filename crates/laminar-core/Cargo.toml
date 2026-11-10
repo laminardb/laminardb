@@ -106,7 +106,7 @@ criterion = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 # Mint a throwaway CA + node cert for the control-plane mTLS integration test.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [[bench]]
 name = "window_bench"

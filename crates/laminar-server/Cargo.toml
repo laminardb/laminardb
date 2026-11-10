@@ -160,7 +160,7 @@ sha2 = { workspace = true }
 tokio-postgres = "0.7"
 mongodb = "3"
 tokio-postgres-rustls = "0.13"
-rcgen = "0.13"
+rcgen = "0.14"
 serde_json = { workspace = true }
 # The RabbitMQ kill test and cluster soak publish inputs and read outputs directly.
 lapin = { version = "4.12.2", default-features = false, features = ["tokio", "rustls--aws_lc_rs", "rustls-webpki-roots-certs"] }
