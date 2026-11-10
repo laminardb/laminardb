@@ -35,15 +35,14 @@ engine and the SQL are the same.
 - **Scales out on object storage.** Cluster nodes share checkpoints in S3, GCS or Azure and find
   one another through gossip or a static peer list.
 
-LaminarDB is pre-1.0. The latest release is
-[v0.33.0](https://github.com/laminardb/laminardb/releases/tag/v0.33.0); this README follows the
-`main` branch, and marks features that are not released yet with *(main only)*. Website:
-[laminardb.io](https://laminardb.io).
+LaminarDB is pre-1.0; see the [latest release](https://github.com/laminardb/laminardb/releases/latest)
+for what's new. This README follows the `main` branch and marks anything added since the latest
+release with *(unreleased)*. Website: [laminardb.io](https://laminardb.io).
 
 ## Quick start
 
-You need Docker. This runs the v0.33.0 server with the built-in `generator` source, so nothing
-else has to be running, and keeps a running total in a materialised view.
+You need Docker. This runs the latest server release with the built-in `generator` source, so
+nothing else has to be running, and keeps a running total in a materialised view.
 
 Save this as `laminardb.toml`:
 
@@ -73,7 +72,7 @@ export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 docker run --rm -d --name laminardb -p 127.0.0.1:8080:8080 \
   -e LAMINAR_CONSOLE_TOKEN \
   -v "$PWD/laminardb.toml:/etc/laminardb/laminardb.toml:ro" \
-  laminardb/laminardb-server:0.33.0
+  laminardb/laminardb-server:latest
 ```
 
 Query the view, wait a few seconds, and query it again:
@@ -160,7 +159,7 @@ need.
 
 This pipeline reads trades from a Kafka topic, totals each symbol's volume per minute of event
 time, and writes each finished minute to another topic. You need Docker; the steps start Apache
-Kafka and LaminarDB v0.33.0 on a private Docker network.
+Kafka and the latest LaminarDB release on a private Docker network.
 
 1. Start Kafka and create the two topics:
 
@@ -233,7 +232,7 @@ Kafka and LaminarDB v0.33.0 on a private Docker network.
    docker run -d --rm --name laminardb --network laminardb-example -p 127.0.0.1:8080:8080 \
      -e LAMINAR_CONSOLE_TOKEN \
      -v "$PWD/laminardb.toml:/etc/laminardb/laminardb.toml:ro" \
-     laminardb/laminardb-server:0.33.0
+     laminardb/laminardb-server:latest
    ```
 
 4. Send five trades, then read the output topic:
@@ -268,15 +267,15 @@ Kafka and LaminarDB v0.33.0 on a private Docker network.
 
 ## Install
 
-- **Binaries:** [v0.33.0 release](https://github.com/laminardb/laminardb/releases/tag/v0.33.0)
+- **Binaries:** the [latest release](https://github.com/laminardb/laminardb/releases/latest)
   for Linux (x86_64 and aarch64 glibc, x86_64 musl), macOS (x86_64 and Apple silicon) and
   Windows (x86_64), with `SHA256SUMS`.
 - **Containers:** [Docker Hub](https://hub.docker.com/r/laminardb/laminardb-server) or
   [GitHub Container Registry](https://github.com/laminardb/laminardb/pkgs/container/laminardb-server).
-  Use a version tag such as `0.33.0`; `latest` and `main` are rebuilt from the `main` branch and
-  are not releases.
-- **Kubernetes:** the [Helm chart](deploy/helm/laminardb/README.md). Set `image.tag` to a
-  published version such as `0.33.0`, because it defaults to the chart's `appVersion`.
+  `latest` is the newest release, a version tag such as `X.Y.Z` or `X.Y` pins one, and `main`
+  is rebuilt from the `main` branch.
+- **Kubernetes:** the [Helm chart](deploy/helm/laminardb/README.md). Set `image.tag` to the
+  release you deploy, because it defaults to the chart's `appVersion`.
 - **Local stack:** [Docker Compose](docker-compose.yml).
 - **From source:** Rust 1.95 or newer, CMake and a C compiler, then
   `cargo build --release -p laminar-server --bin laminardb`.
@@ -289,16 +288,16 @@ The [deployment guide](deploy/README.md) covers setup and operations.
 |---|---|
 | Embedded | Run LaminarDB inside a Rust program with the `laminar-db` crate. Checkpoints go to a local directory. |
 | Single-node server | Run one server with HTTP, WebSocket subscriptions, optional PostgreSQL-compatible connections and local checkpoints. |
-| Cluster | Run several servers over a shared checkpoint store. Sources must be Kafka, AI functions are rejected, and cluster SQL is narrower than single-node SQL. Any node can read materialised views at a committed checkpoint *(main only)*. |
+| Cluster | Run several servers over a shared checkpoint store. Sources must be Kafka, AI functions are rejected, and cluster SQL is narrower than single-node SQL. Any node can read materialised views at a committed checkpoint. |
 
 Client libraries are released separately from the engine and lag behind it:
 
 | Language | Package | Notes |
 |---|---|---|
-| Rust | `cargo add laminar-db` · [API docs](https://docs.rs/laminar-db) | 0.33.0 on crates.io, the same version as the server release. |
-| Python | `pip install laminardb` · [repository](https://github.com/laminardb/laminardb-python) | PyPI has 0.17.0, built against a March 2026 engine. Newer bindings build from the repository. |
-| Node.js / TypeScript | `npm install @laminardb/node` · [repository](https://github.com/laminardb/laminardb-nodejs) | 0.30.0-alpha.4, built against engine v0.30.0 without connectors. |
-| Java | `io.laminardb:laminardb:0.30.0-alpha` · [repository](https://github.com/laminardb/laminardb-java) | Alpha, built against engine v0.30.0 without connectors. |
+| Rust | `cargo add laminar-db` · [API docs](https://docs.rs/laminar-db) | Published to crates.io with each server release. |
+| Python | `pip install laminardb` · [repository](https://github.com/laminardb/laminardb-python) | The PyPI build lags well behind the engine; newer bindings build from the repository. |
+| Node.js / TypeScript | `npm install @laminardb/node` · [repository](https://github.com/laminardb/laminardb-nodejs) | Alpha, built against an older engine without connectors. |
+| Java | `io.laminardb:laminardb` · [repository](https://github.com/laminardb/laminardb-java) | Alpha, built against an older engine without connectors. |
 
 ## SQL
 
@@ -317,7 +316,7 @@ event time (`FOR SYSTEM_TIME AS OF`), and call streaming UDFs. `EXPLAIN` and `EX
 [cluster SQL boundary](docs/SQL_REFERENCE.md#cluster-sql-boundary).
 
 The server accepts SQL at `POST /api/v1/sql` and, when `pgwire_bind` is set, from `psql` or any
-PostgreSQL driver. Ad hoc reads can choose a read level *(main only)*: `latest`, `committed` (one
+PostgreSQL driver. Ad hoc reads can choose a read level: `latest`, `committed` (one
 checkpoint) or `recent`, which waits for a checkpoint holding every record the views' Kafka
 sources had upstream when the read arrived.
 
@@ -350,8 +349,8 @@ the server's default at-least-once delivery rejects them; set `delivery = "best_
 them.
 
 RabbitMQ, IBM MQ, FIX and FpML are optional build features (`rabbitmq`, `ibmmq`, `fix`, `fpml`)
-and are not in the Docker image. Of the v0.33.0 release binaries, x86_64 Linux (glibc) includes
-all four, x86_64 Linux (musl) none, and the others FIX and FpML. See the guides for
+and are not in the Docker image. Of the release binaries, x86_64 Linux (glibc) includes all
+four, x86_64 Linux (musl) none, and the others FIX and FpML. See the guides for
 [RabbitMQ](docs/RABBITMQ.md), [IBM MQ](docs/IBMMQ.md) and [FIX](docs/FIX_SOURCE.md), and the
 [connector guide](crates/laminar-connectors/README.md) for every option.
 
@@ -470,7 +469,7 @@ gossip on a trusted or isolated network. Read the
 ### Change a running cluster's topology
 
 A migration adds, drops or replaces sources, streams and sinks, and keeps their progress. It can
-also add or drop materialised views *(main only)*. Reset an incompatible object with an ordered
+also add or drop materialised views. Reset an incompatible object with an ordered
 `DROP`/`CREATE` in the same request, dependents first; reset state processes only new input. The
 cluster pauses at a checkpoint and returns an asynchronous receipt, and every required node must
 be ready to resume. The vnode owner map then stays frozen until the new topology is active and
@@ -498,8 +497,8 @@ browser app for a server you run: browse the catalogue, run SQL, and follow chec
 and lineage. The [hosted build](https://laminardb.github.io/laminardb-console-ui/) connects from
 your browser straight to your server's HTTP API; nothing is hosted for you. A server that binds to
 a non-loopback address must set `console_token`, and if you restrict browser origins with
-`console_cors_allowed_origins`, include the Console's origin. The Console was last reviewed
-against v0.32.0; it connects to v0.33.0 but shows a notice that compatibility is not guaranteed.
+`console_cors_allowed_origins`, include the Console's origin. The Console names the server
+version it was last reviewed against and shows a notice when it connects to a different one.
 
 ## Documentation
 
@@ -523,8 +522,8 @@ support@laminardb.io.
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-Builds with the `fix` or `fpml` feature, including the v0.33.0 release binaries other than
-x86_64 Linux (musl), also contain third-party software under its own licence; release archives
+Builds with the `fix` or `fpml` feature, including the release binaries other than x86_64 Linux
+(musl), also contain third-party software under its own licence; release archives
 carry the notices in `licenses/`.
 This product includes software developed by quickfixengine.org (http://www.quickfixengine.org/).
 libxml2 is under the MIT License, and the bundled FpML schemas are FpML Specifications under the

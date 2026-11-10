@@ -39,7 +39,7 @@ cargo build --release --bin laminardb
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
-  laminardb/laminardb-server:0.33.0
+  laminardb/laminardb-server:latest
 
 # Check health
 curl http://localhost:8080/health
