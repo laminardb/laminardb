@@ -19,9 +19,11 @@ Available platforms:
 | Windows x86_64 | `laminardb-server-x86_64-pc-windows-msvc-v*.zip` |
 
 ```bash
-# Download and extract (Linux x86_64 example)
-curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.20.2.tar.gz
-tar xzf laminardb-server-x86_64-unknown-linux-gnu-v*.tar.gz
+# Download and extract the latest release (Linux x86_64 example)
+VERSION=$(curl -fsSL https://api.github.com/repos/laminardb/laminardb/releases/latest \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+curl -LO "https://github.com/laminardb/laminardb/releases/download/$VERSION/laminardb-server-x86_64-unknown-linux-gnu-$VERSION.tar.gz"
+tar xzf "laminardb-server-x86_64-unknown-linux-gnu-$VERSION.tar.gz"
 
 # Verify checksums
 curl -LO https://github.com/laminardb/laminardb/releases/latest/download/SHA256SUMS
@@ -39,7 +41,7 @@ Images are published to Docker Hub on every push to `main` and on tagged release
 the same images, but pulling them currently requires authentication.
 
 ```bash
-docker pull laminardb/laminardb-server:0.33.0
+docker pull laminardb/laminardb-server:latest
 
 # Run with default config
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
@@ -47,17 +49,18 @@ docker run -d --name laminardb \
   -p 8080:8080 \
   -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
-  laminardb/laminardb-server:0.33.0
+  laminardb/laminardb-server:latest
 
 # Check health
 curl http://localhost:8080/health
 ```
 
 Available tags:
-- `latest` - latest build from `main`, not a release
-- `0.33.0` - specific version
-- `0.33` - latest patch for minor version
-- `sha-abc1234` - specific commit
+- `latest` - the newest release
+- `X.Y.Z` - a specific release
+- `X.Y` - the newest patch release of a minor version
+- `main` - the latest build from the `main` branch, not a release
+- `sha-abc1234` - a specific commit
 
 Multi-arch support: `linux/amd64` and `linux/arm64`.
 

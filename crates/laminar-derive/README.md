@@ -47,16 +47,18 @@ struct OhlcBar {
 
 ### `#[derive(FromRow)]`
 
-Like `FromRecordBatch`, but also implements `laminar_db::FromBatch`. Fields are matched by **position** (column order in SELECT), not by name.
+Like `FromRecordBatch`, but also implements `laminar_db::FromBatch` for typed subscriptions. Fields are matched by name, in any order; `#[column("name")]` overrides the column name.
 
 ```rust
 use laminar_derive::FromRow;
 
+// SELECT symbol, SUM(volume) AS total, AVG(price) AS avg_price ...
 #[derive(FromRow)]
-struct Result {
-    symbol: String,    // 1st SELECT column
-    total: i64,        // 2nd SELECT column
-    avg_price: f64,    // 3rd SELECT column
+struct Summary {
+    avg_price: f64,
+    symbol: String,
+    #[column("total")]
+    total_volume: i64,
 }
 ```
 

@@ -39,7 +39,7 @@ cargo build --release --bin laminardb
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
-  laminardb/laminardb-server:0.33.0
+  laminardb/laminardb-server:latest
 
 # Check health
 curl http://localhost:8080/health
@@ -366,7 +366,7 @@ incarnations are fenced. Before you remove a node permanently, confirm that the 
 longer names it. More owners do not split a hot key, add source partitions or speed up a slow
 sink.
 
-After a [topology migration](../../docs/architecture/DISTRIBUTED_STATE.md) commits, the
+After a [topology migration](../../README.md#change-a-running-clusters-topology) commits, the
 complete owner map stays frozen until the new topology is Active **and** has committed its own
 checkpoint. Until then, only same-slot replacement of a failed process is admitted. Do not scale
 in or out while `GET /api/v1/cluster/topology` reports `live_migration`. Afterwards all three ownership changes work normally, and a later

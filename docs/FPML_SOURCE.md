@@ -23,7 +23,87 @@ cargo build --release -p laminar-server --features fpml
 
 The feature compiles a trimmed copy of libxml2 2.15.4 with CMake, so you need CMake and a C
 compiler. Builds without the feature don't compile or link libxml2. The prebuilt server binaries
-for Linux (glibc), macOS, and Windows include it; the Linux musl binary does not.
+for Linux (glibc), macOS, and Windows include it; the Linux musl binary does not. The Docker
+image does not.
+
+## Try it locally
+
+You need a Rust toolchain, CMake, a C compiler and a checkout of the repository; run the commands
+from its root. These steps watch a folder for swap confirmations and write the trade date, first
+leg and notional of each swap to a JSON file.
+
+1. Save this as `laminardb.toml`:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE rates FROM FILES (
+       'path' = '/tmp/laminardb-fpml/inbox',
+       'glob_pattern' = '*.xml',
+       'fpml.profile' = 'fpml-5-13-confirmation-rates'
+   ) FORMAT FPML;
+
+   CREATE STREAM swaps AS
+       SELECT
+           trade_header['trade_date'] AS trade_date,
+           swap['streams'][1]['payer_party_href'] AS first_leg_payer,
+           swap['streams'][1]['calculation']['notional_schedule']['currency'] AS currency,
+           swap['streams'][1]['calculation']['notional_schedule']['initial_value'] AS notional
+       FROM rates
+       WHERE product_type = 'swap';
+
+   CREATE SINK swaps_out FROM swaps INTO FILES (
+       'path' = '/tmp/laminardb-fpml/out'
+   ) FORMAT JSON;
+   '''
+
+   [server]
+   bind = "127.0.0.1:8080"
+   delivery = "at_least_once"
+
+   [checkpoint]
+   url = "file:///tmp/laminardb-fpml/checkpoints"
+   interval = "1s"
+   ```
+
+   The source has no column list because the profile defines the columns. Nested values are
+   ordinary SQL structs and lists.
+
+2. Create the inbox and start the server with the `fpml` feature. The first build takes a few
+   minutes:
+
+   ```bash
+   mkdir -p /tmp/laminardb-fpml/inbox
+   cargo run --release -p laminar-server --features fpml --bin laminardb -- --config laminardb.toml
+   ```
+
+3. In another terminal, drop in some of the official FpML examples. They include swaps, FRAs and
+   swaptions; the stream keeps only the swaps:
+
+   ```bash
+   cp crates/laminar-connectors/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/products/interest-rate-derivatives/ird-ex0*.xml \
+     /tmp/laminardb-fpml/inbox/
+   ```
+
+4. A few seconds later, once the files have settled and the next checkpoint has committed, read
+   the output:
+
+   ```bash
+   cat /tmp/laminardb-fpml/out/*.jsonl
+   ```
+
+   You should see 14 lines, one per swap, such as these:
+
+   ```json
+   {"trade_date":"1994-12-12","first_leg_payer":"party1","currency":"EUR","notional":50000000.000000000000000000}
+   {"trade_date":"2018-11-14","first_leg_payer":"partyB","currency":"USD","notional":86000000.000000000000000000}
+   {"trade_date":"2018-09-09","first_leg_payer":"partyB","currency":"USD","notional":121700000.000000000000000000}
+   ```
+
+   The notional keeps all 18 decimal places of its column, because amounts never pass through a
+   float. Some examples are variants of the same trade, so a few lines are identical.
+
+Restart the server and it carries on from its last checkpoint without reading the same files
+again. To start from scratch, stop it and delete `/tmp/laminardb-fpml`.
 
 ## What's supported
 
@@ -74,9 +154,6 @@ CREATE SOURCE messages (
 You don't declare columns. The profile defines them, and the only thing you can add is a
 watermark. Nested values work like any other SQL struct or list, for example
 `trade_header['trade_date']` or `swap['streams'][1]['payer_party_href']`.
-
-The [README](../README.md#fpml-trade-confirmations) has a walkthrough that runs on your machine in
-a few minutes.
 
 ### From RabbitMQ or IBM MQ
 

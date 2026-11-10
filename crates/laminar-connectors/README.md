@@ -36,8 +36,7 @@ straight to sinks: MongoDB → LaminarDB → destinations, with no broker in bet
 embedded and single-node server mode; cluster mode rejects it (singleton sources and mutable
 sinks have no fenced placement).
 
-New to it? The [main README](../../README.md#mongodb-change-data-capture) walks through
-mirroring a collection into PostgreSQL on your machine.
+New to it? [Try it locally](#try-mongodb-cdc-locally) first.
 
 | `output.mode` | Rows | Contract | Destinations |
 |---|---|---|---|
@@ -47,6 +46,89 @@ mirroring a collection into PostgreSQL on your machine.
 `snapshot.mode=never` (default) captures changes made after the source first opens; documents
 that already exist, and changes older than the oplog, are not read. `snapshot.mode=initial` first
 copies the whole collection, then streams every change from the copy's point in time.
+
+#### Try MongoDB CDC locally
+
+You need Docker, a Rust toolchain and a checkout of the repository; run the commands from its
+root. These steps mirror a MongoDB collection into a PostgreSQL table.
+
+1. Start MongoDB and PostgreSQL. MongoDB listens on `127.0.0.1:27117` as a one-node replica set,
+   because change streams need a replica set or sharded cluster. PostgreSQL listens on
+   `127.0.0.1:15433` (user `laminar`, password `laminar-test-secret`, database `mirror`):
+
+   ```bash
+   docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait mongo-rs postgres
+   ```
+
+2. Create the collection. A mirror needs the full document after every update, so turn on pre-
+   and post-images:
+
+   ```bash
+   docker exec laminardb-mongo-rs mongosh --port 27117 --quiet --eval \
+     'db.getSiblingDB("app").createCollection("users", {changeStreamPreAndPostImages: {enabled: true}})'
+   ```
+
+3. Save this as `laminardb.toml`:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE users (
+       _id VARCHAR NOT NULL, name VARCHAR, email VARCHAR, doc VARCHAR,
+       PRIMARY KEY (_id)
+   ) FROM "mongodb-cdc" (
+       'connection.uri' = 'mongodb://127.0.0.1:27117/?directConnection=true&tls=false',
+       'database' = 'app', 'collection' = 'users',
+       'output.mode' = 'document', 'full.document.mode' = 'required',
+       'snapshot.mode' = 'initial',
+       'objectid.columns' = '_id', 'document.json.column' = 'doc'
+   );
+
+   CREATE SINK users_pg FROM users INTO "postgres-sink" (
+       'hostname' = '127.0.0.1', 'port' = '15433', 'database' = 'mirror',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'table.name' = 'users', 'auto.create.table' = 'true',
+       'write.mode' = 'upsert', 'primary.key' = '_id', 'changelog.mode' = 'true'
+   );
+   '''
+
+   [server]
+   bind = "127.0.0.1:8080"
+   delivery = "at_least_once"
+
+   [checkpoint]
+   url = "file:///tmp/laminardb-cdc"
+   interval = "1s"
+   ```
+
+   LaminarDB connects to MongoDB over TLS unless the URI says `tls=false`; the test MongoDB has
+   no TLS. With checkpointing on, SQL cannot hold a literal password: `$${PG_PASSWORD}` reaches
+   the SQL as `${PG_PASSWORD}`, which LaminarDB reads from the environment.
+
+4. Start the server. The first build takes a few minutes:
+
+   ```bash
+   PG_PASSWORD=laminar-test-secret cargo run --release -p laminar-server --bin laminardb -- \
+     --config laminardb.toml
+   ```
+
+5. In another terminal, change some data in MongoDB, then look at PostgreSQL:
+
+   ```bash
+   docker exec laminardb-mongo-rs mongosh --port 27117 --quiet --eval '
+     const users = db.getSiblingDB("app").users;
+     users.insertOne({name: "Ada", email: "ada@example.com"});
+     users.insertOne({name: "Alan", email: "alan@example.com"});
+     users.updateOne({name: "Ada"}, {$set: {email: "ada@lovelace.dev"}});
+     users.deleteOne({name: "Alan"});'
+
+   docker exec laminardb-cdc-postgres psql -U laminar -d mirror -c 'SELECT _id, name, email FROM users'
+   ```
+
+   You should see one row: Ada, with her new email. Alan was inserted and then deleted, so he is
+   gone.
+
+Restart the server and it carries on from its last checkpoint without copying the collection
+again.
 
 #### Setup
 
@@ -205,8 +287,7 @@ typed rows straight to sinks or to retractable SQL: PostgreSQL → LaminarDB →
 no broker or Debezium in between. It runs in embedded and single-node server mode; cluster mode
 rejects it.
 
-New to it? The [main README](../../README.md#postgresql-change-data-capture) walks through
-mirroring a table on your machine.
+New to it? [Try it locally](#try-postgresql-cdc-locally) first.
 
 | `output.mode` | Rows | Contract | Consumers |
 |---|---|---|---|
@@ -215,6 +296,113 @@ mirroring a table on your machine.
 
 `snapshot.mode=initial` (default) copies the table, then streams every later change.
 `snapshot.mode=never` streams only changes committed after the source creates its slot.
+
+#### Try PostgreSQL CDC locally
+
+You need Docker, a Rust toolchain and a checkout of the repository; run the commands from its
+root. These steps mirror a table and maintain totals over it, writing both back into the same
+PostgreSQL server.
+
+1. Start PostgreSQL 17 with logical replication turned on. It listens on `127.0.0.1:15532`
+   (user `laminar`, password `laminar-test-secret`, database `cdc`):
+
+   ```bash
+   docker compose -f tests/docker/postgres-cdc-compose.yml up -d --wait postgres-17
+   ```
+
+2. Create the table and a publication for it. `REPLICA IDENTITY FULL` makes PostgreSQL send the
+   whole old row with every update and delete:
+
+   ```bash
+   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc -c "
+     CREATE TABLE orders (id bigint PRIMARY KEY, status text NOT NULL, qty integer);
+     ALTER TABLE orders REPLICA IDENTITY FULL;
+     CREATE PUBLICATION orders_pub FOR TABLE orders;
+     INSERT INTO orders VALUES (1, 'OPEN', 100), (2, 'OPEN', 40), (3, 'CLOSED', 7);"
+   ```
+
+3. Save this as `laminardb.toml`. The first source mirrors the table; the second reads it as a
+   changelog so that the totals stay exact as rows change or disappear:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE orders (
+       id BIGINT NOT NULL, status VARCHAR, qty INT, PRIMARY KEY (id)
+   ) FROM "postgres-cdc" (
+       'host' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'publication' = 'orders_pub', 'slot.name' = 'laminar_orders', 'table' = 'public.orders'
+   );
+
+   CREATE SOURCE order_changes (
+       id BIGINT NOT NULL, status VARCHAR NOT NULL, qty INT, __weight BIGINT NOT NULL,
+       PRIMARY KEY (id)
+   ) FROM "postgres-cdc" (
+       'host' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'publication' = 'orders_pub', 'slot.name' = 'laminar_order_changes',
+       'table' = 'public.orders', 'output.mode' = 'changelog'
+   );
+
+   CREATE STREAM status_totals AS
+       SELECT status, SUM(qty) AS total, COUNT(*) AS orders
+       FROM order_changes GROUP BY status EMIT CHANGES;
+
+   CREATE SINK orders_copy FROM orders INTO "postgres-sink" (
+       'hostname' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'table.name' = 'orders_copy', 'auto.create.table' = 'true',
+       'write.mode' = 'upsert', 'primary.key' = 'id', 'changelog.mode' = 'true'
+   );
+
+   CREATE SINK status_totals_pg FROM status_totals INTO "postgres-sink" (
+       'hostname' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'table.name' = 'status_totals', 'auto.create.table' = 'true',
+       'write.mode' = 'upsert', 'primary.key' = 'status', 'changelog.mode' = 'true'
+   );
+   '''
+
+   [server]
+   bind = "127.0.0.1:8080"
+   delivery = "at_least_once"
+
+   [checkpoint]
+   url = "file:///tmp/laminardb-pg-cdc"
+   interval = "1s"
+   ```
+
+   `$${PG_PASSWORD}` reaches the SQL as `${PG_PASSWORD}`, which LaminarDB reads from the
+   environment. Each source creates its replication slot once its first checkpoint commits,
+   named after its `slot.name` prefix, such as `laminar_orders_3f9a0c27d1e4b856`.
+
+4. Start the server. The first build takes a few minutes:
+
+   ```bash
+   PG_PASSWORD=laminar-test-secret cargo run --release -p laminar-server --bin laminardb -- \
+     --config laminardb.toml
+   ```
+
+5. In another terminal, change some rows, then look at the results:
+
+   ```bash
+   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc -c "
+     UPDATE orders SET qty = 120 WHERE id = 1;
+     UPDATE orders SET status = 'CLOSED' WHERE id = 2;
+     UPDATE orders SET id = 4 WHERE id = 3;
+     DELETE FROM orders WHERE id = 1;"
+
+   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc \
+     -c 'SELECT * FROM orders_copy ORDER BY id' -c 'SELECT * FROM status_totals ORDER BY status'
+   ```
+
+   `orders_copy` now holds orders 2 and 4, and `status_totals` has one row: `CLOSED`, total 47,
+   2 orders. Order 1 went from 100 to 120 and was then deleted, so it counts nowhere.
+
+Restart the server and it carries on from its last checkpoint. To start from scratch, stop it,
+drop the slots
+(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name ~ '^laminar_(orders|order_changes)_[0-9a-f]{16}$' AND NOT active`),
+delete `/tmp/laminardb-pg-cdc`, and empty the target tables.
 
 #### Setup
 
