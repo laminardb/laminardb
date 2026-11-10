@@ -146,7 +146,7 @@ impl BoundedStorageFactory {
         {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
-                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] iceberg-rust 0.10.1 OpenDAL storage does not support REST remote signing",
+                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] iceberg-rust 0.11.0 OpenDAL storage does not support REST remote signing",
             ));
         }
         if STORAGE_SENSITIVE_PROPERTIES.iter().any(|property| {
@@ -499,7 +499,7 @@ impl FileWrite for BoundedFileWrite {
         bounded(self.inner.write(bytes), self.request_timeout, "write").await
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&mut self) -> Result<FileMetadata> {
         bounded(self.inner.close(), self.request_timeout, "close").await
     }
 }
@@ -588,8 +588,8 @@ mod tests {
             Ok(())
         }
 
-        async fn close(&mut self) -> Result<()> {
-            Ok(())
+        async fn close(&mut self) -> Result<FileMetadata> {
+            Ok(FileMetadata { size: 0 })
         }
     }
 

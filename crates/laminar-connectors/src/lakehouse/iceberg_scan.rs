@@ -142,7 +142,7 @@ pub(crate) async fn load_manifest(
     deadline: tokio::time::Instant,
 ) -> Result<Manifest, ConnectorError> {
     validate_manifest_object_size(table, manifest_file, limits, deadline).await?;
-    tokio::time::timeout_at(deadline, manifest_file.load_manifest(table.file_io()))
+    tokio::time::timeout_at(deadline, table.manifest_reader().read(manifest_file))
         .await
         .map_err(|_| metadata_timeout("manifest read"))?
         .map_err(|error| metadata_read_error("manifest read", &error))

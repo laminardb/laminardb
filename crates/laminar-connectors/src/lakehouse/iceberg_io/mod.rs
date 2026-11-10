@@ -465,7 +465,7 @@ fn validate_storage_options(
         .or_else(|| infer_storage_type(warehouse));
     if storage_type == Some(IcebergStorageType::Azure) && storage.endpoint.is_some() {
         return Err(ConnectorError::FeatureUnsupported(
-            "iceberg.storage.azure.endpoint: iceberg-storage-opendal 0.10.1 derives the ADLS endpoint from the table URL and exposes no endpoint property"
+            "iceberg.storage.azure.endpoint: iceberg-storage-opendal 0.11.0 derives the ADLS endpoint from the table URL and exposes no endpoint property"
                 .into(),
         ));
     }
