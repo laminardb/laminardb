@@ -12,23 +12,38 @@
 
 # LaminarDB
 
-LaminarDB is a streaming SQL engine written in Rust. It reads events from sources such as Kafka
-or PostgreSQL change data capture, keeps the results of your SQL current as events arrive, and
-writes them to a sink, pushes them to subscribers, or holds them for queries. Run it inside a
-Rust program or as a server; a cluster is optional.
+**Streaming SQL that keeps its answers current.**
 
-The basic flow is **source → SQL query → result**. A source brings in data, a stream updates the
-query result as new data arrives, and a sink or subscription delivers that result.
+LaminarDB is a streaming SQL engine written in Rust. Point it at Kafka, a PostgreSQL or MongoDB
+change stream, files or a message queue, write ordinary SQL, and LaminarDB updates the result as
+each event arrives. Send results to a sink, push them to live subscribers, or query them as
+materialised views. Run it inside your Rust program, as a single server, or as a cluster: the
+engine and the SQL are the same.
 
-LaminarDB is pre-1.0. The current packaged release is
-[v0.33.0](https://github.com/laminardb/laminardb/releases/tag/v0.33.0); this README describes the
-`main` branch, and features added since v0.33.0 say so where they appear. Website:
+- **It's just SQL.** Event-time windows (`TUMBLE`, `HOP`, `SESSION`), watermarks, keyed
+  aggregates, interval and temporal joins and materialised views, built on Apache Arrow and
+  DataFusion.
+- **Correct when things fail.** Checkpoints restore state and source positions together.
+  Delivery is at-least-once by default and exactly-once where the source and sink can prove it,
+  such as Kafka into Kafka, Delta Lake or Iceberg.
+- **No silent downgrades.** A pipeline whose connectors can't honour the guarantee you asked for
+  is rejected at startup, before it reads or writes anything.
+- **Change data capture without the plumbing.** Follow PostgreSQL and MongoDB directly, with no
+  Kafka or Debezium in between.
+- **Embedded or standalone.** `cargo add laminar-db`, or run one binary that serves HTTP,
+  WebSocket, the PostgreSQL wire protocol and Prometheus metrics.
+- **Scales out on object storage.** Cluster nodes share checkpoints in S3, GCS or Azure and find
+  one another through gossip or a static peer list.
+
+LaminarDB is pre-1.0. The latest release is
+[v0.33.0](https://github.com/laminardb/laminardb/releases/tag/v0.33.0); this README follows the
+`main` branch, and marks features that are not released yet with *(main only)*. Website:
 [laminardb.io](https://laminardb.io).
 
 ## Quick start
 
-You need Docker. This runs the v0.33.0 server with a built-in `generator` source, so nothing else
-has to be running, and keeps a running total in a materialized view.
+You need Docker. This runs the v0.33.0 server with the built-in `generator` source, so nothing
+else has to be running, and keeps a running total in a materialised view.
 
 Save this as `laminardb.toml`:
 
@@ -51,7 +66,7 @@ url = "file:///var/lib/laminardb/checkpoints"
 interval = "10s"
 ```
 
-Start the server (commands shown for a Bash-compatible shell):
+Start the server (commands are for a Bash-compatible shell):
 
 ```bash
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
@@ -74,11 +89,72 @@ curl -s http://localhost:8080/api/v1/sql \
 {"result_type":"query","data":[{"rows_seen":"46","last_seq":"45"}]}
 ```
 
-The numbers grow between queries because the view is maintained as rows arrive; yours will differ.
-The generator emits rows `(seq, ts_ms, value)` at a fixed rate and can replay them from a
-checkpoint, which is why the server's default at-least-once delivery accepts it. Counts are
-returned as strings so that 64-bit integers survive JSON parsing in JavaScript. Stop the server
-with `docker stop laminardb`.
+The numbers grow between queries because the view is updated as rows arrive; yours will differ.
+The generator emits `(seq, ts_ms, value)` rows at a fixed rate and can replay them from a
+checkpoint, so the server's default at-least-once delivery accepts it. 64-bit integers are
+returned as strings so that they survive JSON parsing in JavaScript. Stop the server with
+`docker stop laminardb`.
+
+## Embed it in Rust
+
+The same engine runs in-process. Add the crates:
+
+```bash
+cargo add laminar-db laminar-derive
+cargo add tokio --features full
+```
+
+Then push typed rows in and receive typed results:
+
+```rust
+use laminar_db::{LaminarDB, TypedSubscriptionFrame};
+use laminar_derive::{FromRow, Record};
+
+#[derive(Clone, Record)]
+struct Trade {
+    symbol: String,
+    volume: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct BigTrade {
+    symbol: String,
+    volume: i64,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = LaminarDB::open()?;
+    db.execute("CREATE SOURCE trades (symbol VARCHAR NOT NULL, volume BIGINT NOT NULL)")
+        .await?;
+    db.execute("CREATE STREAM big_trades AS SELECT symbol, volume FROM trades WHERE volume >= 100")
+        .await?;
+    db.start().await?;
+
+    let trades = db.source::<Trade>("trades")?;
+    let mut big_trades = db.subscribe::<BigTrade>("big_trades").await?;
+
+    trades.push_batch([
+        Trade { symbol: "AAPL".into(), volume: 100 },
+        Trade { symbol: "MSFT".into(), volume: 30 },
+    ]);
+
+    while let Some(frame) = big_trades.next_frame().await? {
+        if let TypedSubscriptionFrame::Rows { rows, .. } = frame {
+            println!("{rows:?}"); // [BigTrade { symbol: "AAPL", volume: 100 }]
+            break;
+        }
+    }
+    Ok(())
+}
+```
+
+`LaminarDB::open()` runs in memory. `LaminarDB::builder()` adds checkpoint storage, connectors
+and a delivery guarantee; see the [API documentation](https://docs.rs/laminar-db). `FromRow`
+fills struct fields by column name. The default features
+include the Kafka client, which builds librdkafka from source and needs CMake and a C compiler;
+`--no-default-features` gives a lighter build, and you can then turn on only the connectors you
+need.
 
 ## Example: per-minute volume from Kafka
 
@@ -145,9 +221,10 @@ Kafka and LaminarDB v0.33.0 on a private Docker network.
    interval = "5s"
    ```
 
-   The watermark tells LaminarDB to wait five seconds of event time for late trades before a
-   minute is final. With the default at-least-once delivery, a Kafka source must start from
-   `earliest` or explicit offsets rather than the consumer group's committed offsets.
+   The watermark tells LaminarDB to wait five seconds of event time for late trades before it
+   closes a minute. With at-least-once delivery, a Kafka source must start from `earliest`, a
+   timestamp or explicit offsets, rather than the consumer group's committed offsets (the
+   default).
 
 3. Start LaminarDB:
 
@@ -175,9 +252,8 @@ Kafka and LaminarDB v0.33.0 on a private Docker network.
      --topic minute-volume --from-beginning --timeout-ms 10000
    ```
 
-   The consumer exits after ten seconds without new messages and logs a `TimeoutException` as it
-   does so; that is expected. Before it exits you should see three rows, one per finished minute
-   and symbol:
+   You should see three rows, one per finished minute and symbol. The consumer then exits after
+   ten seconds without new messages and logs a `TimeoutException`; that is expected.
 
    ```json
    {"symbol":"AAPL","minute":"2026-10-18T09:30:00","volume":150,"high":189.7}
@@ -190,13 +266,30 @@ Kafka and LaminarDB v0.33.0 on a private Docker network.
 
 5. Clean up with `docker stop laminardb kafka` and `docker network rm laminardb-example`.
 
-## Modes
+## Install
+
+- **Binaries:** [v0.33.0 release](https://github.com/laminardb/laminardb/releases/tag/v0.33.0)
+  for Linux (x86_64 and aarch64 glibc, x86_64 musl), macOS (x86_64 and Apple silicon) and
+  Windows (x86_64), with `SHA256SUMS`.
+- **Containers:** [Docker Hub](https://hub.docker.com/r/laminardb/laminardb-server) or
+  [GitHub Container Registry](https://github.com/laminardb/laminardb/pkgs/container/laminardb-server).
+  Use a version tag such as `0.33.0`; `latest` and `main` are rebuilt from the `main` branch and
+  are not releases.
+- **Kubernetes:** the [Helm chart](deploy/helm/laminardb/README.md). Set `image.tag` to a
+  published version such as `0.33.0`, because it defaults to the chart's `appVersion`.
+- **Local stack:** [Docker Compose](docker-compose.yml).
+- **From source:** Rust 1.95 or newer, CMake and a C compiler, then
+  `cargo build --release -p laminar-server --bin laminardb`.
+
+The [deployment guide](deploy/README.md) covers setup and operations.
+
+## Deployment modes
 
 | Mode | When to use it |
 |---|---|
 | Embedded | Run LaminarDB inside a Rust program with the `laminar-db` crate. Checkpoints go to a local directory. |
-| Single-node server | Run one server with HTTP, WebSocket subscriptions, optional Postgres-compatible connections, and local checkpoints. |
-| Cluster | Run multiple servers with a shared checkpoint store. Sources must be Kafka, AI functions are rejected, and cluster SQL is narrower than single-node SQL. Any node reads materialized views at a committed checkpoint. |
+| Single-node server | Run one server with HTTP, WebSocket subscriptions, optional PostgreSQL-compatible connections and local checkpoints. |
+| Cluster | Run several servers over a shared checkpoint store. Sources must be Kafka, AI functions are rejected, and cluster SQL is narrower than single-node SQL. Any node can read materialised views at a committed checkpoint *(main only)*. |
 
 Client libraries are released separately from the engine and lag behind it:
 
@@ -207,33 +300,146 @@ Client libraries are released separately from the engine and lag behind it:
 | Node.js / TypeScript | `npm install @laminardb/node` · [repository](https://github.com/laminardb/laminardb-nodejs) | 0.30.0-alpha.4, built against engine v0.30.0 without connectors. |
 | Java | `io.laminardb:laminardb:0.30.0-alpha` · [repository](https://github.com/laminardb/laminardb-java) | Alpha, built against engine v0.30.0 without connectors. |
 
-## Configuration
+## SQL
 
-The server reads a `laminardb.toml` file. This example uses a local checkpoint directory and an
-HTTP token supplied through an environment variable:
+| Statement | What it does |
+|---|---|
+| `CREATE SOURCE` | Declares incoming data: its connector, columns (or columns read from the connector) and watermark. |
+| `CREATE STREAM` | Runs a continuous query over sources and other streams. |
+| `CREATE MATERIALIZED VIEW` | Keeps a result you can query at any time. |
+| `CREATE SINK` | Sends a stream to an external system. |
+| `SUBSCRIBE` | Pushes live results of a stream or view over WebSocket (`/ws/{name}`) or a PostgreSQL-protocol cursor. HTTP SQL rejects it. |
 
-```toml
-[server]
-mode = "single"
-bind = "0.0.0.0:8080"
-console_token = "${LAMINAR_CONSOLE_TOKEN}"
+Queries can filter and project, aggregate by key, group by event-time windows, join two streams
+within a time bound, join each event to the version of another source that was current at its
+event time (`FOR SYSTEM_TIME AS OF`), and call streaming UDFs. `EXPLAIN` and `EXPLAIN ANALYZE` show the plan. The
+[SQL reference](docs/SQL_REFERENCE.md) has the syntax, tested patterns and the
+[cluster SQL boundary](docs/SQL_REFERENCE.md#cluster-sql-boundary).
 
-[checkpoint]
-url = "file:///var/lib/laminardb/checkpoints"
-interval = "30s"
+The server accepts SQL at `POST /api/v1/sql` and, when `pgwire_bind` is set, from `psql` or any
+PostgreSQL driver. Ad hoc reads can choose a read level *(main only)*: `latest`, `committed` (one
+checkpoint) or `recent`, which waits for a checkpoint holding every record the views' Kafka
+sources had upstream when the read arrived.
+
+## Delivery guarantees
+
+Each pipeline runs under one guarantee. LaminarDB checks that every source and sink can honour it
+before any connector I/O, and never downgrades it silently.
+
+| Guarantee | What you get |
+|---|---|
+| Best effort | No replay; output can be lost on failure. The embedded default; not available in a cluster. |
+| At-least-once | The server default. State and source positions are restored from the last checkpoint and later input is replayed, so output can repeat. |
+| Exactly-once | Committed output appears once. It needs a source certified for exact replay and a sink that commits with each checkpoint. |
+
+Exactly-once is admitted for Kafka into Kafka, Delta Lake or Iceberg when embedded or on a single
+node, and for Kafka into Delta Lake (direct S3) or Iceberg (REST catalog on S3) in a cluster.
+[Delivery guarantees](docs/DELIVERY_GUARANTEES.md) has the full matrix and the test evidence
+behind each exactly-once composition.
+
+## Connectors
+
+| Use | Connectors |
+|---|---|
+| Sources | Kafka (including Debezium), NATS, PostgreSQL logical replication, MongoDB change streams, Delta Lake (snapshots and change data feed), Iceberg, files, WebSocket, OpenTelemetry and the built-in `generator`. Optional builds add RabbitMQ, IBM MQ and FIX. |
+| Sinks | Kafka, NATS, PostgreSQL, MongoDB, Delta Lake, Iceberg, files and WebSocket. Optional builds add RabbitMQ and IBM MQ. |
+| Lookups | PostgreSQL, MongoDB, Delta Lake and Iceberg. |
+
+The NATS, WebSocket and OpenTelemetry sources and Iceberg snapshot reads are best-effort only, so
+the server's default at-least-once delivery rejects them; set `delivery = "best_effort"` to use
+them.
+
+RabbitMQ, IBM MQ, FIX and FpML are optional build features (`rabbitmq`, `ibmmq`, `fix`, `fpml`)
+and are not in the Docker image. Of the v0.33.0 release binaries, x86_64 Linux (glibc) includes
+all four, x86_64 Linux (musl) none, and the others FIX and FpML. See the guides for
+[RabbitMQ](docs/RABBITMQ.md), [IBM MQ](docs/IBMMQ.md) and [FIX](docs/FIX_SOURCE.md), and the
+[connector guide](crates/laminar-connectors/README.md) for every option.
+
+### PostgreSQL change data capture
+
+Follow a PostgreSQL table through logical replication and keep a copy of it, or running results
+over it, up to date. A mirror (`output.mode = 'upsert'`, the default) keeps one row per primary
+key in a sink. A changelog (`output.mode = 'changelog'`) retracts the old row and adds the new
+one, so filters and `SUM`/`COUNT`/`AVG` totals stay exact as rows change or disappear. It runs
+embedded or on a single-node server, with at-least-once delivery.
+[Try it locally](crates/laminar-connectors/README.md#try-postgresql-cdc-locally) or read the
+[guide](crates/laminar-connectors/README.md#postgresql-cdc).
+
+### MongoDB change data capture
+
+Read a collection's change stream and write it to PostgreSQL, Delta Lake, Iceberg, files or
+another MongoDB. `output.mode = 'document'` keeps a mirror of each document; the default
+`history` mode writes one row per change, deletes included, for audit logs and lake tables. It
+runs embedded or on a single-node server.
+[Try it locally](crates/laminar-connectors/README.md#try-mongodb-cdc-locally) or read the
+[guide](crates/laminar-connectors/README.md#mongodb-cdc).
+
+### FpML trade confirmations
+
+Derivatives confirmations, clearing messages and loan notices often arrive as FpML: large XML
+documents full of nested legs, cross-references and amounts that must never be rounded. LaminarDB
+reads them from files, Kafka, RabbitMQ, IBM MQ or a FIX field such as SecurityXML, validates each
+one against the official FpML 5.13 schema, and turns the parts you need into typed columns. The
+fourteen bundled profiles cover every FpML 5.13 confirmation product, so there is no parser to
+write per product. It needs the `fpml` feature and runs embedded or on a single-node server.
+[Try it locally](docs/FPML_SOURCE.md#try-it-locally) or read the [guide](docs/FPML_SOURCE.md).
+
+### Schemas from connector metadata
+
+Leave out a source's columns when the connector can read them, for example from an Avro schema in
+a schema registry or from a Parquet file; the generator and OpenTelemetry have fixed schemas.
+Sinks take their fields from the query they read, so use aliases and casts to fit the
+destination.
+
+```sql
+CREATE SOURCE events FROM KAFKA (
+  'bootstrap.servers' = 'localhost:19092', 'topic' = 'events',
+  'group.id' = 'schema-example', 'schema.registry.url' = 'http://localhost:8081'
+) FORMAT AVRO;
+CREATE STREAM output AS SELECT label, id FROM events;
+CREATE SINK archive FROM output INTO KAFKA (
+  'bootstrap.servers' = 'localhost:19092', 'topic' = 'archive',
+  'schema.registry.url' = 'http://localhost:8081'
+) FORMAT AVRO;
 ```
 
-The Docker image includes this configuration, which defines no pipeline; mount your own file at
-`/etc/laminardb/laminardb.toml` as in the quick start. The container exits at startup if
-`LAMINAR_CONSOLE_TOKEN` is not set. Mount persistent storage at `/var/lib/laminardb` if you want
-checkpoints to survive container replacement. See the
-[configuration reference](https://laminardb.io/docs/) for all settings and
-[example configuration](examples/laminardb.toml) for sources, streams, and sinks.
+LaminarDB saves the resolved schema before the pipeline starts and reuses it on restart.
+`DESCRIBE events` shows each field and where it came from. JSON and CSV sources need declared
+columns unless file sampling is turned on, and most sinks create a missing destination only when
+you allow it. The [schema guide](docs/SCHEMA_RESOLUTION.md#settings) lists every setting.
 
-## Cluster configuration
+## AI functions
 
-Each cluster node needs a unique ID and address. Nodes share the same checkpoint store and discover
-one another through gossip or a static peer list. A minimal starting point is:
+SQL can call models to classify text, score sentiment, create embeddings or generate text:
+
+```sql
+CREATE STREAM scored_news AS
+SELECT headline, ai_sentiment(headline, model => 'finbert') AS sentiment
+FROM news;
+```
+
+The functions are `ai_classify`, `ai_sentiment`, `ai_embed`, `ai_extract`, `ai_complete`,
+`ai_summarize`, `ai_translate` and `ai_gen`. Models use a remote provider (OpenAI-compatible or
+Anthropic) or, for classification, sentiment and embeddings, a local ONNX encoder. Local models
+need ONNX Runtime 1.24 or newer on the host, which the Docker image does not include. A query may
+contain one aliased AI call over one table, and cluster mode rejects AI functions. See the
+[AI setup guide](crates/laminar-server/README.md#ai-functions).
+
+## Configuration
+
+The server reads `laminardb.toml`, as in the [quick start](#quick-start). `${NAME}` takes a
+value from the environment, and `$${` writes a literal `${`. The Docker image ships a file with
+the quick start's `[server]` and `[checkpoint]` sections (checkpointing every 30 seconds) and no
+pipeline; mount your own at `/etc/laminardb/laminardb.toml`. The container exits at startup if
+`LAMINAR_CONSOLE_TOKEN` is not set. Mount persistent storage at `/var/lib/laminardb` so that
+checkpoints survive container replacement. See the
+[server configuration](crates/laminar-server/README.md) for every setting and the
+[example configuration](examples/laminardb.toml) for sources, streams and sinks.
+
+### Cluster configuration
+
+Each node needs a unique ID and address. Nodes share one checkpoint store and find one another
+through gossip or a static peer list:
 
 ```toml
 node_id = "node-1"
@@ -253,578 +459,56 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
 url = "s3://my-bucket/laminardb/checkpoints"
 ```
 
-Change `node_id` and `advertise_host` for each node. Use a shared S3, GCS, or Azure checkpoint
-location; cluster mode rejects `file://` checkpoints. Cluster sources must be Kafka, because it is
-the only source that can be split across nodes. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip. With
-`strategy = "gossip"`, keep gossip traffic on a trusted or isolated network. See the
+Change `node_id` and `advertise_host` on each node. Use a shared S3, GCS or Azure location;
+cluster mode rejects `file://` checkpoints. Sources must be Kafka, the only source that can be
+split across nodes. Cluster mTLS protects gRPC control and shuffle traffic but not gossip, so keep
+gossip on a trusted or isolated network. Read the
 [cluster setup guide](crates/laminar-server/README.md#cluster-control-plane-tls-mtls),
-[Helm chart](deploy/helm/laminardb/README.md), and
-[cluster SQL limits](docs/SQL_REFERENCE.md#cluster-sql-boundary) before deploying.
+[Helm chart](deploy/helm/laminardb/README.md) and
+[cluster SQL boundary](docs/SQL_REFERENCE.md#cluster-sql-boundary) before deploying.
 
 ### Change a running cluster's topology
 
-Cluster migrations support adding, dropping and replacing sources, streams or sinks.
-Progress is preserved by default; reset incompatible objects with ordered DROP/CREATE
-in one migration request, dropping dependents first. New or reset state processes future input.
-Migrations pause at a checkpoint and return an asynchronous receipt. All required nodes
-must be ready to resume; node IDs and the complete vnode owner map must stay unchanged.
-See the [server REST API](crates/laminar-server/README.md#rest-api) for topology endpoints.
-
-## Production tuning
-
-LaminarDB is pre-1.0. Test your own workload and recovery path before production use. Configure
-persistent checkpoints, authentication, and network security. Measure peak process memory under
-normal load, bursts, and recovery; individual engine limits do not cap total process memory.
-Choose checkpoint frequency and container resources from those measurements.
-
-For topology migrations, measure pause duration and peak restore memory, and budget storage
-for retained migration roots. The current limit is 64 retained operations; do not delete
-authority or root objects to bypass it.
-
-The [server tuning guide](crates/laminar-server/README.md#memory-limits-and-production-tuning)
-and [site guide](https://laminardb.io/docs/#production-tuning) cover memory limits, monitoring,
-and allocator settings in detail.
-
-## SQL statements
-
-| Statement | What it does |
-|---|---|
-| `CREATE SOURCE` | Defines incoming data. |
-| `CREATE STREAM` | Runs a continuous SQL query over incoming data. |
-| `CREATE MATERIALIZED VIEW` | Keeps a queryable result. In a cluster, each node keeps its part, and a query on any node reads the whole view at a committed checkpoint. |
-| `CREATE SINK` | Sends a stream to an external system. |
-| `SUBSCRIBE` | Sends live results of a stream or materialized view over WebSocket (`/ws/{name}`), or through a Postgres-protocol cursor or bounded portal. HTTP SQL rejects it. |
-
-For a `trades` source with a timestamp and watermark, this query calculates volume in one-minute
-windows as events arrive:
-
-```sql
-CREATE STREAM minute_volume AS
-SELECT symbol, SUM(volume) AS total_volume
-FROM trades
-GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
-EMIT ON WINDOW CLOSE;
-```
-
-LaminarDB also supports filters, keyed aggregates, bounded joins, and event-time windows. The
-[SQL reference](docs/SQL_REFERENCE.md) has complete syntax and mode-specific limits. The server
-accepts SQL through its HTTP API and can expose a Postgres-compatible connection for queries and
-cursor-based subscriptions.
-
-## Connectors
-
-| Use | Available connectors |
-|---|---|
-| Sources | Kafka, NATS, PostgreSQL logical replication, MongoDB change streams, Delta Lake change data feed, supported Iceberg reads, local files, WebSockets, OpenTelemetry, and the built-in `generator`. RabbitMQ, IBM MQ, and FIX need optional build features; see below. |
-| Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. RabbitMQ and IBM MQ need optional build features; see below. |
-| Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
-
-WebSocket and OpenTelemetry sources are best-effort only, so the server's default at-least-once
-delivery rejects them; set `delivery = "best_effort"` to use them.
-
-PostgreSQL tables and MongoDB collections can feed sinks and SQL directly. See
-[PostgreSQL change data capture](#postgresql-change-data-capture) and
-[MongoDB change data capture](#mongodb-change-data-capture) to get started. FpML trade
-confirmations can come in from files, Kafka, RabbitMQ, IBM MQ, or a FIX field such as SecurityXML;
-see
-[FpML trade confirmations](#fpml-trade-confirmations). RabbitMQ, IBM MQ, FIX and FpML are
-optional build features (`rabbitmq`, `ibmmq`, `fix`, `fpml`) and are not in the Docker image.
-Among the v0.33.0 release binaries, x86_64 Linux (glibc) includes all four, x86_64 Linux (musl)
-includes none, and the others include FIX and FpML. See [RabbitMQ](docs/RABBITMQ.md) and
-[IBM MQ](docs/IBMMQ.md).
-Connector options and delivery guarantees depend on the source, sink, storage, and deployment
-mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
-
-### PostgreSQL change data capture
-
-LaminarDB can follow a PostgreSQL table through logical replication and keep a copy of it, or
-running results over it, up to date. There is no Kafka or Debezium in between.
-
-You can use it in two ways:
-
-- **Mirror** (`output.mode = 'upsert'`, the default): a sink keeps one row per primary key.
-  Inserts and updates become upserts; deletes and primary-key changes remove the old row.
-- **Changelog** (`output.mode = 'changelog'`): each change retracts the old row and adds the
-  new one, so filters and `SUM`/`COUNT`/`AVG` totals stay exact as rows change or disappear.
-
-#### Try it locally
-
-You need Docker, a Rust toolchain, and a checkout of this repository. These steps mirror a
-table and maintain totals over it, writing both into the same PostgreSQL server.
-
-1. Start PostgreSQL with logical replication turned on:
-
-   ```bash
-   docker compose -f tests/docker/postgres-cdc-compose.yml up -d --wait
-   ```
-
-   PostgreSQL 17 listens on `127.0.0.1:15532` (user `laminar`, password
-   `laminar-test-secret`, database `cdc`).
-
-2. Create the table and a publication for it. `REPLICA IDENTITY FULL` makes PostgreSQL send
-   the whole old row with every update and delete:
-
-   ```bash
-   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc -c "
-     CREATE TABLE orders (id bigint PRIMARY KEY, status text NOT NULL, qty integer);
-     ALTER TABLE orders REPLICA IDENTITY FULL;
-     CREATE PUBLICATION orders_pub FOR TABLE orders;
-     INSERT INTO orders VALUES (1, 'OPEN', 100), (2, 'OPEN', 40), (3, 'CLOSED', 7);"
-   ```
-
-3. Save this as `laminardb.toml`:
-
-   ```toml
-   sql = '''
-   CREATE SOURCE orders (
-       id BIGINT NOT NULL, status VARCHAR, qty INT, PRIMARY KEY (id)
-   ) FROM "postgres-cdc" (
-       'host' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
-       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
-       'publication' = 'orders_pub', 'slot.name' = 'laminar_orders', 'table' = 'public.orders'
-   );
-
-   CREATE SOURCE order_changes (
-       id BIGINT NOT NULL, status VARCHAR NOT NULL, qty INT, __weight BIGINT NOT NULL,
-       PRIMARY KEY (id)
-   ) FROM "postgres-cdc" (
-       'host' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
-       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
-       'publication' = 'orders_pub', 'slot.name' = 'laminar_order_changes',
-       'table' = 'public.orders', 'output.mode' = 'changelog'
-   );
-
-   CREATE STREAM status_totals AS
-       SELECT status, SUM(qty) AS total, COUNT(*) AS orders
-       FROM order_changes GROUP BY status EMIT CHANGES;
-
-   CREATE SINK orders_copy FROM orders INTO "postgres-sink" (
-       'hostname' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
-       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
-       'table.name' = 'orders_copy', 'auto.create.table' = 'true',
-       'write.mode' = 'upsert', 'primary.key' = 'id', 'changelog.mode' = 'true'
-   );
-
-   CREATE SINK status_totals_pg FROM status_totals INTO "postgres-sink" (
-       'hostname' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
-       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
-       'table.name' = 'status_totals', 'auto.create.table' = 'true',
-       'write.mode' = 'upsert', 'primary.key' = 'status', 'changelog.mode' = 'true'
-   );
-   '''
-
-   [server]
-   bind = "127.0.0.1:8080"
-   delivery = "at_least_once"
-
-   [checkpoint]
-   url = "file:///tmp/laminardb-pg-cdc"
-   interval = "1s"
-   ```
-
-   Each source creates and owns a replication slot once its first checkpoint commits, named
-   after its `slot.name` prefix, such as `laminar_orders_3f9a0c27d1e4b856`. Changelog columns end
-   with `__weight BIGINT NOT NULL`, which carries `+1` for an added row and `-1` for a removed one.
-
-4. Start the server. The first build takes a few minutes.
-
-   ```bash
-   PG_PASSWORD=laminar-test-secret cargo run --release -p laminar-server --bin laminardb -- \
-     --config laminardb.toml
-   ```
-
-5. In another terminal, change some rows, then look at the results:
-
-   ```bash
-   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc -c "
-     UPDATE orders SET qty = 120 WHERE id = 1;
-     UPDATE orders SET status = 'CLOSED' WHERE id = 2;
-     UPDATE orders SET id = 4 WHERE id = 3;
-     DELETE FROM orders WHERE id = 1;"
-
-   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc \
-     -c 'SELECT * FROM orders_copy ORDER BY id' -c 'SELECT * FROM status_totals ORDER BY status'
-   ```
-
-   `orders_copy` now holds orders 2 and 4, and `status_totals` has one row: `CLOSED`, total 47,
-   2 orders. Order 1 moved from 100 to 120 and was then deleted, so it counts nowhere.
-
-If you stop the server and start it again, it carries on from its last checkpoint. To start
-over, stop it, drop the slots
-(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name ~ '^laminar_(orders|order_changes)_[0-9a-f]{16}$' AND NOT active`),
-delete `/tmp/laminardb-pg-cdc`, and empty the target tables.
-
-#### Things to know
-
-- Run it with checkpointing on and at-least-once delivery. After a crash, some changes may be
-  applied again; sinks apply rows by key and totals restore with the checkpoint, so the results
-  stay exact. Exactly-once delivery isn't available.
-- Each source reads one table, which needs a primary key and `REPLICA IDENTITY FULL`, through a
-  publication of exactly that table. The declared `PRIMARY KEY` must match the table's.
-- The initial copy (`snapshot.mode = 'initial'`, the default) reads the table in short chunks
-  while it follows changes, so no transaction stays open and WAL is released as checkpoints
-  commit. A restart during the copy resumes it for an upsert source; a changelog source needs the
-  reset above. `snapshot.mode = 'never'` skips the copy and follows changes from the first start.
-- LaminarDB never drops a slot. A slot left behind by a restart is logged as an orphan with the
-  statement that drops it.
-- PostgreSQL keeps WAL for the slot until LaminarDB has committed the changes. Set
-  `max_slot_wal_keep_size` so a stopped pipeline can't fill the disk.
-- `TRUNCATE`, a change to the table's columns, or a change to the publication stops the source
-  with an error that names the reset, instead of guessing.
-- It runs embedded or on a single-node server. Cluster mode isn't supported.
-
-The [connector guide](crates/laminar-connectors/README.md#postgresql-cdc) covers every option,
-the type mapping, and failure handling in detail.
-
-### MongoDB change data capture
-
-LaminarDB can read changes straight from a MongoDB change stream and write them to
-PostgreSQL, Delta Lake, Iceberg, files, or another MongoDB. There is no Kafka or Debezium in
-between.
-
-You can use it in two ways:
-
-- **Mirror** (`output.mode = 'document'`): keep a copy of each document up to date. Inserts
-  and updates become upserts and deletes remove the row. PostgreSQL and Delta Lake support
-  this.
-- **History** (the default): write one row for every change, deletes included. This suits
-  audit logs and lake tables, for example files, Delta Lake, Iceberg, or a PostgreSQL table. A
-  MongoDB sink can also replay the history into an exact copy of the collection.
-
-#### Try it locally
-
-You need Docker, a Rust toolchain, and a checkout of this repository. These steps mirror a
-MongoDB collection into a PostgreSQL table.
-
-1. Start MongoDB and PostgreSQL:
-
-   ```bash
-   docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
-   ```
-
-   MongoDB listens on `127.0.0.1:27117` and PostgreSQL on `127.0.0.1:15433` (user `laminar`,
-   password `laminar-test-secret`, database `mirror`). Change streams only work on a replica
-   set, so even this test MongoDB is a one-node replica set.
-
-2. Create the collection. A mirror needs the full document after every update, so turn on
-   pre- and post-images:
-
-   ```bash
-   docker exec laminardb-mongo-rs mongosh --port 27117 --quiet --eval \
-     'db.getSiblingDB("app").createCollection("users", {changeStreamPreAndPostImages: {enabled: true}})'
-   ```
-
-3. Save this as `laminardb.toml`:
-
-   ```toml
-   sql = '''
-   CREATE SOURCE users (
-       _id VARCHAR NOT NULL, name VARCHAR, email VARCHAR, doc VARCHAR,
-       PRIMARY KEY (_id)
-   ) FROM "mongodb-cdc" (
-       'connection.uri' = 'mongodb://127.0.0.1:27117/?directConnection=true&tls=false',
-       'database' = 'app', 'collection' = 'users',
-       'output.mode' = 'document', 'full.document.mode' = 'required',
-       'snapshot.mode' = 'initial',
-       'objectid.columns' = '_id', 'document.json.column' = 'doc'
-   );
-
-   CREATE SINK users_pg FROM users INTO "postgres-sink" (
-       'hostname' = '127.0.0.1', 'port' = '15433', 'database' = 'mirror',
-       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
-       'table.name' = 'users', 'auto.create.table' = 'true',
-       'write.mode' = 'upsert', 'primary.key' = '_id', 'changelog.mode' = 'true'
-   );
-   '''
-
-   [server]
-   bind = "127.0.0.1:8080"
-   delivery = "at_least_once"
-
-   [checkpoint]
-   url = "file:///tmp/laminardb-cdc"
-   interval = "1s"
-   ```
-
-   LaminarDB connects to MongoDB over TLS unless the URI says `tls=false`. The test MongoDB has
-   no TLS, so this URI turns it off. Passwords can't be written into the SQL: `$${PG_PASSWORD}`
-   reaches the SQL as `${PG_PASSWORD}`, and LaminarDB reads it from the environment when it
-   connects.
-
-4. Start the server. The first build takes a few minutes.
-
-   ```bash
-   PG_PASSWORD=laminar-test-secret cargo run --release -p laminar-server --bin laminardb -- \
-     --config laminardb.toml
-   ```
-
-5. In another terminal, change some data in MongoDB, then look at PostgreSQL:
-
-   ```bash
-   docker exec laminardb-mongo-rs mongosh --port 27117 --quiet --eval '
-     const users = db.getSiblingDB("app").users;
-     users.insertOne({name: "Ada", email: "ada@example.com"});
-     users.insertOne({name: "Alan", email: "alan@example.com"});
-     users.updateOne({name: "Ada"}, {$set: {email: "ada@lovelace.dev"}});
-     users.deleteOne({name: "Alan"});'
-
-   docker exec laminardb-cdc-postgres psql -U laminar -d mirror -c 'SELECT _id, name, email FROM users'
-   ```
-
-   You should see one row: Ada, with her new email. Alan was inserted and then deleted, so he
-   is gone. Changes usually arrive in well under a second.
-
-If you stop the server and start it again, it carries on from its last checkpoint. It does
-not copy the collection a second time.
-
-#### Things to know
-
-- Run it with checkpointing on and at-least-once delivery. After a crash, some changes may be
-  applied twice. Upserts and deletes make that harmless.
-- In a mirror, the `PRIMARY KEY` must be `_id`, and every other column must allow nulls,
-  because a delete only carries the key. List ObjectId columns in `objectid.columns`.
-- Column types must match the stored values. For example, a MongoDB double can't go into a
-  `BIGINT` column. If you don't want to map fields one by one, `document.json.column` holds the
-  whole document as JSON.
-- `snapshot.mode = 'initial'` copies the documents that already exist, then follows changes
-  from that point. Without it, only changes made after the first start are captured.
-- The source stops with an error, instead of guessing, when the oplog no longer holds the
-  changes it needs, when the collection is dropped or replaced, or when a post-image is
-  missing. Size the oplog for the longest outage you expect.
-- It runs embedded or on a single-node server. Cluster mode and exactly-once delivery aren't
-  supported yet.
-
-The [connector guide](crates/laminar-connectors/README.md#mongodb-cdc) covers every option, the
-history record format, and failure handling in detail.
-
-### FpML trade confirmations
-
-Derivatives confirmations, clearing messages, and loan notices often arrive as FpML: large XML
-documents full of nested legs, cross-references, and amounts that must not be rounded. LaminarDB
-reads them from a directory, a Kafka topic, a RabbitMQ or IBM MQ queue, or a FIX field such as
-SecurityXML, checks each one against the official FpML 5.13 schema, and turns the parts you need
-into typed columns. From there it's ordinary SQL, and you don't write a parser for each product.
-
-A profile decides what a row is. The fourteen bundled profiles cover every product in FpML 5.13
-confirmations, with one row per trade (with or without the product's economics), per message, or
-per loan event or facility.
-
-FpML is in the v0.33.0 release binaries except x86_64 Linux (musl), and not in the Docker image.
-The steps below build the server from this repository.
-
-#### Try it locally
-
-You need a Rust toolchain, CMake, a C compiler, and a checkout of this repository. These steps
-watch a folder for swap confirmations and write the trade date, first leg, and notional of each
-swap to a JSON file.
-
-1. Save this as `laminardb.toml`:
-
-   ```toml
-   sql = '''
-   CREATE SOURCE rates FROM FILES (
-       'path' = '/tmp/laminardb-fpml/inbox',
-       'glob_pattern' = '*.xml',
-       'fpml.profile' = 'fpml-5-13-confirmation-rates'
-   ) FORMAT FPML;
-
-   CREATE STREAM swaps AS
-       SELECT
-           trade_header['trade_date'] AS trade_date,
-           swap['streams'][1]['payer_party_href'] AS first_leg_payer,
-           swap['streams'][1]['calculation']['notional_schedule']['currency'] AS currency,
-           swap['streams'][1]['calculation']['notional_schedule']['initial_value'] AS notional
-       FROM rates
-       WHERE product_type = 'swap';
-
-   CREATE SINK swaps_out FROM swaps INTO FILES (
-       'path' = '/tmp/laminardb-fpml/out'
-   ) FORMAT JSON;
-   '''
-
-   [server]
-   bind = "127.0.0.1:8080"
-   delivery = "at_least_once"
-
-   [checkpoint]
-   url = "file:///tmp/laminardb-fpml/checkpoints"
-   interval = "1s"
-   ```
-
-   The source has no column list because the profile defines the columns. Nested values are
-   ordinary SQL structs and lists.
-
-2. Create the inbox and start the server with the `fpml` feature. The first build takes a few
-   minutes.
-
-   ```bash
-   mkdir -p /tmp/laminardb-fpml/inbox
-   cargo run --release -p laminar-server --features fpml --bin laminardb -- --config laminardb.toml
-   ```
-
-3. In another terminal, drop in some of the official FpML examples. They include swaps, FRAs,
-   and swaptions; the stream keeps only the swaps.
-
-   ```bash
-   cp crates/laminar-connectors/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/products/interest-rate-derivatives/ird-ex0*.xml \
-     /tmp/laminardb-fpml/inbox/
-   cat /tmp/laminardb-fpml/out/*.jsonl
-   ```
-
-   Rows land in `out` when the next checkpoint commits, about a second later. You should see 14
-   lines, one per swap, such as these:
-
-   ```json
-   {"trade_date":"1994-12-12","first_leg_payer":"party1","currency":"EUR","notional":50000000.000000000000000000}
-   {"trade_date":"2018-11-14","first_leg_payer":"partyB","currency":"USD","notional":86000000.000000000000000000}
-   {"trade_date":"2018-09-09","first_leg_payer":"partyB","currency":"USD","notional":121700000.000000000000000000}
-   ```
-
-   The notional keeps all 18 decimal places of its column, because amounts never pass through a
-   float. Some examples are variants of the same trade, so a few lines look the same.
-
-If you stop the server and start it again, it carries on from its last checkpoint and doesn't
-read the same files twice. To start over, stop it and delete `/tmp/laminardb-fpml`.
-
-#### Things to know
-
-- Each file or Kafka message is one complete document. A document produces all of its rows or
-  none of them.
-- Amounts are exact decimals, and dates keep the day that was written. A value that doesn't fit
-  its column exactly makes the document fail instead of being rounded.
-- A document that fails validation stops the source at that document, so nothing is silently
-  dropped. Fix or remove it and restart. There's no dead-letter route yet.
-- The profile and schema are locked in when the source is created. To change them, drop the
-  source and create it again.
-- Kafka sources need a profile with one row per document; the default document profile works.
-- Your own schema extensions and column mappings are configuration files, not code:
-  `fpml.schema.path` and `fpml.profile.path`.
-- Run it with checkpointing on and at-least-once delivery. It runs embedded or on a single-node
-  server. Cluster mode isn't supported.
-
-The [FpML source guide](docs/FPML_SOURCE.md) covers every profile and option, the column types,
-extending the schema, failure handling, and security in detail.
-
-### Connector schemas
-
-You can omit source columns when the connector can read them from metadata, such as an Avro
-schema in Schema Registry or a Parquet file. Generators and OpenTelemetry have fixed schemas.
-For OpenTelemetry, leave `format` out of the TOML source and omit `FORMAT` in SQL; it uses
-the native OTLP protocol. Codec-based sources use their connector's default when `format` is omitted.
-JSON and CSV sources need declared columns unless file sampling is explicitly enabled.
-Sinks get their input fields from the source or stream they read. The query must fit the
-destination's fields and types; use aliases and casts in a stream to adjust the output.
-
-For example, if the `events` and `archive` topics already have Avro value schemas containing
-`id` and `label`, you can use them without repeating those fields in SQL:
-
-```sql
-CREATE SOURCE events FROM KAFKA (
-  'bootstrap.servers' = 'localhost:19092', 'topic' = 'events',
-  'group.id' = 'schema-example', 'schema.registry.url' = 'http://localhost:8081'
-) FORMAT AVRO;
-CREATE STREAM output AS SELECT label, id FROM events;
-CREATE SINK archive FROM output INTO KAFKA (
-  'bootstrap.servers' = 'localhost:19092', 'topic' = 'archive',
-  'schema.registry.url' = 'http://localhost:8081'
-) FORMAT AVRO;
-```
-
-By default, this reads the latest schema under each topic's `<topic>-value` subject once when
-you create the object. These settings control selection, sampling and external creation:
-
-| Setting | When to use it |
-|---|---|
-| `schema.registry.url` | Avro registry service URL, such as `http://localhost:8081`. Supply the service URL, not a subject or schema-resource URL. |
-| `schema.registry.value.subject` | Choose a value subject explicitly. Use it when multiple topics, a regex subscription or a naming strategy would make selection ambiguous. |
-| `schema.registry.value.version` or `schema.registry.value.id` | Pin a positive version or schema ID. Set one of these, not both. Without either, creation resolves latest once. |
-| `schema.registry.record.name` | Supply the record name when using the existing record-based subject naming strategies. An explicit value subject overrides subject derivation. |
-| `schema.registry.auto.register` | Defaults to `false`. Set it to `true` on a Kafka sink to permit registration during creation. Changing `schema.compatibility` also requires this permission. |
-| `schema.inference` | Defaults to `false`. Set it to `true` for CSV or JSON file sources to sample up to four files, 1 MiB and 1,000 rows within ten seconds. Empty or all-null samples fail; a sample cannot prove what future files will contain. |
-| `auto.create` | Defaults to `false` for Delta Lake and Iceberg sinks and MongoDB standard collections. Set it to `true` to permit creation of a missing destination. |
-| `auto.create.table` | Defaults to `false` for PostgreSQL sinks. Set it to `true` to permit creation of a missing table. |
-| `schema.evolution` | Keep it `false` for Delta sinks using durable schema contracts. Change an incompatible target through a controlled migration. |
-
-For instance, a local Delta sink may create its table when you ask it to:
-
-```sql
-CREATE SINK delta_out FROM output INTO "delta-lake"
-  ('table.path' = './delta-output', 'auto.create' = 'true');
-```
-
-Durable deployments save the resolved contract before starting the connector. Restarts reuse
-that contract, including the selected registry identity. Keep historical Avro writer schemas
-in the registry for replay. Connectivity, authorization and destination identity checks still
-apply after restart. Creating an external table or registering a schema can succeed before
-catalog publication fails, leaving an unused resource for you to review.
-
-Use `DESCRIBE events` to inspect resolved fields and their origin. The
-[schema guide](docs/SCHEMA_RESOLUTION.md) covers supported formats, mappings, recovery and
-migration. Schema discovery uses the existing deployment and delivery restrictions.
-
-MongoDB time-series sinks permit creation through the existing `timeseries.time_field`
-setting. Saved bindings track the backing bucket UUID, so dropping and recreating a
-time-series collection requires a new binding.
-
-## AI functions
-
-SQL can call models to classify text, score sentiment, create embeddings, or generate text. For
-example:
-
-```sql
-CREATE STREAM scored_news AS
-SELECT headline, ai_sentiment(headline, model => 'finbert') AS sentiment
-FROM news;
-```
-
-The functions are `ai_classify`, `ai_sentiment`, `ai_embed`, `ai_extract`, `ai_complete`,
-`ai_summarize`, `ai_translate`, and `ai_gen`. Models use a remote provider (OpenAI-compatible or
-Anthropic) or, for classification, sentiment and embeddings, a local ONNX encoder; local models
-need ONNX Runtime 1.24 or newer on the host, which the Docker image does not include. A query may
-contain one aliased AI call over one table, and cluster mode rejects AI functions. See the
-[AI setup guide](crates/laminar-server/README.md#ai-functions).
-
-## Console UI
-
-The [LaminarDB Console](https://github.com/laminardb/laminardb-console-ui) is a browser app for a
-server you run: browse the catalog, execute SQL, and follow checkpoints, metrics and lineage. A
-[hosted build](https://laminardb.github.io/laminardb-console-ui/) connects from your browser to
-your server's HTTP API; nothing is hosted for you. A server that binds to a non-loopback address
-must set `console_token`. If you restrict browser origins with `console_cors_allowed_origins`,
-include the Console's origin. You can also use the HTTP API directly. The Console's protocol
-contract was last reviewed against v0.32.0; it connects to a v0.33.0 server but shows a notice that
-compatibility with that version is not guaranteed.
-
-## Monitoring
-
-The server exposes `/health` and `/ready` for health checks and `/metrics` for Prometheus.
-Monitor input, output, checkpoint success, latency, and process memory. The repository includes
-[Prometheus and Grafana examples](grafana/README.md).
-
-## Deployment
-
-Choose the packaging that fits your environment:
-
-- [Prebuilt v0.33.0 binaries](https://github.com/laminardb/laminardb/releases/tag/v0.33.0) for
-  Linux (x86_64 and aarch64, glibc; x86_64 musl), macOS (x86_64 and Apple silicon), and Windows
-  (x86_64), with `SHA256SUMS`.
-- [Docker Hub](https://hub.docker.com/r/laminardb/laminardb-server) or
-  [GitHub Container Registry](https://github.com/laminardb/laminardb/pkgs/container/laminardb-server)
-  images. Use a version tag such as `0.33.0`; `latest` and `main` are rebuilt from the `main`
-  branch and are not releases.
-- [Docker Compose](docker-compose.yml) for a local stack.
-- [Helm chart](deploy/helm/laminardb/README.md) for Kubernetes. The chart's image tag defaults to
-  its `appVersion`; set `image.tag` to a published image version such as `0.33.0`.
-
-See the [deployment guide](deploy/README.md) for setup and operational details.
-
-## More documentation
+A migration adds, drops or replaces sources, streams and sinks, and keeps their progress. It can
+also add or drop materialised views *(main only)*. Reset an incompatible object with an ordered
+`DROP`/`CREATE` in the same request, dependents first; reset state processes only new input. The
+cluster pauses at a checkpoint and returns an asynchronous receipt, and every required node must
+be ready to resume. The vnode owner map then stays frozen until the new topology is active and
+has committed its own checkpoint, so don't scale in or out until then. See the [REST API](crates/laminar-server/README.md#rest-api) for the
+endpoints.
+
+## Running in production
+
+LaminarDB is pre-1.0, so test your own workload and recovery path first. Configure persistent
+checkpoints, authentication and network security. Measure peak process memory under normal load,
+bursts and recovery, because individual engine limits do not cap total process memory, and size
+checkpoint frequency and container resources from those measurements. For topology migrations,
+also measure pause time and peak restore memory, and budget storage for retained migration roots:
+the limit is 64 retained operations, and deleting authority or root objects to get round it is
+not safe. The [server tuning guide](crates/laminar-server/README.md#memory-limits-and-production-tuning)
+and [site guide](https://laminardb.io/docs/#production-tuning) cover memory limits, monitoring and
+allocator settings.
+
+**Monitoring.** The server exposes `/health` and `/ready` for health checks and `/metrics` for
+Prometheus. Watch input, output, checkpoint success, latency and process memory; the repository
+includes [Prometheus and Grafana examples](grafana/README.md).
+
+**Console.** The [LaminarDB Console](https://github.com/laminardb/laminardb-console-ui) is a
+browser app for a server you run: browse the catalogue, run SQL, and follow checkpoints, metrics
+and lineage. The [hosted build](https://laminardb.github.io/laminardb-console-ui/) connects from
+your browser straight to your server's HTTP API; nothing is hosted for you. A server that binds to
+a non-loopback address must set `console_token`, and if you restrict browser origins with
+`console_cors_allowed_origins`, include the Console's origin. The Console was last reviewed
+against v0.32.0; it connects to v0.33.0 but shows a notice that compatibility is not guaranteed.
+
+## Documentation
 
 - [SQL reference](docs/SQL_REFERENCE.md)
-- [Connector schema resolution and recovery](docs/SCHEMA_RESOLUTION.md)
-- [Server configuration](crates/laminar-server/README.md)
+- [Delivery guarantees](docs/DELIVERY_GUARANTEES.md)
+- [Server configuration and REST API](crates/laminar-server/README.md)
 - [Connector guide](crates/laminar-connectors/README.md)
-- [FpML source guide](docs/FPML_SOURCE.md)
+- [Connector schema resolution](docs/SCHEMA_RESOLUTION.md)
+- [FpML](docs/FPML_SOURCE.md) and [FIX](docs/FIX_SOURCE.md) source guides
 - [Rust API](https://docs.rs/laminar-db)
 - [Examples](examples/)
 
@@ -835,7 +519,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute. Use
 [GitHub Discussions](https://github.com/laminardb/laminardb/discussions) for questions, or email
 support@laminardb.io.
 
-## License
+## Licence
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
