@@ -138,6 +138,11 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
+# jemalloc has no background threads on Apple platforms, and enabling them by default there makes
+# its initialisation fail, so every allocation fails and the server aborts at startup.
+[target.'cfg(not(any(target_env = "msvc", target_vendor = "apple")))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
+
 # Kafka admin, producer, and committed-offset oracle used by the cluster soak.
 # Optional normal dependencies let the existing `kafka` feature exclude librdkafka
 # from no-default test builds; Windows resolves OpenSSL via OPENSSL_DIR.
