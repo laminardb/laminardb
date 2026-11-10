@@ -961,6 +961,16 @@ fn make_client_tls(
         tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
     )>,
 ) -> tokio_postgres_rustls::MakeRustlsConnect {
+    tokio_postgres_rustls::MakeRustlsConnect::new(client_tls_config(server_cert_path, client_auth))
+}
+
+fn client_tls_config(
+    server_cert_path: &std::path::Path,
+    client_auth: Option<(
+        Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+    )>,
+) -> tokio_rustls::rustls::ClientConfig {
     super::ensure_tls_provider();
     let cert_bytes = std::fs::read(server_cert_path).unwrap();
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
@@ -971,11 +981,10 @@ fn make_client_tls(
         roots.add(c).unwrap();
     }
     let builder = tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots);
-    let client_cfg = match client_auth {
+    match client_auth {
         Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
         None => builder.with_no_client_auth(),
-    };
-    tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg)
+    }
 }
 
 async fn assert_plaintext_startup_is_fatal(addr: std::net::SocketAddr) {
@@ -1006,6 +1015,66 @@ async fn assert_plaintext_startup_is_fatal(addr: std::net::SocketAddr) {
             .any(|window| window == b"TLS is required"),
         "unexpected ErrorResponse: {body:?}"
     );
+}
+
+#[tokio::test]
+async fn plaintext_pipelined_after_ssl_request_is_refused() {
+    let (_dir, cert_path, key_path) = self_signed_pem();
+    let db = LaminarDB::open().expect("db opens");
+    db.start().await.expect("db starts");
+    let (addr, handle) = super::serve(
+        Arc::clone(&db),
+        "127.0.0.1:0",
+        HashMap::new(),
+        false,
+        Some(super::TlsPaths {
+            cert: &cert_path,
+            key: &key_path,
+            min_version: super::TlsMinVersion::V1_2,
+            client_ca: None,
+        }),
+        256,
+        10,
+    )
+    .await
+    .expect("TLS listener");
+
+    let mut startup_body = BytesMut::new();
+    startup_body.put_i32(196_608);
+    startup_body.extend_from_slice(b"user\0any\0database\0laminardb\0\0");
+    let mut injected = BytesMut::new();
+    injected.put_i32(8);
+    injected.put_i32(80_877_103);
+    injected.put_i32(i32::try_from(startup_body.len() + 4).expect("startup length"));
+    injected.extend_from_slice(&startup_body);
+    injected.extend_from_slice(&raw_frame(b'Q', b"SELECT 1\0"));
+    let mut stream = TcpStream::connect(addr).await.expect("raw connect");
+    stream
+        .write_all(&injected)
+        .await
+        .expect("write SSLRequest with pipelined plaintext");
+
+    let mut ssl_response = [0u8; 1];
+    stream
+        .read_exact(&mut ssl_response)
+        .await
+        .expect("SSLRequest response");
+    assert_eq!(ssl_response[0], b'S');
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls_config(&cert_path, None)));
+    let server_name =
+        tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let handshake = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .expect("handshake settles");
+    assert!(
+        handshake.is_err(),
+        "plaintext sent before the TLS handshake must not reach the TLS session"
+    );
+    handle.abort();
 }
 
 #[tokio::test]
