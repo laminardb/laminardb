@@ -513,6 +513,16 @@ pub async fn negotiate_tls<S>(
     }
     #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
     if let Some(tls_acceptor) = tls_acceptor {
+        // After answering `S`, a client sends only the TLS handshake, which the acceptor reads
+        // from the raw socket. Buffered bytes arrived in plaintext before it; carrying them into
+        // the TLS session would run injected cleartext as the authenticated TLS client.
+        if !old_parts.read_buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "received unencrypted data after SSL request",
+            ));
+        }
+
         // mention the use of ssl
         let mut client_info = DefaultClient::new(addr, true);
 
