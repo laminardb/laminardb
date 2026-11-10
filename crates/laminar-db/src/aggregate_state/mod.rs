@@ -2,6 +2,7 @@
 //!
 //! One `IncrementalAggState` per operator; grouped accumulators are partitioned by stable vnodes.
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -1128,8 +1129,12 @@ impl IncrementalAggState {
         } else if agg_info.where_predicate.is_none() {
             // Changelog source, no WHERE: append the `__weight` passthrough. A WHERE over a
             // changelog needs retraction-aware filtering — fall back to the cached plan.
-            match create_physical_expr(&datafusion_expr::col(WEIGHT_COLUMN), input_df_schema, props)
-            {
+            match create_physical_expr(
+                &datafusion_expr::col(WEIGHT_COLUMN),
+                input_df_schema,
+                props,
+                &PhysicalPlanningContext::default(),
+            ) {
                 Ok(weight_expr) => {
                     let mut exprs = compiled_exprs;
                     let mut fields = proj_fields;

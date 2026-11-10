@@ -2,6 +2,7 @@
 
 pub(crate) mod capability;
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -365,16 +366,15 @@ pub(crate) async fn create_cached_physical_plan(
     )?;
     let physical = state.create_physical_plan(logical).await?;
     physical.apply(|plan| {
-        if plan.as_any().is::<RecursiveQueryExec>() {
+        if plan.is::<RecursiveQueryExec>() {
             return datafusion::common::not_impl_err!(
                 "recursive queries cannot use cached streaming execution"
             );
         }
         // DataSourceExec returns itself on reset; file-source metrics would keep accumulating.
         if plan
-            .as_any()
             .downcast_ref::<DataSourceExec>()
-            .is_some_and(|scan| scan.data_source().as_any().is::<FileScanConfig>())
+            .is_some_and(|scan| scan.data_source().is::<FileScanConfig>())
         {
             return datafusion::common::not_impl_err!(
                 "file scans cannot use cached streaming execution; use a connector source"
@@ -518,9 +518,13 @@ pub(crate) async fn try_compile_post_projection(
     let mut exprs = Vec::with_capacity(info.proj_exprs.len());
     let mut fields = Vec::with_capacity(info.proj_exprs.len());
     for expr in &info.proj_exprs {
-        let physical =
-            datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
-                .ok()?;
+        let physical = datafusion::physical_expr::create_physical_expr(
+            expr,
+            &info.input_df_schema,
+            props,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()?;
         let data_type = physical.data_type(info.input_df_schema.as_arrow()).ok()?;
         let nullable = physical
             .nullable(info.input_df_schema.as_arrow())
@@ -539,6 +543,7 @@ pub(crate) async fn try_compile_post_projection(
                 predicate,
                 &info.input_df_schema,
                 props,
+                &PhysicalPlanningContext::default(),
             )
             .ok()?,
         )

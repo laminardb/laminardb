@@ -784,7 +784,7 @@ CREATE SINK revenue_lake FROM revenue INTO "delta-lake" (
 
 #### Delta support matrix
 
-delta-rs 0.32.4 with its Delta kernel (buoyant_kernel 0.22.2), Arrow 58, DataFusion 53. ALO is
+delta-rs 1.1 with its Delta kernel (buoyant_kernel 0.28.1), Arrow 59, DataFusion 55. ALO is
 at-least-once; EO is exactly-once. "Local" means embedded and single-node; cluster rules are in
 the [object-store matrix](../../docs/cloud-object-store-support.md).
 
@@ -807,6 +807,10 @@ additionally rejects invariants, CHECK constraints and generated columns); colum
 identity columns, row tracking, clustering, type widening, UniForm (Iceberg compatibility) and
 catalog-managed tables are rejected before data is published. Only the cases named as tested
 have dedicated tests; the rest rely on the upstream check.
+
+S3 commits use native conditional put. delta-rs 1.0 removed the DynamoDB log store, so
+`storage.s3_locking_provider`, `storage.dynamodb_table_name`, `AWS_S3_LOCKING_PROVIDER` and
+`DELTA_DYNAMO_TABLE_NAME` are rejected on S3 tables, for reads and writes.
 
 ### Upsert sinks and changelog collapse
 

@@ -1,6 +1,7 @@
 #![deny(clippy::disallowed_types)]
 
 //! Core window state for tumbling/hopping/session aggregate queries.
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -39,6 +40,14 @@ use checkpoint::ArchivedCoreWindowVnodeCheckpoint;
 pub(crate) use checkpoint::CoreWindowVnodeCheckpoint;
 use close_output::ClosedRows;
 use grouping::BatchKeyIds;
+
+fn compile_expr(
+    expr: &datafusion_expr::Expr,
+    schema: &DFSchema,
+    props: &datafusion_expr::execution_props::ExecutionProps,
+) -> datafusion_common::Result<Arc<dyn PhysicalExpr>> {
+    create_physical_expr(expr, schema, props, &PhysicalPlanningContext::default())
+}
 
 /// Sentinel for null timestamps; callers must skip these rows rather than
 /// assigning them to the epoch-zero window.
@@ -684,7 +693,7 @@ impl CoreWindowState {
             let time_expr = datafusion_expr::Expr::Column(
                 datafusion_common::Column::new_unqualified(&window_config.time_column),
             );
-            match create_physical_expr(&time_expr, input_df_schema, compile_props) {
+            match compile_expr(&time_expr, input_df_schema, compile_props) {
                 Ok(phys) => {
                     let dt = phys
                         .data_type(input_df_schema.as_arrow())
@@ -776,10 +785,9 @@ impl CoreWindowState {
                     .map_err(|e| {
                         DbError::Pipeline(format!("type-coerce post-aggregate projection: {e}"))
                     })?;
-                let phys =
-                    create_physical_expr(&coerced, &agg_df_schema, compile_props).map_err(|e| {
-                        DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
-                    })?;
+                let phys = compile_expr(&coerced, &agg_df_schema, compile_props).map_err(|e| {
+                    DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
+                })?;
                 compiled.push(phys);
             }
             let final_schema = Arc::clone(&top_schema);
@@ -2038,7 +2046,7 @@ impl CoreWindowState {
                     ))
                 })?;
                 let state = ctx.state();
-                create_physical_expr(&pred, &nw.df_schema, state.execution_props()).map_err(|e| {
+                compile_expr(&pred, &nw.df_schema, state.execution_props()).map_err(|e| {
                     DbError::Pipeline(format!(
                         "[{}] now() WHERE physical compile: {e}",
                         laminar_core::error_codes::SQL_PLANNING_FAILED

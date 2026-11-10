@@ -6,6 +6,7 @@
 //! - Simple single-source -> compiled `PhysicalExpr` projection
 //! - Complex non-aggregate -> cached physical plan (`LiveSourceExec` reads fresh data)
 
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -1123,9 +1124,13 @@ impl SqlQueryOperator {
         let mut proj_fields = Vec::with_capacity(info.proj_exprs.len());
 
         for expr in &info.proj_exprs {
-            let phys =
-                datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
-                    .ok()?;
+            let phys = datafusion::physical_expr::create_physical_expr(
+                expr,
+                &info.input_df_schema,
+                props,
+                &PhysicalPlanningContext::default(),
+            )
+            .ok()?;
             let dt = phys.data_type(info.input_df_schema.as_arrow()).ok()?;
             let nullable = phys
                 .nullable(info.input_df_schema.as_arrow())
@@ -1141,8 +1146,13 @@ impl SqlQueryOperator {
 
         let compiled_filter = if let Some(ref pred) = info.filter_predicate {
             Some(
-                datafusion::physical_expr::create_physical_expr(pred, &info.input_df_schema, props)
-                    .ok()?,
+                datafusion::physical_expr::create_physical_expr(
+                    pred,
+                    &info.input_df_schema,
+                    props,
+                    &PhysicalPlanningContext::default(),
+                )
+                .ok()?,
             )
         } else {
             None
@@ -2444,7 +2454,7 @@ impl GraphOperator for SqlQueryOperator {
                     && projection
                         .exprs
                         .iter()
-                        .all(|expr| expr.as_any().is::<Column>() || expr.as_any().is::<Literal>())
+                        .all(|expr| expr.is::<Column>() || expr.is::<Literal>())
             })
     }
 

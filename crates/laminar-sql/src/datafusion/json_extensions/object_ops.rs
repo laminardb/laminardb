@@ -76,10 +76,6 @@ impl Hash for JsonbMerge {
 }
 
 impl ScalarUDFImpl for JsonbMerge {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_merge"
     }
@@ -211,10 +207,6 @@ fn deep_merge(
 }
 
 impl ScalarUDFImpl for JsonbDeepMerge {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_deep_merge"
     }
@@ -331,10 +323,6 @@ fn strip_nulls(val: serde_json::Value) -> serde_json::Value {
 }
 
 impl ScalarUDFImpl for JsonbStripNulls {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_strip_nulls"
     }
@@ -438,10 +426,6 @@ impl Hash for JsonbRenameKeys {
 }
 
 impl ScalarUDFImpl for JsonbRenameKeys {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_rename_keys"
     }
@@ -583,10 +567,6 @@ impl Hash for JsonbPick {
 }
 
 impl ScalarUDFImpl for JsonbPick {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_pick"
     }
@@ -713,10 +693,6 @@ impl Hash for JsonbExcept {
 }
 
 impl ScalarUDFImpl for JsonbExcept {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "jsonb_except"
     }

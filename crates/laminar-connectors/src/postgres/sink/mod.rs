@@ -376,7 +376,9 @@ impl PostgresSink {
         // `freeze()` transfers ownership to the COPY sink, so keeping this local also guarantees
         // cancellation releases partially encoded data.
         let mut encode_buf = BytesMut::with_capacity(COPY_ENCODE_INITIAL_CAPACITY);
-        encoder.write_header(&mut encode_buf);
+        encoder
+            .write_header(&mut encode_buf)
+            .map_err(|e| ConnectorError::Internal(format!("pgpq header: {e}")))?;
         encoder
             .write_batch(&copy_batch, &mut encode_buf)
             .map_err(|e| ConnectorError::Internal(format!("pgpq encode: {e}")))?;

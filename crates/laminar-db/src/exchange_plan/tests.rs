@@ -310,7 +310,7 @@ async fn union_all_forwards_a_shared_event_time_column() {
         ),
         (
             "SELECT ts, ts AS later FROM orders \
-             UNION ALL SELECT ts + INTERVAL '1' SECOND, ts FROM payments",
+             UNION ALL SELECT ts + INTERVAL '1' SECOND AS shifted, ts AS original FROM payments",
             "arbitrary, append-only",
         ),
         (

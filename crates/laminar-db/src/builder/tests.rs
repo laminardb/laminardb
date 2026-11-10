@@ -966,10 +966,6 @@ async fn builder_preserves_custom_function_registry_for_graph_contexts() {
     }
 
     impl ScalarUDFImpl for FortyTwo {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn name(&self) -> &'static str {
             "forty_two"
         }

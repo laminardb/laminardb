@@ -60,10 +60,6 @@ impl Hash for JsonAgg {
 }
 
 impl AggregateUDFImpl for JsonAgg {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "json_agg"
     }
@@ -208,10 +204,6 @@ impl Hash for JsonObjectAgg {
 }
 
 impl AggregateUDFImpl for JsonObjectAgg {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "json_object_agg"
     }

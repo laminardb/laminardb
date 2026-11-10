@@ -125,7 +125,12 @@ jobs:
           # Keep the publishable maintained forks on the release version.
           perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
             vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml \
-            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml
+            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml \
+            vendor/iceberg/Cargo.toml vendor/iceberg-catalog-rest/Cargo.toml \
+            vendor/iceberg-storage-opendal/Cargo.toml
+          perl -0pi -e 's{(\[dependencies\.iceberg\]\npackage = "laminardb-iceberg"\nversion = "=)[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/iceberg-catalog-rest/Cargo.toml vendor/iceberg-storage-opendal/Cargo.toml
+          perl -i -pe 's/(path = "vendor\/[^"]*", version = "=)[^"]*"/${1}'"$VERSION"'"/g' Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -348,7 +353,12 @@ jobs:
           # Keep the publishable maintained forks on the release version.
           perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
             vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml \
-            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml
+            vendor/quickfix-ffi/Cargo.toml vendor/libxml2-ffi/Cargo.toml \
+            vendor/iceberg/Cargo.toml vendor/iceberg-catalog-rest/Cargo.toml \
+            vendor/iceberg-storage-opendal/Cargo.toml
+          perl -0pi -e 's{(\[dependencies\.iceberg\]\npackage = "laminardb-iceberg"\nversion = "=)[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/iceberg-catalog-rest/Cargo.toml vendor/iceberg-storage-opendal/Cargo.toml
+          perl -i -pe 's/(path = "vendor\/[^"]*", version = "=)[^"]*"/${1}'"$VERSION"'"/g' Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -383,6 +393,18 @@ jobs:
 
       - name: Publish laminardb-libxml2-ffi
         run: cargo publish --manifest-path vendor/libxml2-ffi/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-iceberg
+        run: cargo publish --manifest-path vendor/iceberg/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-iceberg-catalog-rest
+        run: cargo publish --manifest-path vendor/iceberg-catalog-rest/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-iceberg-storage-opendal
+        run: cargo publish --manifest-path vendor/iceberg-storage-opendal/Cargo.toml --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for fork index entries
