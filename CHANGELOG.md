@@ -62,6 +62,16 @@
   its local rows on the following cycle and held new input until then, even when nothing went to
   another node. A send that has to wait (a new connection, a full send budget) still finishes in
   the background, and the rows apply on a later cycle as before.
+- Arrow and Parquet 59.3.2, DataFusion 55.2.0, Delta Lake 1.1 (Delta kernel 0.28.1) and Iceberg
+  0.11.0. Iceberg is published as the `laminardb-iceberg*` crates, the upstream 0.11.0 sources on
+  Arrow 59, until an upstream release shares Delta Lake's Arrow version.
+- A string compared with a number now converts the string to a number, in every mode:
+  `int_col = 'hello'` fails with a cast error instead of matching no rows, and
+  `str_col IN ('a', 1)` is rejected. In a `UNION ALL`, a computed column needs an alias when
+  another column in the same branch would share its output name.
+- The Iceberg sink writes a partition value containing `/`, `\` or `?` URL-encoded inside one
+  path segment instead of refusing it.
+- The Delta sink refuses a table that uses column mapping when it opens.
 
 ### Fixed
 
@@ -97,6 +107,13 @@
 - The state frame ABI is now 9, for the window state change above. Every checkpoint written by an
   earlier release fails closed at startup, in every pipeline and mode, and the pipeline restarts
   from its sources.
+- Delta tables on S3 no longer accept DynamoDB locking: `storage.s3_locking_provider`,
+  `storage.dynamodb_table_name`, `AWS_S3_LOCKING_PROVIDER` and `DELTA_DYNAMO_TABLE_NAME` are
+  rejected for reads and writes. delta-rs 1.0 removed its DynamoDB log store; S3 commits use
+  conditional put. Remove these settings before upgrading.
+- Cluster nodes admit only peers of the same version, so a cluster moves to 0.40.0 by restarting
+  every node. Checkpoints written by 0.34.0 restore.
+- Applications embedding `laminar-db` move to Arrow 59 and DataFusion 55 with it.
 
 ## [0.33.0]
 
