@@ -257,16 +257,6 @@ impl DeltaLakeSinkConfig {
         );
         cfg.storage_options = resolved.options;
 
-        // Map LogStore configuration keys to delta-rs storage options.
-        if let Some(v) = config.get("storage.s3_locking_provider") {
-            cfg.storage_options
-                .insert("AWS_S3_LOCKING_PROVIDER".to_string(), v.to_string());
-        }
-        if let Some(v) = config.get("storage.dynamodb_table_name") {
-            cfg.storage_options
-                .insert("DELTA_DYNAMO_TABLE_NAME".to_string(), v.to_string());
-        }
-
         cfg.validate()?;
         Ok(cfg)
     }
@@ -721,7 +711,7 @@ impl ParquetWriteConfig {
                 .set_column_bloom_filter_enabled(col_path.clone(), true)
                 .set_column_bloom_filter_fpp(col_path.clone(), self.bloom_filter_fpp);
             if self.bloom_filter_ndv > 0 {
-                builder = builder.set_column_bloom_filter_ndv(col_path, self.bloom_filter_ndv);
+                builder = builder.set_column_bloom_filter_max_ndv(col_path, self.bloom_filter_ndv);
             }
         }
 

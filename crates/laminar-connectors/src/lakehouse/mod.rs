@@ -430,17 +430,6 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "Storage location for auto-created UC external tables (e.g. s3://bucket/path)",
             "",
         ),
-        // ── LogStore configuration ──
-        ConfigKeySpec::optional(
-            "storage.s3_locking_provider",
-            "S3 locking provider: 'dynamodb' for DynamoDB-backed log store",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "storage.dynamodb_table_name",
-            "DynamoDB table name for S3 locking (default: delta_log)",
-            "",
-        ),
         // ── Cloud storage credentials (resolved via StorageCredentialResolver) ──
         ConfigKeySpec::optional(
             "storage.aws_access_key_id",
@@ -574,17 +563,6 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
     ];
     keys.extend(delta_catalog_config_keys());
     keys.extend([
-        // ── LogStore configuration ──
-        ConfigKeySpec::optional(
-            "storage.s3_locking_provider",
-            "S3 locking provider: 'dynamodb' for DynamoDB-backed log store",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "storage.dynamodb_table_name",
-            "DynamoDB table name for S3 locking (default: delta_log)",
-            "",
-        ),
         // ── Cloud storage credentials ──
         ConfigKeySpec::optional("storage.aws_access_key_id", "AWS access key ID", ""),
         ConfigKeySpec::optional("storage.aws_secret_access_key", "AWS secret access key", ""),

@@ -54,7 +54,8 @@ pub(crate) use read::read_batches_at_version;
 pub(crate) use read::snapshot_stream;
 #[cfg(feature = "delta-lake")]
 pub(crate) use table::{
-    reject_unenforced_row_obligations, widen_batch_millisecond_timestamps,
+    reject_column_mapped_table, reject_unenforced_row_obligations,
+    validate_delta_timestamp_precision, widen_batch_millisecond_timestamps,
     widen_millisecond_timestamps, write_batches,
 };
 

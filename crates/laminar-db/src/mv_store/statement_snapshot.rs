@@ -271,7 +271,7 @@ fn collect_scanned_tables(
             scanned.live.push(scan.table_name.to_string());
             return Ok(TreeNodeRecursion::Continue);
         };
-        if let Some(view) = provider.as_any().downcast_ref::<MvTableProvider>() {
+        if let Some(view) = provider.downcast_ref::<MvTableProvider>() {
             scanned.views.push(view.name().to_owned());
         } else if let Some(inner) = provider.get_logical_plan() {
             collect_scanned_tables(&inner, scanned)?;

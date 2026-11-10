@@ -2334,3 +2334,35 @@ fn descriptor_staged_by_delta_0_32_4_decodes_to_the_same_add() {
     assert_eq!(add.partition_values["region"].as_deref(), Some("us east"));
     assert_eq!(objects[0].path.as_ref(), add.path);
 }
+
+#[test]
+fn removed_s3_locking_is_rejected_from_options_and_environment() {
+    let s3 = Url::parse("s3://bucket/table").unwrap();
+    let no_environment = |_: &str| None;
+    let rejected = |options: &[(&str, &str)], environment: &dyn Fn(&str) -> Option<String>| {
+        let options = options
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        storage_preflight::reject_removed_s3_locking(&s3, &options, &environment).is_err()
+    };
+
+    assert!(!rejected(&[], &no_environment));
+    assert!(rejected(
+        &[("s3_locking_provider", "dynamodb")],
+        &no_environment
+    ));
+    assert!(rejected(
+        &[("dynamodb_table_name", "delta_log")],
+        &no_environment
+    ));
+    assert!(rejected(&[], &|key: &str| {
+        (key == "AWS_S3_LOCKING_PROVIDER").then(|| "dynamodb".to_string())
+    }));
+
+    let local = Url::parse("file:///tmp/table").unwrap();
+    let options = HashMap::from([("s3_locking_provider".to_string(), "dynamodb".to_string())]);
+    assert!(
+        storage_preflight::reject_removed_s3_locking(&local, &options, &no_environment).is_ok()
+    );
+}

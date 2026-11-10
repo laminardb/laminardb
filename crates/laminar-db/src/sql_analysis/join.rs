@@ -204,9 +204,9 @@ pub(crate) fn has_unqualified_interval_output_column(sql: &str) -> bool {
         .is_break()
     };
     select.projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            has_unqualified(expr)
-        }
+        SelectItem::UnnamedExpr(expr)
+        | SelectItem::ExprWithAlias { expr, .. }
+        | SelectItem::ExprWithAliases { expr, .. } => has_unqualified(expr),
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
     }) || select.selection.as_ref().is_some_and(has_unqualified)
 }
@@ -326,6 +326,8 @@ fn render_join_projection_item(
             format!("{rewritten} AS {alias}")
         }
         SelectItem::Wildcard(_) => "*".to_string(),
+        // Left unrewritten: the SQL planner rejects multi-column aliases.
+        SelectItem::ExprWithAliases { .. } => item.to_string(),
         // DDL rejects qualified wildcards for bounded joins because the internal pair schema
         // renames right-side columns. Keeping the qualifier here makes any bypass fail closed.
         SelectItem::QualifiedWildcard(name, _) => format!("{name}.*"),

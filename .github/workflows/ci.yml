@@ -552,6 +552,11 @@ jobs:
           cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
           cargo package --manifest-path vendor/quickfix-ffi/Cargo.toml --no-verify
           cargo package --manifest-path vendor/libxml2-ffi/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/iceberg/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/iceberg-catalog-rest/Cargo.toml --no-verify \
+            --config 'patch.crates-io.laminardb-iceberg.path="vendor/iceberg"'
+          cargo package --manifest-path vendor/iceberg-storage-opendal/Cargo.toml --no-verify \
+            --config 'patch.crates-io.laminardb-iceberg.path="vendor/iceberg"'
       - name: Verify workspace packages can be assembled
         run: |
           # The release publishes the maintained forks before the Laminar crates.
@@ -559,7 +564,10 @@ jobs:
             --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
             --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"' \
             --config 'patch.crates-io.laminardb-quickfix-ffi.path="vendor/quickfix-ffi"' \
-            --config 'patch.crates-io.laminardb-libxml2-ffi.path="vendor/libxml2-ffi"'
+            --config 'patch.crates-io.laminardb-libxml2-ffi.path="vendor/libxml2-ffi"' \
+            --config 'patch.crates-io.laminardb-iceberg.path="vendor/iceberg"' \
+            --config 'patch.crates-io.laminardb-iceberg-catalog-rest.path="vendor/iceberg-catalog-rest"' \
+            --config 'patch.crates-io.laminardb-iceberg-storage-opendal.path="vendor/iceberg-storage-opendal"'
 
   # ============================================
   # MSRV Check

@@ -160,16 +160,6 @@ impl DeltaSourceConfig {
         cfg.env_resolved_storage_keys = resolved.env_resolved_keys;
         cfg.storage_options = resolved.options;
 
-        // Map LogStore configuration keys to delta-rs storage options.
-        if let Some(v) = config.get("storage.s3_locking_provider") {
-            cfg.storage_options
-                .insert("AWS_S3_LOCKING_PROVIDER".to_string(), v.to_string());
-        }
-        if let Some(v) = config.get("storage.dynamodb_table_name") {
-            cfg.storage_options
-                .insert("DELTA_DYNAMO_TABLE_NAME".to_string(), v.to_string());
-        }
-
         cfg.validate()?;
         Ok(cfg)
     }

@@ -493,8 +493,11 @@ fn partitioning_abi_v2_composites_are_unambiguous_and_dictionaries_are_hydrated(
 
 #[test]
 fn partitioning_abi_v2_remaining_physical_families_are_golden() {
-    let fixed =
-        FixedSizeBinaryArray::from(vec![Some(b"ab" as &[u8]), None, Some(b"\x00\xff" as &[u8])]);
+    let fixed = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [Some(b"ab" as &[u8]), None, Some(b"\x00\xff" as &[u8])].into_iter(),
+        2,
+    )
+    .unwrap();
     let i32_expected = [
         ("017fffffff", 3_378_966_536_833_104_354, 255),
         ("0180000000", 3_555_926_625_577_413_108, 15),

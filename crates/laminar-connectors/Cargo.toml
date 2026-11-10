@@ -23,7 +23,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # Database drivers for CDC and sinks
 tokio-postgres = { version = "0.7", optional = true, features = ["with-chrono-0_4"] }
 postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_4"] }
-pgpq = { version = "0.11", optional = true }
+pgpq = { version = "0.12", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 pgwire-replication = { package = "laminardb-pgwire-replication", path = "../../vendor/pgwire-replication", version = "=0.34.0", optional = true }
 # Client-side verified TLS for PostgreSQL CDC, sink, and lookup connections.
@@ -36,6 +36,7 @@ tokio-stream = { workspace = true, optional = true }
 
 # Delta Lake
 deltalake = { workspace = true, optional = true, features = ["rustls"] }
+deltalake-core = { workspace = true, optional = true }
 deltalake-catalog-glue = { workspace = true, optional = true }
 deltalake-catalog-unity = { workspace = true, optional = true }
 aws-sdk-glue = { workspace = true, optional = true }
@@ -168,7 +169,7 @@ mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.
 changelog-collapse = ["dep:arrow-row"]
 # Delta Lake
-delta-lake = ["dep:deltalake", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
+delta-lake = ["dep:deltalake", "dep:deltalake-core", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure", "deltalake-catalog-unity?/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs", "laminar-core/gcs", "dep:futures-util", "deltalake-catalog-unity?/gcp"]

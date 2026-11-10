@@ -131,7 +131,7 @@ impl<'a> AggregateInput<'a> {
                     .transpose()?;
                 let input = Self::new(column(value_index, "input")?, filter, weights);
                 template.check_input(&input)?;
-                let extremum = spec.udf.inner().as_any();
+                let extremum = spec.udf.inner();
                 if weights.is_some() && (extremum.is::<Min>() || extremum.is::<Max>()) {
                     input.with_row_encoding()
                 } else {

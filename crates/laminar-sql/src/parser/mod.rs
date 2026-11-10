@@ -285,12 +285,19 @@ fn convert_standard_statement(stmt: sqlparser::ast::Statement) -> StreamingState
         // Extract table name from TableObject
         if let sqlparser::ast::TableObject::TableName(ref name) = insert.table {
             let table_name = name.clone();
-            let columns = insert.columns.clone();
+            let columns = insert
+                .columns
+                .iter()
+                .map(|column| match column.0.as_slice() {
+                    [part] => part.as_ident().cloned(),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
 
             // Try to extract VALUES rows from source query
-            if let Some(ref source) = insert.source {
+            if let (Some(columns), Some(source)) = (columns, insert.source.as_ref()) {
                 if let sqlparser::ast::SetExpr::Values(ref values) = *source.body {
-                    let rows = values.rows.clone();
+                    let rows = values.rows.iter().map(|row| row.content.clone()).collect();
                     return StreamingStatement::InsertInto {
                         table_name,
                         columns,

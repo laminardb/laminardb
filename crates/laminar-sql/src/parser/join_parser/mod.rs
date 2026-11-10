@@ -505,9 +505,14 @@ fn get_join_constraint(op: &JoinOperator) -> Result<&JoinConstraint, ParseError>
         | JoinOperator::Anti(constraint)
         | JoinOperator::StraightJoin(constraint)
         | JoinOperator::AsOf { constraint, .. } => Ok(constraint),
-        JoinOperator::CrossJoin(_) | JoinOperator::CrossApply | JoinOperator::OuterApply => Err(
-            ParseError::StreamingError("CROSS JOIN not supported for streaming".to_string()),
-        ),
+        JoinOperator::CrossJoin(_)
+        | JoinOperator::CrossApply
+        | JoinOperator::OuterApply
+        | JoinOperator::ArrayJoin
+        | JoinOperator::LeftArrayJoin
+        | JoinOperator::InnerArrayJoin => Err(ParseError::StreamingError(
+            "CROSS JOIN not supported for streaming".to_string(),
+        )),
     }
 }
 

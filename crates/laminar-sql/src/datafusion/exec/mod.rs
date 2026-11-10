@@ -8,7 +8,9 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_schema::{SchemaRef, SortOptions};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{
     expressions::Column, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
@@ -182,8 +184,11 @@ impl DisplayAs for StreamingScanExec {
 }
 
 impl ExecutionPlan for StreamingScanExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn name(&self) -> &'static str {

@@ -208,7 +208,7 @@ async fn refresh_publication_cursor_once(
     }
     // RECOVERY: reload from storage so a drop-and-recreate at the same version
     // cannot inherit the staged table's cached snapshot.
-    let mut current = DeltaTable::new(table.log_store(), table.config.clone());
+    let mut current = DeltaTable::new(table.log_store());
     validate_coordinated_log_store(&current)?;
     let context = format!("refresh Delta coordinated publication snapshot {phase}");
     current

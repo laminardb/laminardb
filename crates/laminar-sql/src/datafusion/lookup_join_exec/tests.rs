@@ -1,6 +1,9 @@
 use super::*;
 use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter as TestStreamAdapter;
 use futures::TryStreamExt;
 
@@ -44,8 +47,11 @@ impl DisplayAs for StreamExecStub {
 }
 
 impl ExecutionPlan for StreamExecStub {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn name(&self) -> &'static str {
@@ -275,7 +281,12 @@ fn with_new_children_preserves_state() {
     let exec = Arc::new(make_exec(LookupJoinType::Inner));
     let expected_schema = exec.schema();
     let children = exec.children().into_iter().cloned().collect();
-    let rebuilt = exec.with_new_children(children).unwrap();
+    let rebuilt = exec
+        .replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .unwrap();
     assert_eq!(rebuilt.schema(), expected_schema);
     assert_eq!(rebuilt.name(), "LookupJoinExec");
 }
@@ -516,7 +527,12 @@ fn partial_with_new_children_preserves_state() {
     let exec = Arc::new(make_partial_exec(LookupJoinType::Inner));
     let expected_schema = exec.schema();
     let children = exec.children().into_iter().cloned().collect();
-    let rebuilt = exec.with_new_children(children).unwrap();
+    let rebuilt = exec
+        .replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .unwrap();
     assert_eq!(rebuilt.schema(), expected_schema);
     assert_eq!(rebuilt.name(), "PartialLookupJoinExec");
 }
