@@ -1,7 +1,8 @@
 # Temporary dependency exceptions
 
 Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27,
-re-approved 2026-10-31, two unmaintained-crate exceptions added 2026-11-05; all expire at
+re-approved 2026-10-31, two unmaintained-crate exceptions added 2026-11-05, instant and
+pin-utils exceptions removed 2026-11-10; all expire at
 2026-11-30 UTC (CI fails on that date).
 Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
 The four residual exceptions below were re-reviewed and accepted for this interval under S4.
@@ -12,13 +13,11 @@ Machine-readable versions, sources, checksums and reasons are in `dependency-exc
 | [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html) | rsa 0.9.10 | No patched release. reqsign cloud authentication uses randomized signing rather than RSA decryption, but this does not establish absence of timing leakage or private-key exposure. |
 | [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | paste 1.0.15 | Unmaintained compile-time dependency through DataFusion/Parquet/tokenizers. |
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | proc-macro-error2 2.0.1 | Unmaintained compile-time dependency through validator_derive in Delta Lake. |
-| [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384.html) | instant 0.1.13 | Unmaintained dependency in the wider lockfile, including reqwest-retry/wasm-timer and old parking_lot. |
 | [RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440.html) | astral-tokio-tar 0.6.2 | Unmaintained since 2026-11-03, no maintained release. Test-only: reached through testcontainers 0.27.2 (0.28.0 still requires it), a laminar-connectors dev-dependency; no shipped build compiles it. |
-| [RUSTSEC-2026-0441](https://rustsec.org/advisories/RUSTSEC-2026-0441.html) | pin-utils 0.1.0 | Unmaintained since 2026-10-01. hyper and the AWS smithy crates were updated off it; it remains in the lockfile only under wasm-timer for reqwest-retry 0.7.0 (Delta Lake's Unity catalog), a `wasm32`-only dependency no build target compiles. |
 
 Thirteen zstd advisories published in October 2026 were excepted on 2026-10-27 ([PR #637](https://github.com/laminardb/laminardb/pull/637)),
 with the same deadline. They are fixed only in zstd 0.14.3 and zstd-safe 8.2.0, but DataFusion
-55.2, Arrow and Parquet 58.4, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require
+55.2, Arrow and Parquet 59.3, iceberg 0.11.0, chitchat 0.13 and apache-avro 0.22 still require
 zstd `^0.13`, so the lockfile pins zstd 0.13.3 and zstd-safe 7.3.0 for them. async-compression
 0.4.51 (through compression-codecs 0.4.46) resolves the patched zstd 0.14.3 and zstd-safe 8.2.0,
 which share the locked zstd-sys 2.1.2 (it fixes RUSTSEC-2026-0410); all four zstd identities are
@@ -92,4 +91,9 @@ requires OpenDAL `^0.57`. instant comes only through parking_lot 0.11, which was
 through reqwest-retry 0.7 in deltalake-catalog-unity 0.16; unity 1.0 moves to reqwest-retry 0.9
 but needs the Delta Lake 1.x generation. The quick-xml backport's only change in this review is
 its due date, so its reviewed digest was recomputed.
+Re-review on 2026-11-10 (Arrow 59, DataFusion 55.2, Delta Lake 1.1): deltalake-catalog-unity 1.0
+uses reqwest-retry 0.9, so instant and pin-utils left the lockfile and RUSTSEC-2024-0384 and
+RUSTSEC-2026-0441 are no longer excepted. DataFusion 55.2 and Delta kernel 0.28 still require
+object_store `^0.13.2` (so quick-xml `^0.39`), so the quick-xml patch and XML exceptions remain;
+Arrow and Parquet 59.3 still require zstd `^0.13`.
 Keep these exceptions under review before **2026-11-30**, which is the hard CI deadline.
