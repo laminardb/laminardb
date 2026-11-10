@@ -1,6 +1,6 @@
 # Connector schema resolution
 
-Implementation contract for LaminarDB 0.33.0, updated 2026-10-17.
+Implementation contract for LaminarDB 0.40.0, updated 2026-11-10.
 
 Sources can omit columns when their connector has an authoritative metadata or
 protocol schema. Sinks derive their input fields from a named source or stream.
@@ -14,6 +14,29 @@ does not need to expand columns. Custom connector factories declare capabilities
 reference-table or lookup resolution hook. Direct connector users must resolve,
 validate, explicitly prepare and retain the binding themselves; using a raw
 connector does not create a database catalog or grant durable delivery.
+
+## Settings
+
+By default a Kafka Avro source or sink reads the latest schema under its topic's
+`<topic>-value` subject once, when you create the object. These settings control selection,
+sampling and external creation:
+
+| Setting | When to use it |
+|---|---|
+| `schema.registry.url` | Avro registry service URL, such as `http://localhost:8081`. Give the service URL, not a subject or schema-resource URL. |
+| `schema.registry.value.subject` | Choose a value subject explicitly. Use it when several topics, a regex subscription or a naming strategy would make the choice ambiguous. |
+| `schema.registry.value.version` or `schema.registry.value.id` | Pin a positive version or schema ID. Set one, not both. Without either, creation resolves the latest once. |
+| `schema.registry.record.name` | Give the record name when using a record-based subject naming strategy. An explicit value subject overrides subject derivation. |
+| `schema.registry.auto.register` | Defaults to `false`. Set it to `true` on a Kafka sink to allow registration during creation. Changing `schema.compatibility` also needs this permission. |
+| `schema.inference` | Defaults to `false`. Set it to `true` for CSV or JSON file sources to sample up to four files, 1 MiB and 1,000 rows within ten seconds. Empty or all-null samples fail; a sample cannot prove what future files will contain. |
+| `auto.create` | Defaults to `false` for Iceberg sinks and MongoDB standard collections, and for Delta Lake sinks unless `catalog.storage.location` is set. Set it to `true` to allow creation of a missing destination. MongoDB time-series collections are created through `timeseries.time_field`. |
+| `auto.create.table` | Defaults to `false` for PostgreSQL sinks. Set it to `true` to allow creation of a missing table. |
+| `schema.evolution` | Keep it `false` for Delta Lake sinks with durable schema contracts. Change an incompatible target through a controlled migration. |
+
+In TOML source definitions, leave `format` out for OpenTelemetry, which uses the native OTLP
+protocol; codec-based sources use their connector's default when `format` is omitted. A saved
+MongoDB time-series binding tracks the backing bucket UUID, so dropping and recreating the
+collection needs a new binding.
 
 ## Direction and format capabilities
 
@@ -92,8 +115,10 @@ PostgreSQL uses named COPY columns, allowing omitted columns only when the datab
 write path can apply their default/generated/nullable behavior. Generated fields
 cannot be supplied as ordinary query fields. Lakehouse alignment follows the
 installed Rust libraries and existing writer policy. Delta's established top-level
-millisecond-to-microsecond timestamp normalization is retained; unsupported lossy
-types, including UInt64, fail before target creation. Engine changelog fields are
+millisecond-to-microsecond timestamp normalization is retained. Nanosecond timestamps,
+and millisecond timestamps nested in lists, maps or structs, have no exact Delta
+representation and fail with a request to cast in `CREATE STREAM`; other unsupported
+lossy types, including UInt64, fail before target creation. Engine changelog fields are
 consumed only by the supported keyed writer mode and remain outside business data.
 
 MongoDB lookup inference needs a flat, closed `$jsonSchema` with one supported

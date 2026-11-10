@@ -538,26 +538,28 @@ Otherwise the source must be owned by a route that keeps keyed state (a temporal
 or a bounded interval join); sink filters and plain streams over it are rejected before any I/O.
 
 ```rust
-// FromRow struct fields must match SELECT column order exactly
 #[derive(FromRow)]
 pub struct OhlcRow {
-    pub symbol: String,      // 1st SELECT column
-    pub window_start: i64,   // 2nd SELECT column
-    pub open: f64,           // 3rd SELECT column
-    // ... etc
+    pub symbol: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
 }
 
-let sub = db.subscribe::<OhlcRow>("ohlc")?;
+let mut sub = db.subscribe::<OhlcRow>("ohlc").await?;
 
-// Poll for results (non-blocking)
-while let Some(rows) = sub.poll() {
+// Poll for results without blocking; `sub.next_frame().await` waits instead.
+while let Some(rows) = sub.poll()? {
     for row in &rows {
         println!("{}: O={} H={} L={} C={}", row.symbol, row.open, row.high, row.low, row.close);
     }
 }
 ```
 
-**Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter, only position does.
+`FromRow` fills each field from the column with the same name, or the name given in
+`#[column("...")]`, so alias SQL expressions to match the struct. An `i64` field needs a
+`BIGINT` column; cast a window's `TIMESTAMP` first.
 
 ### Kafka
 
@@ -894,27 +896,23 @@ SELECT TUMBLE_START(ts, INTERVAL '5' SECOND), FIRST(price), LAST(price)
 SELECT tumble(ts, INTERVAL '5' SECOND), first_value(price), last_value(price)
 ```
 
-### 4. FromRow field ordering
+### 4. FromRow matches columns by name
 
 ```rust
 // SQL: SELECT symbol, SUM(volume) AS total, AVG(price) AS avg_price
 
-// WRONG: field names don't matter, ORDER matters
 #[derive(FromRow)]
-pub struct Bad {
-    pub avg_price: f64,  // This gets the 1st column (symbol), not avg_price!
+pub struct Summary {
+    pub avg_price: f64,    // field order does not matter
     pub symbol: String,
-    pub total: i64,
-}
-
-// CORRECT: matches SELECT column order
-#[derive(FromRow)]
-pub struct Good {
-    pub symbol: String,    // 1st column
-    pub total: i64,        // 2nd column
-    pub avg_price: f64,    // 3rd column
+    #[column("total")]
+    pub total_volume: i64, // reads the `total` column
 }
 ```
+
+Each field reads the column with its own name, or the name given in `#[column("...")]`. A field
+whose column is missing from the result panics when rows are converted, so alias SQL
+expressions to match the struct.
 
 ### 5. Both sources must advance watermarks for bounded joins
 
