@@ -6,7 +6,7 @@ use arrow_array::RecordBatch;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use iceberg::spec::{NameMapping, SchemaRef, SnapshotRef, DEFAULT_SCHEMA_NAME_MAPPING};
+use iceberg::spec::{NameMapping, SchemaRef, SnapshotRef, TableProperties};
 use iceberg::table::Table;
 use tokio::sync::mpsc;
 
@@ -264,7 +264,7 @@ fn added_file_tasks(
     let name_mapping = table
         .metadata()
         .properties()
-        .get(DEFAULT_SCHEMA_NAME_MAPPING)
+        .get(TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
         .map(|encoded| serde_json::from_str::<NameMapping>(encoded))
         .transpose()
         .map_err(|_| {
@@ -288,10 +288,11 @@ fn added_file_tasks(
         }
     }
     let field_ids = field_ids.to_vec();
+    let metadata = table.metadata_ref();
     let tasks = files.into_iter().map(move |added| {
         let file = added.data_file;
         let size = file.file_size_in_bytes();
-        Ok(FileScanTask::builder()
+        FileScanTask::builder()
             .with_file_size_in_bytes(size)
             .with_start(0)
             .with_length(size)
@@ -305,11 +306,14 @@ fn added_file_tasks(
             // admission rejects every delete-file addition after the retained cursor.
             .with_deletes(Vec::new())
             .with_partition(Some(file.partition().clone()))
-            // COMPAT: Iceberg 0.10.1 native scan tasks leave this unset; setting it changes the reader schema.
-            .with_partition_spec(None)
+            .with_partition_spec(
+                metadata
+                    .partition_spec_by_id(added.partition_spec_id)
+                    .cloned(),
+            )
             .with_name_mapping(name_mapping.clone())
             .with_case_sensitive(true)
-            .build())
+            .build()
     });
     Ok(Box::pin(futures_util::stream::iter(tasks)))
 }

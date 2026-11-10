@@ -247,6 +247,14 @@ fn canonical_pipeline(context: &PipelineIdentityContext<'_>) -> Result<Canonical
     })
 }
 
+#[cfg(all(test, feature = "cluster"))]
+pub(crate) fn canonical_value(
+    context: &PipelineIdentityContext<'_>,
+) -> Result<serde_json::Value, DbError> {
+    serde_json::to_value(canonical_pipeline(context)?)
+        .map_err(|error| DbError::Checkpoint(format!("pipeline identity encode: {error}")))
+}
+
 fn identity_for_payload(payload: &CanonicalPipeline) -> Result<PipelineIdentity, DbError> {
     let encoded = serde_json::to_vec(&payload)
         .map_err(|error| DbError::Checkpoint(format!("pipeline identity encode: {error}")))?;

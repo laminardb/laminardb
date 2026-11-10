@@ -665,8 +665,10 @@ fn validate_partition_path(partition: &PartitionKey, path: &str) -> Result<(), C
         let Some(component) = components.next() else {
             return Err(invalid_partition_path());
         };
+        let encoded_name: String =
+            url::form_urlencoded::byte_serialize(field.name.as_bytes()).collect();
         let valid = component
-            .strip_prefix(&field.name)
+            .strip_prefix(&encoded_name)
             .is_some_and(|value| value.starts_with('='));
         if !valid {
             return Err(invalid_partition_path());
@@ -941,8 +943,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsafe_partition_paths_fail_before_opening_a_writer() {
-        for value in ["safe/../../escape", "safe\\..\\escape", "safe?token=value"] {
+    async fn partition_values_with_path_characters_stay_in_one_encoded_segment() {
+        for (value, encoded) in [
+            ("safe/../../escape", "category=safe%2F..%2F..%2Fescape"),
+            ("safe\\..\\escape", "category=safe%5C..%5Cescape"),
+            ("safe?token=value", "category=safe%3Ftoken%3Dvalue"),
+        ] {
             let fixture = create_test_table(true).await;
             let mut writer = IcebergEpochWriter::new(
                 &fixture.table,
@@ -951,14 +957,51 @@ mod tests {
                 IcebergMetrics::new(None),
             )
             .unwrap();
-            let error = writer
+            writer
                 .write(batch(&fixture.table, &[(1, Some(value))]))
                 .await
-                .expect_err("unsafe partition path must fail before writer creation");
-            assert!(error.to_string().contains("LDB-ICEBERG-PARTITION-PATH"));
-            assert!(writer.active.is_empty());
-            assert!(writer.completed.is_empty());
-            assert_eq!(writer.file_count, 0);
+                .unwrap();
+            assert_eq!(writer.active.keys().collect::<Vec<_>>(), [encoded]);
+        }
+    }
+
+    #[test]
+    fn partition_paths_must_be_one_encoded_segment_per_field() {
+        use iceberg::spec::{
+            Literal, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Transform, Type,
+        };
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([NestedField::required(
+                    1,
+                    "my col",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into()])
+                .build()
+                .unwrap(),
+        );
+        let spec = PartitionSpec::builder(Arc::clone(&schema))
+            .add_partition_field("my col", "my col", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let data = Struct::from_iter([Some(Literal::string("a"))]);
+        let key = PartitionKey::new(spec, schema, data);
+
+        assert!(validate_partition_path(&key, "my+col=a").is_ok());
+        for unsafe_path in [
+            "my col=a",
+            "my+col=a?b",
+            "my+col=a\\b",
+            "my+col=a/extra",
+            "",
+        ] {
+            assert!(
+                validate_partition_path(&key, unsafe_path).is_err(),
+                "{unsafe_path}"
+            );
         }
     }
 
