@@ -2,10 +2,10 @@
 
 ## [Unreleased]
 
-## [0.40.1]
+## [0.40.2]
 
-0.40.0 was tagged but never published, so this is the first release since 0.33.0 and carries
-everything below.
+0.40.0 and 0.40.1 were tagged but never published, so this is the first release since 0.33.0
+and carries everything below.
 
 ### Added
 
@@ -80,6 +80,8 @@ everything below.
 
 ### Fixed
 
+- rustix moves to 1.1.6 for RUSTSEC-2026-0486 (xattr functions marked unwritten bytes as
+  initialized when given a zero-length buffer).
 - An exactly-once Delta Lake sink now writes a Delta checkpoint every 10 commits, or at the
   table's `delta.checkpointInterval` when it sets one, in every mode. It used to write none, so
   each checkpoint's Delta commit read the table's whole log several times and took longer the
@@ -122,7 +124,7 @@ everything below.
   `storage.dynamodb_table_name`, `AWS_S3_LOCKING_PROVIDER` and `DELTA_DYNAMO_TABLE_NAME` are
   rejected for reads and writes. delta-rs 1.0 removed its DynamoDB log store; S3 commits use
   conditional put. Remove these settings before upgrading.
-- Cluster nodes admit only peers of the same version, so a cluster moves to 0.40.1 by restarting
+- Cluster nodes admit only peers of the same version, so a cluster moves to 0.40.2 by restarting
   every node. Checkpoints written by 0.34.0 restore.
 - Applications embedding `laminar-db` move to Arrow 59 and DataFusion 55 with it.
 

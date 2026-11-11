@@ -1,6 +1,6 @@
 [package]
 name = "laminardb-libxml2-ffi"
-version = "0.40.1"
+version = "0.40.2"
 edition = "2021"
 rust-version = "1.95"
 links = "xml2"
