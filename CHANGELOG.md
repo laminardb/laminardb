@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.40.1]
+
+0.40.0 was tagged but never published, so this is the first release since 0.33.0 and carries
+everything below.
+
 ### Added
 
 - Event time flows through interval joins and closed windows, in every mode. An interval join's
@@ -111,7 +116,7 @@
   `storage.dynamodb_table_name`, `AWS_S3_LOCKING_PROVIDER` and `DELTA_DYNAMO_TABLE_NAME` are
   rejected for reads and writes. delta-rs 1.0 removed its DynamoDB log store; S3 commits use
   conditional put. Remove these settings before upgrading.
-- Cluster nodes admit only peers of the same version, so a cluster moves to 0.40.0 by restarting
+- Cluster nodes admit only peers of the same version, so a cluster moves to 0.40.1 by restarting
   every node. Checkpoints written by 0.34.0 restore.
 - Applications embedding `laminar-db` move to Arrow 59 and DataFusion 55 with it.
 

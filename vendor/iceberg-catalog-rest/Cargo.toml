@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95"
 name = "laminardb-iceberg-catalog-rest"
-version = "0.40.0"
+version = "0.40.1"
 build = false
 publish = true
 autolib = false
@@ -49,7 +49,7 @@ version = "1.2"
 
 [dependencies.iceberg]
 package = "laminardb-iceberg"
-version = "=0.40.0"
+version = "=0.40.1"
 path = "../iceberg"
 
 [dependencies.itertools]

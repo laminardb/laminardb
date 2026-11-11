@@ -28,7 +28,7 @@ quick-xml = { path = "vendor/quick-xml" }
 rdkafka-sys = { path = "vendor/rdkafka-sys" }
 
 [workspace.package]
-version = "0.40.0"
+version = "0.40.1"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -150,9 +150,9 @@ delta_kernel = { package = "buoyant_kernel", version = "=0.28.1", default-featur
 # Apache Iceberg
 # Upstream 0.11.0 requires Arrow 58 and Delta 1.1 requires Arrow 59; provenance and removal in
 # vendor/iceberg/VENDORED.md.
-iceberg = { package = "laminardb-iceberg", path = "vendor/iceberg", version = "=0.40.0" }
-iceberg-catalog-rest = { package = "laminardb-iceberg-catalog-rest", path = "vendor/iceberg-catalog-rest", version = "=0.40.0" }
-iceberg-storage-opendal = { package = "laminardb-iceberg-storage-opendal", path = "vendor/iceberg-storage-opendal", version = "=0.40.0", default-features = false }
+iceberg = { package = "laminardb-iceberg", path = "vendor/iceberg", version = "=0.40.1" }
+iceberg-catalog-rest = { package = "laminardb-iceberg-catalog-rest", path = "vendor/iceberg-catalog-rest", version = "=0.40.1" }
+iceberg-storage-opendal = { package = "laminardb-iceberg-storage-opendal", path = "vendor/iceberg-storage-opendal", version = "=0.40.1", default-features = false }
 apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)
