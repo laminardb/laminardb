@@ -243,7 +243,13 @@ async fn observe(url: &'static str, queue: String, observed: Arc<Mutex<BTreeMap<
                 .await
                 .entry(value["id"].as_i64().unwrap())
                 .or_default() += 1;
-            if delivery.ack(BasicAckOptions::default()).await.is_err() {
+            // lapin can leave an ack pending forever when the broker closes the channel under it.
+            let acked = tokio::time::timeout(
+                Duration::from_secs(5),
+                delivery.ack(BasicAckOptions::default()),
+            )
+            .await;
+            if !matches!(acked, Ok(Ok(_))) {
                 break;
             }
         }
