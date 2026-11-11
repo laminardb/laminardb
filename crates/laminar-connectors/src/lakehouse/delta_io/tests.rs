@@ -1380,7 +1380,8 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
     assert_eq!(
         commit_batch_coordinated(&writer, &first, test_publication_deadline())
             .await
-            .unwrap(),
+            .unwrap()
+            .descriptor_count,
         1
     );
     assert_eq!(stale_committer.version(), Some(0));
@@ -1412,7 +1413,8 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
     assert_eq!(
         commit_batch_coordinated(&stale_committer, &overlap, test_publication_deadline())
             .await
-            .unwrap(),
+            .unwrap()
+            .descriptor_count,
         1
     );
 
@@ -1624,7 +1626,8 @@ async fn coordinated_empty_batch_commits_cursor_without_object_io() {
     assert_eq!(
         commit_batch_coordinated(&table, &batch, test_publication_deadline())
             .await
-            .unwrap(),
+            .unwrap()
+            .descriptor_count,
         0
     );
     let reopened = open_or_create_table(table_path, HashMap::new(), None)
@@ -2364,5 +2367,79 @@ fn removed_s3_locking_is_rejected_from_options_and_environment() {
     let options = HashMap::from([("s3_locking_provider".to_string(), "dynamodb".to_string())]);
     assert!(
         storage_preflight::reject_removed_s3_locking(&local, &options, &no_environment).is_ok()
+    );
+}
+
+#[tokio::test]
+async fn coordinated_checkpoint_keeps_the_exact_cursor() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload,
+    };
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+    let writer = open_or_create_table(table_path, HashMap::new(), Some(&test_schema()))
+        .await
+        .unwrap();
+    let binding = coordinated_table_binding(&writer).unwrap();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_checkpointed",
+    )
+    .unwrap();
+
+    let mut due = Vec::new();
+    for checkpoint_id in 1..=10_u64 {
+        let attempt = CheckpointAttempt::canonical(checkpoint_id);
+        let descriptor =
+            encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(2)).await).unwrap();
+        let batch = CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: checkpoint_id - 1,
+                fencing_token: u64::from(checkpoint_id != 1),
+            },
+            fencing_token: 1,
+            target: attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt,
+                participant_id: 1,
+                payload: Some(descriptor),
+            }],
+        };
+        let table = coordinated_table_handle(table_path, HashMap::new()).unwrap();
+        let outcome = commit_batch_coordinated(&table, &batch, test_publication_deadline())
+            .await
+            .unwrap();
+        if let Some(version) = outcome.checkpoint_version {
+            write_coordinated_checkpoint(table_path, HashMap::new(), version)
+                .await
+                .unwrap();
+            due.push(version);
+        }
+    }
+
+    // Version 0 created the table, so checkpoint 9 committed the first due version.
+    assert_eq!(due, vec![9]);
+    assert!(temp_dir
+        .path()
+        .join("_delta_log/00000000000000000009.checkpoint.parquet")
+        .exists());
+    let reopened = open_or_create_table(table_path, HashMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(reopened.version(), Some(10));
+    assert_eq!(
+        get_coordinated_cursor(&reopened, &namespace.external_key())
+            .await
+            .unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 10,
+            fencing_token: 1,
+        })
     );
 }

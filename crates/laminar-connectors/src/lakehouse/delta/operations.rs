@@ -51,6 +51,8 @@ impl DeltaLakeSink {
             #[cfg(feature = "delta-lake")]
             coordinated_unresolved_publication: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "delta-lake")]
+            coordinated_checkpoint_running: Arc::default(),
+            #[cfg(feature = "delta-lake")]
             table: None,
             #[cfg(feature = "delta-lake")]
             resolved_table_path: String::new(),
