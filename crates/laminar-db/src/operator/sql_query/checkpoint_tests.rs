@@ -2022,6 +2022,72 @@ async fn pending_certified_emission_defers_the_next_remote_event() {
     assert_eq!(operator.queued_remote_events, 0);
 }
 
+/// Every certified snapshot drained before a cut is staged against the bounded subscription
+/// output, so a drain applies its whole peer backlog before one snapshot instead of one per event.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_drain_applies_queued_remote_events_before_one_certified_snapshot() {
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    attach_test_subscription_certificate(&mut operator);
+
+    let (key, first) = projected_batch_for_vnode(&operator, 0, 10);
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+    for batch in [
+        first,
+        projected_batch_for_key(&operator, &key, 20),
+        projected_batch_for_key(&operator, &key, 30),
+    ] {
+        operator
+            .stage_checkpointed_shuffle(
+                "sum",
+                crate::operator::RetainedBatch::restored_channel(
+                    batch,
+                    2,
+                    assignment,
+                    recovery,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+    }
+
+    operator.set_execution_mode(crate::operator_graph::GraphExecutionMode::CheckpointDrain);
+    let output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    assert_eq!(operator.queued_remote_events, 0);
+    let totals = output
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("total")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(totals, [60]);
+    let prepared = operator.take_prepared_subscription_output_frames().unwrap();
+    assert_eq!(prepared.frames.len(), 1);
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn zero_admission_retry_has_no_runnable_spin() {

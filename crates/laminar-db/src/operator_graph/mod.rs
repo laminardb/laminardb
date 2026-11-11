@@ -513,6 +513,10 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn bind_cluster_topology(&mut self, _topology: laminar_core::shuffle::ShuffleTopologyFence) {}
 
+    /// Whether the graph's current pass is ordinary execution or a drain toward a checkpoint cut.
+    #[cfg(feature = "cluster")]
+    fn set_execution_mode(&mut self, _mode: GraphExecutionMode) {}
+
     /// Retain a peer-shipped shuffle batch as channel state outside the normal `process` path so
     /// the barrier-aligned row and its pending downstream emission enter the snapshot together.
     #[cfg(feature = "cluster")]
@@ -676,7 +680,7 @@ enum GateDecision {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GraphExecutionMode {
+pub(crate) enum GraphExecutionMode {
     Normal,
     CheckpointDrain,
 }
@@ -1158,6 +1162,8 @@ pub(crate) struct OperatorGraph {
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
     last_execution_assignment_version: Option<u64>,
+    #[cfg(feature = "cluster")]
+    execution_mode: GraphExecutionMode,
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
@@ -1234,6 +1240,8 @@ impl OperatorGraph {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             last_execution_assignment_version: None,
+            #[cfg(feature = "cluster")]
+            execution_mode: GraphExecutionMode::Normal,
             #[cfg(feature = "cluster")]
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
@@ -3255,6 +3263,9 @@ impl OperatorGraph {
         current_watermark: i64,
         source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        // Every pass sets the mode, so a cancelled drain cannot leave operators draining.
+        #[cfg(feature = "cluster")]
+        self.set_execution_mode(GraphExecutionMode::Normal);
         self.execute_cycle_with_mode(
             source_batches,
             current_watermark,
@@ -3344,6 +3355,8 @@ impl OperatorGraph {
         frozen_source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         let source_batches = FxHashMap::default();
+        #[cfg(feature = "cluster")]
+        self.set_execution_mode(GraphExecutionMode::CheckpointDrain);
         self.execute_cycle_with_mode(
             &source_batches,
             current_watermark,
@@ -3351,6 +3364,17 @@ impl OperatorGraph {
             GraphExecutionMode::CheckpointDrain,
         )
         .await
+    }
+
+    #[cfg(feature = "cluster")]
+    fn set_execution_mode(&mut self, mode: GraphExecutionMode) {
+        if self.execution_mode == mode {
+            return;
+        }
+        self.execution_mode = mode;
+        for node in &mut self.nodes {
+            node.operator.set_execution_mode(mode);
+        }
     }
 
     async fn execute_cycle_with_mode(

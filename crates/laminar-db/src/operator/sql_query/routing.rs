@@ -258,17 +258,17 @@ impl SqlQueryOperator {
         &mut self,
         batches: &[(RecordBatch, Option<u32>)],
         watermark: i64,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    ) -> Result<(), DbError> {
         self.invalidate_local_aggregate_output_cache();
         match &mut self.state {
             QueryState::Agg(aggregate) if aggregate.gathers_partials() => {
                 for (batch, _) in batches {
                     aggregate.merge_global_partials(batch, watermark)?;
                 }
+                Ok(())
             }
-            _ => return self.apply_routed_aggregate(batches, watermark),
+            _ => self.apply_routed_rows(batches, watermark),
         }
-        self.emit_agg_output()
     }
 }
 

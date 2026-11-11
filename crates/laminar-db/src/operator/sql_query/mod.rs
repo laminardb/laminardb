@@ -784,6 +784,8 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     queued_remote_events: usize,
     #[cfg(feature = "cluster")]
+    execution_mode: crate::operator_graph::GraphExecutionMode,
+    #[cfg(feature = "cluster")]
     pending_cluster_input: Option<PendingAggClusterInput>,
     #[cfg(feature = "cluster")]
     whole_restore_applied: bool,
@@ -867,6 +869,8 @@ impl SqlQueryOperator {
             queued_event_capacity_bytes: 0,
             #[cfg(feature = "cluster")]
             queued_remote_events: 0,
+            #[cfg(feature = "cluster")]
+            execution_mode: crate::operator_graph::GraphExecutionMode::Normal,
             #[cfg(feature = "cluster")]
             pending_cluster_input: None,
             #[cfg(feature = "cluster")]
@@ -1236,6 +1240,15 @@ impl SqlQueryOperator {
         batches: &[(RecordBatch, Option<u32>)],
         watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        self.apply_routed_rows(batches, watermark)?;
+        self.emit_agg_output()
+    }
+
+    fn apply_routed_rows(
+        &mut self,
+        batches: &[(RecordBatch, Option<u32>)],
+        watermark: i64,
+    ) -> Result<(), DbError> {
         // Any routed apply may change accumulator or tombstone state. Drop the reusable full-state
         // emission before the first mutation so partial-apply failures cannot leave a stale cache.
         self.invalidate_local_aggregate_output_cache();
@@ -1247,7 +1260,7 @@ impl SqlQueryOperator {
         for (batch, vnode) in batches {
             aggregate.process_batch_for_vnode(batch, watermark, *vnode)?;
         }
-        self.emit_agg_output()
+        Ok(())
     }
 
     async fn execute_agg(
@@ -1838,12 +1851,37 @@ impl SqlQueryOperator {
         }
     }
 
+    /// Apply the next queued peer event and emit. Every certified snapshot a checkpoint drain
+    /// emits is staged before the cut, and each one replaces its whole partition, so a drain
+    /// applies the whole queued backlog before one snapshot.
     #[cfg(feature = "cluster")]
-    fn drain_remote_event(
+    fn drain_remote_events(
         &mut self,
         assignment: &VnodeAssignmentSnapshot,
         config: &ClusterShuffleConfig,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        let mut applied_rows = self.apply_remote_event(assignment, config)?;
+        if self.execution_mode == crate::operator_graph::GraphExecutionMode::CheckpointDrain
+            && !self.emit_changelog
+            && self.subscription_certificate.is_some()
+        {
+            while self.queued_remote_events != 0 {
+                applied_rows |= self.apply_remote_event(assignment, config)?;
+            }
+        }
+        if !applied_rows {
+            return Ok(Vec::new());
+        }
+        self.emit_agg_output()
+            .map_err(|error| self.remote_replay_error(error))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn apply_remote_event(
+        &mut self,
+        assignment: &VnodeAssignmentSnapshot,
+        config: &ClusterShuffleConfig,
+    ) -> Result<bool, DbError> {
         let peer = self.next_remote_peer().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "aggregate '{}' remote event accounting is inconsistent",
@@ -1911,12 +1949,11 @@ impl SqlQueryOperator {
         let effective = self
             .effective_cluster_frontier(self.local_frontier, Some((peer, applied, pending)))
             .map_err(|error| self.remote_replay_error(error))?;
-        let output = if local_batches.is_empty() {
-            Vec::new()
-        } else {
+        let applied_rows = !local_batches.is_empty();
+        if applied_rows {
             self.apply_remote_aggregate(&local_batches, Self::frontier_watermark(effective))
-                .map_err(|error| self.remote_replay_error(error))?
-        };
+                .map_err(|error| self.remote_replay_error(error))?;
+        }
         let released = event.payload_bytes();
         let channel = self
             .peer_channels
@@ -1939,7 +1976,7 @@ impl SqlQueryOperator {
             .expect("aggregate event accounting was prevalidated");
         self.remote_peer_cursor = Some(peer);
         self.effective_frontier = effective;
-        Ok(output)
+        Ok(applied_rows)
     }
 
     /// Starts the pending plan's send unless one is running, and applies its local rows when the
@@ -2064,7 +2101,7 @@ impl SqlQueryOperator {
                     self.op_name
                 )));
             }
-            output.extend(self.drain_remote_event(&assignment, &config)?);
+            output.extend(self.drain_remote_events(&assignment, &config)?);
             drained_remote = true;
         }
         // A certified emission must reach its publication owner before another state mutation can
@@ -2441,6 +2478,11 @@ impl GraphOperator for SqlQueryOperator {
         if let Some(scope) = &mut self.cluster_shuffle {
             scope.topology = Some(topology);
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn set_execution_mode(&mut self, mode: crate::operator_graph::GraphExecutionMode) {
+        self.execution_mode = mode;
     }
 
     fn certifies_input_batch_coalescing(&self) -> bool {
