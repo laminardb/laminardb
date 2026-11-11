@@ -203,8 +203,10 @@ jobs:
             emulator: "1"
             checkpoint_ms: "10000"
             # Keep 23 Delta sinks plus partitioned subscription output below hosted-runner S3
-            # saturation while leaving headroom above the 8 MiB retained-state floor.
+            # saturation. Three-node EO live join state peaks at 8-10 MiB on hosted runners, so
+            # the retained-state floor sits at 6 MiB to leave room for runner variance.
             rps: "120"
+            min_live_state_bytes: "6291456"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
@@ -240,6 +242,7 @@ jobs:
             checkpoint_ms: "10000"
             # Match the gossip workload so discovery is the only intended variant.
             rps: "120"
+            min_live_state_bytes: "6291456"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
