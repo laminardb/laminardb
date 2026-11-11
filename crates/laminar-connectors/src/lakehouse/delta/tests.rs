@@ -1239,6 +1239,92 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
     recovered.close().await.unwrap();
 }
 
+/// Coordinated publication drops delta-rs's post-commit hook, so the sink writes due Delta
+/// checkpoints itself; otherwise every publication replays the table's whole log.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_publication_checkpoints_the_delta_log() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_checkpointed",
+    )
+    .unwrap();
+    let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    writer
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    let terminal = writer.terminal_task_tracker().unwrap();
+
+    for epoch in 1..=10_u64 {
+        writer.begin_epoch(epoch).await.unwrap();
+        writer.write_batch(&test_batch(2)).await.unwrap();
+        let descriptor = writer.pre_commit(epoch).await.unwrap();
+        let attempt = CheckpointAttempt::canonical(epoch);
+        writer
+            .commit_aggregated(
+                CoordinatedCommitBatch {
+                    namespace: namespace.clone(),
+                    expected_predecessor: CoordinatedCommitCursor {
+                        checkpoint_id: epoch - 1,
+                        fencing_token: u64::from(epoch != 1),
+                    },
+                    fencing_token: 1,
+                    target: attempt,
+                    entries: vec![CoordinatedCommitPayload {
+                        attempt,
+                        participant_id: 1,
+                        payload: descriptor,
+                    }],
+                },
+                coordinated_commit_context(),
+            )
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(30), terminal.wait_terminated())
+        .await
+        .expect("background checkpoint finishes");
+
+    let checkpoints = std::fs::read_dir(dir.path().join("_delta_log"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".checkpoint.parquet")
+        })
+        .count();
+    assert_eq!(checkpoints, 1);
+
+    let mut recovered = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    recovered
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.committed_cursor(&namespace).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 10,
+            fencing_token: 1,
+        })
+    );
+    recovered.close().await.unwrap();
+}
+
 /// A new designated leader may construct its batch before observing a late
 /// commit from the old leader. The fresh external cursor read must filter the
 /// already-published attempt while still publishing the new attempt and

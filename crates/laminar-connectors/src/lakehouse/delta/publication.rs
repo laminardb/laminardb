@@ -2,12 +2,61 @@
 
 #[cfg(feature = "delta-lake")]
 use super::{
-    info, Arc, Array, ConnectorError, ConnectorTaskGuard, DeltaTable, Duration, Future, RecordBatch,
+    info, warn, Arc, Array, ConnectorError, ConnectorTaskGuard, DeltaLakeSink, DeltaTable,
+    Duration, Future, RecordBatch,
 };
+#[cfg(feature = "delta-lake")]
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "delta-lake")]
 const DELTA_METADATA_BACKOFF: crate::retry::Backoff =
     crate::retry::Backoff::new(Duration::from_millis(50), Duration::from_secs(1), 0.25);
+
+/// Bounds a background checkpoint so retiring the connector never waits on it for long.
+#[cfg(feature = "delta-lake")]
+const COORDINATED_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(feature = "delta-lake")]
+impl DeltaLakeSink {
+    /// Writes the Delta checkpoint a coordinated publication made due, after that publication
+    /// has returned. A failed checkpoint only defers checkpointing to the next due version, and
+    /// a version that falls due while one is still running is skipped.
+    pub(super) fn spawn_coordinated_checkpoint(&self, version: u64) {
+        if self
+            .coordinated_checkpoint_running
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let running = Arc::clone(&self.coordinated_checkpoint_running);
+        let table_path = self.resolved_table_path.clone();
+        let storage_options = self.resolved_storage_options.clone();
+        let checkpoint = async move {
+            let result = tokio::time::timeout(
+                COORDINATED_CHECKPOINT_TIMEOUT,
+                super::super::delta_io::write_coordinated_checkpoint(
+                    &table_path,
+                    storage_options,
+                    version,
+                ),
+            )
+            .await;
+            running.store(false, Ordering::Release);
+            match result {
+                Ok(Ok(())) => info!(version, "wrote Delta coordinated checkpoint"),
+                Ok(Err(error)) => warn!(version, %error, "Delta coordinated checkpoint failed"),
+                Err(_) => warn!(
+                    version,
+                    "Delta coordinated checkpoint exceeded {COORDINATED_CHECKPOINT_TIMEOUT:?}"
+                ),
+            }
+        };
+        if self.spawn_tracked_delta_task(checkpoint).is_err() {
+            self.coordinated_checkpoint_running
+                .store(false, Ordering::Release);
+        }
+    }
+}
 
 #[cfg(feature = "delta-lake")]
 pub(super) async fn run_tracked_delta_task<F>(guard: ConnectorTaskGuard, task: F) -> F::Output
@@ -144,35 +193,34 @@ pub(super) async fn publish_coordinated_delta_batch(
     batch: crate::connector::CoordinatedCommitBatch,
     deadline: tokio::time::Instant,
     publication_budget: Duration,
-) -> Result<(), ConnectorError> {
+) -> Result<Option<u64>, ConnectorError> {
     super::super::delta_io::validate_coordinated_storage_preflight(&table_path, &storage_options)?;
     let storage_options =
         super::super::delta_io::bound_coordinated_storage_options(storage_options);
     let result = async {
-        // RECOVERY: `schema = None` keeps retries metadata-only. The conditional commit below is
-        // dispatched exactly once and retains its existing outcome-unknown reconciliation path.
-        let table = retry_delta_metadata_until(deadline, "coordinated table open", || {
-            super::super::delta_io::open_or_create_table(&table_path, storage_options.clone(), None)
-        })
-        .await?;
-        let descriptor_count =
+        // RECOVERY: the publication reloads the snapshot itself and dispatches the conditional
+        // commit exactly once, keeping its outcome-unknown reconciliation path.
+        let table = super::super::delta_io::coordinated_table_handle(&table_path, storage_options)?;
+        let outcome =
             super::super::delta_io::commit_batch_coordinated(&table, &batch, deadline).await?;
         info!(
             epoch = batch.target.epoch,
             checkpoint_id = batch.target.checkpoint_id,
-            descriptors = descriptor_count,
+            descriptors = outcome.descriptor_count,
             "delta coordinated commit"
         );
-        Ok(())
+        Ok(outcome.checkpoint_version)
     }
     .await;
 
-    if result.is_ok() && tokio::time::Instant::now() < deadline {
-        let mut unresolved = unresolved.lock();
-        if unresolved.as_ref() == Some(&pending) {
-            *unresolved = None;
+    if let Ok(checkpoint_version) = result {
+        if tokio::time::Instant::now() < deadline {
+            let mut unresolved = unresolved.lock();
+            if unresolved.as_ref() == Some(&pending) {
+                *unresolved = None;
+            }
+            return Ok(checkpoint_version);
         }
-        return Ok(());
     }
     if result.is_ok() {
         return Err(ConnectorError::outcome_unknown(

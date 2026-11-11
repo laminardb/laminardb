@@ -66,17 +66,19 @@ pub(super) use descriptor::{
     coordinated_table_binding, encode_commit_descriptor, encoded_add_array_len,
     MAX_COORDINATED_ADD_ACTIONS,
 };
-#[cfg(feature = "delta-lake")]
-pub(super) use publication::commit_batch_coordinated;
 #[cfg(all(feature = "delta-lake", test))]
 pub(super) use publication::{
     commit_adds_coordinated, DelayedCoordinatedCatalogCommit, DELAY_COORDINATED_CATALOG_COMMIT,
 };
 #[cfg(feature = "delta-lake")]
+pub(super) use publication::{commit_batch_coordinated, write_coordinated_checkpoint};
+#[cfg(feature = "delta-lake")]
 pub(super) use storage_preflight::{
     bound_coordinated_storage_options, custom_s3_endpoint_configured,
     validate_coordinated_storage_preflight, verify_custom_s3_conditional_create,
 };
+#[cfg(feature = "delta-lake")]
+pub(super) use table::coordinated_table_handle;
 
 #[cfg(feature = "delta-lake")]
 use descriptor::{

@@ -80,6 +80,12 @@ everything below.
 
 ### Fixed
 
+- An exactly-once Delta Lake sink now writes a Delta checkpoint every 10 commits, or at the
+  table's `delta.checkpointInterval` when it sets one, in every mode. It used to write none, so
+  each checkpoint's Delta commit read the table's whole log several times and took longer the
+  longer the pipeline ran. It also reads the log once less per commit.
+- The macOS server binary no longer aborts at startup with "option background_thread currently
+  supports pthread only"; jemalloc background threads stay enabled on Linux.
 - In cluster mode a `UNION ALL` that reads one source twice passed `CREATE` and was then refused
   when the pipeline started (`[LDB-6066]`, "SQL execution shape has not been classified"); it now
   runs.

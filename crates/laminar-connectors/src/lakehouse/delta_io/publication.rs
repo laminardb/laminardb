@@ -148,9 +148,58 @@ enum PreparedCoordinatedPublication {
     },
 }
 
+/// What one coordinated publication did.
 #[cfg(feature = "delta-lake")]
-struct CoordinatedPublicationOutcome {
-    descriptor_count: usize,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::lakehouse) struct CoordinatedPublicationOutcome {
+    /// Participant descriptors the publication carried.
+    pub(in crate::lakehouse) descriptor_count: usize,
+    /// The version this publication committed, when it is due a Delta checkpoint.
+    pub(in crate::lakehouse) checkpoint_version: Option<u64>,
+}
+
+/// Delta's reference default. delta-rs defaults to 100, and every coordinated publication
+/// replays the log since the last checkpoint several times.
+#[cfg(feature = "delta-lake")]
+const COORDINATED_CHECKPOINT_INTERVAL: std::num::NonZeroU64 =
+    std::num::NonZeroU64::new(10).expect("non-zero coordinated checkpoint interval");
+
+/// `version` when it is due a checkpoint, at the table's `delta.checkpointInterval` when it sets
+/// one. Like delta-rs, version `n * interval - 1` is due.
+#[cfg(feature = "delta-lake")]
+fn due_checkpoint(version: u64, configured: Option<std::num::NonZeroU64>) -> Option<u64> {
+    let interval = configured.unwrap_or(COORDINATED_CHECKPOINT_INTERVAL).get();
+    version
+        .checked_add(1)
+        .is_some_and(|next| next.is_multiple_of(interval))
+        .then_some(version)
+}
+
+/// Writes the Delta checkpoint for `version` of a coordinated table.
+///
+/// Coordinated publication drops delta-rs's post-commit hook, so without this the table's log is
+/// never checkpointed and every publication replays all of it.
+///
+/// # Errors
+/// Returns the classified metadata error when the version cannot be loaded or the checkpoint
+/// cannot be written.
+#[cfg(feature = "delta-lake")]
+pub(in crate::lakehouse) async fn write_coordinated_checkpoint(
+    table_path: &str,
+    storage_options: std::collections::HashMap<String, String>,
+    version: u64,
+) -> Result<(), ConnectorError> {
+    let mut table = super::coordinated_table_handle(
+        table_path,
+        super::bound_coordinated_storage_options(storage_options),
+    )?;
+    table
+        .load_version(version)
+        .await
+        .map_err(|error| classify_delta_metadata_error("load Delta checkpoint version", &error))?;
+    deltalake::checkpoints::create_checkpoint(&table, None)
+        .await
+        .map_err(|error| classify_delta_metadata_error("write Delta checkpoint", &error))
 }
 
 #[cfg(feature = "delta-lake")]
@@ -404,9 +453,7 @@ where
                 "Delta coordinated cursor exists on an unversioned table".into(),
             )
         })?;
-        return Ok(CoordinatedPublicationOutcome {
-            descriptor_count: 0,
-        });
+        return Ok(CoordinatedPublicationOutcome::default());
     };
     let (checkpoint_id, fencing_token) = delta_transaction_versions(cursor)?;
 
@@ -414,6 +461,7 @@ where
         .snapshot()
         .map_err(|error| ConnectorError::TransactionError(format!("snapshot: {error}")))?;
     validate_staged_table_binding(&current, &adds, binding.as_ref())?;
+    let checkpoint_interval = snapshot.table_config().checkpoint_interval;
     let partition_columns = snapshot.metadata().partition_columns().to_vec();
     let objects = validate_coordinated_descriptors(&adds, &partition_columns, deadline)?;
     validate_coordinated_objects(
@@ -482,15 +530,20 @@ where
 
     // Only PreparedCommit may outlive the caller: it performs conflict checks
     // and the atomic log write. Dropping the returned PostCommit deliberately
-    // keeps snapshot refresh, checkpoints, and log cleanup off this path.
-    match prepared_commit.await {
-        Ok(_post_commit) => Ok(CoordinatedPublicationOutcome { descriptor_count }),
+    // keeps snapshot refresh, checkpoints, and log cleanup off this path; the
+    // caller writes a due checkpoint after the publication has returned.
+    let checkpoint_version = match prepared_commit.await {
+        Ok(post_commit) => due_checkpoint(post_commit.version, checkpoint_interval),
         Err(error) => {
             reconcile_prepared_commit_failure(&current, external_key, cursor, &error, deadline)
                 .await?;
-            Ok(CoordinatedPublicationOutcome { descriptor_count })
+            None
         }
-    }
+    };
+    Ok(CoordinatedPublicationOutcome {
+        descriptor_count,
+        checkpoint_version,
+    })
 }
 
 /// Filter a validated checkpoint batch against one freshly observed cursor,
@@ -503,9 +556,9 @@ pub(in crate::lakehouse) async fn commit_batch_coordinated(
     table: &DeltaTable,
     batch: &CoordinatedCommitBatch,
     deadline: tokio::time::Instant,
-) -> Result<usize, ConnectorError> {
+) -> Result<CoordinatedPublicationOutcome, ConnectorError> {
     let external_key = batch.namespace.external_key();
-    let outcome = publish_coordinated(table, &external_key, deadline, |observed_cursor| {
+    publish_coordinated(table, &external_key, deadline, |observed_cursor| {
         batch
             .validate_observed_cursor(observed_cursor)
             .map_err(|error| {
@@ -550,8 +603,7 @@ pub(in crate::lakehouse) async fn commit_batch_coordinated(
             descriptor_count: descriptors.len(),
         })
     })
-    .await?;
-    Ok(outcome.descriptor_count)
+    .await
 }
 
 /// Low-level cursor primitive retained only for focused unit tests. Production
@@ -713,5 +765,21 @@ mod tests {
             "{error}"
         );
         assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    #[test]
+    fn coordinated_checkpoint_falls_due_at_the_table_interval() {
+        use std::num::NonZeroU64;
+
+        assert_eq!(due_checkpoint(0, None), None);
+        assert_eq!(due_checkpoint(9, None), Some(9));
+        assert_eq!(due_checkpoint(10, None), None);
+        assert_eq!(due_checkpoint(19, None), Some(19));
+
+        let configured = NonZeroU64::new(100);
+        assert_eq!(due_checkpoint(9, configured), None);
+        assert_eq!(due_checkpoint(99, configured), Some(99));
+
+        assert_eq!(due_checkpoint(u64::MAX, None), None);
     }
 }

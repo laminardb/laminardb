@@ -617,20 +617,28 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
             }
         };
 
-        match tokio::time::timeout_at(deadline, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(ConnectorError::outcome_unknown(
-                format!("Delta coordinated publication task terminated unexpectedly: {error}"),
-                true,
-            )),
-            Err(_) => Err(ConnectorError::outcome_unknown(
-                format!(
-                    "Delta coordinated publication exceeded its {publication_budget:?} remaining \
-                     budget; reconcile the exact cursor before replay"
-                ),
-                true,
-            )),
+        let checkpoint_version = match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(error)) => {
+                return Err(ConnectorError::outcome_unknown(
+                    format!("Delta coordinated publication task terminated unexpectedly: {error}"),
+                    true,
+                ))
+            }
+            Err(_) => {
+                return Err(ConnectorError::outcome_unknown(
+                    format!(
+                        "Delta coordinated publication exceeded its {publication_budget:?} \
+                         remaining budget; reconcile the exact cursor before replay"
+                    ),
+                    true,
+                ))
+            }
+        };
+        if let Some(version) = checkpoint_version {
+            self.spawn_coordinated_checkpoint(version);
         }
+        Ok(())
     }
 
     async fn committed_cursor(

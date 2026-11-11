@@ -136,6 +136,9 @@ pub struct DeltaLakeSink {
     /// remote catalog mutation because the server may still complete it.
     #[cfg(feature = "delta-lake")]
     coordinated_unresolved_publication: Arc<parking_lot::Mutex<Option<UnresolvedDeltaPublication>>>,
+    /// Whether a background Delta checkpoint of the coordinated table is still running.
+    #[cfg(feature = "delta-lake")]
+    coordinated_checkpoint_running: Arc<std::sync::atomic::AtomicBool>,
     /// Resolved table path after catalog lookup (may differ from `config.table_path`
     /// when using Unity/Glue catalogs). Used by `reopen_table()` so retries
     /// target the same resolved path that `open()` connected to.
