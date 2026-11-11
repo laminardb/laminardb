@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.86.0"
 name = "laminardb-quickfix-ffi"
-version = "0.40.1"
+version = "0.40.2"
 authors = ["Arthur LE MOIGNE"]
 build = "build.rs"
 links = "quickfixbind"
