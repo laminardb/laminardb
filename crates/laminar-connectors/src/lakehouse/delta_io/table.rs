@@ -201,6 +201,27 @@ fn delta_table_url(
     Ok(url)
 }
 
+/// Builds a handle on the table's log store without reading the log. Coordinated publication
+/// reloads its snapshot from storage, so loading here would only replay the log a second time.
+///
+/// # Errors
+/// Returns `ConnectorError::ConfigurationError` when the location cannot be resolved.
+#[cfg(feature = "delta-lake")]
+pub(in crate::lakehouse) fn coordinated_table_handle(
+    table_path: &str,
+    mut storage_options: HashMap<String, String>,
+) -> Result<DeltaTable, ConnectorError> {
+    let url = delta_table_url(table_path, &mut storage_options)?;
+    deltalake::DeltaTableBuilder::from_url(url)
+        .and_then(|builder| builder.with_storage_options(storage_options).build())
+        .map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid Delta table location ({})",
+                super::attempt_error::delta_error_category(&error)
+            ))
+        })
+}
+
 /// Opens an existing table's log metadata (version, `metaData`, protocol) without materializing
 /// its file list, which a reader that scans through the Delta kernel never needs.
 ///
