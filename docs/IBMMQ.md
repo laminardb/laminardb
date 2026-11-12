@@ -295,7 +295,7 @@ backout-and-replay without loss across a restart, metadata columns across a rest
 documents across a restart.
 `crates/laminar-server/tests/ibmmq_kill.rs` hard-kills the standalone server while a publisher
 runs; every published message reached the output, with duplicates.
-`crates/laminar-server/tests/cluster_soak/messaging_sinks.rs` runs the sink in a three-node
+`crates/laminar-server/tests/cluster_soak/multi_writer_sinks/` runs the sink in a three-node
 cluster: a Kafka source (Redpanda) feeds a projection, every node puts its share of the rows to
 one local queue, and checkpoints go to a shared S3 store (SeaweedFS). The leader was hard-killed
 twice and each follower once, every time while paused inside a checkpoint after the sinks

@@ -114,6 +114,25 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |
 
+## Evidence for cluster at-least-once sinks
+
+Every node of a cluster writes its own share of a stream to these sinks. One three-node soak,
+`crates/laminar-server/tests/cluster_soak/multi_writer_sinks/`, covers them: a Kafka source feeds a
+projection, the leader and each follower are hard-killed while paused inside a checkpoint after
+the sinks flushed, and every node must write before the first kill, after it rejoins, and through
+the steady phase that follows. An independent reader of the destination must see every
+Kafka-acknowledged id; ids never produced fail the run, and duplicates are counted. Checkpoints go
+to emulated S3 (SeaweedFS). The PostgreSQL, MongoDB and NATS legs are candidates: they run weekly
+and before each release, but do not yet fail the `Checkpoint fault and soak` workflow.
+
+| Sink | Destination read by the oracle | Leg |
+|---|---|---|
+| RabbitMQ | Durable classic queue, consumed and acknowledged | `three_node_rabbitmq_sink_kill9_soak` |
+| IBM MQ | Local queue, read under syncpoint | `three_node_ibmmq_sink_kill9_soak` (needs the licensed client; not in CI) |
+| PostgreSQL append | Keyless table, rows counted per id | `three_node_postgres_sink_kill9_soak` |
+| MongoDB insert | Collection, documents counted per id | `three_node_mongodb_sink_kill9_soak` |
+| NATS JetStream | File-backed stream with three replicas, drained by a durable consumer | `three_node_nats_sink_kill9_soak` |
+
 ## Materialized view reads
 
 A materialized view is not a sink, so the pipeline's delivery guarantee does not describe it.

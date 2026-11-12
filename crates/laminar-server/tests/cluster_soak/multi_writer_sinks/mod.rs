@@ -1,35 +1,62 @@
-//! Three-node at-least-once soaks for the RabbitMQ and IBM MQ sinks. A Kafka source feeds a
-//! projection, every node publishes its share of the rows to one queue, and the observed leader
-//! and each follower are hard-killed while paused inside a checkpoint, after the sinks flushed.
-//! An independent consumer drains the queue: every Kafka-acknowledged id must arrive, no other id
-//! may, and duplicates are reported. Every node must publish before the first kill and again
-//! after it rejoins, so a run in which a single node does all the writing fails.
+//! Three-node at-least-once soaks for sinks that every node writes to: RabbitMQ, IBM MQ,
+//! PostgreSQL append, MongoDB insert, and NATS JetStream. A Kafka source feeds a projection, every
+//! node writes its share of the rows to one destination, and the observed leader and each follower
+//! are hard-killed while paused inside a checkpoint, after the sinks flushed. An independent oracle
+//! reads the destination: every Kafka-acknowledged id must arrive, no other id may, and duplicates
+//! are reported. Every node must write before the first kill and again after it rejoins, so a run
+//! in which a single node does all the writing fails.
 //!
 //! ```text
 //! cargo test --profile soak -p laminar-server --no-default-features \
 //!   --features cluster,aws,kafka,rabbitmq --test cluster_soak \
-//!   messaging_sinks::three_node_rabbitmq_sink_kill9_soak -- --ignored --exact --nocapture
+//!   multi_writer_sinks::three_node_rabbitmq_sink_kill9_soak -- --ignored --exact --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features \
 //!   --features cluster,aws,kafka,ibmmq --test cluster_soak \
-//!   messaging_sinks::three_node_ibmmq_sink_kill9_soak -- --ignored --exact --nocapture
+//!   multi_writer_sinks::three_node_ibmmq_sink_kill9_soak -- --ignored --exact --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features \
+//!   --features cluster,aws,kafka,postgres-sink --test cluster_soak \
+//!   multi_writer_sinks::three_node_postgres_sink_kill9_soak -- --ignored --exact --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features \
+//!   --features cluster,aws,kafka,mongodb-cdc --test cluster_soak \
+//!   multi_writer_sinks::three_node_mongodb_sink_kill9_soak -- --ignored --exact --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features \
+//!   --features cluster,aws,kafka,nats --test cluster_soak \
+//!   multi_writer_sinks::three_node_nats_sink_kill9_soak -- --ignored --exact --nocapture
 //! ```
 //!
-//! Both read the shared `LAMINAR_SOAK_CHECKPOINT_URL`, `LAMINAR_SOAK_S3_*`,
+//! All read the shared `LAMINAR_SOAK_CHECKPOINT_URL`, `LAMINAR_SOAK_S3_*`,
 //! `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`, `LAMINAR_SOAK_KAFKA_PARTITIONS`,
 //! `LAMINAR_SOAK_KEY_GROUPS`, `LAMINAR_SOAK_INTERVAL_MS`, `LAMINAR_SOAK_MAX_RECOVERY_MS`, and
 //! `LAMINAR_SOAK_DISCOVERY` knobs, plus `LAMINAR_SOAK_KILLS` (default 4),
 //! `LAMINAR_SOAK_SECONDS` (steady phase after the kills, default 30), and `LAMINAR_SOAK_RPS`
-//! (default 400). Broker settings:
+//! (default 400). Destination settings, with defaults matching `tests/docker/compose.yml`:
 //! - RabbitMQ: `LAMINAR_SOAK_RABBITMQ_URL` (default `amqp://127.0.0.1:5672/%2f`),
 //!   `LAMINAR_SOAK_RABBITMQ_USERNAME` (default `guest`), and `LAMINAR_SOAK_RABBITMQ_PASSWORD`.
-//! - IBM MQ, against the `tests/docker/compose.yml` queue manager `QM1` (channel
-//!   `DEV.APP.SVRCONN`, user `app`): `LAMINAR_SOAK_IBMMQ_LIBRARY` (the MQ client library),
-//!   `LAMINAR_SOAK_IBMMQ_CONTAINER` (where `runmqsc` defines the queue),
-//!   `LAMINAR_SOAK_IBMMQ_CONNECTION` (default `127.0.0.1(1414)`), and
-//!   `LAMINAR_SOAK_IBMMQ_PASSWORD`.
+//! - IBM MQ, against the queue manager `QM1` (channel `DEV.APP.SVRCONN`, user `app`):
+//!   `LAMINAR_SOAK_IBMMQ_LIBRARY` (the MQ client library), `LAMINAR_SOAK_IBMMQ_CONTAINER` (where
+//!   `runmqsc` defines the queue), `LAMINAR_SOAK_IBMMQ_CONNECTION` (default `127.0.0.1(1414)`),
+//!   and `LAMINAR_SOAK_IBMMQ_PASSWORD`.
+//! - PostgreSQL: `LAMINAR_SOAK_POSTGRES_HOST` (default `127.0.0.1`), `LAMINAR_SOAK_POSTGRES_PORT`
+//!   (default `15434`), `LAMINAR_SOAK_POSTGRES_DATABASE` and `LAMINAR_SOAK_POSTGRES_USERNAME`
+//!   (default `laminar`), and `LAMINAR_SOAK_POSTGRES_PASSWORD`.
+//! - MongoDB: `LAMINAR_SOAK_MONGODB_URI` (the compose service is
+//!   `mongodb://127.0.0.1:27217/?directConnection=true&tls=false`; the sink enables TLS unless the
+//!   URI disables it).
+//! - NATS JetStream: `LAMINAR_SOAK_NATS_URL` (default `nats://127.0.0.1:14222`).
 //!
-//! The sink DDL carries the password as a `${VAR}` reference that each node resolves from the
-//! environment it inherits, so the secret never reaches the shared catalog.
+//! The sink DDL carries each password, and the MongoDB URI, as a `${VAR}` reference that each node
+//! resolves from the environment it inherits, so no secret reaches the shared catalog.
+
+#[cfg(feature = "ibmmq")]
+mod ibmmq;
+#[cfg(feature = "mongodb-cdc")]
+mod mongo;
+#[cfg(feature = "nats")]
+mod nats;
+#[cfg(feature = "postgres-sink")]
+mod postgres;
+#[cfg(feature = "rabbitmq")]
+mod rabbitmq;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -48,184 +75,75 @@ use super::{
     SOAK_PRODUCER_MAX_IN_FLIGHT,
 };
 
-const SINK: &str = "mq_out";
+const SINK: &str = "sink_out";
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka, S3, and RabbitMQ"]
 #[cfg(feature = "rabbitmq")]
 fn three_node_rabbitmq_sink_kill9_soak() {
-    run_three_node_sink_kill9_soak(&Broker::rabbitmq());
+    run_three_node_sink_kill9_soak(&rabbitmq::RabbitMq::from_environment());
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka, S3, and IBM MQ"]
 #[cfg(feature = "ibmmq")]
 fn three_node_ibmmq_sink_kill9_soak() {
-    run_three_node_sink_kill9_soak(&Broker::ibmmq());
+    run_three_node_sink_kill9_soak(&ibmmq::IbmMq::from_environment());
 }
 
-fn required(name: &str) -> String {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| panic!("the messaging sink soak requires {name}"))
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka, S3, and PostgreSQL"]
+#[cfg(feature = "postgres-sink")]
+fn three_node_postgres_sink_kill9_soak() {
+    run_three_node_sink_kill9_soak(&postgres::Postgres::from_environment());
 }
 
-fn optional(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka, S3, and MongoDB"]
+#[cfg(feature = "mongodb-cdc")]
+fn three_node_mongodb_sink_kill9_soak() {
+    run_three_node_sink_kill9_soak(&mongo::MongoDb::from_environment());
 }
 
-/// The broker the sink publishes to, and how the test provisions and reads its queue.
-enum Broker {
-    #[cfg(feature = "rabbitmq")]
-    RabbitMq { url: String, username: String },
-    #[cfg(feature = "ibmmq")]
-    IbmMq {
-        library: String,
-        container: String,
-        connection: String,
-    },
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka, S3, and NATS JetStream"]
+#[cfg(feature = "nats")]
+fn three_node_nats_sink_kill9_soak() {
+    run_three_node_sink_kill9_soak(&nats::Nats::from_environment());
 }
 
-impl Broker {
-    #[cfg(feature = "rabbitmq")]
-    fn rabbitmq() -> Self {
-        required("LAMINAR_SOAK_RABBITMQ_PASSWORD");
-        Self::RabbitMq {
-            url: optional("LAMINAR_SOAK_RABBITMQ_URL", "amqp://127.0.0.1:5672/%2f"),
-            username: optional("LAMINAR_SOAK_RABBITMQ_USERNAME", "guest"),
-        }
+/// The environment value of `name`, or `default`; without a default the setting is required.
+fn setting(name: &str, default: Option<&str>) -> String {
+    match (std::env::var(name), default) {
+        (Ok(value), _) if !value.trim().is_empty() => value,
+        (_, Some(default)) => default.to_owned(),
+        _ => panic!("the multi-writer sink soak requires {name}"),
     }
+}
 
-    #[cfg(feature = "ibmmq")]
-    fn ibmmq() -> Self {
-        required("LAMINAR_SOAK_IBMMQ_PASSWORD");
-        Self::IbmMq {
-            library: required("LAMINAR_SOAK_IBMMQ_LIBRARY"),
-            container: required("LAMINAR_SOAK_IBMMQ_CONTAINER"),
-            connection: optional("LAMINAR_SOAK_IBMMQ_CONNECTION", "127.0.0.1(1414)"),
-        }
-    }
+/// The external system the sink writes to, and how the test provisions and reads it.
+trait Destination {
+    /// The `connector` of the sink.
+    fn connector(&self) -> &'static str;
 
-    fn connector(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { .. } => "rabbitmq",
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq { .. } => "ibmmq",
-        }
-    }
+    /// A per-node counter that grows only when that node's sink writes.
+    fn written_metric(&self) -> &'static str;
 
-    fn published_metric(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { .. } => "laminardb_rabbitmq_sink_published_total",
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq { .. } => "laminardb_ibmmq_sink_put_total",
-        }
-    }
+    /// The sink's `format`, for connectors that take one.
+    fn format(&self) -> Option<&'static str>;
 
-    fn queue_name(&self, run_id: &str) -> String {
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { .. } => format!("soak.sink.{run_id}"),
-            // The developer image authorizes `app` for `DEV.**`; MQ names allow no hyphen.
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq { .. } => format!("DEV.SOAK.SINK.{}", run_id.replace('-', ".")),
-        }
-    }
+    /// The run's queue, table, collection, or stream.
+    fn name(&self, run_id: &str) -> String;
 
-    fn sink_properties(&self, queue: &str) -> String {
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { url, username } => format!(
-                r#"url = "{url}"
-username = "{username}"
-password = "$${{LAMINAR_SOAK_RABBITMQ_PASSWORD}}"
-"routing.key" = "{queue}"
-"#
-            ),
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq {
-                library,
-                connection,
-                ..
-            } => format!(
-                r#""client.library" = "{library}"
-"queue.manager" = "QM1"
-channel = "DEV.APP.SVRCONN"
-"connection.name" = "{connection}"
-username = "app"
-password = "$${{LAMINAR_SOAK_IBMMQ_PASSWORD}}"
-queue = "{queue}"
-"#
-            ),
-        }
-    }
+    /// The `[sink.properties]` entries that target `name`.
+    fn sink_properties(&self, name: &str) -> String;
 
-    /// Create the output queue before any node starts: an unroutable or missing destination
-    /// fails every write.
-    fn create_queue(&self, queue: &str) {
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { .. } => block_on(rabbitmq::declare(self.amqp_uri(), queue)),
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq { container, .. } => ibmmq::mqsc(
-                container,
-                &format!("DEFINE QLOCAL('{queue}') MAXDEPTH(999999999) REPLACE\n"),
-            ),
-        }
-    }
+    /// Create `name` before any node starts: a missing destination fails every write.
+    fn create(&self, name: &str);
 
-    fn delete_queue(&self, queue: &str) {
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { .. } => block_on(rabbitmq::delete(self.amqp_uri(), queue)),
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq { container, .. } => {
-                ibmmq::mqsc(container, &format!("DELETE QLOCAL('{queue}') PURGE\n"));
-            }
-        }
-    }
+    fn delete(&self, name: &str);
 
-    fn spawn_oracle(&self, queue: &str) -> Oracle {
-        let queue = queue.to_owned();
-        match self {
-            #[cfg(feature = "rabbitmq")]
-            Self::RabbitMq { .. } => {
-                let uri = self.amqp_uri();
-                Oracle::spawn(move |observed, stop| {
-                    block_on(rabbitmq::consume(uri, queue, observed, stop));
-                })
-            }
-            #[cfg(feature = "ibmmq")]
-            Self::IbmMq {
-                library,
-                connection,
-                ..
-            } => {
-                let config = ibmmq::oracle_config(library, connection, &queue);
-                Oracle::spawn(move |observed, stop| {
-                    block_on(ibmmq::consume(config, observed, stop));
-                })
-            }
-        }
-    }
-
-    #[cfg(feature = "rabbitmq")]
-    fn amqp_uri(&self) -> lapin::uri::AMQPUri {
-        let Self::RabbitMq { url, username } = self else {
-            unreachable!("only the RabbitMQ broker has an AMQP URI");
-        };
-        let mut uri: lapin::uri::AMQPUri = url
-            .parse()
-            .unwrap_or_else(|error| panic!("LAMINAR_SOAK_RABBITMQ_URL is invalid: {error}"));
-        uri.authority.userinfo = lapin::uri::AMQPUserInfo {
-            username: username.clone(),
-            password: required("LAMINAR_SOAK_RABBITMQ_PASSWORD"),
-        };
-        uri
-    }
+    fn spawn_oracle(&self, name: &str) -> Oracle;
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -236,21 +154,34 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-type Observed = Arc<Mutex<BTreeMap<u64, u32>>>;
+/// How many times the oracle has seen each id.
+#[derive(Clone, Default)]
+struct Observed(Arc<Mutex<BTreeMap<u64, u32>>>);
 
-fn record(observed: &Mutex<BTreeMap<u64, u32>>, payload: &[u8]) {
-    let value: serde_json::Value =
-        serde_json::from_slice(payload).expect("sink output is a JSON object");
-    let id = value["id"].as_u64().expect("sink output carries a u64 id");
-    *observed
-        .lock()
-        .expect("oracle map lock")
-        .entry(id)
-        .or_default() += 1;
+impl Observed {
+    /// Count one delivery from a queue or stream.
+    #[cfg(any(feature = "rabbitmq", feature = "ibmmq", feature = "nats"))]
+    fn add(&self, payload: &[u8]) {
+        let value: serde_json::Value =
+            serde_json::from_slice(payload).expect("sink output is a JSON object");
+        let id = value["id"].as_u64().expect("sink output carries a u64 id");
+        *self.lock().entry(id).or_default() += 1;
+    }
+
+    /// Replace every count with a snapshot of a table or collection.
+    #[cfg(any(feature = "postgres-sink", feature = "mongodb-cdc"))]
+    fn replace(&self, counts: BTreeMap<u64, u32>) {
+        *self.lock() = counts;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, u32>> {
+        self.0.lock().expect("oracle map lock")
+    }
 }
 
-/// Independent consumer of the output queue. It acknowledges or commits only after recording, so
-/// a consumer reconnect can add duplicates but never hide a loss.
+/// Independent reader of the destination. Queue readers acknowledge or commit only after
+/// recording, so a reconnect can add duplicates but never hide a loss; table readers count rows
+/// in full snapshots.
 struct Oracle {
     observed: Observed,
     stop: Arc<AtomicBool>,
@@ -262,7 +193,7 @@ impl Oracle {
         let observed = Observed::default();
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
-            let (observed, stop) = (Arc::clone(&observed), Arc::clone(&stop));
+            let (observed, stop) = (observed.clone(), Arc::clone(&stop));
             std::thread::spawn(move || consume(observed, stop))
         };
         Self {
@@ -284,7 +215,7 @@ impl Oracle {
 
     /// Ids in `0..produced` not yet observed: their count and the first few.
     fn missing(&self, produced: u64) -> (u64, Vec<u64>) {
-        let observed = self.observed.lock().expect("oracle map lock");
+        let observed = self.observed.lock();
         let mut count = 0;
         let mut sample = Vec::new();
         for id in (0..produced).filter(|id| !observed.contains_key(id)) {
@@ -303,7 +234,7 @@ impl Oracle {
                 std::panic::resume_unwind(payload);
             }
         }
-        std::mem::take(&mut *self.observed.lock().expect("oracle map lock"))
+        std::mem::take(&mut *self.observed.lock())
     }
 }
 
@@ -312,199 +243,6 @@ impl Drop for Oracle {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
-        }
-    }
-}
-
-#[cfg(feature = "rabbitmq")]
-mod rabbitmq {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use futures_util::StreamExt as _;
-    use lapin::options::{
-        BasicAckOptions, BasicConsumeOptions, QueueDeclareOptions, QueueDeleteOptions,
-    };
-    use lapin::types::FieldTable;
-    use lapin::uri::AMQPUri;
-    use lapin::{Connection, ConnectionProperties};
-
-    use super::{record, Observed};
-
-    pub(super) async fn declare(uri: AMQPUri, queue: &str) {
-        let connection = Connection::connect_uri(uri, ConnectionProperties::default())
-            .await
-            .expect("connect to RabbitMQ");
-        let channel = connection.create_channel().await.expect("channel");
-        channel
-            .queue_declare(
-                queue.into(),
-                QueueDeclareOptions {
-                    durable: true,
-                    ..QueueDeclareOptions::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .expect("declare the output queue");
-        let _ = connection.close(200, "declared".into()).await;
-    }
-
-    pub(super) async fn delete(uri: AMQPUri, queue: &str) {
-        let Ok(connection) = Connection::connect_uri(uri, ConnectionProperties::default()).await
-        else {
-            return;
-        };
-        if let Ok(channel) = connection.create_channel().await {
-            let _ = channel
-                .queue_delete(queue.into(), QueueDeleteOptions::default())
-                .await;
-        }
-        let _ = connection.close(200, "deleted".into()).await;
-    }
-
-    pub(super) async fn consume(
-        uri: AMQPUri,
-        queue: String,
-        observed: Observed,
-        stop: Arc<AtomicBool>,
-    ) {
-        while !stop.load(Ordering::Acquire) {
-            let Ok(connection) =
-                Connection::connect_uri(uri.clone(), ConnectionProperties::default()).await
-            else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            };
-            if let Ok(channel) = connection.create_channel().await {
-                if let Ok(mut consumer) = channel
-                    .basic_consume(
-                        queue.as_str().into(),
-                        "".into(),
-                        BasicConsumeOptions::default(),
-                        FieldTable::default(),
-                    )
-                    .await
-                {
-                    while !stop.load(Ordering::Acquire) {
-                        let Ok(next) =
-                            tokio::time::timeout(Duration::from_millis(250), consumer.next()).await
-                        else {
-                            continue;
-                        };
-                        let Some(Ok(delivery)) = next else {
-                            break;
-                        };
-                        record(&observed, &delivery.data);
-                        if delivery.ack(BasicAckOptions::default()).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = connection.close(200, "oracle".into()).await;
-        }
-    }
-}
-
-#[cfg(feature = "ibmmq")]
-mod ibmmq {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use arrow_array::cast::AsArray as _;
-    use arrow_schema::{DataType, Field, Schema};
-    use laminar_connectors::config::ConnectorConfig;
-    use laminar_connectors::connector::{
-        DeliveryGuarantee, SourceConnector as _, SourcePosition, SourceStart,
-    };
-    use laminar_connectors::ibmmq::IbmMqSource;
-
-    use super::{record, required, Observed};
-
-    pub(super) fn mqsc(container: &str, commands: &str) {
-        let mut child = Command::new("docker")
-            .args(["exec", "-i", container, "runmqsc", "QM1"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("run runmqsc in the IBM MQ container");
-        child
-            .stdin
-            .take()
-            .expect("runmqsc stdin")
-            .write_all(commands.as_bytes())
-            .expect("write MQSC commands");
-        let output = child.wait_with_output().expect("runmqsc output");
-        assert!(
-            output.status.success(),
-            "runmqsc failed: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    pub(super) fn oracle_config(library: &str, connection: &str, queue: &str) -> ConnectorConfig {
-        let mut config = ConnectorConfig::new("ibmmq");
-        for (key, value) in [
-            ("client.library", library),
-            ("queue.manager", "QM1"),
-            ("channel", "DEV.APP.SVRCONN"),
-            ("connection.name", connection),
-            ("username", "app"),
-            ("queue", queue),
-            ("format", "raw"),
-        ] {
-            config.set(key, value);
-        }
-        config.set("password", required("LAMINAR_SOAK_IBMMQ_PASSWORD"));
-        config
-    }
-
-    /// Commit each polled batch after recording it; a failed generation restarts the source,
-    /// and the queue manager returns its uncommitted messages.
-    pub(super) async fn consume(
-        config: ConnectorConfig,
-        observed: Observed,
-        stop: Arc<AtomicBool>,
-    ) {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Utf8,
-            false,
-        )]));
-        let mut epoch = 0;
-        while !stop.load(Ordering::Acquire) {
-            let mut source = IbmMqSource::new(Arc::clone(&schema), None);
-            let start = SourceStart::new(
-                config.clone(),
-                SourcePosition::Initial,
-                DeliveryGuarantee::AtLeastOnce,
-            )
-            .expect("oracle start request");
-            if source.start(start).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-            while !stop.load(Ordering::Acquire) {
-                let batch = match source.poll_batch(1_000).await {
-                    Ok(Some(batch)) => batch,
-                    Ok(None) => continue,
-                    Err(_) => break,
-                };
-                for text in batch.records.column(0).as_string::<i32>().iter().flatten() {
-                    record(&observed, text.as_bytes());
-                }
-                epoch += 1;
-                let cut = source.checkpoint();
-                if source.notify_epoch_committed(epoch, &cut).await.is_err() {
-                    break;
-                }
-            }
-            let _ = source.close().await;
         }
     }
 }
@@ -660,11 +398,21 @@ impl SoakSettings {
     }
 }
 
-fn workload(brokers: &str, topic: &str, group: &str, broker: &Broker, queue: &str) -> String {
+fn workload(
+    brokers: &str,
+    topic: &str,
+    group: &str,
+    destination: &dyn Destination,
+    name: &str,
+) -> String {
+    let format = destination
+        .format()
+        .map(|format| format!("format = \"{format}\"\n"))
+        .unwrap_or_default();
     format!(
         r#"
 [[source]]
-name = "mq_input"
+name = "sink_input"
 connector = "kafka"
 format = "json"
 [source.properties]
@@ -683,18 +431,17 @@ nullable = false
 
 # A cluster sink may not read a source directly.
 [[pipeline]]
-name = "mq_forwarded"
-sql = "SELECT id, payload FROM mq_input"
+name = "sink_forwarded"
+sql = "SELECT id, payload FROM sink_input"
 
 [[sink]]
 name = "{SINK}"
-pipeline = "mq_forwarded"
+pipeline = "sink_forwarded"
 connector = "{connector}"
-format = "json"
-[sink.properties]
+{format}[sink.properties]
 {properties}"#,
-        connector = broker.connector(),
-        properties = broker.sink_properties(queue),
+        connector = destination.connector(),
+        properties = destination.sink_properties(name),
     )
 }
 
@@ -737,37 +484,37 @@ fn cluster_nodes(
         .collect()
 }
 
-fn run_three_node_sink_kill9_soak(broker: &Broker) {
+fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
     );
     executable.describe();
     let settings = SoakSettings::from_environment();
-    let brokers = required("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS");
+    let brokers = setting("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS", None);
     let run_id = soak_run_id();
     let checkpoint_url =
         scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
     let topic = format!("soak-sink-in-{run_id}");
     kafka_create_topic(&brokers, &topic, settings.partitions);
-    let queue = broker.queue_name(&run_id);
-    broker.create_queue(&queue);
-    let mut oracle = broker.spawn_oracle(&queue);
+    let name = destination.name(&run_id);
+    destination.create(&name);
+    let mut oracle = destination.spawn_oracle(&name);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let log_dir: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
     std::fs::create_dir(&log_dir).expect("create exclusive soak log directory");
     eprintln!(
         "soak: {} sink node logs in {}",
-        broker.connector(),
+        destination.connector(),
         log_dir.display()
     );
     let workload = workload(
         &brokers,
         &topic,
         &format!("soak-sink-{run_id}"),
-        broker,
-        &queue,
+        destination,
+        &name,
     );
     let mut nodes = cluster_nodes(
         &executable,
@@ -778,7 +525,7 @@ fn run_three_node_sink_kill9_soak(broker: &Broker) {
         &workload,
     );
     let mut producer = InputProducer::spawn(brokers, topic, settings.partitions, settings.rps);
-    let metric = broker.published_metric();
+    let metric = destination.written_metric();
 
     let mut latest = boot(&mut nodes, &mut producer, &settings, metric);
     let mut killed_followers = BTreeSet::new();
@@ -816,7 +563,7 @@ fn run_three_node_sink_kill9_soak(broker: &Broker) {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "the queue holds {} ids that were never produced, first {:?}",
+        "the destination holds {} ids that were never produced, first {:?}",
         unexpected.len(),
         &unexpected[..unexpected.len().min(8)]
     );
@@ -824,14 +571,14 @@ fn run_three_node_sink_kill9_soak(broker: &Broker) {
     eprintln!(
         "soak: {} sink across {NODES} nodes: produced={produced} lost=0 duplicates={duplicates} \
          kills={} (followers {killed_followers:?})",
-        broker.connector(),
+        destination.connector(),
         settings.kills
     );
     drop(nodes);
-    broker.delete_queue(&queue);
+    destination.delete(&name);
 }
 
-/// Start every node, wait for one durable cluster checkpoint, and require every node to publish.
+/// Start every node, wait for one durable cluster checkpoint, and require every node to write.
 fn boot(
     nodes: &mut [Node],
     producer: &mut InputProducer,
@@ -1014,7 +761,7 @@ fn steady_phase(
     );
 }
 
-/// Wait until every produced id has reached the queue, then stop the oracle.
+/// Wait until every produced id has reached the destination, then stop the oracle.
 fn wait_for_delivery(
     mut oracle: Oracle,
     produced: u64,
@@ -1027,7 +774,9 @@ fn wait_for_delivery(
     });
     if !caught_up {
         let (missing, sample) = oracle.missing(produced);
-        panic!("{missing} of {produced} produced ids never reached the queue, first {sample:?}");
+        panic!(
+            "{missing} of {produced} produced ids never reached the destination, first {sample:?}"
+        );
     }
     oracle.finish()
 }
