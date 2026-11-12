@@ -23,3 +23,6 @@ disallowed-types = [
 
 # Product names that are not code identifiers in rustdoc.
 doc-valid-idents = ["RabbitMQ", ".."]
+
+# Keep lint suggestions within the workspace rust-version; crates do not inherit it.
+msrv = "1.95"

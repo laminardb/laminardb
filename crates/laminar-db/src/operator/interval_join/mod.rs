@@ -2295,8 +2295,7 @@ impl IntervalJoinOperator {
                         self.projection.op_name
                     )));
                 }
-                for port in 0..2 {
-                    let channels = &cluster.channels[port];
+                for channels in &cluster.channels {
                     if channels.len() != peers.len()
                         || !channels
                             .iter()
@@ -4278,12 +4277,9 @@ impl GraphOperator for IntervalJoinOperator {
         self.pending_cluster_input.is_some() || self.queued_remote_events != 0
     }
 
+    #[cfg(feature = "cluster")]
     fn checkpoint_drain_pending(&self) -> bool {
-        #[cfg(feature = "cluster")]
-        if self.pending_cluster_input.is_some() || self.last_broadcasts != self.local_frontiers {
-            return true;
-        }
-        false
+        self.pending_cluster_input.is_some() || self.last_broadcasts != self.local_frontiers
     }
 
     #[cfg(feature = "cluster")]

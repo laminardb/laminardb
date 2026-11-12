@@ -995,8 +995,8 @@ async fn fresh_owner_installs_portable_cut_and_bootstrap_topology() {
     target.attach_cluster_shuffle(scope.clone());
     target.local_assignment = predecessor_registry.versioned_snapshot();
     target.cluster_peers = Arc::from([2_u64, 3]);
-    for port in 0..2 {
-        target.peer_channels[port].entry(3).or_default();
+    for channels in &mut target.peer_channels {
+        channels.entry(3).or_default();
     }
 
     let encode_whole = |participant_id: u64, peer: u64, queued: bool, published_watermark: i64| {
@@ -1440,8 +1440,8 @@ async fn cluster_plan_is_atomic_and_orders_idle_revival_data_and_frontier() {
         watermark: Some(200),
         idle: false,
     }; 2];
-    for port in 0..2 {
-        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+    for channels in &mut operator.peer_channels {
+        let channel = channels.get_mut(&2).unwrap();
         channel.applied = idle;
         channel.accepted = idle;
     }
@@ -1960,8 +1960,8 @@ async fn queued_cluster_checkpoint() -> (OperatorCheckpoint, ClusterShuffleConfi
         watermark: Some(100),
         idle: true,
     });
-    for port in 0..2 {
-        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+    for channels in &mut operator.peer_channels {
+        let channel = channels.get_mut(&2).unwrap();
         channel.applied = applied;
         channel.accepted = applied;
     }
@@ -2115,8 +2115,8 @@ async fn cluster_channel_checkpoint_round_trip_preserves_order_and_replay() {
 
     assert_eq!(restored.queued_remote_events, 6);
     assert_eq!(restored.remote_peer_cursors, [Some(2); 2]);
-    for port in 0..2 {
-        let channel = &restored.peer_channels[port][&2];
+    for channels in &restored.peer_channels {
+        let channel = &channels[&2];
         assert_eq!(channel.applied.watermark, Some(100));
         assert_eq!(channel.accepted.watermark, Some(250));
     }
@@ -2368,8 +2368,8 @@ async fn temporal_with_one_peer(
     operator.local_frontiers = [local; 2];
     operator.last_broadcasts = [local; 2];
     operator.frontiers = [effective; 2];
-    for port in 0..2 {
-        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+    for channels in &mut operator.peer_channels {
+        let channel = channels.get_mut(&2).unwrap();
         channel.applied = peer;
         channel.accepted = peer;
     }

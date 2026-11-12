@@ -527,11 +527,7 @@ impl super::RecoveryMonitor {
                 false
             }
         };
-        if !assignment_restorable
-            || db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
-        {
-            return false;
-        }
-        true
+        assignment_restorable
+            && db.assignment_authority_revision.load(Ordering::Acquire) == authority_revision
     }
 }
