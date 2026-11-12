@@ -2481,12 +2481,12 @@ async fn zero_owner_topology_transition_is_not_an_acquisition() {
     operator.applied_right_watermark = 200;
     operator.local_frontiers = operator.applied_frontiers();
     operator.last_broadcasts = operator.local_frontiers;
-    for port in 0..2 {
+    for (port, channels) in operator.peer_channels.iter_mut().enumerate() {
         let stale = InputFrontier {
             watermark: Some(900 + i64::try_from(port).unwrap()),
             idle: false,
         };
-        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+        let channel = channels.get_mut(&2).unwrap();
         channel.applied = stale;
         channel.accepted = stale;
     }
@@ -2901,9 +2901,9 @@ async fn reviving_reader_row_is_admitted_after_idle_non_reader_frontier() {
     operator.applied_right_idle = true;
     operator.local_frontiers = [idle(1_000); 2];
     operator.last_broadcasts = [idle(1_000); 2];
-    for port in 0..2 {
+    for channels in &mut operator.peer_channels {
         for peer in [2_u64, 3] {
-            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            let channel = channels.get_mut(&peer).unwrap();
             channel.applied = idle(1_000);
             channel.accepted = idle(1_000);
         }
@@ -3002,9 +3002,9 @@ async fn all_idle_close_stops_at_the_committed_cut_for_a_reviving_reader() {
     operator.applied_right_idle = true;
     operator.local_frontiers = [idle(1_000); 2];
     operator.last_broadcasts = [idle(1_000); 2];
-    for port in 0..2 {
+    for channels in &mut operator.peer_channels {
         for peer in [2_u64, 3] {
-            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            let channel = channels.get_mut(&peer).unwrap();
             channel.applied = idle(1_000);
             channel.accepted = idle(1_000);
         }
@@ -3085,9 +3085,9 @@ async fn all_idle_merge_below_the_applied_cut_holds() {
     operator.applied_right_idle = true;
     operator.local_frontiers = [idle(1_000); 2];
     operator.last_broadcasts = [idle(1_000); 2];
-    for port in 0..2 {
+    for channels in &mut operator.peer_channels {
         for peer in [2_u64, 3] {
-            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            let channel = channels.get_mut(&peer).unwrap();
             channel.applied = idle(1_000);
             channel.accepted = idle(1_000);
         }
@@ -3124,8 +3124,8 @@ async fn idle_non_reader_does_not_echo_its_applied_cut() {
     operator.applied_right_idle = true;
     operator.local_frontiers = [idle(1_000); 2];
     operator.last_broadcasts = [idle(1_000); 2];
-    for port in 0..2 {
-        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+    for (port, channels) in operator.peer_channels.iter_mut().enumerate() {
+        let channel = channels.get_mut(&2).unwrap();
         let applied = if port == 0 {
             InputFrontier {
                 watermark: Some(20_000),
@@ -3188,9 +3188,9 @@ async fn held_all_idle_frontier_round_trips_through_a_checkpoint() {
     operator.applied_right_idle = true;
     operator.local_frontiers = [idle(1_000); 2];
     operator.last_broadcasts = [idle(1_000); 2];
-    for port in 0..2 {
+    for channels in &mut operator.peer_channels {
         for peer in [2_u64, 3] {
-            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            let channel = channels.get_mut(&peer).unwrap();
             channel.applied = idle(1_000);
             channel.accepted = idle(1_000);
         }

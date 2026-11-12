@@ -6175,18 +6175,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn intake_paused(&self) -> bool {
-        if self.intake_gate.load(std::sync::atomic::Ordering::Acquire) {
-            return true;
-        }
+        let paused = self.intake_gate.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(feature = "cluster")]
-        if self
-            .cluster_controller
-            .as_ref()
-            .is_some_and(|controller| !controller.process_lease_is_live())
-        {
-            return true;
-        }
-        false
+        let paused = paused
+            || self
+                .cluster_controller
+                .as_ref()
+                .is_some_and(|controller| !controller.process_lease_is_live());
+        paused
     }
 
     fn reserve_subscription_cut(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {

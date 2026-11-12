@@ -882,17 +882,10 @@ impl SqlQueryOperator {
         let QueryState::Agg(aggregate) = &self.state else {
             return false;
         };
-        if self.emit_changelog || aggregate.having_filter().is_some() {
-            return false;
-        }
+        let cacheable = !self.emit_changelog && aggregate.having_filter().is_none();
         #[cfg(feature = "cluster")]
-        {
-            self.cluster_shuffle.is_none()
-        }
-        #[cfg(not(feature = "cluster"))]
-        {
-            true
-        }
+        let cacheable = cacheable && self.cluster_shuffle.is_none();
+        cacheable
     }
 
     fn invalidate_local_aggregate_output_cache(&mut self) {

@@ -4970,8 +4970,7 @@ impl ManagedTemporalJoinOperator {
                                 self.name, restore.participant_id
                             )));
                         }
-                        for port in 0..2 {
-                            let channels = &cluster.channels[port];
+                        for channels in &cluster.channels {
                             let expected_peers = predecessor_participants
                                 .iter()
                                 .copied()
@@ -5370,8 +5369,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                                 self.name
                             )));
                         }
-                        for port in 0..2 {
-                            let channels = &cluster.channels[port];
+                        for channels in &cluster.channels {
                             if channels.len() != peers.len()
                                 || !channels
                                     .iter()
