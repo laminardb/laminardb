@@ -2,7 +2,7 @@
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Prometheus-backed counters for Kafka sink connector statistics.
 #[derive(Debug, Clone)]
@@ -23,6 +23,7 @@ pub struct KafkaSinkMetrics {
     pub produce_latency_max_us: IntGauge,
     /// Number of produce delivery latency samples.
     pub produce_latency_count: IntCounter,
+    _registration: Registration,
 }
 
 impl KafkaSinkMetrics {
@@ -57,6 +58,7 @@ impl KafkaSinkMetrics {
                 "kafka_sink_produce_latency_max_us",
                 "Max produce delivery latency (us)",
             ),
+            _registration: reg.into_registration(),
         }
     }
 
