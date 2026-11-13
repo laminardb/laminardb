@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Cluster mode can listen for control-plane gRPC and shuffle traffic on fixed ports:
+  `[discovery] control_port` and `shuffle_port`, or `controlPort` and `shufflePort` in the Helm
+  chart. Both default to `0`, an ephemeral port as before, and must differ when set. Fixed ports
+  let a firewall, NetworkPolicy or service mesh admit peers on known ports instead of all ports.
+
+### Fixed
+
+- The Helm chart declared the gossip port as TCP; it is UDP with gossip discovery and TCP with
+  static discovery, so a NetworkPolicy that names it now matches the traffic.
+
 ## [0.40.2]
 
 0.40.0 and 0.40.1 were tagged but never published, so this is the first release since 0.33.0
