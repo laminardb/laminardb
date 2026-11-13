@@ -24,7 +24,7 @@ pub use recency::{RecencyTarget, SourceRecency};
 pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
     SourceCheckpointUnavailablePolicy, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourcePosition, SourceStart,
+    SourceDrainResolution, SourceDrainSettlement, SourcePosition, SourceStart,
 };
 pub use source_batch::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,

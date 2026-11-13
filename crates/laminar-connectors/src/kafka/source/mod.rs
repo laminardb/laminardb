@@ -21,7 +21,7 @@ use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourceInputMode, SourceMutation, SourcePosition,
+    SourceDrainResolution, SourceDrainSettlement, SourceInputMode, SourceMutation, SourcePosition,
     SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
@@ -81,10 +81,11 @@ use drain::{
     kafka_partition_set, lock_or_recover, publish_reader_fault, resolve_kafka_reader_drain,
     terminalize_guaranteed_poll_error, try_capture_at_assignment_fence, validate_kafka_assignment,
     validate_kafka_partition_results, KafkaAssignmentPublication, KafkaDrainBoundary,
-    KafkaDrainPartition, KafkaDrainPosition, KafkaPartitionBaselines, KafkaPartitionRoutes,
-    KafkaPartitionSet, KafkaPayload, KafkaReaderDrain, KafkaReaderDrainCommand, KafkaReaderItem,
-    KafkaReaderRx, KafkaRotationBaselines, KafkaSourceDrain, KafkaStartPlan,
-    KAFKA_BACKGROUND_CLOSE_BUDGET, KAFKA_POSITION_LOOKUP_BUDGET, KAFKA_POSITION_LOOKUP_CONCURRENCY,
+    KafkaDrainPartition, KafkaDrainPosition, KafkaDrainSettlement, KafkaPartitionBaselines,
+    KafkaPartitionRoutes, KafkaPartitionSet, KafkaPayload, KafkaReaderDrain,
+    KafkaReaderDrainCommand, KafkaReaderItem, KafkaReaderRx, KafkaRotationBaselines,
+    KafkaSourceDrain, KafkaStartPlan, KAFKA_BACKGROUND_CLOSE_BUDGET, KAFKA_POSITION_LOOKUP_BUDGET,
+    KAFKA_POSITION_LOOKUP_CONCURRENCY,
 };
 use metadata::{
     fetch_explicit_topic_metadata, fetch_partition_low_watermarks, fetch_partition_watermarks,

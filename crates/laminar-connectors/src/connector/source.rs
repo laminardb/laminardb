@@ -162,6 +162,56 @@ pub struct SourceDrainResolution {
     pub outcome: SourceDrainOutcome,
 }
 
+/// A drain resolution with what the source adopts: a commit carries the source's merged cursor
+/// at the committed handoff cut, an abort carries nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDrainSettlement {
+    resolution: SourceDrainResolution,
+    committed: Option<Arc<SourceCheckpoint>>,
+}
+
+impl SourceDrainSettlement {
+    /// The target committed; channels this node acquires resume from `committed`, the cursor
+    /// every participant merged into the handoff checkpoint, not from this node's own history.
+    #[must_use]
+    pub fn commit(
+        round: laminar_core::checkpoint::AssignmentDrainId,
+        committed: Arc<SourceCheckpoint>,
+    ) -> Self {
+        Self {
+            resolution: SourceDrainResolution {
+                round,
+                outcome: SourceDrainOutcome::Commit,
+            },
+            committed: Some(committed),
+        }
+    }
+
+    /// The transition aborted; the source resumes from its own predecessor cut.
+    #[must_use]
+    pub fn abort(round: laminar_core::checkpoint::AssignmentDrainId) -> Self {
+        Self {
+            resolution: SourceDrainResolution {
+                round,
+                outcome: SourceDrainOutcome::Abort,
+            },
+            committed: None,
+        }
+    }
+
+    /// The round and outcome this settlement resolves.
+    #[must_use]
+    pub fn resolution(&self) -> SourceDrainResolution {
+        self.resolution
+    }
+
+    /// The committed handoff cursor; present exactly when the drain commits.
+    #[must_use]
+    pub fn committed(&self) -> Option<&Arc<SourceCheckpoint>> {
+        self.committed.as_ref()
+    }
+}
+
 /// Trait for source connectors that read data from external systems.
 ///
 /// Source connectors operate in Ring 1 and push data into Ring 0 via
@@ -380,12 +430,14 @@ pub trait SourceConnector: Send {
     /// Resolve an exact drain after target commit or abort.
     ///
     /// An abort must rewind any client-delivered but engine-unaccepted records before resuming.
-    /// A commit must reconcile target ownership before clearing its post-cut filter.
+    /// A commit must reconcile target ownership before clearing its post-cut filter, and must
+    /// position every channel it acquires from the settlement's committed cursor: the donor may
+    /// have read far past anything this node remembers.
     /// `deadline` is the engine-owned absolute deadline for the complete resolution; provider
     /// retries and blocking client calls must be bounded by its remaining time.
     async fn finish_drain(
         &mut self,
-        _resolution: SourceDrainResolution,
+        _settlement: SourceDrainSettlement,
         _deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
         Err(ConnectorError::ConfigurationError(

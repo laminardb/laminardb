@@ -1,5 +1,6 @@
 //! Vnode assignment delta preparation, validation, and publication.
 
+use super::drain_control::awaits_drain_settlement;
 use super::{
     acquired_numeric_position, fetch_partition_low_watermarks, info, kafka_input_channels,
     kafka_owned_partition_sets, kafka_partition_set, lock_or_recover, publish_reader_fault,
@@ -32,7 +33,9 @@ pub(super) async fn reconcile_vnode_assignment(
     };
     let published = registry.versioned_snapshot();
     let version = published.version();
-    if version == *last_assignment_version {
+    if version == *last_assignment_version
+        || awaits_drain_settlement(context.active_drain.as_ref(), version)
+    {
         return ReaderLoopAction::Proceed;
     }
 
@@ -195,24 +198,30 @@ fn rotation_partition_offset(
     partition: i32,
     acquired_positions: &mut KafkaPartitionBaselines,
 ) -> Option<rdkafka::Offset> {
-    let durable =
-        match acquired_numeric_position(offsets, context.reassign_baselines, topic, partition) {
-            Ok(position) => position,
-            Err(error) => {
-                warn!(
-                    topic,
-                    partition,
-                    %error,
-                    "Kafka source rejected an invalid checkpoint position"
-                );
-                publish_reader_fault(
-                    context.reader_fault,
-                    context.data_ready,
-                    format!("invalid checkpoint position: {error}"),
-                );
-                return None;
-            }
-        };
+    let committed = context
+        .active_drain
+        .as_ref()
+        .and_then(|active| active.settlement.as_ref())
+        .and_then(|settlement| settlement.committed_position(topic, partition));
+    let durable = match committed.unwrap_or_else(|| {
+        acquired_numeric_position(offsets, context.reassign_baselines, topic, partition)
+    }) {
+        Ok(position) => position,
+        Err(error) => {
+            warn!(
+                topic,
+                partition,
+                %error,
+                "Kafka source rejected an invalid checkpoint position"
+            );
+            publish_reader_fault(
+                context.reader_fault,
+                context.data_ready,
+                format!("invalid checkpoint position: {error}"),
+            );
+            return None;
+        }
+    };
     if let Some(next) = durable {
         info!(
             topic,

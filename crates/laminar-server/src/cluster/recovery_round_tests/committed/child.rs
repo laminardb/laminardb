@@ -111,7 +111,6 @@ impl DatabasePeer {
                     Arc::clone(&self.probe),
                     root.join("output.jsonl"),
                     self.runtime,
-                    objects,
                 ),
             )
             .await?;

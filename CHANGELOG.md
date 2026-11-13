@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a
+  `SourceDrainResolution`. A commit carries the source's merged cursor at the committed handoff
+  checkpoint, and a connector that implements cluster drains positions every input it acquires
+  from that cursor. `SourceDrainSettlement::resolution()` returns the round and outcome.
+
+### Fixed
+
+- In cluster mode, a Kafka partition that moved live between two running nodes, for example when
+  a node drained for a graceful shutdown, was read again from where the new owner last knew it,
+  or from the start of the partition, instead of after the records the previous owner had
+  processed. At-least-once pipelines counted those records twice in their state, and
+  exactly-once pipelines published them twice. The new owner now resumes the partition from the
+  committed handoff checkpoint. Recovery after a node is killed was not affected.
+
 ## [0.40.2]
 
 0.40.0 and 0.40.1 were tagged but never published, so this is the first release since 0.33.0

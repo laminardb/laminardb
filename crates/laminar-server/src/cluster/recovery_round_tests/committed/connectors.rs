@@ -4,13 +4,12 @@ use arrow_array::{
     Array as _, BinaryArray, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt32Array,
 };
 use laminar_connectors::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceDrainOutcome,
-    SourceDrainRequest, SourceDrainResolution, SourcePosition, SourceRowPositionCapability,
-    SourceRowPositions, WriteResult,
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceDrainRequest,
+    SourceDrainSettlement, SourcePosition, SourceRowPositionCapability, SourceRowPositions,
+    WriteResult,
 };
 use laminar_core::checkpoint::AssignmentDrainId;
 use laminar_core::state::PartitionKeyCodecV1;
-use object_store::ObjectStoreExt as _;
 
 #[derive(Default)]
 pub(super) struct ReplayProbe {
@@ -60,15 +59,8 @@ struct ReplaySource {
     assignment: std::num::NonZeroU64,
     checkpoint: SourceCheckpoint,
     registry: Option<(Arc<VnodeRegistry>, StateNodeId)>,
-    /// Shared storage carrying partition cursors from a draining owner to its successor, as a
-    /// provider's own offset store would.
-    handoff: Arc<dyn object_store::ObjectStore>,
-    /// Cursor writes of a live handoff in progress; the source reads nothing until it resolves.
-    draining: Option<tokio::task::JoinHandle<object_store::Result<()>>>,
-}
-
-fn handoff_cursor(partition: u8) -> object_store::path::Path {
-    object_store::path::Path::from(format!("fixture-handoff/partition-{partition}"))
+    /// A live handoff is in progress; the source reads nothing until it resolves.
+    draining: bool,
 }
 
 impl ReplaySource {
@@ -188,83 +180,43 @@ impl SourceConnector for ReplaySource {
         .map_err(|_| ConnectorError::ConfigurationError("fixture recovery hold expired".into()))
     }
 
-    // Each poll delivers a whole record, so a paused source holds nothing past the boundary
-    // once its cursors are stored.
+    // Each poll delivers a whole record, so a paused source holds nothing past the boundary.
     fn begin_drain(
         &mut self,
         _: &SourceDrainRequest,
         _: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
-        let cursors = self
-            .owned
-            .iter()
-            .filter_map(|partition| {
-                let offset = self
-                    .checkpoint
-                    .get_offset(&format!("partition-{partition}"))?;
-                Some((handoff_cursor(*partition), offset.to_owned()))
-            })
-            .collect::<Vec<_>>();
-        let handoff = Arc::clone(&self.handoff);
-        self.draining = Some(tokio::spawn(async move {
-            for (path, offset) in cursors {
-                handoff.put(&path, offset.into_bytes().into()).await?;
-            }
-            Ok(())
-        }));
+        self.draining = true;
         Ok(())
     }
 
     fn poll_drain_ready(&mut self, _: AssignmentDrainId) -> Result<bool, ConnectorError> {
-        match self.draining.as_mut().map(futures::FutureExt::now_or_never) {
-            Some(None) => Ok(false),
-            Some(Some(Ok(Ok(())))) => Ok(true),
-            outcome => Err(ConnectorError::ConfigurationError(format!(
-                "fixture handoff cursors were not stored: {outcome:?}"
-            ))),
-        }
+        Ok(self.draining)
     }
 
-    /// A committed handoff takes the acquired partitions' cursors from their former owner.
+    /// A committed handoff resumes the acquired partitions from the engine's committed cursor.
     async fn finish_drain(
         &mut self,
-        resolution: SourceDrainResolution,
+        settlement: SourceDrainSettlement,
         _: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
-        self.draining = None;
-        if resolution.outcome == SourceDrainOutcome::Abort {
+        self.draining = false;
+        let Some(committed) = settlement.committed() else {
             return Ok(());
-        }
-        let mut cursors = self
-            .checkpoint
-            .offsets()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
+        };
+        let retained = self.checkpoint.clone();
         self.own_assignment()?;
-        for partition in &self.owned {
-            let key = format!("partition-{partition}");
-            if cursors.contains_key(&key) {
-                continue;
-            }
-            let stored = self
-                .handoff
-                .get(&handoff_cursor(*partition))
-                .await
-                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?
-                .bytes()
-                .await
-                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
-            let offset = String::from_utf8(stored.to_vec())
-                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
-            cursors.insert(key, offset);
-        }
-        self.install_cursors(|key| cursors.get(key).cloned())
+        self.install_cursors(|key| {
+            retained
+                .get_offset(key)
+                .or_else(|| committed.get_offset(key))
+                .map(str::to_owned)
+        })
     }
 
     async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
         self.probe.polls.fetch_add(1, Ordering::Relaxed);
-        if self.draining.is_some() {
+        if self.draining {
             return Ok(None);
         }
         let prefix = self.probe.prefix.load(Ordering::Acquire);
@@ -421,7 +373,6 @@ pub(super) fn register(
     probe: Arc<ReplayProbe>,
     path: PathBuf,
     runtime: Runtime,
-    handoff: Arc<dyn object_store::ObjectStore>,
 ) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {
     move |registry| {
         if runtime != Runtime::Aggregate {
@@ -449,8 +400,7 @@ pub(super) fn register(
                     assignment: std::num::NonZeroU64::new(1).unwrap(),
                     checkpoint: SourceCheckpoint::new(),
                     registry: None,
-                    handoff: Arc::clone(&handoff),
-                    draining: None,
+                    draining: false,
                 }))
             }),
         )?;

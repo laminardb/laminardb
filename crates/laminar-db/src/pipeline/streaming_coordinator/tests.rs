@@ -5478,7 +5478,7 @@ impl SourceConnector for BarrierHoldProbeSource {
     #[cfg(feature = "cluster")]
     async fn finish_drain(
         &mut self,
-        _resolution: SourceDrainResolution,
+        _settlement: SourceDrainSettlement,
         _deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
         self.state
@@ -5642,6 +5642,7 @@ async fn source_drain_deadlines_fail_before_provider_work() {
                 round,
                 outcome: SourceDrainOutcome::Abort,
             },
+            committed: None,
             deadline: tokio::time::Instant::now(),
         }),
     });
@@ -5681,6 +5682,7 @@ async fn blocking_finish_drain_retires_at_its_absolute_deadline() {
                 round,
                 outcome: SourceDrainOutcome::Abort,
             },
+            committed: None,
             deadline,
         }),
     });
@@ -5758,6 +5760,7 @@ async fn process_lease_loss_cancels_blocking_finish_drain_without_later_hooks() 
                     round,
                     outcome: SourceDrainOutcome::Commit,
                 },
+                committed: Some(Arc::new(SourceCheckpoint::default())),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             }),
         });
@@ -5856,6 +5859,7 @@ async fn ready_source_drain_outlives_prepare_deadline() {
                 round,
                 outcome: SourceDrainOutcome::Commit,
             },
+            committed: Some(Arc::new(SourceCheckpoint::default())),
             deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         }))
         .unwrap();
@@ -5878,6 +5882,83 @@ async fn ready_source_drain_outlives_prepare_deadline() {
             round: resolved,
             outcome: SourceDrainOutcome::Commit,
         } if resolved == round
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn ready_provider_drain_refuses_a_commit_without_its_cursor() {
+    let state = Arc::new(BarrierHoldProbeState::default());
+    let mut connector = BarrierHoldProbeSource {
+        state: Arc::clone(&state),
+    };
+    let round = AssignmentDrainId {
+        predecessor_version: 7,
+        target_version: 8,
+        digest: [9; 32],
+    };
+    let (command_tx, mut command_rx) =
+        tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
+    let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+    let control = SourceDrainLeaseControl {
+        task_incarnation: uuid::Uuid::from_u128(101),
+        command_tx,
+        status_tx,
+        wake: Arc::new(tokio::sync::Notify::new()),
+    };
+    control
+        .command_tx
+        .send(Some(SourceDrainCommand::Begin {
+            request: SourceDrainRequest::new(round).unwrap(),
+            participant: CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(11),
+            },
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        }))
+        .unwrap();
+    let mut active = None;
+    apply_latest_source_drain_command(
+        &mut connector,
+        &mut command_rx,
+        &control.status_tx,
+        &mut active,
+        true,
+    )
+    .await
+    .unwrap();
+    publish_source_drain_ready(&mut connector, &control, &mut active).unwrap();
+
+    control
+        .command_tx
+        .send(Some(SourceDrainCommand::Resolve {
+            resolution: SourceDrainResolution {
+                round,
+                outcome: SourceDrainOutcome::Commit,
+            },
+            committed: None,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        }))
+        .unwrap();
+    let error = apply_latest_source_drain_command(
+        &mut connector,
+        &mut command_rx,
+        &control.status_tx,
+        &mut active,
+        true,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(error, ConnectorError::InvalidState { .. }),
+        "{error}"
+    );
+    assert!(active.is_some());
+    assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        control.status_tx.borrow().clone(),
+        SourceDrainTaskStatus::Ready(_)
     ));
 }
 
@@ -5943,6 +6024,7 @@ async fn source_drain_retries_cannot_extend_phase_deadlines() {
     command_tx
         .send(Some(SourceDrainCommand::Resolve {
             resolution,
+            committed: None,
             deadline: first_resolution_deadline,
         }))
         .unwrap();
@@ -5958,6 +6040,7 @@ async fn source_drain_retries_cannot_extend_phase_deadlines() {
     command_tx
         .send(Some(SourceDrainCommand::Resolve {
             resolution,
+            committed: None,
             deadline: first_resolution_deadline + Duration::from_secs(10),
         }))
         .unwrap();
@@ -5975,6 +6058,7 @@ async fn source_drain_retries_cannot_extend_phase_deadlines() {
             .as_ref()
             .unwrap()
             .pending_resolution
+            .as_ref()
             .unwrap()
             .deadline,
         first_resolution_deadline
@@ -6456,6 +6540,7 @@ async fn ready_global_source_drain_holds_polling_but_still_emits_barriers() {
                 round,
                 outcome: SourceDrainOutcome::Abort,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
@@ -6624,6 +6709,7 @@ async fn barrier_hold_retains_unobserved_begin_until_abort_overwrites_it() {
                 round,
                 outcome: SourceDrainOutcome::Abort,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
@@ -6731,6 +6817,7 @@ async fn idle_source_drain_resolution_accepts_only_a_reconciled_replacement_comm
                 round,
                 outcome: SourceDrainOutcome::Abort,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
@@ -6777,6 +6864,7 @@ async fn idle_source_drain_resolution_accepts_only_a_reconciled_replacement_comm
                 round,
                 outcome: SourceDrainOutcome::Commit,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
@@ -6823,6 +6911,7 @@ async fn idle_source_drain_resolution_accepts_only_a_reconciled_replacement_comm
                 round,
                 outcome: SourceDrainOutcome::Commit,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
@@ -6851,6 +6940,7 @@ async fn idle_source_drain_resolution_accepts_only_a_reconciled_replacement_comm
                 round,
                 outcome: SourceDrainOutcome::Commit,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
@@ -6884,6 +6974,10 @@ async fn finished_source_retains_its_exact_resolved_drain_terminal() {
     resolve_owned_source_drain(
         &tasks,
         resolution,
+        &std::collections::BTreeMap::from([(
+            "resolved-source".to_string(),
+            Arc::new(SourceCheckpoint::default()),
+        )]),
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
     .await
@@ -6974,6 +7068,7 @@ async fn active_source_drain_abort_waits_for_the_fifo_cut() {
                 round,
                 outcome: SourceDrainOutcome::Abort,
             },
+            committed: None,
             deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         }))
         .unwrap();
