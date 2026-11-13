@@ -107,8 +107,13 @@ laminardb:
     discovery:
       # -- Discovery strategy: "gossip" (recommended) or "static"
       strategy: gossip
-      # -- Gossip port
+      # -- Gossip port (UDP for gossip, TCP for static discovery)
       gossipPort: 7946
+      # -- Fixed TCP port for the control-plane gRPC server. 0 = ephemeral; set it (and
+      # -- shufflePort) to scope NetworkPolicies, firewalls, or mesh port exclusions to known ports
+      controlPort: 0
+      # -- Fixed TCP port for the inbound shuffle receiver. 0 = ephemeral
+      shufflePort: 0
       # -- Seed nodes. Empty = generated from replicaCount as
       # -- <fullname>-N.<headless>.<namespace>.svc.cluster.local:<gossipPort>
       seeds: []

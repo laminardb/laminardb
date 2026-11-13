@@ -886,6 +886,13 @@ pub struct DiscoverySection {
     pub seeds: Vec<String>,
     #[serde(default = "default_gossip_port")]
     pub gossip_port: u16,
+    /// TCP port of the control-plane gRPC server (barrier sync, leader proofs); 0 picks an
+    /// ephemeral port at startup.
+    #[serde(default)]
+    pub control_port: u16,
+    /// TCP port of the inbound shuffle receiver; 0 picks an ephemeral port at startup.
+    #[serde(default)]
+    pub shuffle_port: u16,
     #[serde(default)]
     pub advertise_host: Option<String>,
     /// Failure-domain locality, gossiped to peers. A flat label (`"rack17"`)

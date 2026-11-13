@@ -103,6 +103,12 @@ Apply this via:
 helm install my-laminardb deploy/helm/laminardb -f cluster-values.yaml
 ```
 
+Cluster pods reach each other directly on the discovery, control and shuffle ports. With
+`networkPolicy.enabled`, add an ingress rule that admits peer pods on those ports, or pods cannot
+form a cluster. The control and shuffle ports are ephemeral unless `controlPort` and `shufflePort`
+are set, so a port-scoped rule needs both fixed; `ci/full-values.yaml` shows one. Listing any
+`networkPolicy.egress` rule denies all other egress, including the object store and DNS.
+
 ---
 
 ## Scaling a cluster
@@ -201,6 +207,9 @@ checkpoint progress alerts using the existing `prometheusRule.rules` setting.
 | `laminardb.checkpoint.url` | Provider-neutral checkpoint URL: `s3://` (including R2/MinIO), `gs://`, `az://`, `abfs(s)://`, or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
+| `laminardb.cluster.discovery.gossipPort` | Discovery port: UDP for `gossip`, TCP for `static` | `7946` |
+| `laminardb.cluster.discovery.controlPort` | Fixed TCP port for control-plane gRPC; `0` = ephemeral | `0` |
+| `laminardb.cluster.discovery.shufflePort` | Fixed TCP port for inbound shuffle; `0` = ephemeral | `0` |
 | `laminardb.cluster.drainTimeoutSeconds` | SIGTERM handoff allowance rendered as `server.drain_timeout`; at least `checkpoint.timeout` | `150` |
 | `terminationGracePeriodSeconds` | Pod grace period; a cluster render fails below `drainTimeoutSeconds + 60` | `240` |
 | `autoscaling.enabled` | Optional coarse CPU HPA (see [Scaling](#scaling-a-cluster)) | `false` |

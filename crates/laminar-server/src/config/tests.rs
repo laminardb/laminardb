@@ -446,6 +446,8 @@ interval = "30s"
 strategy = "static"
 seeds = ["node-1:7946", "node-2:7946"]
 gossip_port = 7946
+control_port = 7947
+shuffle_port = 7948
 failure_domain = "region=us-east-1;zone=us-east-1a;rack=r17"
 placement_isolation_tier = 1
 
@@ -482,6 +484,7 @@ connector = "kafka"
         Some("region=us-east-1;zone=us-east-1a;rack=r17")
     );
     assert_eq!(disc.placement_isolation_tier, 1);
+    assert_eq!((disc.control_port, disc.shuffle_port), (7947, 7948));
 
     validate_config(&config).unwrap();
 }

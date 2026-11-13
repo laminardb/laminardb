@@ -1,4 +1,5 @@
 {{- $isCluster := eq .Values.laminardb.mode "cluster" -}}
+{{- $strategy := ((.Values.laminardb.cluster | default dict).discovery | default dict).strategy | default "gossip" -}}
 {{- if or .Values.headlessService.enabled $isCluster }}
 apiVersion: v1
 kind: Service
@@ -21,7 +22,7 @@ spec:
     {{- if $isCluster }}
     - port: {{ .Values.service.gossipPort }}
       targetPort: gossip
-      protocol: TCP
+      protocol: {{ eq $strategy "static" | ternary "TCP" "UDP" }}
       name: gossip
     {{- end }}
   selector:

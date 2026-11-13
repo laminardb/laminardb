@@ -82,6 +82,12 @@ data:
     {{- $podDomain := printf "%s.%s.svc.%s" (include "laminardb.headlessServiceName" .) .Release.Namespace (.Values.clusterDomain | default "cluster.local") }}
     strategy = "{{ $discovery.strategy | default "gossip" }}"
     gossip_port = {{ $gossipPort }}
+    {{- with $discovery.controlPort }}
+    control_port = {{ . }}
+    {{- end }}
+    {{- with $discovery.shufflePort }}
+    shuffle_port = {{ . }}
+    {{- end }}
     # Peers must reach this node by its per-pod headless-service DNS name; the
     # bare pod hostname the server would otherwise advertise is not resolvable.
     advertise_host = "{{ $discovery.advertiseHost | default (printf "${HOSTNAME}.%s" $podDomain) }}"

@@ -90,6 +90,12 @@ impl ClusterConfig {
             return Err(ClusterConfigError::EmptySeeds);
         }
 
+        if discovery.control_port != 0 && discovery.control_port == discovery.shuffle_port {
+            return Err(ClusterConfigError::SharedControlShufflePort(
+                discovery.control_port,
+            ));
+        }
+
         let tls_configured = [
             discovery.cluster_tls_cert.is_some(),
             discovery.cluster_tls_key.is_some(),
@@ -128,6 +134,8 @@ pub enum ClusterConfigError {
     EmptySeeds,
     #[error("unsupported discovery strategy {0:?}; expected \"gossip\" or \"static\"")]
     InvalidDiscoveryStrategy(String),
+    #[error("[discovery] control_port and shuffle_port must differ (both are {0})")]
+    SharedControlShufflePort(u16),
     #[error("cluster mutual TLS configuration must be complete and use a valid server name")]
     IncompleteControlPlaneTls,
 }
@@ -163,6 +171,8 @@ mod tests {
             strategy: "static".to_string(),
             seeds: vec!["node-1:7946".to_string(), "node-2:7946".to_string()],
             gossip_port: 7946,
+            control_port: 0,
+            shuffle_port: 0,
             advertise_host: None,
             failure_domain: None,
             placement_isolation_tier: 0,
@@ -286,5 +296,26 @@ mod tests {
             err,
             ClusterConfigError::InvalidDiscoveryStrategy(strategy) if strategy == "typo"
         ));
+    }
+
+    #[test]
+    fn test_fixed_control_and_shuffle_ports_must_differ() {
+        let mut config = cluster_config();
+        let discovery = config.discovery.as_mut().unwrap();
+        discovery.control_port = 7947;
+        discovery.shuffle_port = 7947;
+
+        let err = ClusterConfig::from_server_config(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterConfigError::SharedControlShufflePort(7947)
+        ));
+
+        config.discovery.as_mut().unwrap().shuffle_port = 7948;
+        let cluster_cfg = ClusterConfig::from_server_config(&config)
+            .unwrap()
+            .expect("cluster mode");
+        assert_eq!(cluster_cfg.discovery.control_port, 7947);
+        assert_eq!(cluster_cfg.discovery.shuffle_port, 7948);
     }
 }

@@ -85,6 +85,7 @@ pub(super) struct PreparedClusterBootstrap {
     pub(super) node_id: NodeId,
     pub(super) http_port: u16,
     pub(super) bind_host: String,
+    pub(super) control_port: u16,
     pub(super) advertise_host: String,
     pub(super) key_groups: laminar_core::state::vnode::KeyGroupCount,
     pub(super) shuffle_send_stall_timeout: Option<Duration>,
@@ -173,6 +174,7 @@ fn prepare_cluster_bootstrap(
         node_id,
         http_port,
         bind_host: bind_host.to_string(),
+        control_port: cluster_cfg.discovery.control_port,
         advertise_host,
         key_groups,
         shuffle_send_stall_timeout: config.server.shuffle_send_stall_timeout,
@@ -359,9 +361,9 @@ async fn form_cluster_discovery(
     })
 }
 
-/// Bind the shuffle receiver on an ephemeral port, derive its advertised
-/// address, and build this node's membership record with the shuffle and
-/// process-incarnation tags.
+/// Bind the shuffle receiver on the configured port (ephemeral when 0), derive
+/// its advertised address, and build this node's membership record with the
+/// shuffle and process-incarnation tags.
 async fn bind_shuffle_and_local_node(
     cluster_cfg: &ClusterConfig,
     prepared: &PreparedClusterBootstrap,
@@ -386,13 +388,17 @@ async fn bind_shuffle_and_local_node(
     let bind_host = bind_host.clone();
     let advertise_host = advertise_host.clone();
     // Bind ShuffleReceiver first to discover port and publish it in metadata tags.
-    let bind_addr: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
-        ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
-    })?;
+    let shuffle_port = cluster_cfg.discovery.shuffle_port;
+    let bind_addr: std::net::SocketAddr =
+        format!("{bind_host}:{shuffle_port}").parse().map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
+        })?;
     let shuffle_receiver =
         laminar_core::shuffle::ShuffleReceiver::bind(node_id.0, bind_addr, process_incarnation)
             .await
-            .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?;
+            .map_err(|e| {
+                ClusterStartupError::EngineConstruction(format!("shuffle bind on {bind_addr}: {e}"))
+            })?;
     shuffle_receiver
         .install_process_lease_deadline(Arc::clone(&process_lease.deadline))
         .map_err(|error| {

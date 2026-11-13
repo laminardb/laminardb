@@ -412,6 +412,28 @@ many groups and bytes holds many warm keys; more owners do not split it, and pla
 move a vnode by load. A global aggregate or keyless window keeps all its state on vnode 0; a
 global aggregate counts no `applied_rows`, because other nodes send it partial rows.
 
+## Cluster Network Ports
+
+Besides HTTP, each cluster node listens on three peer-facing ports:
+
+| `[discovery]` key | Protocol | Default | Carries |
+|---|---|---|---|
+| `gossip_port` | UDP (`gossip`) or TCP (`static`) | `7946` | Membership and liveness |
+| `control_port` | TCP | `0` (ephemeral) | Control-plane gRPC: barrier sync and leader proofs |
+| `shuffle_port` | TCP | `0` (ephemeral) | Rows shuffled between nodes |
+
+Nodes advertise their bound control and shuffle ports to peers, so the ephemeral default works
+whenever peers can reach each other on any port. Set fixed, distinct ports when a firewall,
+Kubernetes NetworkPolicy or service mesh must name them:
+
+```toml
+[discovery]
+strategy = "gossip"
+seeds = ["node-1:7946", "node-2:7946"]
+control_port = 7947
+shuffle_port = 7948
+```
+
 ## Cluster Control-Plane TLS (mTLS)
 
 In `mode = "cluster"`, the inter-node control plane (barrier sync and row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
