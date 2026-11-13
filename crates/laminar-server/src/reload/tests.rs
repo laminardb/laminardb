@@ -78,6 +78,8 @@ fn commit_reloadable_config_replaces_only_live_sections() {
         strategy: "static".to_owned(),
         seeds: vec!["127.0.0.1:9000".to_owned()],
         gossip_port: 9_001,
+        control_port: 0,
+        shuffle_port: 0,
         advertise_host: Some("127.0.0.1".to_owned()),
         failure_domain: Some("rack=old".to_owned()),
         placement_isolation_tier: 0,

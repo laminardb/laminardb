@@ -350,13 +350,6 @@ async fn install_leased_controller(
     formed: &mut FormedCluster,
     resolved: &ResolvedClusterAssignment,
 ) -> Result<Arc<laminar_core::cluster::control::ClusterController>, ClusterStartupError> {
-    let PreparedClusterBootstrap {
-        bind_host,
-        advertise_host,
-        ..
-    } = prepared;
-    let bind_host = bind_host.clone();
-    let advertise_host = advertise_host.clone();
     let AcquiredClusterIdentity {
         process_lease_authority,
         ..
@@ -383,8 +376,7 @@ async fn install_leased_controller(
             Arc::clone(recovery_kv),
             Arc::clone(snapshot_store),
             discovery.membership_watch(),
-            &bind_host,
-            &advertise_host,
+            prepared,
             process_lease,
         ) => Some(result),
     };

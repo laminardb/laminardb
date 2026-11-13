@@ -28,6 +28,7 @@ use super::abort_and_join_cluster_task;
 use super::control_kv::StaticClusterKv;
 use super::discovery::DiscoveryImpl;
 use super::leases::ProcessLeaseRuntime;
+use super::startup::PreparedClusterBootstrap;
 use crate::config::{DiscoverySection, ServerConfig};
 
 use super::ClusterStartupError;
@@ -98,8 +99,7 @@ pub(super) async fn install_cluster_controller(
     recovery_kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
     snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
-    bind_host: &str,
-    advertise_host: &str,
+    prepared: &PreparedClusterBootstrap,
     process_lease: &ProcessLeaseRuntime,
 ) -> Result<Arc<laminar_core::cluster::control::ClusterController>, ClusterStartupError> {
     use laminar_core::cluster::control::ClusterController;
@@ -118,18 +118,23 @@ pub(super) async fn install_cluster_controller(
     controller.set_active(false);
     controller.install_local_leader_proof_provider();
 
-    let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
-        ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
-    })?;
+    let PreparedClusterBootstrap {
+        bind_host,
+        control_port,
+        advertise_host,
+        ..
+    } = prepared;
+    let bind: std::net::SocketAddr =
+        format!("{bind_host}:{control_port}").parse().map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
+        })?;
     let bound = controller
-        .start_leased_barrier_server(
-            bind,
-            Some(advertise_host.to_string()),
-            &process_lease.acquired,
-        )
+        .start_leased_barrier_server(bind, Some(advertise_host.clone()), &process_lease.acquired)
         .await
         .map_err(|e| {
-            ClusterStartupError::EngineConstruction(format!("cluster control endpoint start: {e}"))
+            ClusterStartupError::EngineConstruction(format!(
+                "cluster control endpoint start on {bind}: {e}"
+            ))
         })?;
     info!("Barrier sync gRPC server listening on {bound}");
     info!(
@@ -247,11 +252,11 @@ pub(super) async fn build_shuffle_sender(
 
 /// Compute the address peers should use to reach our `ShuffleReceiver`.
 ///
-/// The receiver binds to `0.0.0.0:0` (any interface, ephemeral port), so
-/// `local_addr.ip()` is the wildcard — publishing it unchanged leaves remote
-/// senders unable to connect. Use the configured advertise host (matching the
-/// HTTP/barrier endpoints for NAT/container deployments), falling back to
-/// `gethostname` when it is itself a wildcard, keeping the actual bound port.
+/// The receiver usually binds a wildcard address, so `local_addr.ip()` is the
+/// wildcard — publishing it unchanged leaves remote senders unable to connect.
+/// Use the configured advertise host (matching the HTTP/barrier endpoints for
+/// NAT/container deployments), falling back to `gethostname` when it is itself
+/// a wildcard, keeping the actual bound port.
 pub(super) fn shuffle_advertise_addr(
     local_addr: std::net::SocketAddr,
     advertise_host: &str,

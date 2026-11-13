@@ -14,6 +14,8 @@ laminardb:
     discovery:
       strategy: gossip
       gossipPort: 7946
+      controlPort: 7947
+      shufflePort: 7948
 
 sources:
   - name: trades
@@ -110,9 +112,22 @@ networkPolicy:
       ports:
         - port: 8080
           protocol: TCP
+    # Cluster peers: gossip (UDP; TCP with static discovery), control, and shuffle. Peers also
+    # call each other on HTTP, which the rule above admits.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: laminardb
+      ports:
+        - port: 7946
+          protocol: UDP
+        - port: 7947
+          protocol: TCP
+        - port: 7948
+          protocol: TCP
+  # Any egress rule turns on egress default-deny; the object store and DNS must stay reachable.
   egress:
-    - to:
-        - namespaceSelector: {}
+    - {}
 
 extraEnv:
   - name: RUST_LOG

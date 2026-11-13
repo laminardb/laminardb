@@ -64,9 +64,20 @@ spec:
             {{- $isCluster := eq .Values.laminardb.mode "cluster" }}
             {{- $cluster := .Values.laminardb.cluster | default dict }}
             {{- if $isCluster }}
+            {{- $discovery := $cluster.discovery | default dict }}
             - name: gossip
-              containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
+              containerPort: {{ $discovery.gossipPort | default 7946 }}
+              protocol: {{ eq ($discovery.strategy | default "gossip") "static" | ternary "TCP" "UDP" }}
+            {{- with $discovery.controlPort }}
+            - name: control
+              containerPort: {{ . }}
               protocol: TCP
+            {{- end }}
+            {{- with $discovery.shufflePort }}
+            - name: shuffle
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
             {{- end }}
           startupProbe:
             httpGet:
