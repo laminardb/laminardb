@@ -414,13 +414,15 @@ global aggregate counts no `applied_rows`, because other nodes send it partial r
 
 ## Cluster Network Ports
 
-Besides HTTP, each cluster node listens on three peer-facing ports:
+Cluster nodes reach each other on four ports, so a firewall or NetworkPolicy must admit all four
+between nodes:
 
-| `[discovery]` key | Protocol | Default | Carries |
+| Key | Protocol | Default | Carries |
 |---|---|---|---|
-| `gossip_port` | UDP (`gossip`) or TCP (`static`) | `7946` | Membership and liveness |
-| `control_port` | TCP | `0` (ephemeral) | Control-plane gRPC: barrier sync and leader proofs |
-| `shuffle_port` | TCP | `0` (ephemeral) | Rows shuffled between nodes |
+| `[server] bind` | TCP | `8080` | HTTP API; nodes forward checkpoint requests and topology changes to the leader over it |
+| `[discovery] gossip_port` | UDP (`gossip`) or TCP (`static`) | `7946` | Membership and liveness |
+| `[discovery] control_port` | TCP | `0` (ephemeral) | Control-plane gRPC: barrier sync and leader proofs |
+| `[discovery] shuffle_port` | TCP | `0` (ephemeral) | Rows shuffled between nodes |
 
 Nodes advertise their bound control and shuffle ports to peers, so the ephemeral default works
 whenever peers can reach each other on any port. Set fixed, distinct ports when a firewall,

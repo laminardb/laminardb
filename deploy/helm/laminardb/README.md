@@ -103,7 +103,7 @@ Apply this via:
 helm install my-laminardb deploy/helm/laminardb -f cluster-values.yaml
 ```
 
-Cluster pods reach each other directly on the discovery, control and shuffle ports. With
+Cluster pods reach each other directly on the HTTP, discovery, control and shuffle ports. With
 `networkPolicy.enabled`, add an ingress rule that admits peer pods on those ports, or pods cannot
 form a cluster. The control and shuffle ports are ephemeral unless `controlPort` and `shufflePort`
 are set, so a port-scoped rule needs both fixed; `ci/full-values.yaml` shows one. Listing any

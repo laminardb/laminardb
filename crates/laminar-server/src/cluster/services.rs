@@ -253,9 +253,10 @@ pub(super) async fn build_shuffle_sender(
 /// Compute the address peers should use to reach our `ShuffleReceiver`.
 ///
 /// The receiver usually binds a wildcard address, so `local_addr.ip()` is the
-/// wildcard — publishing it unchanged leaves remote senders unable to connect. Use the configured advertise host (matching the
-/// HTTP/barrier endpoints for NAT/container deployments), falling back to
-/// `gethostname` when it is itself a wildcard, keeping the actual bound port.
+/// wildcard — publishing it unchanged leaves remote senders unable to connect.
+/// Use the configured advertise host (matching the HTTP/barrier endpoints for
+/// NAT/container deployments), falling back to `gethostname` when it is itself
+/// a wildcard, keeping the actual bound port.
 pub(super) fn shuffle_advertise_addr(
     local_addr: std::net::SocketAddr,
     advertise_host: &str,

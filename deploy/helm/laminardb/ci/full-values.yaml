@@ -112,7 +112,8 @@ networkPolicy:
       ports:
         - port: 8080
           protocol: TCP
-    # Cluster peers: gossip (UDP; TCP with static discovery), control, and shuffle.
+    # Cluster peers: gossip (UDP; TCP with static discovery), control, and shuffle. Peers also
+    # call each other on HTTP, which the rule above admits.
     - from:
         - podSelector:
             matchLabels:
@@ -124,9 +125,9 @@ networkPolicy:
           protocol: TCP
         - port: 7948
           protocol: TCP
+  # Any egress rule turns on egress default-deny; the object store and DNS must stay reachable.
   egress:
-    - to:
-        - namespaceSelector: {}
+    - {}
 
 extraEnv:
   - name: RUST_LOG
