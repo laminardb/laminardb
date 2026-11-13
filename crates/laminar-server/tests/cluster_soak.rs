@@ -101,9 +101,18 @@ use std::time::{Duration, Instant};
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
 #[path = "cluster_soak/iceberg_leg.rs"]
 mod iceberg_leg;
-#[cfg(all(feature = "kafka", any(feature = "rabbitmq", feature = "ibmmq")))]
-#[path = "cluster_soak/messaging_sinks.rs"]
-mod messaging_sinks;
+#[cfg(all(
+    feature = "kafka",
+    any(
+        feature = "rabbitmq",
+        feature = "ibmmq",
+        feature = "postgres-sink",
+        feature = "mongodb-cdc",
+        feature = "nats"
+    )
+))]
+#[path = "cluster_soak/multi_writer_sinks/mod.rs"]
+mod multi_writer_sinks;
 // Shared with iceberg_cluster_soak, which uses every helper this soak does not.
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
 #[allow(dead_code)]

@@ -106,6 +106,9 @@ jobs:
     # Covers a cold feature-specific build plus the bounded soak. Correctness deadlines are
     # enforced inside the harness and remain independent of hosted-runner compile variance.
     timeout-minutes: 90
+    # A candidate leg runs everywhere this workflow runs but cannot fail it, so it gathers hosted
+    # evidence before it gates releases. Promote a leg by removing its `candidate` entry.
+    continue-on-error: ${{ matrix.candidate == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -247,7 +250,7 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: observe
           - label: Cluster ALO RabbitMQ sink (gossip)
-            test: messaging_sinks::three_node_rabbitmq_sink_kill9_soak
+            test: multi_writer_sinks::three_node_rabbitmq_sink_kill9_soak
             features: cluster,aws,kafka,rabbitmq
             delivery: alo
             topology: cluster-rabbitmq
@@ -260,6 +263,51 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda rabbitmq
+          - label: Cluster ALO PostgreSQL sink (gossip)
+            test: multi_writer_sinks::three_node_postgres_sink_kill9_soak
+            features: cluster,aws,kafka,postgres-sink
+            delivery: alo
+            topology: cluster-postgres
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # Every node appends its share to one table; the oracle requires every input id.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs redpanda postgres
+            candidate: "true"
+          - label: Cluster ALO MongoDB sink (gossip)
+            test: multi_writer_sinks::three_node_mongodb_sink_kill9_soak
+            features: cluster,aws,kafka,mongodb-cdc
+            delivery: alo
+            topology: cluster-mongodb
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # Every node inserts its share into one collection; the oracle requires every input id.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs redpanda mongodb
+            candidate: "true"
+          - label: Cluster ALO NATS JetStream sink (gossip)
+            test: multi_writer_sinks::three_node_nats_sink_kill9_soak
+            features: cluster,aws,kafka,nats
+            delivery: alo
+            topology: cluster-nats
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # Every node publishes its share to one stream; the oracle requires every input id.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs redpanda nats nats-2 nats-3
+            candidate: "true"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -360,8 +408,10 @@ jobs:
           LAMINAR_SOAK_ICEBERG_S3_SECRET_KEY: minioadmin
           LAMINAR_SOAK_ALLOW_S3_EMULATOR: ${{ matrix.emulator }}
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
-          # The compose broker's default account; only the RabbitMQ sink leg reads it.
+          # The compose services' test accounts; only the matching sink leg reads each one.
           LAMINAR_SOAK_RABBITMQ_PASSWORD: guest
+          LAMINAR_SOAK_POSTGRES_PASSWORD: laminar-test-secret
+          LAMINAR_SOAK_MONGODB_URI: mongodb://127.0.0.1:27217/?directConnection=true&tls=false
 
       - name: Upload join soak logs
         if: always()
