@@ -3,7 +3,7 @@
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
 
 use super::metrics::LakehouseSinkMetrics;
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Prometheus-backed counters/gauges for Delta Lake sink connector statistics.
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ pub struct DeltaLakeSinkMetrics {
     /// Changelog-collapse duration histogram (per upsert flush).
     /// Buckets cover 100µs up to ~3.3s (0.0001 * 2^15).
     pub collapse_duration: Histogram,
+    _registration: Registration,
 }
 
 impl DeltaLakeSinkMetrics {
@@ -51,10 +52,7 @@ impl DeltaLakeSinkMetrics {
             .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
         )
         .unwrap();
-        // Best-effort registration (matches `kafka/metrics.rs` pattern):
-        // `AlreadyReg` is benign on re-init; surface anything else so a
-        // dropped histogram doesn't disappear silently.
-        if let Err(e) = handle.registry().register(Box::new(flush_duration.clone())) {
+        if let Err(e) = handle.register(&flush_duration) {
             tracing::warn!(
                 metric = "delta_sink_flush_duration_seconds",
                 error = %e,
@@ -70,10 +68,7 @@ impl DeltaLakeSinkMetrics {
             .buckets(prometheus::exponential_buckets(0.0001, 2.0, 16).unwrap()),
         )
         .unwrap();
-        if let Err(e) = handle
-            .registry()
-            .register(Box::new(collapse_duration.clone()))
-        {
+        if let Err(e) = handle.register(&collapse_duration) {
             tracing::warn!(
                 metric = "delta_sink_collapse_duration_seconds",
                 error = %e,
@@ -105,6 +100,7 @@ impl DeltaLakeSinkMetrics {
                 "Delete rows emitted by collapse (_op = D)",
             ),
             collapse_duration,
+            _registration: handle.into_registration(),
         }
     }
 

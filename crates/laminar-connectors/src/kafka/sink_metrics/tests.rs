@@ -28,3 +28,12 @@ fn test_produce_latency() {
     assert_eq!(m.produce_latency_sum_us.get(), 450);
     assert_eq!(m.produce_latency_max_us.get(), 300);
 }
+
+#[test]
+fn a_recreated_instance_exports_its_own_counters() {
+    crate::prom::assert_recreated_metrics_export(
+        KafkaSinkMetrics::new,
+        "kafka_sink_records_written_total",
+        |metrics, n| metrics.records_written.inc_by(n),
+    );
+}

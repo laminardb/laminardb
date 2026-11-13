@@ -4,7 +4,7 @@
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Metrics for the `PostgreSQL` CDC source connector.
 ///
@@ -44,6 +44,7 @@ pub struct PostgresCdcMetrics {
 
     /// Inactive slots of other claims under the `slot.name` prefix, last counted.
     pub orphaned_slots: IntGauge,
+    _registration: Registration,
 }
 
 impl PostgresCdcMetrics {
@@ -93,6 +94,7 @@ impl PostgresCdcMetrics {
                 "postgres_cdc_orphaned_slots",
                 "Inactive replication slots of other claims under the slot.name prefix",
             ),
+            _registration: reg.into_registration(),
         }
     }
 

@@ -60,3 +60,21 @@ fn metrics_register_on_shared_registry() {
     assert!(names.contains(&"nats_sink_records_total".to_string()));
     assert!(names.contains(&"nats_sink_dedup_total".to_string()));
 }
+
+#[test]
+fn a_recreated_sink_exports_its_own_writes() {
+    crate::prom::assert_recreated_metrics_export(
+        NatsSinkMetrics::new,
+        "nats_sink_records_total",
+        |metrics, n| metrics.records_total.inc_by(n),
+    );
+}
+
+#[test]
+fn a_recreated_instance_exports_its_own_counters() {
+    crate::prom::assert_recreated_metrics_export(
+        NatsSourceMetrics::new,
+        "nats_source_records_total",
+        |metrics, n| metrics.records_total.inc_by(n),
+    );
+}

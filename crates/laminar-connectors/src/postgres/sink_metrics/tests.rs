@@ -55,3 +55,12 @@ fn test_upsert_metric() {
 
     assert_eq!(m.upsert_operations.get(), 1);
 }
+
+#[test]
+fn a_recreated_sink_exports_its_own_writes() {
+    crate::prom::assert_recreated_metrics_export(
+        PostgresSinkMetrics::new,
+        "postgres_sink_records_written_total",
+        |metrics, n| metrics.records_written.inc_by(n),
+    );
+}

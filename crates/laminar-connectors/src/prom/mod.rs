@@ -3,15 +3,49 @@
 //! boilerplate and `reg_c!` macros that used to be duplicated in
 //! eleven places.
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use prometheus::core::Collector;
 use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
 
 /// Borrowed registry handle used during metric-struct construction.
 pub struct RegHandle<'a> {
     registry: &'a Registry,
     _local: Option<Registry>,
+    /// Collectors this handle registered; a name another live instance holds is not among them.
+    registered: RefCell<Vec<Box<dyn Collector>>>,
 }
 
 impl RegHandle<'_> {
+    /// Register `collector`, keeping it for [`Self::into_registration`] when this handle holds
+    /// the name.
+    ///
+    /// # Errors
+    /// Returns the registry's error, such as another live instance holding the name.
+    pub fn register<C: Collector + Clone + 'static>(
+        &self,
+        collector: &C,
+    ) -> prometheus::Result<()> {
+        self.registry.register(Box::new(collector.clone()))?;
+        self.registered
+            .borrow_mut()
+            .push(Box::new(collector.clone()));
+        Ok(())
+    }
+
+    /// Keep this handle's registrations until the returned guard and all its clones drop.
+    ///
+    /// A connector instance re-created in the same process, such as after a recovery round,
+    /// can only export its own metrics once the previous instance has released the names.
+    #[must_use]
+    pub fn into_registration(self) -> Registration {
+        Registration(Arc::new(Exported {
+            registry: self.registry.clone(),
+            collectors: self.registered.into_inner(),
+        }))
+    }
+
     /// Borrow the inner registry for non-helper registrations (e.g. `Histogram`).
     #[must_use]
     pub fn registry(&self) -> &Registry {
@@ -27,7 +61,7 @@ impl RegHandle<'_> {
     pub fn counter(&self, name: &str, help: &str) -> IntCounter {
         let c =
             IntCounter::new(name, help).unwrap_or_else(|e| panic!("invalid counter '{name}': {e}"));
-        self.registry.register(Box::new(c.clone())).ok();
+        let _ = self.register(&c);
         c
     }
 
@@ -39,7 +73,7 @@ impl RegHandle<'_> {
     #[must_use]
     pub fn gauge(&self, name: &str, help: &str) -> IntGauge {
         let g = IntGauge::new(name, help).unwrap_or_else(|e| panic!("invalid gauge '{name}': {e}"));
-        self.registry.register(Box::new(g.clone())).ok();
+        let _ = self.register(&g);
         g
     }
 
@@ -52,7 +86,7 @@ impl RegHandle<'_> {
     pub fn counter_vec(&self, name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
         let v = IntCounterVec::new(Opts::new(name, help), labels)
             .unwrap_or_else(|e| panic!("invalid counter_vec '{name}': {e}"));
-        self.registry.register(Box::new(v.clone())).ok();
+        let _ = self.register(&v);
         v
     }
 
@@ -65,7 +99,7 @@ impl RegHandle<'_> {
     pub fn gauge_vec(&self, name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
         let v = IntGaugeVec::new(Opts::new(name, help), labels)
             .unwrap_or_else(|e| panic!("invalid gauge_vec '{name}': {e}"));
-        self.registry.register(Box::new(v.clone())).ok();
+        let _ = self.register(&v);
         v
     }
 }
@@ -83,12 +117,39 @@ pub fn reg_or_local<'a>(
         RegHandle {
             registry: r,
             _local: None,
+            registered: RefCell::default(),
         }
     } else {
         *local = Some(Registry::new());
         RegHandle {
             registry: local.as_ref().expect("just initialized"),
             _local: None,
+            registered: RefCell::default(),
+        }
+    }
+}
+
+/// Metrics a connector instance exports, unregistered when the last clone drops.
+#[derive(Clone)]
+pub struct Registration(Arc<Exported>);
+
+impl std::fmt::Debug for Registration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registration")
+            .field("collectors", &self.0.collectors.len())
+            .finish()
+    }
+}
+
+struct Exported {
+    registry: Registry,
+    collectors: Vec<Box<dyn Collector>>,
+}
+
+impl Drop for Exported {
+    fn drop(&mut self) {
+        for collector in self.collectors.drain(..) {
+            let _ = self.registry.unregister(collector);
         }
     }
 }
@@ -179,6 +240,32 @@ impl Drop for LabelledFamilies {
             }
         }
     }
+}
+
+/// Assert that metrics re-created on one registry after the previous instance dropped export the
+/// new instance's `counter`, bumped through `bump`.
+#[cfg(test)]
+pub(crate) fn assert_recreated_metrics_export<M>(
+    build: impl Fn(Option<&Registry>) -> M,
+    counter: &str,
+    bump: impl Fn(&M, u64),
+) {
+    let registry = Registry::new();
+    let previous = build(Some(&registry));
+    bump(&previous, 3);
+    drop(previous);
+    let current = build(Some(&registry));
+    bump(&current, 5);
+    let exported = registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == counter)
+        .map(|family| family.get_metric()[0].get_counter().value());
+    assert_eq!(
+        exported,
+        Some(5.0),
+        "{counter} must export the re-created instance"
+    );
 }
 
 #[cfg(test)]

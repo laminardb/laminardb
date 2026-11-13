@@ -64,3 +64,12 @@ fn test_changelog_deletes() {
 
     assert_eq!(m.common.changelog_deletes.get(), 80);
 }
+
+#[test]
+fn a_recreated_instance_exports_its_own_counters() {
+    crate::prom::assert_recreated_metrics_export(
+        DeltaLakeSinkMetrics::new,
+        "delta_sink_merge_operations_total",
+        |metrics, n| metrics.merge_operations.inc_by(n),
+    );
+}
