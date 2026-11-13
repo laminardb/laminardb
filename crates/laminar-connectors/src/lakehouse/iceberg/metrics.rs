@@ -4,7 +4,7 @@ use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
 use tracing::info;
 
 use crate::lakehouse::iceberg_config::IcebergSinkConfig;
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 pub(super) fn trace_sink_connected(config: &IcebergSinkConfig, namespace: &str, table: &str) {
     info!(
@@ -41,6 +41,7 @@ pub(super) struct IcebergMetrics {
     pub(super) credential_refresh_failures: IntCounter,
     pub(super) committed_checkpoint: IntGauge,
     pub(super) last_successful_commit_timestamp: IntGauge,
+    _registration: Registration,
 }
 
 impl IcebergMetrics {
@@ -50,7 +51,7 @@ impl IcebergMetrics {
         let histogram = |name: &str, help: &str, buckets: Vec<f64>| {
             let metric = Histogram::with_opts(HistogramOpts::new(name, help).buckets(buckets))
                 .unwrap_or_else(|error| panic!("invalid Iceberg histogram '{name}': {error}"));
-            handle.registry().register(Box::new(metric.clone())).ok();
+            let _ = handle.register(&metric);
             metric
         };
 
@@ -138,6 +139,7 @@ impl IcebergMetrics {
                 "iceberg_sink_last_successful_commit_timestamp_seconds",
                 "Unix timestamp of the latest successful Iceberg publication",
             ),
+            _registration: handle.into_registration(),
         }
     }
 
@@ -205,5 +207,14 @@ mod tests {
 
         assert_eq!(metrics.data_files_written.get(), 1);
         assert_eq!(metrics.small_files_written.get(), 1);
+    }
+
+    #[test]
+    fn a_recreated_instance_exports_its_own_counters() {
+        crate::prom::assert_recreated_metrics_export(
+            IcebergMetrics::new,
+            "iceberg_sink_data_files_written_total",
+            |metrics, n| metrics.data_files_written.inc_by(n),
+        );
     }
 }

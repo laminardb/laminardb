@@ -261,7 +261,7 @@ missing:
 
 In the node-loss run the restarted pipeline reached the next `url` endpoint and caught up in 19 s.
 
-`crates/laminar-server/tests/cluster_soak/messaging_sinks.rs` runs the sink in a three-node
+`crates/laminar-server/tests/cluster_soak/multi_writer_sinks/` runs the sink in a three-node
 cluster: a Kafka source (Redpanda) feeds a projection, every node publishes its share of the rows
 to one classic queue, and checkpoints go to a shared S3 store (SeaweedFS). The leader was
 hard-killed twice and each follower once, every time while paused inside a checkpoint after the

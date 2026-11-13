@@ -44,3 +44,21 @@ fn test_sink_metrics_record_flush() {
     assert_eq!(m.deletes.get(), 5);
     assert_eq!(m.errors.get(), 1);
 }
+
+#[test]
+fn a_recreated_sink_exports_its_own_writes() {
+    crate::prom::assert_recreated_metrics_export(
+        MongoDbSinkMetrics::new,
+        "mongodb_sink_records_written_total",
+        |metrics, n| metrics.records_written.inc_by(n),
+    );
+}
+
+#[test]
+fn a_recreated_instance_exports_its_own_counters() {
+    crate::prom::assert_recreated_metrics_export(
+        MongoDbCdcMetrics::new,
+        "mongodb_cdc_events_received_total",
+        |metrics, n| metrics.events_received.inc_by(n),
+    );
+}

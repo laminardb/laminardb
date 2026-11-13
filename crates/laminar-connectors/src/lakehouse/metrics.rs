@@ -5,7 +5,7 @@
 
 use prometheus::{IntCounter, Registry};
 
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Prometheus-backed counters for Lakehouse sink connector statistics.
 #[derive(Debug, Clone)]
@@ -30,6 +30,7 @@ pub struct LakehouseSinkMetrics {
 
     /// Total changelog DELETE operations processed.
     pub changelog_deletes: IntCounter,
+    _registration: Registration,
 }
 
 impl LakehouseSinkMetrics {
@@ -63,6 +64,7 @@ impl LakehouseSinkMetrics {
                 "lakehouse_sink_changelog_deletes_total",
                 "Total changelog DELETE operations",
             ),
+            _registration: reg.into_registration(),
         }
     }
 
@@ -97,5 +99,19 @@ impl LakehouseSinkMetrics {
 impl Default for LakehouseSinkMetrics {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recreated_instance_exports_its_own_counters() {
+        crate::prom::assert_recreated_metrics_export(
+            LakehouseSinkMetrics::new,
+            "lakehouse_sink_rows_flushed_total",
+            |metrics, n| metrics.rows_flushed.inc_by(n),
+        );
     }
 }

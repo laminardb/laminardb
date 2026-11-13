@@ -4,6 +4,10 @@
 # flushed, so logical decoding already sends it while snapshots still treat it as running.
 # Every other session uses the configured synchronous_commit=local and never waits.
 #
+# Pinned to 17.11: from 17.12 on, slot creation waits for every transaction still in the procarray,
+# so a commit waiting in SyncRep holds the slot back instead of racing its initial snapshot. The
+# connector still has to handle the race on servers without that change.
+#
 # Its own compose project, network, and port; it does not touch the shared `docker` project.
 #
 # Bring up:   docker compose -f tests/docker/postgres-cdc-syncrep-compose.yml up -d --wait
@@ -15,7 +19,7 @@ name: laminardb-pg-cdc-syncrep
 
 services:
   postgres-syncrep:
-    image: postgres:17
+    image: postgres:17.11
     container_name: laminardb-pg-cdc-syncrep
     environment:
       POSTGRES_USER: laminar

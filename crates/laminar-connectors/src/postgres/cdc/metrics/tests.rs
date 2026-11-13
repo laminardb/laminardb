@@ -29,3 +29,12 @@ fn test_lsn_and_lag_tracking() {
     assert_eq!(m.confirmed_flush_lsn.get(), 0x1234_ABCD_i64);
     assert_eq!(m.replication_lag_bytes.get(), 4096);
 }
+
+#[test]
+fn a_recreated_instance_exports_its_own_counters() {
+    crate::prom::assert_recreated_metrics_export(
+        PostgresCdcMetrics::new,
+        "postgres_cdc_events_received_total",
+        |metrics, n| metrics.events_received.inc_by(n),
+    );
+}

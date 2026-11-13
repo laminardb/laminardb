@@ -1,26 +1,9 @@
 //! NATS connector metrics. No per-subject labels — subjects are
 //! wildcard-addressable and unbounded-cardinality.
 
-use prometheus::core::Collector;
-use prometheus::{Error as PromError, IntCounter, IntGauge, Registry};
-use tracing::warn;
+use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::prom::reg_or_local;
-
-fn register_collector<C: Collector + Clone + 'static>(reg: &Registry, name: &str, c: &C) {
-    match reg.register(Box::new(c.clone())) {
-        Ok(()) => {}
-        // Multiple connectors on a shared registry can collide; the
-        // second registration silently drops so its counts won't scrape.
-        Err(PromError::AlreadyReg) => {
-            warn!(
-                metric = name,
-                "metric already registered; use separate registries per connector"
-            );
-        }
-        Err(e) => warn!(metric = name, error = ?e, "failed to register metric"),
-    }
-}
+use crate::prom::{reg_or_local, Registration};
 
 /// Prometheus counters for the NATS source.
 #[derive(Debug, Clone)]
@@ -34,6 +17,7 @@ pub struct NatsSourceMetrics {
     pub pending_acks: IntGauge,
     /// Stream messages not yet delivered to the consumer.
     pub consumer_lag: IntGauge,
+    _registration: Registration,
 }
 
 impl NatsSourceMetrics {
@@ -42,37 +26,22 @@ impl NatsSourceMetrics {
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
         let mut local = None;
-        let handle = reg_or_local(registry, &mut local);
-        let reg = handle.registry();
-
-        macro_rules! reg_c {
-            ($name:expr, $help:expr) => {{
-                let c = IntCounter::new($name, $help).unwrap();
-                register_collector(reg, $name, &c);
-                c
-            }};
-        }
-        let pending_acks = IntGauge::new(
-            "nats_source_pending_acks",
-            "JetStream acks queued or in flight",
-        )
-        .unwrap();
-        register_collector(reg, "nats_source_pending_acks", &pending_acks);
-        let consumer_lag = IntGauge::new(
-            "nats_source_consumer_lag",
-            "Stream messages not yet delivered to the consumer",
-        )
-        .unwrap();
-        register_collector(reg, "nats_source_consumer_lag", &consumer_lag);
-
+        let reg = reg_or_local(registry, &mut local);
         Self {
-            records_total: reg_c!("nats_source_records_total", "Records delivered"),
-            bytes_total: reg_c!("nats_source_bytes_total", "Payload bytes delivered"),
-            fetch_errors_total: reg_c!("nats_source_fetch_errors_total", "Fetch errors"),
-            acks_total: reg_c!("nats_source_acks_total", "Successful acks"),
-            ack_errors_total: reg_c!("nats_source_ack_errors_total", "Failed acks"),
-            pending_acks,
-            consumer_lag,
+            records_total: reg.counter("nats_source_records_total", "Records delivered"),
+            bytes_total: reg.counter("nats_source_bytes_total", "Payload bytes delivered"),
+            fetch_errors_total: reg.counter("nats_source_fetch_errors_total", "Fetch errors"),
+            acks_total: reg.counter("nats_source_acks_total", "Successful acks"),
+            ack_errors_total: reg.counter("nats_source_ack_errors_total", "Failed acks"),
+            pending_acks: reg.gauge(
+                "nats_source_pending_acks",
+                "JetStream acks queued or in flight",
+            ),
+            consumer_lag: reg.gauge(
+                "nats_source_consumer_lag",
+                "Stream messages not yet delivered to the consumer",
+            ),
+            _registration: reg.into_registration(),
         }
     }
 
@@ -141,6 +110,7 @@ pub struct NatsSinkMetrics {
     /// Publishes the broker dropped as `Nats-Msg-Id` duplicates.
     pub dedup_total: IntCounter,
     pub pending_futures: IntGauge,
+    _registration: Registration,
 }
 
 impl NatsSinkMetrics {
@@ -149,27 +119,16 @@ impl NatsSinkMetrics {
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
         let mut local = None;
-        let handle = reg_or_local(registry, &mut local);
-        let reg = handle.registry();
-
-        macro_rules! reg_c {
-            ($name:expr, $help:expr) => {{
-                let c = IntCounter::new($name, $help).unwrap();
-                register_collector(reg, $name, &c);
-                c
-            }};
-        }
-        let pending_futures =
-            IntGauge::new("nats_sink_pending_futures", "Outstanding PublishAckFutures").unwrap();
-        register_collector(reg, "nats_sink_pending_futures", &pending_futures);
-
+        let reg = reg_or_local(registry, &mut local);
         Self {
-            records_total: reg_c!("nats_sink_records_total", "Records published"),
-            bytes_total: reg_c!("nats_sink_bytes_total", "Payload bytes published"),
-            publish_errors_total: reg_c!("nats_sink_publish_errors_total", "Publish errors"),
-            ack_errors_total: reg_c!("nats_sink_ack_errors_total", "Publish-ack errors"),
-            dedup_total: reg_c!("nats_sink_dedup_total", "Broker-dropped duplicates"),
-            pending_futures,
+            records_total: reg.counter("nats_sink_records_total", "Records published"),
+            bytes_total: reg.counter("nats_sink_bytes_total", "Payload bytes published"),
+            publish_errors_total: reg.counter("nats_sink_publish_errors_total", "Publish errors"),
+            ack_errors_total: reg.counter("nats_sink_ack_errors_total", "Publish-ack errors"),
+            dedup_total: reg.counter("nats_sink_dedup_total", "Broker-dropped duplicates"),
+            pending_futures: reg
+                .gauge("nats_sink_pending_futures", "Outstanding PublishAckFutures"),
+            _registration: reg.into_registration(),
         }
     }
 

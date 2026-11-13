@@ -169,6 +169,8 @@ rcgen = "0.13"
 serde_json = { workspace = true }
 # The RabbitMQ kill test and cluster soak publish inputs and read outputs directly.
 lapin = { version = "4.12.2", default-features = false, features = ["tokio", "rustls--aws_lc_rs", "rustls-webpki-roots-certs"] }
+# The cluster soak provisions and drains the NATS JetStream sink's stream.
+async-nats = "0.47"
 futures-util = "0.3"
 
 [features]

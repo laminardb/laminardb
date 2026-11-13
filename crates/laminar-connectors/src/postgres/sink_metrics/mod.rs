@@ -5,7 +5,7 @@
 
 use prometheus::{IntCounter, Registry};
 
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Prometheus-backed counters for `PostgreSQL` sink connector statistics.
 #[derive(Debug, Clone)]
@@ -30,6 +30,8 @@ pub struct PostgresSinkMetrics {
 
     /// Total changelog deletes applied (Z-set weight -1).
     pub changelog_deletes: IntCounter,
+
+    _registration: Registration,
 }
 
 impl PostgresSinkMetrics {
@@ -66,6 +68,7 @@ impl PostgresSinkMetrics {
                 "postgres_sink_changelog_deletes_total",
                 "Total changelog deletes applied",
             ),
+            _registration: reg.into_registration(),
         }
     }
 

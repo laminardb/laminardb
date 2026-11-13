@@ -5,7 +5,7 @@
 use prometheus::{IntCounter, IntGauge, Registry};
 
 use super::change_event::ChangeOperation;
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Metrics for the `MongoDB` CDC source connector.
 #[derive(Debug, Clone)]
@@ -36,6 +36,7 @@ pub struct MongoDbCdcMetrics {
     pub snapshot_in_progress: IntGauge,
     /// Total reconnection attempts.
     pub reconnects: IntCounter,
+    _registration: Registration,
 }
 
 impl MongoDbCdcMetrics {
@@ -84,6 +85,7 @@ impl MongoDbCdcMetrics {
                 "mongodb_cdc_reconnects_total",
                 "Total reconnection attempts",
             ),
+            _registration: reg.into_registration(),
         }
     }
 
@@ -150,6 +152,7 @@ pub struct MongoDbSinkMetrics {
     pub upserts: IntCounter,
     /// Total delete operations.
     pub deletes: IntCounter,
+    _registration: Registration,
 }
 
 impl MongoDbSinkMetrics {
@@ -181,6 +184,7 @@ impl MongoDbSinkMetrics {
             inserts: reg.counter("mongodb_sink_inserts_total", "Total insert operations"),
             upserts: reg.counter("mongodb_sink_upserts_total", "Total upsert operations"),
             deletes: reg.counter("mongodb_sink_deletes_total", "Total delete operations"),
+            _registration: reg.into_registration(),
         }
     }
 

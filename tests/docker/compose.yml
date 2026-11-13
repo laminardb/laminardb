@@ -86,6 +86,72 @@ services:
       timeout: 10s
       retries: 30
 
+  # Sink destinations for the cluster soak's multi-writer legs. Host ports avoid the CDC compose
+  # files so both can run at once.
+  postgres:
+    image: postgres:17
+    container_name: laminardb-postgres
+    environment:
+      POSTGRES_USER: laminar
+      POSTGRES_PASSWORD: laminar-test-secret
+      POSTGRES_DB: laminar
+    ports:
+      - "127.0.0.1:15434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "laminar", "-d", "laminar"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mongodb:
+    image: mongo:8.0
+    container_name: laminardb-mongodb
+    # MongoDB 8.0's per-CPU allocator caches break on Linux 6.19 to 7.0.13, where mongod refuses
+    # to start; glibc's rseq registration keeps the caches off on every kernel.
+    environment:
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
+    ports:
+      - "127.0.0.1:27217:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # A three-server JetStream cluster: the NATS sink requires a file-backed stream with three
+  # replicas. Clients reach it through `nats` only; `--no_advertise` keeps the other servers'
+  # container addresses away from clients outside the network.
+  nats:
+    image: nats:2.10-alpine
+    container_name: laminardb-nats
+    command: ["-js", "-sd", "/data", "-m", "8222", "--server_name", "nats-1",
+              "--cluster_name", "laminar", "--cluster", "nats://0.0.0.0:6222",
+              "--routes", "nats://nats-2:6222,nats://nats-3:6222", "--no_advertise"]
+    depends_on: [nats-2, nats-3]
+    ports:
+      - "127.0.0.1:14222:4222"
+    healthcheck:
+      # Healthy only once this server is current with the JetStream meta leader, so a stream can be
+      # created.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-server-only=true"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  nats-2:
+    image: nats:2.10-alpine
+    container_name: laminardb-nats-2
+    command: ["-js", "-sd", "/data", "--server_name", "nats-2", "--cluster_name", "laminar",
+              "--cluster", "nats://0.0.0.0:6222",
+              "--routes", "nats://nats:6222,nats://nats-3:6222", "--no_advertise"]
+
+  nats-3:
+    image: nats:2.10-alpine
+    container_name: laminardb-nats-3
+    command: ["-js", "-sd", "/data", "--server_name", "nats-3", "--cluster_name", "laminar",
+              "--cluster", "nats://0.0.0.0:6222",
+              "--routes", "nats://nats:6222,nats://nats-2:6222", "--no_advertise"]
+
   # IBM MQ Advanced for Developers (non-production developer license; amd64-only image).
   # Opt in with `--profile ibmmq` and IBM_MQ_LICENSE=accept after reading the license
   # (`docker run --rm icr.io/ibm-messaging/mq:9.4.0.26-r2 --license`). On Apple silicon,

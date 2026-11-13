@@ -2,7 +2,7 @@
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 /// Prometheus-backed counters/gauges for Kafka source connector statistics.
 #[derive(Debug, Clone)]
@@ -37,6 +37,7 @@ pub struct KafkaSourceMetrics {
     pub schema_fetch_microseconds: IntCounter,
     /// Records currently blocked behind unresolved writer metadata.
     pub schema_unresolved_records: IntGauge,
+    _registration: Registration,
 }
 
 impl KafkaSourceMetrics {
@@ -106,6 +107,7 @@ impl KafkaSourceMetrics {
                 "kafka_source_sr_discovery_timeouts_total",
                 "Schema Registry discovery timeouts",
             ),
+            _registration: handle.into_registration(),
         }
     }
 
@@ -223,5 +225,14 @@ mod tests {
             .collect();
         assert!(names.contains(&"kafka_source_records_polled_total"));
         assert!(names.contains(&"kafka_source_errors_total"));
+    }
+
+    #[test]
+    fn a_recreated_instance_exports_its_own_counters() {
+        crate::prom::assert_recreated_metrics_export(
+            KafkaSourceMetrics::new,
+            "kafka_source_records_polled_total",
+            |metrics, n| metrics.records_polled.inc_by(n),
+        );
     }
 }

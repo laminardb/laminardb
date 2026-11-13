@@ -1,6 +1,6 @@
 use prometheus::{Gauge, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
 
-use crate::prom::reg_or_local;
+use crate::prom::{reg_or_local, Registration};
 
 #[derive(Debug, Clone)]
 pub(super) struct IcebergSourceMetrics {
@@ -22,6 +22,7 @@ pub(super) struct IcebergSourceMetrics {
     pub(super) read_bytes: IntCounter,
     pub(super) read_storage_bytes: IntCounter,
     pub(super) credential_refresh_failures: IntCounter,
+    _registration: Registration,
 }
 
 impl IcebergSourceMetrics {
@@ -34,13 +35,13 @@ impl IcebergSourceMetrics {
                     .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
             )
             .unwrap_or_else(|error| panic!("invalid Iceberg source histogram '{name}': {error}"));
-            handle.registry().register(Box::new(metric.clone())).ok();
+            let _ = handle.register(&metric);
             metric
         };
         let gauge = |name: &str, help: &str| {
             let metric = Gauge::with_opts(Opts::new(name, help))
                 .unwrap_or_else(|error| panic!("invalid Iceberg source gauge '{name}': {error}"));
-            handle.registry().register(Box::new(metric.clone())).ok();
+            let _ = handle.register(&metric);
             metric
         };
 
@@ -117,6 +118,7 @@ impl IcebergSourceMetrics {
                 "iceberg_source_credential_refresh_failures_total",
                 "Failed proactive Iceberg catalog credential refreshes",
             ),
+            _registration: handle.into_registration(),
         }
     }
 
@@ -185,5 +187,14 @@ mod tests {
         assert_eq!(metrics.data_file_count.get(), 1);
         assert_eq!(metrics.delete_file_count.get(), 0);
         assert_eq!(metrics.delete_to_data_file_ratio.get(), 0.0);
+    }
+
+    #[test]
+    fn a_recreated_instance_exports_its_own_counters() {
+        crate::prom::assert_recreated_metrics_export(
+            IcebergSourceMetrics::new,
+            "iceberg_source_planned_files_total",
+            |metrics, n| metrics.planned_files.inc_by(n),
+        );
     }
 }
