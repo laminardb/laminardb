@@ -8,9 +8,11 @@ use laminar_core::cluster::control::{
     LocalProcessAuthorityIdentity, TopologyAdmissionPlan, TopologyError,
     TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
 };
-use laminar_sql::parser::StreamingStatement;
+use laminar_sql::parser::parse_streaming_sql;
 
-use super::{DbError, LaminarDB, TopologyAdmissionStatus, TopologyOperationId, TopologyVersion};
+use super::{
+    DbError, DbState, LaminarDB, TopologyAdmissionStatus, TopologyOperationId, TopologyVersion,
+};
 
 pub(super) const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -221,12 +223,43 @@ impl LaminarDB {
         }
     }
 
-    pub(in crate::db) async fn submit_cluster_topology_sql(
+    /// Admit a running cluster's DDL script as one atomic migration with a single receipt.
+    ///
+    /// Returns `None` when the script must run statement by statement: outside a running
+    /// cluster, during catalog replay or bootstrap, or when it contains no topology DDL.
+    pub(in crate::db) async fn submit_cluster_topology_script(
         &self,
-        sql: &str,
-        statement: &StreamingStatement,
-    ) -> Result<crate::handle::ExecuteResult, DbError> {
-        let (name, _, _) = super::catalog_changes::statement_identity(self, sql, statement)?;
+        statements: &[&str],
+    ) -> Result<Option<crate::handle::ExecuteResult>, DbError> {
+        if !self.is_cluster_runtime()
+            || DbState::load(&self.state) != DbState::Running
+            || crate::db::catalog_manifest_replay_active()
+            || crate::db::catalog_bootstrap_active()
+        {
+            return Ok(None);
+        }
+        let mut names = Vec::with_capacity(statements.len());
+        for sql in statements {
+            let parsed = parse_streaming_sql(sql)?;
+            let statement = parsed
+                .first()
+                .ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))?;
+            if crate::db::is_topology_ddl(statement) {
+                names.push(super::catalog_changes::statement_identity(self, sql, statement)?.0);
+            }
+        }
+        if names.is_empty() {
+            return Ok(None);
+        }
+        // A later statement would run against a catalog whose migration has not activated yet.
+        if names.len() != statements.len() {
+            return Err(TopologyError::Unsupported(
+                "a cluster script cannot mix topology DDL with other statements; submit them separately"
+                    .into(),
+            )
+            .into());
+        }
+        self.ensure_catalog_cleanup_unfenced("database mutation")?;
         let parent = self
             .cluster_topology_status()
             .await?
@@ -239,8 +272,10 @@ impl LaminarDB {
         let request = ClusterTopologyRequest {
             operation_id: uuid::Uuid::new_v4().try_into()?,
             expected_parent_version: parent,
-            statements: vec![sql.to_owned()],
+            statements: statements.iter().map(|sql| (*sql).to_owned()).collect(),
         };
+        // Admission plans its private catalog under the read lock. Do not take the
+        // direct-mutation write lock or invoke the startup bootstrap exception here.
         let status = Box::pin(self.submit_cluster_topology_change(&request))
             .await
             .map_err(|source| {
@@ -260,12 +295,14 @@ impl LaminarDB {
                     source
                 }
             })?;
-        Ok(crate::handle::ExecuteResult::Ddl(crate::handle::DdlInfo {
-            statement_type: "TOPOLOGY MIGRATION".into(),
-            object_name: name,
-            applied: false,
-            topology_operation: Some(Box::new(status)),
-        }))
+        Ok(Some(crate::handle::ExecuteResult::Ddl(
+            crate::handle::DdlInfo {
+                statement_type: "TOPOLOGY MIGRATION".into(),
+                object_name: names.join(", "),
+                applied: false,
+                topology_operation: Some(Box::new(status)),
+            },
+        )))
     }
 
     fn topology_submission_controller(&self) -> Result<Arc<ClusterController>, DbError> {
