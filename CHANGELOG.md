@@ -17,6 +17,10 @@
   processed. At-least-once pipelines counted those records twice in their state, and
   exactly-once pipelines published them twice. The new owner now resumes the partition from the
   committed handoff checkpoint. Recovery after a node is killed was not affected.
+- quinn-proto moves to 0.11.19 for RUSTSEC-2026-0523 (a MAX_STREAM_DATA frame could open streams
+  beyond the stream limit) and RUSTSEC-2026-0524 (a long Retry token could panic or exhaust memory
+  in a QUIC client), and quinn-udp to 0.5.16 for RUSTSEC-2026-0538 (the receive loop could spin
+  after a truncated datagram).
 
 ## [0.40.2]
 
