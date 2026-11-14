@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
+use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_core::checkpoint::{
     AdoptedViewLog, CheckpointAssignmentFence, CheckpointManifest, CheckpointScope,
     CheckpointStore, CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef,
@@ -431,6 +432,29 @@ impl CheckpointCoordinator {
         )
         .await
         .map_err(|_| handoff_error("vnode handoff frame read timed out"))?
+    }
+
+    /// Every source's merged cursor at the handoff cut: where acquired channels resume.
+    pub(crate) async fn load_handoff_source_cursors(
+        &self,
+        pinned: &CommittedCheckpointRef,
+        predecessor: &CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<BTreeMap<String, Arc<SourceCheckpoint>>, DbError> {
+        let cut = self
+            .load_validated_handoff_cut_until(pinned, predecessor, deadline)
+            .await?;
+        Ok(cut
+            .committed
+            .source_offsets
+            .iter()
+            .map(|(source, cursor)| {
+                (
+                    source.clone(),
+                    Arc::new(super::connector_to_source_checkpoint(cursor)),
+                )
+            })
+            .collect())
     }
 
     /// The append-view logs this participant adopts from the participants of the handoff cut

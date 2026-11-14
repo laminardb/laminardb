@@ -867,12 +867,13 @@ async fn captured_cut_outlives_prepare_deadline_and_uses_resolution_deadline() {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     source.reader_drain_tx = Some(tx);
-    let resolution = SourceDrainResolution {
-        round: request.round,
-        outcome: SourceDrainOutcome::Commit,
-    };
+    let mut committed = SourceCheckpoint::default();
+    committed.set_metadata("connector", "kafka");
+    committed.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
+    let settlement = SourceDrainSettlement::commit(request.round, Arc::new(committed));
+    let resolution = settlement.resolution();
     let resolution_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-    let finish = source.finish_drain(resolution, resolution_deadline);
+    let finish = source.finish_drain(settlement, resolution_deadline);
     let respond = async {
         let KafkaReaderDrainCommand::Resolve {
             resolution: actual,
@@ -1525,10 +1526,7 @@ async fn terminal_reader_fault_preempts_assignment_wait_and_control_plane() {
             .expect_err("drain cut must fail closed"),
         source
             .finish_drain(
-                SourceDrainResolution {
-                    round: drain_request().round,
-                    outcome: SourceDrainOutcome::Abort,
-                },
+                SourceDrainSettlement::abort(drain_request().round),
                 drain_deadline,
             )
             .await
@@ -3442,4 +3440,196 @@ mod fpml {
         );
         assert!(source.fpml.is_none());
     }
+}
+
+/// A committed drain moves partitions from a running donor to a running acquirer. The acquirer
+/// resumes them from the committed handoff cursor, after every record the donor consumed, not
+/// from its own history (here: nothing, so the earliest offset).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_drain_resumes_acquired_partitions_after_the_donor_progress() {
+    use laminar_core::state::{NodeId, VnodeRegistry};
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    const VNODES: u32 = 8;
+    let route = |partition| {
+        crate::kafka::vnode_routing::partition_vnode("events_source", "events", partition, VNODES)
+            .unwrap() as usize
+    };
+    let cluster = MockCluster::new(1).expect("create in-process Kafka mock cluster");
+    cluster.create_topic("events", 4, 1).unwrap();
+    let (node_a, node_b) = (NodeId(1), NodeId(2));
+    let before: Arc<[NodeId]> = (0..VNODES as usize)
+        .map(|vnode| if vnode == route(1) { node_b } else { node_a })
+        .collect();
+    let after: Arc<[NodeId]> = (0..VNODES).map(|_| node_a).collect();
+    let owned_by = |node| -> Vec<i32> {
+        (0..4)
+            .filter(|partition| before[route(*partition)] == node)
+            .collect()
+    };
+    let (a_partitions, b_partitions) = (owned_by(node_a), owned_by(node_b));
+    assert!(!a_partitions.is_empty() && !b_partitions.is_empty());
+
+    let node = |id: NodeId| {
+        let registry = Arc::new(VnodeRegistry::single_owner(VNODES, id));
+        registry.set_assignment_and_version(Arc::clone(&before), 2);
+        let mut config = test_config();
+        config.bootstrap_servers = cluster.bootstrap_servers();
+        config.group_id = "committed-drain-acquisition".into();
+        config.startup_mode = StartupMode::Earliest;
+        let mut source = KafkaSource::new(test_schema(), config, None);
+        source
+            .set_vnode_assignment("events_source", Arc::clone(&registry), id)
+            .unwrap();
+        (source, registry)
+    };
+    let (mut a, registry_a) = node(node_a);
+    let (mut b, registry_b) = node(node_b);
+    for source in [&mut a, &mut b] {
+        source
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", cluster.bootstrap_servers())
+        .create()
+        .unwrap();
+    for partition in 0..4 {
+        for row in 0..3 {
+            let payload = format!(r#"{{"id":{},"value":"v"}}"#, partition * 100 + row);
+            producer
+                .send(
+                    FutureRecord::<(), str>::to("events")
+                        .partition(partition)
+                        .payload(&payload),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    collect_native_ids(&mut a, 3 * a_partitions.len(), 64).await;
+    collect_native_ids(&mut b, 3 * b_partitions.len(), 64).await;
+
+    let round = laminar_core::checkpoint::AssignmentDrainId {
+        predecessor_version: 2,
+        target_version: 3,
+        digest: [7; 32],
+    };
+    let request = SourceDrainRequest::new(round).unwrap();
+    for source in [&mut a, &mut b] {
+        source
+            .begin_drain(
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(source.poll_batch(64).await.unwrap().is_none());
+            if source.poll_drain_ready(round).unwrap() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drain cut timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    // The handoff checkpoint merges every participant's cursor at the cut.
+    let mut committed = SourceCheckpoint::new();
+    for source in [&a, &b] {
+        let checkpoint = source.checkpoint();
+        for (key, value) in checkpoint.offsets() {
+            committed.set_offset(key.clone(), value.clone());
+        }
+        for (key, value) in checkpoint.metadata() {
+            committed.set_metadata(key.clone(), value.clone());
+        }
+    }
+    let committed = Arc::new(committed);
+    for registry in [&registry_a, &registry_b] {
+        registry.set_assignment_and_version(Arc::clone(&after), 3);
+    }
+    for source in [&mut a, &mut b] {
+        source
+            .finish_drain(
+                SourceDrainSettlement::commit(round, Arc::clone(&committed)),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut reread: Vec<i64> = Vec::new();
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < quiet {
+        match a.poll_batch(64).await.unwrap() {
+            Some(batch) => reread.extend(
+                batch
+                    .records
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .values(),
+            ),
+            None => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    let checkpoint = a.checkpoint();
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+    assert!(
+        reread.is_empty(),
+        "partitions {b_partitions:?} were read again after the donor consumed them: {reread:?}"
+    );
+    // Until it reads past them, the acquirer reports the committed positions as its baselines.
+    for partition in b_partitions {
+        assert_eq!(
+            checkpoint.get_offset(&super::checkpoint::partition_baseline_key(
+                "events", partition
+            )),
+            Some("3"),
+            "partition {partition}"
+        );
+    }
+}
+
+#[test]
+fn committed_settlement_positions_from_offsets_then_baselines() {
+    let committed = std::collections::HashMap::from([
+        ("events:0".to_string(), "41".to_string()),
+        (
+            super::checkpoint::partition_baseline_key("events", 1),
+            "7".to_string(),
+        ),
+    ]);
+    let settlement = KafkaDrainSettlement::Commit {
+        offsets: OffsetTracker::try_from_offset_map(&committed).unwrap(),
+        baselines: super::checkpoint::decode_partition_baselines_from_offsets(&committed).unwrap(),
+    };
+    let position = |partition| {
+        settlement
+            .committed_position("events", partition)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(position(0), Some(42));
+    // A donor that acquired partition 1 and never read it hands over its baseline.
+    assert_eq!(position(1), Some(7));
+    // Nobody ever positioned partition 2: the deterministic default applies on every node.
+    assert_eq!(position(2), None);
+    assert!(KafkaDrainSettlement::Abort
+        .committed_position("events", 0)
+        .is_none());
 }
