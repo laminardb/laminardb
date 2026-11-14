@@ -446,6 +446,65 @@ async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_an
     Box::pin(fixture.db.shutdown()).await.unwrap();
 }
 
+#[tokio::test]
+async fn topology_sql_script_is_one_atomic_migration_and_a_mixed_script_admits_nothing() {
+    let (fixture, probe) = running_parent().await;
+    let inventory = fixture.db.catalog_manifest_inventory().unwrap();
+    let retained = fixture
+        .db
+        .cluster_topology_status()
+        .await
+        .unwrap()
+        .journal
+        .retained;
+    let pipeline = independent_pipeline();
+    let mixed = format!("{}; SELECT * FROM totals", pipeline[0]);
+    assert!(matches!(
+        Box::pin(fixture.db.execute(&mixed)).await,
+        Err(DbError::Topology(TopologyError::Unsupported(_)))
+    ));
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), inventory);
+    assert_eq!(
+        fixture
+            .db
+            .cluster_topology_status()
+            .await
+            .unwrap()
+            .journal
+            .retained,
+        retained
+    );
+
+    let script = pipeline.join(";\n");
+    let result = when_planning_idle(|| Box::pin(fixture.db.execute(&script)))
+        .await
+        .unwrap();
+    let ExecuteResult::Ddl(info) = result else {
+        panic!("a DDL script must return its durable receipt");
+    };
+    assert_eq!(info.object_name, "added_source, added_stream, added_sink");
+    active(&fixture, info.topology_operation.unwrap().operation_id).await;
+    let status = fixture.db.cluster_topology_status().await.unwrap();
+    assert_eq!(status.committed_version, TopologyVersion::new(2).ok());
+    assert_eq!(status.journal.retained, retained + 1);
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(19)["trades"][0].clone(),
+            91,
+        )]),
+    );
+    wait_until(|| {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "new-output")
+    })
+    .await;
+    Box::pin(fixture.db.shutdown()).await.unwrap();
+}
+
 /// This fixture certifies only public admission/retry; it deliberately has no runnable driver.
 async fn metadata_coordinator(fixture: &Fixture) -> crate::db::ForceCheckpointRx {
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(

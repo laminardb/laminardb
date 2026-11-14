@@ -4179,11 +4179,15 @@ impl LaminarDB {
         }
     }
 
-    /// Execute a SQL statement.
+    /// Execute a SQL statement or a `;`-separated script, returning the last statement's result.
+    ///
+    /// In a running cluster, a script of DDL statements is admitted as one atomic topology
+    /// migration and returns its single receipt.
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if SQL parsing, planning, or execution fails.
+    /// Returns `DbError` if SQL parsing, planning, or execution fails. A running cluster rejects
+    /// a script that mixes DDL with other statements before running any of it.
     pub async fn execute(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(DbError::Shutdown);
@@ -4192,6 +4196,10 @@ impl LaminarDB {
         let stmts = sql_utils::split_statements(sql);
         if stmts.is_empty() {
             return Err(DbError::InvalidOperation("Empty SQL statement".into()));
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(result) = Box::pin(self.submit_cluster_topology_script(&stmts)).await? {
+            return Ok(result);
         }
 
         let mut last_result = None;
@@ -4227,16 +4235,6 @@ impl LaminarDB {
             self.ensure_catalog_cleanup_unfenced("database mutation")?;
         }
         if is_topology_ddl(statement) {
-            #[cfg(feature = "cluster")]
-            if self.is_cluster_runtime()
-                && DbState::load(&self.state) == DbState::Running
-                && !catalog_manifest_replay_active()
-                && !catalog_bootstrap_active()
-            {
-                // Admission plans its private catalog under the read lock. Do not take the
-                // direct-mutation write lock or invoke the startup bootstrap exception here.
-                return Box::pin(self.submit_cluster_topology_sql(sql, statement)).await;
-            }
             futures::FutureExt::boxed(self.execute_schema_ddl(sql, statement)).await
         } else if reads_catalog(statement) {
             let _topology_read = self.topology_ddl_lock.read().await;
