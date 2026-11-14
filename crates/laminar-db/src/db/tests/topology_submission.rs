@@ -446,6 +446,79 @@ async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_an
     Box::pin(fixture.db.shutdown()).await.unwrap();
 }
 
+#[tokio::test]
+async fn topology_sql_builds_a_pipeline_from_an_empty_sealed_cluster_catalog() {
+    let fixture = Box::pin(empty_preparation_fixture()).await;
+    let probe = enable_runtime(&fixture);
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    DbState::Created.store(&fixture.db.state);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    Box::pin(fixture.db.start()).await.unwrap();
+    assert_eq!(
+        Box::pin(
+            fixture
+                .db
+                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(5))
+        )
+        .await
+        .unwrap(),
+        crate::ClusterStartupDisposition::Serving
+    );
+    let empty = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(empty.success, "{empty:?}");
+    // One SQL statement per migration, as a console worksheet submits them.
+    for sql in independent_pipeline() {
+        let result = when_planning_idle(|| Box::pin(fixture.db.execute(&sql)))
+            .await
+            .unwrap();
+        let ExecuteResult::Ddl(info) = result else {
+            panic!("SQL must return its durable receipt");
+        };
+        active(&fixture, info.topology_operation.unwrap().operation_id).await;
+    }
+    assert_eq!(
+        fixture
+            .db
+            .cluster_topology_status()
+            .await
+            .unwrap()
+            .committed_version,
+        Some(TopologyVersion::new(4).unwrap())
+    );
+    assert_eq!(fixture.db.catalog.list_sources(), ["added_source"]);
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(19)["trades"][0].clone(),
+            91,
+        )]),
+    );
+    wait_until(|| {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "new-output")
+    })
+    .await;
+    let checkpoint = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(checkpoint.success, "{checkpoint:?}");
+    assert_eq!(
+        latest_index(&fixture).await.source_offsets["added_source"].offsets["partition-0-next"],
+        "94"
+    );
+    Box::pin(fixture.db.shutdown()).await.unwrap();
+}
+
 /// This fixture certifies only public admission/retry; it deliberately has no runnable driver.
 async fn metadata_coordinator(fixture: &Fixture) -> crate::db::ForceCheckpointRx {
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(

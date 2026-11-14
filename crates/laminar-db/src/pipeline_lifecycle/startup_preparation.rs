@@ -150,8 +150,10 @@ impl LaminarDB {
         }
 
         let install_runtime = has_external || !stream_regs.is_empty() || !process_regs.is_empty();
+        // Every cluster catalog change is a topology migration admitted through the live
+        // checkpoint coordinator, so an empty cluster still needs one to accept its first object.
         #[cfg(feature = "cluster")]
-        let install_runtime = install_runtime || topology.is_some();
+        let install_runtime = install_runtime || startup_runtime == RuntimeMode::Cluster;
         if install_runtime {
             tracing::info!(
                 sources = source_regs.len(),
