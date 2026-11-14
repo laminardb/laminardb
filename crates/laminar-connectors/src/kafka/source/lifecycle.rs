@@ -5,7 +5,7 @@ use super::{
     ConnectorConfig, ConnectorError, ConnectorState, ConnectorTaskTracker, Consumer, Format,
     KafkaReaderDrainCommand, KafkaSource, KafkaSourceConfig, KafkaSourceDrain, Notify,
     OffsetTracker, Ordering, SchemaRef, SourceBatch, SourceCheckpoint, SourceConnector,
-    SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution, SourceInputMode,
+    SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainSettlement, SourceInputMode,
     SourceRowPositionCapability, SourceStart, SourceTopology, KAFKA_BACKGROUND_CLOSE_BUDGET,
 };
 
@@ -196,10 +196,10 @@ impl SourceConnector for KafkaSource {
 
     async fn finish_drain(
         &mut self,
-        resolution: SourceDrainResolution,
+        settlement: SourceDrainSettlement,
         deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
-        self.finish_drain_inner(resolution, deadline).await
+        self.finish_drain_inner(settlement, deadline).await
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {

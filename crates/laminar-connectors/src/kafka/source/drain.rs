@@ -3,8 +3,9 @@
 use super::{
     warn, Arc, AtomicU64, AtomicU8, ConnectorError, ConnectorState, Consumer, DeliveryGuarantee,
     KafkaBlockingTasks, KafkaHeader, KafkaSource, KafkaSourceConfig, KafkaSourceMetrics,
-    KafkaTimestampType, LaminarConsumerContext, Mutex, Notify, Ordering, SourceDrainOutcome,
-    SourceDrainRequest, SourceDrainResolution, StreamConsumer, TopicPartitionList,
+    KafkaTimestampType, LaminarConsumerContext, Mutex, Notify, OffsetTracker, Ordering,
+    SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourceDrainSettlement,
+    StreamConsumer, TopicPartitionList,
 };
 
 /// Locks a mutex, recovering from poison if a prior holder panicked.
@@ -128,6 +129,7 @@ pub(super) enum KafkaReaderDrainCommand {
     },
     Resolve {
         resolution: SourceDrainResolution,
+        settlement: KafkaDrainSettlement,
         cut: Arc<[KafkaDrainPosition]>,
         deadline: tokio::time::Instant,
         execution: Arc<AtomicU8>,
@@ -143,6 +145,47 @@ pub(super) struct KafkaReaderDrain {
     pub(super) held_assignment_version: Option<u64>,
     pub(super) hold_complete: bool,
     pub(super) boundary_queued: bool,
+    /// Where acquired partitions start once the round resolves. The reader does not reconcile
+    /// the target assignment before it arrives.
+    pub(super) settlement: Option<KafkaDrainSettlement>,
+}
+
+/// The committed handoff cursor a drain resolution positions acquired partitions from.
+#[derive(Clone)]
+pub(super) enum KafkaDrainSettlement {
+    Commit {
+        offsets: OffsetTracker,
+        baselines: KafkaPartitionBaselines,
+    },
+    Abort,
+}
+
+impl KafkaDrainSettlement {
+    fn decode(settlement: &SourceDrainSettlement) -> Result<Self, ConnectorError> {
+        // A settlement carries a cursor exactly when its drain commits.
+        let Some(committed) = settlement.committed() else {
+            return Ok(Self::Abort);
+        };
+        Ok(Self::Commit {
+            offsets: OffsetTracker::try_from_checkpoint(committed)?,
+            baselines: super::checkpoint::decode_partition_baselines(committed)?,
+        })
+    }
+
+    /// The acquired partition's next offset from the committed cut. A partition no participant
+    /// ever positioned has none and starts at the deterministic default on every node.
+    pub(super) fn committed_position(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Option<Result<Option<i64>, ConnectorError>> {
+        match self {
+            Self::Commit { offsets, baselines } => Some(
+                super::checkpoint::acquired_numeric_position(offsets, baselines, topic, partition),
+            ),
+            Self::Abort => None,
+        }
+    }
 }
 
 pub(super) struct KafkaPendingDrainResolution {
@@ -658,10 +701,10 @@ pub(super) type KafkaReaderRx = crossfire::AsyncRx<crossfire::mpsc::Array<KafkaR
 impl KafkaSource {
     pub(super) async fn finish_drain_inner(
         &mut self,
-        resolution: SourceDrainResolution,
+        settlement: SourceDrainSettlement,
         deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
-        self.ensure_pending_drain_resolution(resolution, deadline)?;
+        self.ensure_pending_drain_resolution(&settlement, deadline)?;
         let pending = self
             .source_drain
             .as_mut()
@@ -714,9 +757,10 @@ impl KafkaSource {
 
     fn ensure_pending_drain_resolution(
         &mut self,
-        resolution: SourceDrainResolution,
+        settlement: &SourceDrainSettlement,
         deadline: tokio::time::Instant,
     ) -> Result<(), ConnectorError> {
+        let resolution = settlement.resolution();
         self.check_reader_health("resolving a global source drain")?;
         let active = self
             .source_drain
@@ -770,6 +814,7 @@ impl KafkaSource {
             let (reply, result) = tokio::sync::oneshot::channel();
             tx.send(KafkaReaderDrainCommand::Resolve {
                 resolution,
+                settlement: KafkaDrainSettlement::decode(settlement)?,
                 cut,
                 deadline,
                 execution: Arc::clone(&execution),

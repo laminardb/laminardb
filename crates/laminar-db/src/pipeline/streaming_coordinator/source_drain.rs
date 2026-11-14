@@ -4,8 +4,8 @@
 use super::{
     check_source_sync_fence, source_operation_authority_error, ActiveSourceDrain,
     PendingSourceDrainResolution, SourceDrainCommand, SourceDrainCommandPolicy,
-    SourceDrainLeaseControl, SourceDrainOutcome, SourceDrainReceipt, SourceDrainTaskStatus,
-    SourceProcessAuthority,
+    SourceDrainLeaseControl, SourceDrainOutcome, SourceDrainReceipt, SourceDrainSettlement,
+    SourceDrainTaskStatus, SourceProcessAuthority,
 };
 use super::{
     run_source_operation, source_operation_deadline_error, Arc, ConnectorCancellationPolicy,
@@ -235,6 +235,7 @@ pub(super) async fn apply_latest_source_drain_command_fenced(
         }
         SourceDrainCommand::Resolve {
             resolution,
+            committed,
             deadline,
         } => {
             let Some(current) = active.as_ref() else {
@@ -355,7 +356,7 @@ pub(super) async fn apply_latest_source_drain_command_fenced(
                     actual: format!("resolution for {:?}", resolution.round),
                 });
             }
-            let resolution_deadline = match current.pending_resolution {
+            let resolution_deadline = match current.pending_resolution.as_ref() {
                 Some(pending) if pending.resolution != resolution => {
                     return Err(ConnectorError::InvalidState {
                         expected: format!("pending resolution for {:?}", current.request.round),
@@ -385,33 +386,28 @@ pub(super) async fn apply_latest_source_drain_command_fenced(
                 if current.pending_resolution.is_none() {
                     current.pending_resolution = Some(PendingSourceDrainResolution {
                         resolution,
+                        committed,
                         deadline: resolution_deadline,
                     });
                 }
                 return Ok(());
             }
             if current.provider_drain {
-                match run_source_operation(resolution_deadline, process_authority, || {
-                    connector.finish_drain(resolution, resolution_deadline)
-                })
-                .await
-                {
-                    SourceOperationOutcome::Completed(result) => result?,
-                    SourceOperationOutcome::Deadline => {
-                        lifecycle.cancelled(cancellation_policy);
-                        return Err(source_operation_deadline_error(
-                            source_name,
-                            "drain resolution",
-                        ));
-                    }
-                    SourceOperationOutcome::ProcessAuthorityLost => {
-                        lifecycle.authority_lost();
-                        return Err(source_operation_authority_error(
-                            source_name,
-                            "drain resolution",
-                        ));
-                    }
-                }
+                let pending = PendingSourceDrainResolution {
+                    resolution,
+                    committed,
+                    deadline: resolution_deadline,
+                };
+                finish_provider_drain(
+                    connector,
+                    &pending,
+                    source_name,
+                    "drain resolution",
+                    cancellation_policy,
+                    lifecycle,
+                    process_authority,
+                )
+                .await?;
             }
             lifecycle.run_sync_hook(
                 source_name,
@@ -433,6 +429,47 @@ pub(super) async fn apply_latest_source_drain_command_fenced(
     Ok(())
 }
 
+/// A commit hands the provider its committed cursor; a commit without one never reaches it.
+#[cfg(feature = "cluster")]
+async fn finish_provider_drain(
+    connector: &mut dyn SourceConnector,
+    pending: &PendingSourceDrainResolution,
+    source_name: &str,
+    operation: &'static str,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
+    process_authority: Option<&SourceProcessAuthority>,
+) -> Result<(), ConnectorError> {
+    let round = pending.resolution.round;
+    let settlement = match (pending.resolution.outcome, pending.committed.clone()) {
+        (SourceDrainOutcome::Commit, Some(committed)) => {
+            SourceDrainSettlement::commit(round, committed)
+        }
+        (SourceDrainOutcome::Abort, None) => SourceDrainSettlement::abort(round),
+        (outcome, committed) => {
+            return Err(ConnectorError::InvalidState {
+                expected: "a committed handoff cursor exactly when the drain commits".into(),
+                actual: format!("{outcome:?} with cursor present: {}", committed.is_some()),
+            });
+        }
+    };
+    match run_source_operation(pending.deadline, process_authority, || {
+        connector.finish_drain(settlement, pending.deadline)
+    })
+    .await
+    {
+        SourceOperationOutcome::Completed(result) => result,
+        SourceOperationOutcome::Deadline => {
+            lifecycle.cancelled(cancellation_policy);
+            Err(source_operation_deadline_error(source_name, operation))
+        }
+        SourceOperationOutcome::ProcessAuthorityLost => {
+            lifecycle.authority_lost();
+            Err(source_operation_authority_error(source_name, operation))
+        }
+    }
+}
+
 #[cfg(feature = "cluster")]
 pub(super) async fn resolve_pending_source_drain_fenced(
     connector: &mut dyn SourceConnector,
@@ -446,7 +483,7 @@ pub(super) async fn resolve_pending_source_drain_fenced(
     let Some(pending) = active.as_ref().and_then(|current| {
         current
             .ready
-            .then_some(current.pending_resolution)
+            .then(|| current.pending_resolution.clone())
             .flatten()
     }) else {
         return Ok(());
@@ -461,27 +498,16 @@ pub(super) async fn resolve_pending_source_drain_fenced(
         .as_ref()
         .is_some_and(|current| current.provider_drain)
     {
-        match run_source_operation(pending.deadline, process_authority, || {
-            connector.finish_drain(pending.resolution, pending.deadline)
-        })
-        .await
-        {
-            SourceOperationOutcome::Completed(result) => result?,
-            SourceOperationOutcome::Deadline => {
-                lifecycle.cancelled(cancellation_policy);
-                return Err(source_operation_deadline_error(
-                    source_name,
-                    "pending drain resolution",
-                ));
-            }
-            SourceOperationOutcome::ProcessAuthorityLost => {
-                lifecycle.authority_lost();
-                return Err(source_operation_authority_error(
-                    source_name,
-                    "pending drain resolution",
-                ));
-            }
-        }
+        finish_provider_drain(
+            connector,
+            &pending,
+            source_name,
+            "pending drain resolution",
+            cancellation_policy,
+            lifecycle,
+            process_authority,
+        )
+        .await?;
     }
     lifecycle.run_sync_hook(
         source_name,
