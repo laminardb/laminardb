@@ -106,6 +106,16 @@ pub enum SourceLocality {
     LocalFiles,
 }
 
+/// Fixed input channels of a split source, each read by the owner of the vnode the engine's
+/// channel route gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct SourceChannelPlacement {
+    /// Number of input channels, fixed for the life of the pipeline.
+    pub channels: std::num::NonZeroU32,
+    /// Route from a channel index to its vnode.
+    pub route: laminar_core::state::SourceChannelRoute,
+}
+
 /// Update model emitted by a configured source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +184,9 @@ pub struct SourceContract {
     pub replay_order: SourceReplayOrder,
     /// Where the state the source resumes from lives; portable unless explicitly declared.
     pub locality: SourceLocality,
+    /// Channels the engine places on vnodes; absent for a source that is not split or that
+    /// places its own input partitions.
+    pub placement: Option<SourceChannelPlacement>,
     exact_delivery_certified: bool,
     cluster_exact_delivery_certified: bool,
 }
@@ -194,6 +207,7 @@ impl SourceContract {
             row_positions: SourceRowPositionCapability::Unavailable,
             replay_order: SourceReplayOrder::Unspecified,
             locality: SourceLocality::Portable,
+            placement: None,
             exact_delivery_certified: false,
             cluster_exact_delivery_certified: false,
         }
@@ -218,6 +232,13 @@ impl SourceContract {
     #[must_use]
     pub const fn with_locality(mut self, locality: SourceLocality) -> Self {
         self.locality = locality;
+        self
+    }
+
+    /// Declare the fixed input channels the engine places on vnodes.
+    #[must_use]
+    pub const fn with_placement(mut self, placement: SourceChannelPlacement) -> Self {
+        self.placement = Some(placement);
         self
     }
 

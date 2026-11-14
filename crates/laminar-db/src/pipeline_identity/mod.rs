@@ -6,7 +6,8 @@ use std::sync::atomic::Ordering;
 use arrow_schema::{Field, Schema, SchemaRef};
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
-    SourceContract, SourceInputMode, SourceReplayOrder, SourceRowPositionCapability,
+    SourceChannelPlacement, SourceContract, SourceInputMode, SourceReplayOrder,
+    SourceRowPositionCapability,
 };
 use laminar_connectors::registry::ConnectorRegistry;
 use rustc_hash::FxHashMap;
@@ -65,6 +66,9 @@ struct CanonicalSource {
     // COMPAT: undeclared order leaves existing non-process pipeline identities unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     replay_order: Option<SourceReplayOrder>,
+    // COMPAT: only engine-placed split sources carry it, so no existing identity changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement: Option<SourceChannelPlacement>,
     schema: Option<CanonicalSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     schema_contract: Option<String>,
@@ -347,6 +351,7 @@ fn canonical_source(
             order @ (SourceReplayOrder::SingleChannel
             | SourceReplayOrder::SingleChannelFixedBatches) => Some(order),
         },
+        placement: contract.placement,
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
         schema_contract: None,
         primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),

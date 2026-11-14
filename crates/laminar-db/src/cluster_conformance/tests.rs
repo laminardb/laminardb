@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use super::oracle::OutputForm;
@@ -77,6 +77,7 @@ pub(super) fn events_in(
         name,
         columns: EVENT_COLUMNS,
         partitions: partitions.into(),
+        generated: false,
     }
 }
 
@@ -883,6 +884,83 @@ async fn window_over_interval_join_closes_past_a_node_without_input() {
             OutputForm::Rows,
         )
     };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// `rows` rows of the built-in generator split over `splits` channels, as it emits them.
+fn generated(name: &'static str, splits: u32, rows: i64) -> FixtureSource {
+    let partitions = (0..i64::from(splits))
+        .map(|channel| {
+            let seqs: Vec<i64> = (channel..rows)
+                .step_by(usize::try_from(splits).unwrap())
+                .collect();
+            let rate = super::source::GENERATED_ROWS_PER_SECOND;
+            vec![RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("seq", DataType::Int64, false),
+                    Field::new("ts_ms", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(seqs.clone())),
+                    Arc::new(Int64Array::from_iter_values(
+                        seqs.iter().map(|seq| seq * 1_000 / rate),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        seqs.iter().map(|seq| format!("v{seq}")),
+                    )),
+                ],
+            )
+            .unwrap()]
+        })
+        .collect::<Vec<_>>();
+    FixtureSource {
+        name,
+        columns: "",
+        partitions: partitions.into(),
+        generated: true,
+    }
+}
+
+fn generator_case(
+    name: &'static str,
+    stream: &str,
+    form: OutputForm,
+    ground_truth: &'static str,
+) -> Case {
+    Case {
+        name,
+        sources: vec![generated("gen", 4, 2_000)],
+        streams: vec![stream.to_string()],
+        observe: "out",
+        form,
+        ground_truth: Some(ground_truth),
+        checkpoint_under_load: false,
+    }
+}
+
+// The real generator with `splits`: each split is read on the node its route vnode gives, every
+// node reads at least one, and the merged cursor claims no split twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_generator_projection_is_equal() {
+    let case = generator_case(
+        "split_generator_projection",
+        "CREATE STREAM out AS SELECT seq, value FROM gen WHERE seq % 3 = 0",
+        OutputForm::Rows,
+        "SELECT seq, value FROM gen WHERE seq % 3 = 0",
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_generator_keyed_aggregate_is_equal() {
+    let case = generator_case(
+        "split_generator_keyed_aggregate",
+        "CREATE STREAM out AS SELECT seq % 7 AS k, COUNT(*) AS n, SUM(seq) AS s FROM gen \
+         GROUP BY seq % 7 EMIT CHANGES",
+        OutputForm::Changelog,
+        "SELECT seq % 7 AS k, COUNT(*) AS n, SUM(seq) AS s FROM gen GROUP BY seq % 7",
+    );
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 

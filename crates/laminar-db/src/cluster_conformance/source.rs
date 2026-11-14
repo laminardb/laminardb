@@ -16,6 +16,9 @@ use laminar_connectors::error::ConnectorError;
 use laminar_connectors::registry::ConnectorRegistry;
 use laminar_core::state::{NodeId, VnodeRegistry};
 
+/// Generator rate in generated fixtures; the rows' `ts_ms` is `seq * 1000 / rate`.
+pub(super) const GENERATED_ROWS_PER_SECOND: i64 = 1_000_000;
+
 /// One fixture source: partition `p` is read by the owner of vnode `p % vnode_count`.
 #[derive(Clone)]
 pub(super) struct FixtureSource {
@@ -23,6 +26,9 @@ pub(super) struct FixtureSource {
     /// Column list and watermark clause of `CREATE SOURCE`, including parentheses.
     pub columns: &'static str,
     pub partitions: Arc<[Vec<RecordBatch>]>,
+    /// Read by the built-in generator with one split per partition rather than by the fixture
+    /// connector; partition `c` holds the rows split `c` emits.
+    pub generated: bool,
 }
 
 impl FixtureSource {
@@ -31,6 +37,18 @@ impl FixtureSource {
     }
 
     pub fn ddl(&self) -> String {
+        if self.generated {
+            return format!(
+                "CREATE SOURCE {} FROM GENERATOR ('splits' = '{}', 'max.rows' = '{}', \
+                 'rows.per.second' = '{GENERATED_ROWS_PER_SECOND}', 'batch.max.size' = '64')",
+                self.name,
+                self.partitions.len(),
+                self.all_batches()
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            );
+        }
         format!(
             "CREATE SOURCE {} {} FROM \"{}\" ('fixture' = 'conformance')",
             self.name,
@@ -48,7 +66,11 @@ impl FixtureSource {
             .schema()
     }
 
+    /// Batches the fixture connector delivers; the generator's are not counted.
     pub fn batch_count(&self) -> u64 {
+        if self.generated {
+            return 0;
+        }
         self.partitions.iter().map(|p| p.len() as u64).sum()
     }
 
@@ -65,7 +87,7 @@ pub(super) fn register(
     allowance: Arc<AtomicU64>,
 ) -> impl FnOnce(&ConnectorRegistry) -> Result<(), ConnectorError> + Send + 'static {
     move |registry| {
-        for source in sources {
+        for source in sources.into_iter().filter(|source| !source.generated) {
             let name = source.connector_type();
             let polled = Arc::clone(&polled);
             let allowance = Arc::clone(&allowance);

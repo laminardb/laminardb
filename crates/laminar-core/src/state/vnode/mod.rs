@@ -20,6 +20,10 @@ use std::sync::Arc;
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 
+mod source_route;
+
+pub use source_route::SourceChannelRoute;
+
 /// Durable encoding and hashing contract used to map keys to key groups.
 ///
 /// Any change to Arrow row encoding, key hashing, or modulo mapping requires a
