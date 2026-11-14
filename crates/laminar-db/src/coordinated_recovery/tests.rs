@@ -1218,6 +1218,10 @@ async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum()
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
         .vnode_registry(registry)
         .build()
         .await
