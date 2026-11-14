@@ -951,8 +951,10 @@ fn source_contract_admission_matrix_is_fail_closed() {
                                         && checkpointing_enabled
                                 }
                             };
+                            // The generator's certification is single-node only.
                             let expected = expected
-                                && (delivery != DeliveryGuarantee::ExactlyOnce || certified)
+                                && (delivery != DeliveryGuarantee::ExactlyOnce
+                                    || (certified && runtime == RuntimeMode::Local))
                                 && !(runtime == RuntimeMode::Cluster
                                     && delivery == DeliveryGuarantee::BestEffort)
                                 && (runtime != RuntimeMode::Cluster
@@ -1218,6 +1220,28 @@ fn deterministic_generator_is_admitted_for_local_exact_delivery() {
         RuntimeMode::Local,
     )
     .expect("the certified deterministic generator must remain locally admissible");
+}
+
+#[test]
+fn cluster_exact_delivery_requires_cluster_certification() {
+    let mut contract = laminar_connectors::generator::GeneratorSource::default()
+        .contract(&ConnectorConfig::new("generator"))
+        .expect("static generator contract");
+    // A split source with only single-node certification, as a newly split connector starts.
+    contract.topology = SourceTopology::Splittable;
+    assert!(contract.is_exact_delivery_certified());
+    assert!(!contract.is_cluster_exact_delivery_certified());
+    let admit =
+        |delivery, runtime| admit_source_contract(contract, false, false, delivery, true, runtime);
+
+    admit(DeliveryGuarantee::ExactlyOnce, RuntimeMode::Local)
+        .expect("single-node certification admits local exactly-once");
+    admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster)
+        .expect("cluster at-least-once needs no exact certification");
+    let error = admit(DeliveryGuarantee::ExactlyOnce, RuntimeMode::Cluster)
+        .expect_err("cluster exactly-once requires cluster certification");
+    assert!(error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED));
+    assert!(error.contains("across cluster nodes"));
 }
 
 #[test]

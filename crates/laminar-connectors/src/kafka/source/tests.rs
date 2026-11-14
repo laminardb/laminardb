@@ -1009,6 +1009,7 @@ fn source_contract_is_replayable_and_splittable() {
         SourceRowPositionCapability::OrderedDeterministic
     );
     assert!(contract.is_exact_delivery_certified());
+    assert!(contract.is_cluster_exact_delivery_certified());
     assert_eq!(
         contract.replay_order,
         crate::connector::SourceReplayOrder::Unspecified

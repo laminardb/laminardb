@@ -175,6 +175,7 @@ pub struct SourceContract {
     /// Where the state the source resumes from lives; portable unless explicitly declared.
     pub locality: SourceLocality,
     exact_delivery_certified: bool,
+    cluster_exact_delivery_certified: bool,
 }
 
 impl SourceContract {
@@ -194,6 +195,7 @@ impl SourceContract {
             replay_order: SourceReplayOrder::Unspecified,
             locality: SourceLocality::Portable,
             exact_delivery_certified: false,
+            cluster_exact_delivery_certified: false,
         }
     }
 
@@ -251,6 +253,22 @@ impl SourceContract {
     #[must_use]
     pub const fn is_exact_delivery_certified(self) -> bool {
         self.exact_delivery_certified
+    }
+
+    /// Mark a built-in connector whose multi-node exact-delivery suite is an engine release gate.
+    /// Cluster exactly-once also requires [`Self::with_exact_delivery_certification`].
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn with_cluster_exact_delivery_certification(mut self) -> Self {
+        self.cluster_exact_delivery_certified = true;
+        self
+    }
+
+    /// Whether this source is certified for exactly-once delivery across cluster nodes.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_cluster_exact_delivery_certified(self) -> bool {
+        self.cluster_exact_delivery_certified
     }
 
     /// Whether a persisted source position can be replayed after recovery.

@@ -341,6 +341,16 @@ impl StreamingCoordinator {
                         src.name
                     )));
                 }
+                #[cfg(feature = "cluster")]
+                if runtime_mode.is_cluster()
+                    && !src.contract().is_cluster_exact_delivery_certified()
+                {
+                    return Err(DbError::Config(format!(
+                        "[{}] exactly-once source '{}' is not certified across cluster nodes",
+                        laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED,
+                        src.name
+                    )));
+                }
             }
         }
         if matches!(
