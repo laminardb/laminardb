@@ -238,6 +238,8 @@ including remote AI — runs normally.
 
 `POST /api/v1/sql` returns at most 1000 result rows (and stops after a 5s collection budget). When the result is larger, the JSON response sets `"truncated": true` and `data` holds the first 1000 rows; the field is omitted when the result is complete. Use SUBSCRIBE (pgwire/WebSocket) to stream unbounded results.
 
+In cluster mode, DDL sent to `POST /api/v1/sql` becomes a topology migration and returns 202 with its receipt. A script of several DDL statements becomes one atomic migration. A script that mixes DDL with other statements is rejected before any of it runs.
+
 A query reads materialized views at `read_level`: `latest` (the latest completed cycle, which
 recovery may roll back), `committed` (one committed checkpoint for every view in the query) or
 `recent` (a committed checkpoint holding every record written to the views' Kafka sources before
