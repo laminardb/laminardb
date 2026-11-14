@@ -4,9 +4,9 @@ use super::{
     kafka_drain_partitions, kafka_drain_target_ready, publish_reader_fault,
     resolve_kafka_reader_drain, tpl_of, validate_kafka_partition_results, warn, Arc, AtomicU8,
     AtomicUsize, Consumer, KafkaBlockingTasks, KafkaDrainBoundary, KafkaDrainPosition,
-    KafkaReaderDrain, KafkaReaderDrainCommand, KafkaReaderItem, KafkaReaderTx,
-    LaminarConsumerContext, Mutex, Notify, Ordering, ReaderLoopAction, SourceDrainRequest,
-    SourceDrainResolution, StreamConsumer,
+    KafkaDrainSettlement, KafkaReaderDrain, KafkaReaderDrainCommand, KafkaReaderItem,
+    KafkaReaderTx, LaminarConsumerContext, Mutex, Notify, Ordering, ReaderLoopAction,
+    SourceDrainRequest, SourceDrainResolution, StreamConsumer,
 };
 
 pub(super) struct KafkaDrainHoldContext<'a> {
@@ -19,6 +19,15 @@ pub(super) struct KafkaDrainHoldContext<'a> {
     pub(super) last_assignment_version: u64,
     pub(super) drain_paused: &'a mut std::collections::HashSet<(Arc<str>, i32)>,
     pub(super) active: &'a mut KafkaReaderDrain,
+}
+
+/// Whether the reader must wait for the round's settlement before reconciling `version`. A
+/// committed drain positions acquired partitions from the handoff cut, which this node only
+/// learns at resolution; reconciling earlier would choose positions from its own history.
+pub(super) fn awaits_drain_settlement(active: Option<&KafkaReaderDrain>, version: u64) -> bool {
+    active.is_some_and(|active| {
+        active.settlement.is_none() && active.request.round.target_version == version
+    })
 }
 
 pub(super) async fn hold_reader_drain(context: KafkaDrainHoldContext<'_>) -> ReaderLoopAction {
@@ -167,13 +176,22 @@ pub(super) async fn process_reader_drain_command(
         }
         KafkaReaderDrainCommand::Resolve {
             resolution,
+            settlement,
             cut,
             deadline,
             execution,
             reply,
         } => {
-            resolve_reader_drain_command(&mut context, resolution, cut, deadline, execution, reply)
-                .await
+            resolve_reader_drain_command(
+                &mut context,
+                resolution,
+                settlement,
+                cut,
+                deadline,
+                execution,
+                reply,
+            )
+            .await
         }
     }
 }
@@ -272,6 +290,7 @@ fn begin_reader_drain(
         held_assignment_version: Some(context.last_assignment_version),
         hold_complete: false,
         boundary_queued: false,
+        settlement: None,
     });
     ReaderLoopAction::Proceed
 }
@@ -279,15 +298,18 @@ fn begin_reader_drain(
 async fn resolve_reader_drain_command(
     context: &mut KafkaDrainCommandContext<'_>,
     resolution: SourceDrainResolution,
+    settlement: KafkaDrainSettlement,
     cut: Arc<[KafkaDrainPosition]>,
     deadline: tokio::time::Instant,
     execution: Arc<AtomicU8>,
     reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) -> ReaderLoopAction {
-    if context.active_drain.is_none() {
+    let Some(active) = context.active_drain.as_mut() else {
         let _ = reply.send(Err("Kafka reader has no active drain to resolve".into()));
         return ReaderLoopAction::Retry;
-    }
+    };
+    // The reader reconciles the target only after this: acquired partitions start from it.
+    active.settlement.get_or_insert_with(|| settlement.clone());
     if tokio::time::Instant::now() >= deadline {
         let _ = reply.send(Err(
             "Kafka drain deadline expired before target reconciliation".into(),
@@ -319,6 +341,7 @@ async fn resolve_reader_drain_command(
     if !target_ready || !target_paused {
         *context.deferred_command = Some(KafkaReaderDrainCommand::Resolve {
             resolution,
+            settlement,
             cut,
             deadline,
             execution,

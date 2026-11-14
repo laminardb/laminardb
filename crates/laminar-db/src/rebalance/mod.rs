@@ -2519,7 +2519,8 @@ async fn settle_observed_local_drain(
             "local assignment {target_version} does not match the durable drain outcome"
         ));
     }
-    db.resolve_local_source_drain(transition.id(), outcome, drain_deadline.resolve())
+    let handoff = audited.handoff_checkpoint.as_ref();
+    db.resolve_local_source_drain(transition, outcome, handoff, drain_deadline.resolve())
         .await
         .map_err(|error| error.to_string())?;
     Ok(true)
@@ -4399,13 +4400,11 @@ async fn finalize_drain_snapshot(
             .await
             .map_err(|error| error.to_string())?;
         if local_drain_participant(controller, transition).is_some() {
-            db.resolve_local_source_drain(
-                transition.id(),
-                source_outcome,
-                tokio::time::Instant::now() + config.drain_ack_timeout,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let handoff = decision.handoff_checkpoint.as_ref();
+            let deadline = tokio::time::Instant::now() + config.drain_ack_timeout;
+            db.resolve_local_source_drain(transition, source_outcome, handoff, deadline)
+                .await
+                .map_err(|error| error.to_string())?;
         }
     } else {
         warn!(

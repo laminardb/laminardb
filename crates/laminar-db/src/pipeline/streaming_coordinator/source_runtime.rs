@@ -300,6 +300,8 @@ pub(super) enum SourceDrainCommand {
     },
     Resolve {
         resolution: SourceDrainResolution,
+        /// This source's merged cursor at the committed handoff cut; present for a commit.
+        committed: Option<Arc<SourceCheckpoint>>,
         deadline: tokio::time::Instant,
     },
 }
@@ -383,9 +385,10 @@ pub(super) struct ActiveSourceDrain {
 }
 
 #[cfg(feature = "cluster")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct PendingSourceDrainResolution {
     pub(super) resolution: SourceDrainResolution,
+    pub(super) committed: Option<Arc<SourceCheckpoint>>,
     pub(super) deadline: tokio::time::Instant,
 }
 

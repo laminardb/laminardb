@@ -9,9 +9,9 @@ use super::{
     update_rotation_baselines, validate_kafka_assignment, validate_kafka_partition_results,
     validate_positions_not_expired, warn, Arc, AtomicBool, AtomicU64, AtomicU8, AtomicUsize,
     Consumer, KafkaAssignmentPublication, KafkaBlockingTaskError, KafkaBlockingTasks,
-    KafkaDrainBoundary, KafkaDrainPosition, KafkaHeader, KafkaPartitionBaselines,
-    KafkaPartitionRoutes, KafkaPartitionSet, KafkaPayload, KafkaReaderDrain,
-    KafkaReaderDrainCommand, KafkaReaderItem, KafkaSource, KafkaTimestampType,
+    KafkaDrainBoundary, KafkaDrainPosition, KafkaDrainSettlement, KafkaHeader,
+    KafkaPartitionBaselines, KafkaPartitionRoutes, KafkaPartitionSet, KafkaPayload,
+    KafkaReaderDrain, KafkaReaderDrainCommand, KafkaReaderItem, KafkaSource, KafkaTimestampType,
     LaminarConsumerContext, Message, Mutex, Notify, OffsetTracker, Ordering, RebalanceState,
     SourceDrainRequest, SourceDrainResolution, StreamConsumer, TopicPartitionList,
 };

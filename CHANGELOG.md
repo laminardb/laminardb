@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a
+  `SourceDrainResolution`. A commit carries the source's merged cursor at the committed handoff
+  checkpoint, and a connector that implements cluster drains positions every input it acquires
+  from that cursor. `SourceDrainSettlement::resolution()` returns the round and outcome.
+
+### Fixed
+
+- In cluster mode, a Kafka partition that moved live between two running nodes, for example when
+  a node drained for a graceful shutdown, was read again from where the new owner last knew it,
+  or from the start of the partition, instead of after the records the previous owner had
+  processed. At-least-once pipelines counted those records twice in their state, and
+  exactly-once pipelines published them twice. The new owner now resumes the partition from the
+  committed handoff checkpoint. Recovery after a node is killed was not affected.
+- quinn-proto moves to 0.11.19 for RUSTSEC-2026-0523 (a MAX_STREAM_DATA frame could open streams
+  beyond the stream limit) and RUSTSEC-2026-0524 (a long Retry token could panic or exhaust memory
+  in a QUIC client), and quinn-udp to 0.5.16 for RUSTSEC-2026-0538 (the receive loop could spin
+  after a truncated datagram).
+
 ## [0.40.2]
 
 0.40.0 and 0.40.1 were tagged but never published, so this is the first release since 0.33.0

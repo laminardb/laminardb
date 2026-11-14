@@ -1,13 +1,13 @@
 //! Mechanically extracted coordinator responsibility.
 
 #[cfg(all(test, feature = "cluster"))]
-use super::{spawn_source_actor, Arc, AtomicBool};
+use super::{spawn_source_actor, AtomicBool};
 #[cfg(feature = "cluster")]
 use super::{
-    validate_source_drain_receipts, AssignmentDrainId, AssignmentDrainTransition,
-    CheckpointParticipant, OwnedSourceTasks, SourceDrainCommand, SourceDrainLeaseControl,
-    SourceDrainOutcome, SourceDrainReceipt, SourceDrainRequest, SourceDrainResolution,
-    SourceDrainTaskStatus, SourceTaskLease,
+    validate_source_drain_receipts, Arc, AssignmentDrainId, AssignmentDrainTransition,
+    CheckpointParticipant, OwnedSourceTasks, SourceCheckpoint, SourceDrainCommand,
+    SourceDrainLeaseControl, SourceDrainOutcome, SourceDrainReceipt, SourceDrainRequest,
+    SourceDrainResolution, SourceDrainTaskStatus, SourceTaskLease,
 };
 
 #[cfg(feature = "cluster")]
@@ -211,10 +211,30 @@ pub(crate) fn owned_source_drain_resolved(
     Ok(true)
 }
 
+/// Whether a running source still holds `round`'s drain cut. Only such a source takes the
+/// committed cursor: a replacement started by recovery already resumed from the recovery cut.
+#[cfg(feature = "cluster")]
+pub(crate) fn owned_source_holds_drain(tasks: &OwnedSourceTasks, round: AssignmentDrainId) -> bool {
+    tasks
+        .lock()
+        .iter()
+        .filter(|task| !task.is_finished())
+        .filter_map(SourceTaskLease::drain_control)
+        .any(|control| {
+            matches!(
+                *control.status_tx.borrow(),
+                SourceDrainTaskStatus::Pausing(held)
+                    | SourceDrainTaskStatus::Ready(SourceDrainReceipt { round: held, .. })
+                    if held == round
+            )
+        })
+}
+
 #[cfg(feature = "cluster")]
 pub(crate) async fn resolve_owned_source_drain(
     tasks: &OwnedSourceTasks,
     resolution: SourceDrainResolution,
+    committed: &std::collections::BTreeMap<String, Arc<SourceCheckpoint>>,
     deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     let snapshot: Vec<(SourceTaskLease, SourceDrainLeaseControl)> = tasks
@@ -241,6 +261,7 @@ pub(crate) async fn resolve_owned_source_drain(
             .command_tx
             .send(Some(SourceDrainCommand::Resolve {
                 resolution,
+                committed: committed.get(task.name()).cloned(),
                 deadline,
             }))
             .is_ok();

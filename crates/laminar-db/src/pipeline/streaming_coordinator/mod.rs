@@ -24,7 +24,7 @@ use laminar_connectors::connector::{
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
-    SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution,
+    SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourceDrainSettlement,
 };
 use laminar_connectors::error::ConnectorError;
 #[cfg(feature = "cluster")]
@@ -107,7 +107,8 @@ use source_runtime::{
 pub(crate) use drain_ownership::install_replacement_source_drain_task_for_test;
 #[cfg(feature = "cluster")]
 pub(crate) use drain_ownership::{
-    owned_source_drain_resolved, prepare_owned_source_drain, resolve_owned_source_drain,
+    owned_source_drain_resolved, owned_source_holds_drain, prepare_owned_source_drain,
+    resolve_owned_source_drain,
 };
 pub use source_runtime::StreamingCoordinatorRuntime;
 pub(crate) use source_runtime::{OwnedSourceTasks, SourceTaskLease};
