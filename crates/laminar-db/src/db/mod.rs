@@ -15,6 +15,8 @@ mod datafusion_memory_tests;
 mod explain;
 pub(crate) mod read_level;
 mod session;
+#[cfg(feature = "cluster")]
+mod source_drain_resolution;
 mod source_watermarks;
 mod subscription_open;
 pub(crate) use source_watermarks::{RecoveredInputChannelProgress, SourceWatermarkState};
@@ -3786,23 +3788,6 @@ impl LaminarDB {
         )
         .await
         .map_err(|error| DbError::Checkpoint(format!("source drain failed: {error}")))
-    }
-
-    /// Resolve the exact local source drain after target commit or abort.
-    #[cfg(feature = "cluster")]
-    pub(crate) async fn resolve_local_source_drain(
-        &self,
-        round: laminar_core::checkpoint::AssignmentDrainId,
-        outcome: laminar_connectors::connector::SourceDrainOutcome,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), DbError> {
-        crate::pipeline::streaming_coordinator::resolve_owned_source_drain(
-            &self.owned_source_tasks,
-            laminar_connectors::connector::SourceDrainResolution { round, outcome },
-            deadline,
-        )
-        .await
-        .map_err(|error| DbError::Checkpoint(format!("source drain resolution failed: {error}")))
     }
 
     /// Validate a draining generation without changing local ownership. Source intake is held by

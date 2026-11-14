@@ -22,8 +22,8 @@ use tokio::time::{sleep, Instant as TokioInstant};
 
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
-    DeliveryGuarantee, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourcePosition, SourceStart,
+    DeliveryGuarantee, SourceConnector, SourceDrainRequest, SourceDrainSettlement, SourcePosition,
+    SourceStart,
 };
 use laminar_connectors::kafka::testing::partition_vnodes;
 use laminar_connectors::kafka::{
@@ -326,10 +326,7 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
     let abort_resolution_deadline = TokioInstant::now() + Duration::from_secs(15);
     source
         .finish_drain(
-            SourceDrainResolution {
-                round: abort_round,
-                outcome: SourceDrainOutcome::Abort,
-            },
+            SourceDrainSettlement::abort(abort_round),
             abort_resolution_deadline,
         )
         .await
@@ -380,10 +377,7 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
     let commit_resolution_deadline = TokioInstant::now() + Duration::from_secs(15);
     source
         .finish_drain(
-            SourceDrainResolution {
-                round: commit_round,
-                outcome: SourceDrainOutcome::Commit,
-            },
+            SourceDrainSettlement::commit(commit_round, Arc::new(successor_checkpoint.clone())),
             commit_resolution_deadline,
         )
         .await
