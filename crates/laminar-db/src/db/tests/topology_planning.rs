@@ -376,6 +376,11 @@ impl Fixture {
                 .await
                 .unwrap();
         }
+        bootstrap.extend(extra);
+        Self::with_exact_bootstrap(authority, bootstrap).await
+    }
+
+    async fn with_exact_bootstrap(authority: TestCatalogAuthority, bootstrap: Vec<String>) -> Self {
         let effects = Arc::new(AtomicUsize::new(0));
         let factory_effects = Arc::clone(&effects);
         let resolutions = Arc::new(AtomicUsize::new(0));
@@ -464,7 +469,6 @@ impl Fixture {
             .build()
             .await
             .unwrap();
-        bootstrap.extend(extra);
         db.execute_cluster_bootstrap_batch(&bootstrap)
             .await
             .unwrap();
@@ -523,6 +527,28 @@ async fn preparation_fixture_with_bootstrap(
 ) -> (
     Fixture,
     laminar_core::cluster::control::AssignmentSnapshotStore,
+) {
+    let (authority, process, objects) = preparation_authority().await;
+    let mut fixture = Fixture::with_bootstrap(authority, stream_generation, extra).await;
+    fixture.process_lease = Some(process);
+    (
+        fixture,
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(objects),
+    )
+}
+
+/// A durable leader whose sealed startup catalog has no objects.
+async fn empty_preparation_fixture() -> Fixture {
+    let (authority, process, _) = preparation_authority().await;
+    let mut fixture = Fixture::with_exact_bootstrap(authority, Vec::new()).await;
+    fixture.process_lease = Some(process);
+    fixture
+}
+
+async fn preparation_authority() -> (
+    TestCatalogAuthority,
+    laminar_core::cluster::control::ProcessLease,
+    Arc<dyn ObjectStore>,
 ) {
     use laminar_core::cluster::control::{
         AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv,
@@ -603,9 +629,7 @@ async fn preparation_fixture_with_bootstrap(
         .unwrap();
     authority.controller = controller;
     authority.lease_tx = lease_tx;
-    let mut fixture = Fixture::with_bootstrap(authority, stream_generation, extra).await;
-    fixture.process_lease = Some(process);
-    (fixture, AssignmentSnapshotStore::new(objects))
+    (authority, process, objects)
 }
 
 async fn admit_preparation_candidate(
