@@ -2,9 +2,9 @@ use super::{
     admit_append_only_source, Arc, CheckpointStorageScope, ConnectorConfig,
     ConnectorTaskFenceRegistration, DbError, DeliveryGuarantee, FxHashMap, HashMap,
     RecoveredInputChannelProgress, RuntimeMode, SinkConnector, SinkConsistency, SinkContract,
-    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceRowPositionCapability,
-    SourceTopology, SourceWatermarkState, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
-    KEYED_SOURCE_PRIMARY_KEY,
+    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceLocality,
+    SourceRowPositionCapability, SourceTopology, SourceWatermarkState, CLUSTER_BEST_EFFORT,
+    EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
 };
 
 /// Validate source durability and placement before the connector performs I/O.
@@ -61,6 +61,17 @@ pub(super) fn admit_source_recovery_contract(
     }
 
     if runtime == RuntimeMode::Cluster {
+        match contract.locality {
+            SourceLocality::Portable => {}
+            SourceLocality::LocalJournal => {
+                return Err(
+                    "cluster sources cannot resume from a receive journal on one node's disk",
+                );
+            }
+            SourceLocality::LocalFiles => {
+                return Err("cluster sources cannot read files from one node's local filesystem");
+            }
+        }
         match contract.topology {
             SourceTopology::Splittable => {}
             SourceTopology::NodeLocalIngress => {

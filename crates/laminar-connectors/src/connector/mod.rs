@@ -10,7 +10,7 @@ mod task_tracking;
 
 pub use contracts::{
     DeliveryGuarantee, SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
-    SourceConsistency, SourceContract, SourceInputMode, SourceReplayOrder,
+    SourceConsistency, SourceContract, SourceInputMode, SourceLocality, SourceReplayOrder,
     SourceRowPositionCapability, SourceTopology,
 };
 pub use coordinated_commit::{

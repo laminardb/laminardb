@@ -8,6 +8,10 @@
   `SourceDrainResolution`. A commit carries the source's merged cursor at the committed handoff
   checkpoint, and a connector that implements cluster drains positions every input it acquires
   from that cursor. `SourceDrainSettlement::resolution()` returns the round and outcome.
+- In cluster mode, a FIX source or a Files source is rejected with a reason naming the state that
+  ties it to one node: the FIX receive journal or the local input files. Both were already
+  rejected, with a generic singleton-placement message. `SourceContract` gains a `locality`
+  field, set with `with_locality(SourceLocality::…)`; it defaults to `Portable`.
 
 ### Fixed
 

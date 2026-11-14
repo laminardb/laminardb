@@ -114,7 +114,7 @@ impl Case {
         let started = db.start().await.map_err(|e| format!("embedded start: {e}"));
         let output = match started.and_then(|()| self.portal(&db, reader)) {
             Ok(portal) => {
-                self.drain(&[Arc::clone(&db)], &mut [portal], &[polled])
+                self.drain(&[Arc::clone(&db)], &mut [portal], &[polled], &mut [0])
                     .await
             }
             Err(error) => Err(error),
@@ -144,8 +144,9 @@ impl Case {
             .zip(readers)
             .map(|(db, reader)| self.portal(db, reader))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut published = vec![0; cluster.dbs.len()];
         let mut output = self
-            .drain(&cluster.dbs, &mut portals, &cluster.polled)
+            .drain(&cluster.dbs, &mut portals, &cluster.polled, &mut published)
             .await?;
         if self.checkpoint_under_load && !cluster.dbs.iter().any(|db| flush_crossed_exchange(db)) {
             return Err(format!(
@@ -153,15 +154,43 @@ impl Case {
                 self.name
             ));
         }
-        if let Some(idle) = cluster
-            .polled
-            .iter()
-            .position(|polled| polled.load(Ordering::Acquire) == 0)
+        if let Some((idle, _)) = (0..NODES)
+            .zip(&cluster.polled)
+            .find(|(node, polled)| self.reads_input(*node) && polled.load(Ordering::Acquire) == 0)
         {
             return Err(format!("{}: node {} read no input", self.name, idle + 1));
         }
-        self.settle(&cluster.dbs, &mut portals, &mut output, embedded)
-            .await
+        let observed = self
+            .settle(
+                &cluster.dbs,
+                &mut portals,
+                &mut output,
+                &mut published,
+                embedded,
+            )
+            .await?;
+        // A node without input is only tested if its own operators emit; a diverging output is
+        // reported as such by the caller.
+        if let Some((idle, _)) = (0..NODES)
+            .zip(&published)
+            .find(|(node, rows)| observed == *embedded && !self.reads_input(*node) && **rows == 0)
+        {
+            return Err(format!(
+                "{}: node {} owns no partition and published no rows, so the case does not test \
+                 its frontier",
+                self.name,
+                idle + 1
+            ));
+        }
+        Ok(observed)
+    }
+
+    /// Whether node `node` (0-based) owns a fixture partition. Partition `p` is read by the owner
+    /// of vnode `p % VNODES`, and the conformance assignment gives vnode `v` to node `v % NODES`.
+    fn reads_input(&self, node: u64) -> bool {
+        self.sources.iter().any(|source| {
+            (0..source.partitions.len() as u64).any(|p| p % u64::from(VNODES) % NODES == node)
+        })
     }
 
     /// A cluster window closes only once its input's frontier has crossed each exchange, which the
@@ -173,6 +202,7 @@ impl Case {
         dbs: &[Arc<LaminarDB>],
         portals: &mut [SubscriptionPortal],
         batches: &mut Vec<RecordBatch>,
+        published: &mut [usize],
         expected: &Consolidated,
     ) -> Result<Consolidated, String> {
         let deadline = tokio::time::Instant::now() + DEADLINE;
@@ -184,10 +214,26 @@ impl Case {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
             self.checkpoint(dbs).await?;
-            for portal in portals.iter_mut() {
-                read_published(portal, batches).map_err(|e| format!("{}: {e}", self.name))?;
-            }
+            self.read_portals(portals, batches, published)?;
         }
+    }
+
+    /// Read what every portal published, counting rows per portal in `published`.
+    fn read_portals(
+        &self,
+        portals: &mut [SubscriptionPortal],
+        batches: &mut Vec<RecordBatch>,
+        published: &mut [usize],
+    ) -> Result<(), String> {
+        for (portal, rows) in portals.iter_mut().zip(published.iter_mut()) {
+            let before = batches.len();
+            read_published(portal, batches).map_err(|e| format!("{}: {e}", self.name))?;
+            *rows += batches[before..]
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+        }
+        Ok(())
     }
 
     /// Owner-local observation of the stream log, attached before start so no output is missed;
@@ -217,6 +263,7 @@ impl Case {
         dbs: &[Arc<LaminarDB>],
         portals: &mut [SubscriptionPortal],
         polled: &[Arc<AtomicU64>],
+        published: &mut [usize],
     ) -> Result<Vec<RecordBatch>, String> {
         let total = self.batch_count();
         let delivered = || -> u64 { polled.iter().map(|p| p.load(Ordering::Acquire)).sum() };
@@ -244,9 +291,7 @@ impl Case {
             })?;
         self.checkpoint(dbs).await?;
         let mut batches = Vec::new();
-        for portal in portals.iter_mut() {
-            read_published(portal, &mut batches).map_err(|e| format!("{}: {e}", self.name))?;
-        }
+        self.read_portals(portals, &mut batches, published)?;
         Ok(batches)
     }
 

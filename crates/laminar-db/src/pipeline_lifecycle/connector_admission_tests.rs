@@ -19,7 +19,7 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee,
     SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceLocality,
     SourceRowPositionCapability, SourceStart, SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
@@ -1055,10 +1055,10 @@ fn fix_source_is_admitted_only_locally_with_checkpoints() {
         admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Local),
         Ok(())
     );
+    assert_eq!(contract.locality, SourceLocality::LocalJournal);
     assert_eq!(
         admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster),
-        Err("cluster singleton sources require fenced singleton placement, which is not implemented"),
-        "the journal and engine store are node-local"
+        Err("cluster sources cannot resume from a receive journal on one node's disk")
     );
     assert_eq!(
         admit(DeliveryGuarantee::ExactlyOnce, true, RuntimeMode::Local),
@@ -1068,6 +1068,61 @@ fn fix_source_is_admitted_only_locally_with_checkpoints() {
     assert!(admit(DeliveryGuarantee::ExactlyOnce, false, RuntimeMode::Local).is_err());
     assert!(admit(DeliveryGuarantee::AtLeastOnce, false, RuntimeMode::Local).is_err());
     assert!(admit(DeliveryGuarantee::BestEffort, true, RuntimeMode::Local).is_err());
+}
+
+#[cfg(feature = "files")]
+#[test]
+fn files_source_is_admitted_only_locally() {
+    use super::admit_source_recovery_contract;
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::files::register_file_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", "/data/in/*.json");
+    config.set("format", "json");
+    let source = registry.create_source(&config, None).unwrap();
+    let contract = source.contract(&config).unwrap();
+    assert_eq!(contract.locality, SourceLocality::LocalFiles);
+    let admit =
+        |delivery, runtime| admit_source_recovery_contract(contract, delivery, true, runtime);
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local),
+        Ok(())
+    );
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster),
+        Err("cluster sources cannot read files from one node's local filesystem")
+    );
+}
+
+/// The rejection follows the source's state, not its topology, so it holds for a splittable
+/// source and after cluster singleton placement exists.
+#[test]
+fn node_local_sources_are_rejected_in_cluster_whatever_their_topology() {
+    use super::admit_source_recovery_contract;
+
+    for (locality, reason) in [
+        (
+            SourceLocality::LocalJournal,
+            "cluster sources cannot resume from a receive journal on one node's disk",
+        ),
+        (
+            SourceLocality::LocalFiles,
+            "cluster sources cannot read files from one node's local filesystem",
+        ),
+    ] {
+        let contract = SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Splittable,
+            SourceInputMode::AppendOnly,
+        )
+        .with_locality(locality);
+        let admit = |runtime| {
+            admit_source_recovery_contract(contract, DeliveryGuarantee::AtLeastOnce, true, runtime)
+        };
+        assert_eq!(admit(RuntimeMode::Local), Ok(()), "{locality:?}");
+        assert_eq!(admit(RuntimeMode::Cluster), Err(reason), "{locality:?}");
+    }
 }
 
 #[cfg(feature = "delta-lake")]

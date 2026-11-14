@@ -22,8 +22,8 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceReplayOrder,
-    SourceRowPositionCapability, SourceStart, SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourceLocality, SourcePosition,
+    SourceReplayOrder, SourceRowPositionCapability, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::schema::resolution::{
@@ -271,14 +271,15 @@ impl SourceConnector for FixSource {
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         FixSourceConfig::parse(config)?;
         // Journal retention advances only on committed checkpoints. One session is one ordered
-        // channel; cluster placement is rejected because the journal is node-local. The barrier
-        // cut is exact: a cursor is a journal index, every emitted record is durable, and one
-        // FIX message is one atomic record with no upstream transaction spanning the cut.
+        // channel. The barrier cut is exact: a cursor is a journal index, every emitted record is
+        // durable, and one FIX message is one atomic record with no upstream transaction spanning
+        // the cut.
         Ok(SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
         )
+        .with_locality(SourceLocality::LocalJournal)
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
         .with_replay_order(SourceReplayOrder::SingleChannel)
         .with_exact_delivery_certification())
