@@ -93,6 +93,19 @@ pub enum SourceTopology {
     NodeLocalIngress,
 }
 
+/// Where the state a source resumes from lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLocality {
+    /// Upstream or the committed checkpoint holds it, so any node can resume the source.
+    #[default]
+    Portable,
+    /// A receive journal on the local disk of the node that runs the source.
+    LocalJournal,
+    /// Input files on the local filesystem of the node that runs the source.
+    LocalFiles,
+}
+
 /// Update model emitted by a configured source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +172,8 @@ pub struct SourceContract {
     pub row_positions: SourceRowPositionCapability,
     /// Order reproduced from a persisted cursor; unspecified unless explicitly declared.
     pub replay_order: SourceReplayOrder,
+    /// Where the state the source resumes from lives; portable unless explicitly declared.
+    pub locality: SourceLocality,
     exact_delivery_certified: bool,
 }
 
@@ -177,6 +192,7 @@ impl SourceContract {
             input_mode,
             row_positions: SourceRowPositionCapability::Unavailable,
             replay_order: SourceReplayOrder::Unspecified,
+            locality: SourceLocality::Portable,
             exact_delivery_certified: false,
         }
     }
@@ -193,6 +209,13 @@ impl SourceContract {
     #[must_use]
     pub const fn with_replay_order(mut self, order: SourceReplayOrder) -> Self {
         self.replay_order = order;
+        self
+    }
+
+    /// Declare where the state the source resumes from lives.
+    #[must_use]
+    pub const fn with_locality(mut self, locality: SourceLocality) -> Self {
+        self.locality = locality;
         self
     }
 

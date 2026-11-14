@@ -8,8 +8,8 @@ use futures::FutureExt;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract,
-    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceRowPositionCapability,
-    SourceTopology,
+    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceLocality,
+    SourceRowPositionCapability, SourceTopology,
 };
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 use laminar_core::checkpoint::{channel_progress_frontier, SINGLETON_WATERMARK_CHANNEL};

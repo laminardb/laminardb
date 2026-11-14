@@ -810,6 +810,82 @@ async fn window_over_interval_join_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// Two partitions over three nodes leave node 3 with no channel of `events`. Its idle input must
+/// neither hold back the windows of the other nodes nor keep its own from closing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_close_past_a_node_without_input() {
+    let case = Case {
+        sources: vec![events_in("events", 0, 2, BATCHES_PER_PARTITION)],
+        ..case(
+            "windows_past_a_node_without_input",
+            &[
+                "CREATE STREAM out AS SELECT k, tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
+               COUNT(*) AS n, SUM(v) AS s FROM events \
+               GROUP BY k, tumble(ts, INTERVAL '100' MILLISECOND) EMIT ON WINDOW CLOSE",
+            ],
+            OutputForm::Rows,
+            Some(
+                "SELECT k, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n, \
+                 SUM(v) AS s FROM events WHERE ts < CAST(1400000 AS TIMESTAMP(6)) \
+                 GROUP BY k, tumble(ts, INTERVAL '100' MILLISECOND)",
+            ),
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Node 3 reads no `orders` but does read `payments`, and joins the `orders` rows other nodes
+/// shuffle to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interval_join_keeps_pairs_on_a_node_without_one_input() {
+    let case = Case {
+        sources: vec![
+            events_in("orders", 0, 2, BATCHES_PER_PARTITION),
+            events("payments", 3),
+        ],
+        ground_truth: Some(INTERVAL_JOIN),
+        ..join_case(
+            "interval_join_on_a_node_without_one_input",
+            vec![format!("CREATE STREAM out AS {INTERVAL_JOIN}")],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Neither source has a channel on node 3, so its join and the window over it are fed only by
+/// other nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_over_interval_join_closes_past_a_node_without_input() {
+    let case = Case {
+        sources: vec![
+            events_in("orders", 0, 2, BATCHES_PER_PARTITION),
+            events_in("payments", 3, 2, BATCHES_PER_PARTITION),
+        ],
+        ground_truth: Some(
+            "SELECT k, tumble(ots, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, \
+             SUM(pv) AS s FROM \
+             (SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+              INNER JOIN payments p ON o.k = p.k \
+              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND) \
+             WHERE ots < CAST(1400000 AS TIMESTAMP(6)) \
+             GROUP BY k, tumble(ots, INTERVAL '20' MILLISECOND)",
+        ),
+        ..join_case(
+            "window_over_interval_join_past_a_node_without_input",
+            vec![
+                JOINED.to_owned(),
+                "CREATE STREAM out AS SELECT k, tumble(ots, INTERVAL '20' MILLISECOND) AS w, \
+                 COUNT(*) AS n, SUM(pv) AS s FROM joined \
+                 GROUP BY k, tumble(ots, INTERVAL '20' MILLISECOND) EMIT ON WINDOW CLOSE"
+                    .to_owned(),
+            ],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Checkpoints taken while joined rows cross to their window owners.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loaded_window_over_interval_join_checkpoints_are_equal() {

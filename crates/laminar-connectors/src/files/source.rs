@@ -15,8 +15,8 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
-    SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourceLocality, SourcePosition,
+    SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
@@ -476,12 +476,14 @@ impl SourceConnector for FileSource {
 
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         // Replayability is backed by an exact processed-path inventory plus an
-        // exact file/row cursor for a partially emitted file.
+        // exact file/row cursor for a partially emitted file. Configuration rejects remote
+        // backends, so the files are always on the local filesystem.
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
-        ))
+        )
+        .with_locality(SourceLocality::LocalFiles))
     }
 }
 
