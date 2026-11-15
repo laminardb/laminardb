@@ -65,13 +65,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSettings};
 use super::{
-    assert_running_nodes, cluster_kafka_partition_count, cluster_key_group_count,
-    cluster_node_config, configured_cluster_checkpoint_timeout, custom_s3_endpoint_configured,
-    env_u64, has_full_membership, kafka_create_topic, observed_leader, recovery_ceiling,
-    remaining_progress_window, scoped_soak_storage_url, select_follower_victim, soak_run_id,
-    validate_checkpoint_liveness, wait_for, wait_for_converged_durable_checkpoint, wait_until,
-    DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, BASE_PORT, NODES,
+    cluster_kafka_partition_count, kafka_create_topic, scoped_soak_storage_url, soak_run_id,
+    wait_for_converged_durable_checkpoint, wait_until, ResolvedExecutable, NODES,
     SOAK_PRODUCER_MAX_IN_FLIGHT,
 };
 
@@ -354,50 +351,6 @@ fn produce(brokers: &str, topic: &str, partitions: i32, rps: u64, stop: &AtomicB
     })
 }
 
-struct SoakSettings {
-    interval_ms: u64,
-    checkpoint_timeout: Duration,
-    recovery_ceiling: Duration,
-    kills: u64,
-    steady: Duration,
-    rps: u64,
-    partitions: i32,
-    key_groups: u32,
-}
-
-impl SoakSettings {
-    fn from_environment() -> Self {
-        let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
-        assert!(
-            interval_ms >= 100,
-            "LAMINAR_SOAK_INTERVAL_MS must be at least 100"
-        );
-        let recovery_ceiling = recovery_ceiling();
-        let checkpoint_timeout = configured_cluster_checkpoint_timeout(
-            JoinDelivery::AtLeastOnce,
-            custom_s3_endpoint_configured(),
-        );
-        validate_checkpoint_liveness(interval_ms, checkpoint_timeout, recovery_ceiling);
-        let kills = env_u64("LAMINAR_SOAK_KILLS", 4);
-        assert!(
-            cfg!(debug_assertions) || kills == 0,
-            "killing inside a checkpoint needs the debug-only gate of `cargo test --profile soak`"
-        );
-        let rps = env_u64("LAMINAR_SOAK_RPS", 400);
-        assert!(rps > 0, "LAMINAR_SOAK_RPS must be greater than zero");
-        Self {
-            interval_ms,
-            checkpoint_timeout,
-            recovery_ceiling,
-            kills,
-            steady: Duration::from_secs(env_u64("LAMINAR_SOAK_SECONDS", 30)),
-            rps,
-            partitions: cluster_kafka_partition_count(),
-            key_groups: cluster_key_group_count(),
-        }
-    }
-}
-
 fn workload(
     brokers: &str,
     topic: &str,
@@ -445,45 +398,6 @@ connector = "{connector}"
     )
 }
 
-fn cluster_nodes(
-    executable: &Arc<ResolvedExecutable>,
-    dir: &Path,
-    log_dir: &Path,
-    settings: &SoakSettings,
-    checkpoint_url: &str,
-    workload: &str,
-) -> Vec<Node> {
-    (0..NODES)
-        .map(|id| {
-            let config = format!(
-                "{}{workload}",
-                cluster_node_config(
-                    id,
-                    settings.interval_ms,
-                    settings.checkpoint_timeout,
-                    settings.key_groups,
-                    checkpoint_url,
-                    JoinDelivery::AtLeastOnce,
-                )
-            );
-            let config_path = dir.join(format!("node{id}.toml"));
-            std::fs::write(&config_path, config).expect("write node config");
-            Node {
-                id,
-                executable: Arc::clone(executable),
-                config_path,
-                log_path: log_dir.join(format!("node{id}.log")),
-                child: None,
-                process_generation: 0,
-                http_port: BASE_PORT + id as u16,
-                fault_trigger_path: None,
-                checkpoint_gate_path: Some(dir.join(format!("checkpoint-node-{id}.arm"))),
-                sink_commit_gate_path: None,
-            }
-        })
-        .collect()
-}
-
 fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
@@ -491,12 +405,13 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
     );
     executable.describe();
     let settings = SoakSettings::from_environment();
+    let partitions = cluster_kafka_partition_count();
     let brokers = setting("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS", None);
     let run_id = soak_run_id();
     let checkpoint_url =
         scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
     let topic = format!("soak-sink-in-{run_id}");
-    kafka_create_topic(&brokers, &topic, settings.partitions);
+    kafka_create_topic(&brokers, &topic, partitions);
     let name = destination.name(&run_id);
     destination.create(&name);
     let mut oracle = destination.spawn_oracle(&name);
@@ -522,17 +437,23 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
         &log_dir,
         &settings,
         &checkpoint_url,
+        "",
         &workload,
     );
-    let mut producer = InputProducer::spawn(brokers, topic, settings.partitions, settings.rps);
+    let mut producer = InputProducer::spawn(brokers, topic, partitions, settings.rps);
     let metric = destination.written_metric();
 
-    let mut latest = boot(&mut nodes, &mut producer, &settings, metric);
+    let mut latest = boot(
+        &mut nodes,
+        &mut || producer.assert_running(),
+        &settings,
+        metric,
+    );
     let mut killed_followers = BTreeSet::new();
     for round in 0..settings.kills {
-        latest = kill_round(
+        (_, latest) = kill_round(
             &mut nodes,
-            &mut producer,
+            &mut || producer.assert_running(),
             round,
             &mut killed_followers,
             &settings,
@@ -542,8 +463,10 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
     }
     steady_phase(
         &mut nodes,
-        &mut producer,
-        &mut oracle,
+        &mut || {
+            producer.assert_running();
+            oracle.assert_running();
+        },
         settings.steady,
         metric,
     );
@@ -576,189 +499,6 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
     );
     drop(nodes);
     destination.delete(&name);
-}
-
-/// Start every node, wait for one durable cluster checkpoint, and require every node to write.
-fn boot(
-    nodes: &mut [Node],
-    producer: &mut InputProducer,
-    settings: &SoakSettings,
-    metric: &str,
-) -> DurableCheckpointStatus {
-    for node in nodes.iter_mut() {
-        let permit = node.verify_executable_for_spawn();
-        node.spawn(permit);
-        // Stagger process startup to reduce formation churn, as the join soak does.
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    wait_for(
-        "every node to become ready",
-        Duration::from_secs(60),
-        || {
-            producer.assert_running();
-            nodes.iter_mut().all(|node| {
-                node.assert_running();
-                node.epoch().is_some() && node.is_ready()
-            })
-        },
-    );
-    wait_for(
-        "every node to observe full cluster membership",
-        Duration::from_secs(60),
-        || {
-            assert_running_nodes(nodes);
-            producer.assert_running();
-            has_full_membership(nodes)
-        },
-    );
-    // A pre-join epoch can burn a full gate timeout before the first durable checkpoint.
-    let deadline = Instant::now() + settings.recovery_ceiling + Duration::from_secs(60);
-    let first = wait_for_converged_durable_checkpoint(nodes, deadline, "first checkpoint", None);
-    wait_for(
-        "every node to publish to the sink",
-        remaining_progress_window(deadline, "first publication"),
-        || {
-            assert_running_nodes(nodes);
-            producer.assert_running();
-            nodes
-                .iter()
-                .all(|node| node.metric(metric).is_some_and(|published| published > 0.0))
-        },
-    );
-    first
-}
-
-fn stable_leader(nodes: &mut [Node], producer: &mut InputProducer) -> usize {
-    let mut candidate = None;
-    let mut samples = 0_u8;
-    wait_for(
-        "one stable observed cluster leader",
-        Duration::from_secs(30),
-        || {
-            assert_running_nodes(nodes);
-            producer.assert_running();
-            let leader = observed_leader(nodes);
-            samples = if leader.is_some() && leader == candidate {
-                samples + 1
-            } else {
-                1
-            };
-            candidate = leader;
-            candidate.is_some() && samples >= 3
-        },
-    );
-    candidate.expect("stable leader wait completed without a leader")
-}
-
-/// Kill the leader (every `NODES`th round) or a follower while it is paused inside a checkpoint,
-/// require the survivors to commit, then restart it and require it to publish and commit again.
-fn kill_round(
-    nodes: &mut [Node],
-    producer: &mut InputProducer,
-    round: u64,
-    killed_followers: &mut BTreeSet<usize>,
-    settings: &SoakSettings,
-    metric: &str,
-    latest: DurableCheckpointStatus,
-) -> DurableCheckpointStatus {
-    let leader = stable_leader(nodes, producer);
-    let (victim, role) = if round.is_multiple_of(NODES as u64) {
-        (leader, "leader")
-    } else {
-        let rotation = usize::try_from(round).unwrap_or(usize::MAX);
-        let victim = select_follower_victim(leader, killed_followers, rotation);
-        (victim, "follower")
-    };
-    nodes[victim].arm_checkpoint_kill(role);
-    // A spontaneous recovery round exposes no checkpoint to arm until it completes.
-    wait_for(
-        "the selected node to pause inside its armed checkpoint phase",
-        settings.recovery_ceiling + Duration::from_secs(45),
-        || {
-            assert_running_nodes(nodes);
-            producer.assert_running();
-            nodes[victim].checkpoint_kill_ready(role)
-        },
-    );
-    let failover_deadline = Instant::now() + settings.recovery_ceiling;
-    nodes[victim].kill9();
-    nodes[victim].disarm_checkpoint_kill();
-    if role == "follower" {
-        killed_followers.insert(victim);
-    }
-    eprintln!("soak round {round}: kill -9 delivered to {role} node {victim} inside a checkpoint");
-    let survived = wait_for_converged_durable_checkpoint(
-        nodes,
-        failover_deadline,
-        "survivor progress after kill",
-        Some(latest),
-    );
-
-    let permit = nodes[victim].verify_executable_for_spawn();
-    let rejoin_deadline = Instant::now() + settings.recovery_ceiling;
-    nodes[victim].spawn(permit);
-    wait_for(
-        "the restarted node to rejoin and publish to the sink",
-        remaining_progress_window(rejoin_deadline, "restarted-node recovery"),
-        || {
-            assert_running_nodes(nodes);
-            producer.assert_running();
-            has_full_membership(nodes)
-                && nodes[victim]
-                    .metric(metric)
-                    .is_some_and(|published| published > 0.0)
-        },
-    );
-    let rejoined = wait_for_converged_durable_checkpoint(
-        nodes,
-        rejoin_deadline,
-        "progress after rejoin",
-        Some(survived),
-    );
-    eprintln!(
-        "soak round {round}: node {victim} rejoined; checkpoint {} committed",
-        rejoined.checkpoint_id
-    );
-    rejoined
-}
-
-fn published(node: &Node, metric: &str) -> f64 {
-    let mut value = None;
-    wait_for(
-        &format!("node{} to expose {metric}", node.id),
-        Duration::from_secs(10),
-        || {
-            value = node.metric(metric);
-            value.is_some()
-        },
-    );
-    value.expect("sink metric wait completed without a value")
-}
-
-/// Run the steady phase and require every node to keep publishing through it, so a node that
-/// published once and then stalled cannot pass for a writer.
-fn steady_phase(
-    nodes: &mut [Node],
-    producer: &mut InputProducer,
-    oracle: &mut Oracle,
-    steady: Duration,
-    metric: &str,
-) {
-    let before: Vec<f64> = nodes.iter().map(|node| published(node, metric)).collect();
-    let until = Instant::now() + steady;
-    while Instant::now() < until {
-        assert_running_nodes(nodes);
-        producer.assert_running();
-        oracle.assert_running();
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let after: Vec<f64> = nodes.iter().map(|node| published(node, metric)).collect();
-    let during: Vec<f64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
-    eprintln!("soak: published per node during the steady phase: {during:?}");
-    assert!(
-        during.iter().all(|published| *published > 0.0),
-        "every node must keep publishing through the steady phase: {during:?}"
-    );
 }
 
 /// Wait until every produced id has reached the destination, then stop the oracle.

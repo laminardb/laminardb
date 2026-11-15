@@ -76,7 +76,7 @@ UNION ALL SELECT 'r', COUNT(*) AS a, SUM(id) AS b, SUM(join_key) AS c, CAST(NULL
 FROM soak_view_rows";
 /// Committed-read errors HTTP answers with 400 while a node catches up, as pgwire's retryable
 /// SQLSTATEs below. A read that reaches its deadline answers 504.
-const RETRYABLE_HTTP_ERRORS: [&str; 4] = [
+pub(super) const RETRYABLE_HTTP_ERRORS: [&str; 4] = [
     "no checkpoint has committed",
     "is not retained",
     "hold checkpoints",
@@ -559,7 +559,7 @@ fn http_read(
     Ok((epoch, wait, idle))
 }
 
-fn http_post(node: usize, path: &str, body: &str) -> std::io::Result<(u16, String)> {
+pub(super) fn http_post(node: usize, path: &str, body: &str) -> std::io::Result<(u16, String)> {
     let port = BASE_PORT + u16::try_from(node).expect("soak node id fits u16");
     let mut stream = TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),

@@ -114,9 +114,15 @@ mod iceberg_leg;
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
 // Shared with iceberg_cluster_soak, which uses every helper this soak does not.
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/generator_splits.rs"]
+mod generator_splits;
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
 #[allow(dead_code)]
 mod iceberg_table;
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/kill_rejoin.rs"]
+mod kill_rejoin;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/paused_leader.rs"]
 mod paused_leader;

@@ -308,6 +308,22 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs redpanda nats nats-2 nats-3
             candidate: "true"
+          - label: Cluster ALO split generator (gossip)
+            test: generator_splits::three_node_generator_splits_kill9_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster-generator
+            discovery: gossip
+            emulator: "0"
+            # One split per vnode into a keyed view; every committed read on every node must hold
+            # an exact prefix of each split through every kill and rejoin.
+            checkpoint_ms: "500"
+            rps: "400"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs
+            candidate: "true"
     steps:
       - uses: actions/checkout@v6
         with:
