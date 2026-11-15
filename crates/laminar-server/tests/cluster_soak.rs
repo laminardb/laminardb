@@ -5832,6 +5832,7 @@ fn subscription_websocket_error_is_retryable(error: &tungstenite::Error) -> bool
             | tungstenite::Error::AlreadyClosed
             | tungstenite::Error::Protocol(
                 tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+                    | tungstenite::error::ProtocolError::HandshakeIncomplete
             )
     )
 }
