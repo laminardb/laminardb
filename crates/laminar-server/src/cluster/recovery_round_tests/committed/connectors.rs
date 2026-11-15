@@ -375,8 +375,12 @@ pub(super) fn register(
     runtime: Runtime,
 ) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {
     move |registry| {
-        if runtime != Runtime::Aggregate {
-            return process::register(probe, path)(registry);
+        match runtime {
+            Runtime::Aggregate => {}
+            Runtime::Generator => return Ok(()),
+            Runtime::Native => return process::register(probe, path)(registry),
+            #[cfg(feature = "process-remote")]
+            Runtime::RemoteRust => return process::register(probe, path)(registry),
         }
         let keys = keys().map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
         let source_probe = Arc::clone(&probe);

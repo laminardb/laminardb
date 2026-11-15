@@ -111,7 +111,7 @@ async fn read_subscriptions(process: &mut Process, through: u64) -> Result<Vec<V
 }
 
 /// Wait until both databases run an assignment in which `owner` owns every vnode.
-async fn wait_owned_by(processes: &mut [Process; 2], owner: u64) -> Result<()> {
+pub(super) async fn wait_owned_by(processes: &mut [Process; 2], owner: u64) -> Result<()> {
     let mut last = Vec::new();
     tokio::time::timeout(DEADLINE, async {
         loop {

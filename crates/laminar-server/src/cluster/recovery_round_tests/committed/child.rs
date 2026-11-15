@@ -76,8 +76,8 @@ impl DatabasePeer {
                     )
                     .await?;
             }
-            Runtime::Aggregate => {
-                return Err(anyhow!("aggregate fixture cannot install process code"))
+            Runtime::Aggregate | Runtime::Generator => {
+                return Err(anyhow!("this fixture cannot install process code"))
             }
         }
         let ddl = [
@@ -379,9 +379,23 @@ impl DatabasePeer {
                 .ok_or_else(|| anyhow!("fixture sender is absent"))?
                 .register_peer(node, address),
             Command::Catalog => {
-                if self.runtime != Runtime::Aggregate {
-                    self.install_process_catalog().await?;
-                    return Ok(Response::Done);
+                match self.runtime {
+                    Runtime::Aggregate => {}
+                    Runtime::Generator => {
+                        self.db()?
+                            .execute_cluster_bootstrap_batch(&generator::catalog())
+                            .await?;
+                        return Ok(Response::Done);
+                    }
+                    Runtime::Native => {
+                        self.install_process_catalog().await?;
+                        return Ok(Response::Done);
+                    }
+                    #[cfg(feature = "process-remote")]
+                    Runtime::RemoteRust => {
+                        self.install_process_catalog().await?;
+                        return Ok(Response::Done);
+                    }
                 }
                 let ddl = [
                     "CREATE SOURCE recovery_input (account BIGINT, amount BIGINT, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"recovery-cut-probe\" ('fixture' = 'bounded-replay-v1')".into(),
@@ -426,13 +440,14 @@ impl DatabasePeer {
                 self.db()?.enable_coordinated_recovery()?;
             }
             Command::Prefix(prefix) => {
-                if prefix
-                    > if self.runtime == Runtime::Aggregate {
-                        4
-                    } else {
-                        7
-                    }
-                {
+                let bound = match self.runtime {
+                    Runtime::Aggregate => 4,
+                    Runtime::Native => 7,
+                    #[cfg(feature = "process-remote")]
+                    Runtime::RemoteRust => 7,
+                    Runtime::Generator => 0,
+                };
+                if prefix > bound {
                     return Err(anyhow!("fixture source prefix exceeds its record bound"));
                 }
                 self.probe.prefix.store(prefix, Ordering::Release);
