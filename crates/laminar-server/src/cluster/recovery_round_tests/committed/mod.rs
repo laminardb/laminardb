@@ -1,5 +1,6 @@
-//! Independent database processes recover aggregates, split interval-join chains and process
-//! functions through the existing shared checkpoint, assignment and recovery lifecycle.
+//! Independent database processes recover aggregates, split interval-join chains, process
+//! functions and generator splits through the existing shared checkpoint, assignment and recovery
+//! lifecycle.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use laminar_core::cluster::control::{TopologyAdmissionPhase, TopologyVersion};
 
 mod child;
 mod connectors;
+mod generator;
 mod migration;
 mod process;
 mod rotation;
@@ -36,6 +38,8 @@ enum Runtime {
     Native,
     #[cfg(feature = "process-remote")]
     RemoteRust,
+    /// The built-in generator with splits, read into a keyed view.
+    Generator,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,4 +158,20 @@ async fn two_databases_migrate_and_seed_views_from_the_cut() {
 #[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
 async fn a_draining_database_hands_its_views_over_live() {
     scenario::run_drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_failed_databases_generator_splits_resume_on_the_survivor_from_the_committed_cut() {
+    scenario::run_generator(generator::Handover::FailedOwner)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_hands_its_generator_splits_over_at_the_handoff_cut() {
+    scenario::run_generator(generator::Handover::Drain)
+        .await
+        .unwrap();
 }
