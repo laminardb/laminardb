@@ -63,7 +63,8 @@ impl SourceConnector for KafkaSource {
             input_mode,
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
-        .with_exact_delivery_certification())
+        .with_exact_delivery_certification()
+        .with_cluster_exact_delivery_certification())
     }
 
     fn set_vnode_assignment(

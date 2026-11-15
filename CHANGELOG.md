@@ -12,6 +12,11 @@
   ties it to one node: the FIX receive journal or the local input files. Both were already
   rejected, with a generic singleton-placement message. `SourceContract` gains a `locality`
   field, set with `with_locality(SourceLocality::…)`; it defaults to `Portable`.
+- Cluster exactly-once now requires a source certified for it across cluster nodes, in addition
+  to the single-node certification. Kafka is the only such source, so the admitted compositions
+  are unchanged; a connector that later splits across nodes runs exactly-once in cluster only
+  after its own cluster certification. `SourceContract` gains
+  `is_cluster_exact_delivery_certified()`.
 
 ### Fixed
 

@@ -38,6 +38,15 @@ pub(super) fn admit_source_recovery_contract(
              connector contract",
         );
     }
+    if runtime == RuntimeMode::Cluster
+        && delivery == DeliveryGuarantee::ExactlyOnce
+        && !contract.is_cluster_exact_delivery_certified()
+    {
+        return Err(
+            "[LDB-5037] exactly-once source delivery is not certified across cluster nodes for \
+             this connector contract",
+        );
+    }
     // Certification of a commit-coupled source asserts that its barrier cut is exact: no
     // upstream transaction spans the cut, so committed output never holds part of one.
     if contract.consistency == SourceConsistency::CommitCoupled {
