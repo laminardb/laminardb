@@ -54,6 +54,7 @@
 //! - `LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE`  `certify` (default) enforces frozen-input-to-Delta
 //!   visibility; `observe` records the immutable boundary but still requires bounded exact output
 //! - `LAMINAR_SOAK_KILLS`  total fault rounds (local exact requires at least two)
+//! - `LAMINAR_SOAK_SPLITS`  runs the local exact leg over a generator with that many splits
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
@@ -11594,6 +11595,7 @@ fn write_local_exact_config(
     span: u64,
     max_rows: u64,
     rows_per_second: u64,
+    splits: Option<u64>,
 ) -> PathBuf {
     let checkpoint_dir = dir.join("checkpoints");
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
@@ -11605,6 +11607,7 @@ fn write_local_exact_config(
         format!("file:///{checkpoint_path}")
     };
 
+    let splits = splits.map_or_else(String::new, |splits| format!(", \"splits\" = \"{splits}\""));
     let config = format!(
         r#"
 node_id = "local-exact"
@@ -11628,7 +11631,7 @@ timeout = "30s"
 [[source]]
 name = "gen"
 connector = "generator"
-properties = {{ "rows.per.second" = "{rows_per_second}", "batch.max.size" = "256", "max.rows" = "{max_rows}" }}
+properties = {{ "rows.per.second" = "{rows_per_second}", "batch.max.size" = "256", "max.rows" = "{max_rows}"{splits} }}
 "#,
     );
     let path = dir.join("local-exact.toml");
@@ -11636,9 +11639,11 @@ properties = {{ "rows.per.second" = "{rows_per_second}", "batch.max.size" = "256
     path
 }
 
-fn local_exact_checkpoint_source_sequence(
+/// The rows the generator's cursor at `checkpoint` has read.
+fn local_exact_checkpoint_rows_read(
     checkpoint_dir: &Path,
     checkpoint: DurableCheckpointStatus,
+    splits: Option<u64>,
 ) -> Result<u64, String> {
     let path = checkpoint_dir.join(format!(
         "nodes/1/checkpoints/{:020}/manifest.json",
@@ -11654,14 +11659,56 @@ fn local_exact_checkpoint_source_sequence(
             manifest.checkpoint_id, manifest.epoch
         ));
     }
-    let sequence = manifest
+    let offsets = &manifest
         .source_offsets
         .get("gen")
-        .and_then(|checkpoint| checkpoint.offsets.get("seq"))
-        .ok_or_else(|| format!("checkpoint {checkpoint:?} has no generator sequence offset"))?;
-    sequence.parse::<u64>().map_err(|error| {
-        format!("checkpoint {checkpoint:?} has invalid generator sequence {sequence:?}: {error}")
-    })
+        .ok_or_else(|| format!("checkpoint {checkpoint:?} has no generator cursor"))?
+        .offsets;
+    generator_rows_read(offsets, splits)
+        .map_err(|error| format!("checkpoint {checkpoint:?}: {error}"))
+}
+
+/// Rows read by a generator cursor: its `seq`, or with `splits` the rows below each split's
+/// `seq.<c>`, where split `c` of `n` reads `c, c + n, …`. The cursor must have the configured
+/// shape, so a source that ignored `splits` cannot pass.
+fn generator_rows_read(
+    offsets: &std::collections::HashMap<String, String>,
+    splits: Option<u64>,
+) -> Result<u64, String> {
+    let parse = |key: &str| {
+        let value = offsets
+            .get(key)
+            .ok_or_else(|| format!("the generator cursor has no {key} offset"))?;
+        value
+            .parse::<u64>()
+            .map_err(|error| format!("invalid generator offset {key}={value:?}: {error}"))
+    };
+    let split_offsets = offsets.keys().filter(|key| key.starts_with("seq.")).count() as u64;
+    let Some(splits) = splits else {
+        if split_offsets != 0 {
+            return Err(format!(
+                "an unsplit generator cursor has {split_offsets} split offsets"
+            ));
+        }
+        return parse("seq");
+    };
+    if split_offsets != splits || offsets.contains_key("seq") {
+        return Err(format!(
+            "a generator cursor of {splits} splits has offsets {:?}",
+            offsets.keys().collect::<BTreeSet<_>>()
+        ));
+    }
+    (0..splits)
+        .map(|split| {
+            let next = parse(&format!("seq.{split}"))?;
+            if next < split || (next - split) % splits != 0 {
+                return Err(format!(
+                    "seq.{split}={next} is not on split {split} of {splits}"
+                ));
+            }
+            Ok((next - split) / splits)
+        })
+        .sum()
 }
 
 fn assert_no_local_checkpoint_consistency_fault(node: &Node) {
@@ -11888,11 +11935,14 @@ fn wait_for_local_assignment_convergence(
     );
 }
 
+/// `in_sequence_order` holds for an unsplit generator, whose every read is a prefix of the
+/// sequence; a split generator reads a prefix of each split instead, so only the bound applies.
 fn validate_local_exact_snapshot(
     rows: &[serde_json::Value],
     produced_count: u64,
     groups: u64,
     span: u64,
+    in_sequence_order: bool,
 ) -> BTreeMap<u64, (u64, u64)> {
     let mut observed = BTreeMap::new();
     for row in rows {
@@ -11901,11 +11951,13 @@ fn validate_local_exact_snapshot(
         let high_seq = json_u64_field(row, "hi");
         assert!(key < groups, "local aggregate key {key} is out of range");
         assert!(count > 0, "local aggregate key {key} emitted zero rows");
-        assert_eq!(
-            high_seq,
-            aggregate_high_seq(key, count, groups, span),
-            "local exact aggregate diverged for key {key} at generator seq {high_seq}"
-        );
+        if in_sequence_order {
+            assert_eq!(
+                high_seq,
+                aggregate_high_seq(key, count, groups, span),
+                "local exact aggregate diverged for key {key} at generator seq {high_seq}"
+            );
+        }
         let final_count = expected_aggregate_count(produced_count, key, groups, span);
         assert!(
             count <= final_count,
@@ -11927,6 +11979,7 @@ fn assert_local_exact_prefix(
     produced_count: u64,
     groups: u64,
     span: u64,
+    splits: Option<u64>,
     deadline: Duration,
 ) {
     let start = Instant::now();
@@ -11942,7 +11995,13 @@ fn assert_local_exact_prefix(
                 "local aggregate oracle returned a non-query response: {response}"
             );
             if let Some(rows) = response.get("data").and_then(serde_json::Value::as_array) {
-                latest = validate_local_exact_snapshot(rows, produced_count, groups, span);
+                latest = validate_local_exact_snapshot(
+                    rows,
+                    produced_count,
+                    groups,
+                    span,
+                    splits.is_none(),
+                );
                 if (0..groups).all(|key| {
                     let count = expected_aggregate_count(produced_count, key, groups, span);
                     latest.get(&key) == Some(&(count, aggregate_high_seq(key, count, groups, span)))
@@ -12830,6 +12889,7 @@ fn local_exact_source_state_kill9_soak() {
         rows_per_second > 0,
         "LAMINAR_SOAK_RPS must be greater than zero"
     );
+    let splits = Some(env_u64("LAMINAR_SOAK_SPLITS", 0)).filter(|splits| *splits > 0);
     let prefix_rows = local_exact_prefix_rows(groups, span);
     validate_local_source_liveness(prefix_rows, rows_per_second, interval_ms, recovery_ceiling);
 
@@ -12850,6 +12910,7 @@ fn local_exact_source_state_kill9_soak() {
             span,
             prefix_rows,
             rows_per_second,
+            splits,
         ),
         log_path: log_dir.join("node0.log"),
         child: None,
@@ -12894,8 +12955,8 @@ fn local_exact_source_state_kill9_soak() {
     let moving_checkpoint = node
         .checkpoint_kill_predecessor("leader")
         .expect("moving local checkpoint gate has no exact durable-cut evidence");
-    let moving_checkpoint_sequence =
-        local_exact_checkpoint_source_sequence(&checkpoint_dir, moving_checkpoint)
+    let moving_checkpoint_rows =
+        local_exact_checkpoint_rows_read(&checkpoint_dir, moving_checkpoint, splits)
             .unwrap_or_else(|error| panic!("moving-source recovery cut is invalid: {error}"));
     assert!(
         moving_checkpoint.checkpoint_id >= initial_checkpoint.checkpoint_id
@@ -12903,8 +12964,8 @@ fn local_exact_source_state_kill9_soak() {
         "moving-source durable cut regressed from {initial_checkpoint:?} to {moving_checkpoint:?}"
     );
     assert!(
-        moving_checkpoint_sequence < prefix_rows,
-        "moving-source fault selected an already exhausted durable cut: sequence={moving_checkpoint_sequence}, prefix={prefix_rows}"
+        moving_checkpoint_rows < prefix_rows,
+        "moving-source fault selected an already exhausted durable cut: rows read={moving_checkpoint_rows}, prefix={prefix_rows}"
     );
     let moving_ingested = node
         .metric("laminardb_events_ingested_total")
@@ -12942,6 +13003,7 @@ fn local_exact_source_state_kill9_soak() {
         prefix_rows,
         groups,
         span,
+        splits,
         remaining_progress_window(moving_recovery_deadline, "moving local exact recovery"),
     );
     // Take the completion baseline only after the exact finite prefix is visible. Two later
@@ -12989,11 +13051,11 @@ fn local_exact_source_state_kill9_soak() {
             "local checkpoint id reused or regressed: previous={latest_checkpoint_id}, current={}",
             durable_checkpoint.checkpoint_id
         );
-        let durable_source_sequence =
-            local_exact_checkpoint_source_sequence(&checkpoint_dir, durable_checkpoint)
+        let durable_source_rows =
+            local_exact_checkpoint_rows_read(&checkpoint_dir, durable_checkpoint, splits)
                 .unwrap_or_else(|error| panic!("frozen-prefix recovery cut is invalid: {error}"));
         assert_eq!(
-            durable_source_sequence, prefix_rows,
+            durable_source_rows, prefix_rows,
             "checkpoint {durable_checkpoint:?} does not contain the exhausted finite source cut"
         );
         latest_checkpoint_id = durable_checkpoint.checkpoint_id;
@@ -13030,6 +13092,7 @@ fn local_exact_source_state_kill9_soak() {
             prefix_rows,
             groups,
             span,
+            splits,
             remaining_progress_window(recovery_deadline, "local exact recovery"),
         );
         assert_eq!(
@@ -20095,9 +20158,45 @@ fn local_exact_source_cursor_oracle_reads_v8_node_manifest() {
     std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
     assert_eq!(
-        local_exact_checkpoint_source_sequence(directory.path(), checkpoint).unwrap(),
+        local_exact_checkpoint_rows_read(directory.path(), checkpoint, None).unwrap(),
         4096
     );
+}
+
+#[test]
+fn split_generator_cursor_counts_the_rows_below_every_split() {
+    let cursor = |offsets: &[(&str, &str)]| {
+        offsets
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    // Split 0 read 0, 4; split 1 read 1, 5; split 2 read 2, 6; split 3 read 3.
+    let read = cursor(&[
+        ("seq.0", "8"),
+        ("seq.1", "9"),
+        ("seq.2", "10"),
+        ("seq.3", "7"),
+    ]);
+    assert_eq!(generator_rows_read(&read, Some(4)), Ok(7));
+    assert!(
+        generator_rows_read(&read, Some(2)).is_err(),
+        "another split count"
+    );
+    assert!(
+        generator_rows_read(&read, None).is_err(),
+        "a split cursor where none was configured"
+    );
+    let unsplit = cursor(&[("seq", "12")]);
+    assert_eq!(generator_rows_read(&unsplit, None), Ok(12));
+    assert!(
+        generator_rows_read(&unsplit, Some(4)).is_err(),
+        "splits were ignored"
+    );
+    let off_split = cursor(&[("seq.0", "8"), ("seq.1", "8")]);
+    assert!(generator_rows_read(&off_split, Some(2)).is_err());
+    let missing = cursor(&[("seq.0", "8"), ("seq.2", "10")]);
+    assert!(generator_rows_read(&missing, Some(2)).is_err());
 }
 
 #[test]
@@ -20107,7 +20206,8 @@ fn exact_prefix_snapshot_accepts_complete_unordered_state() {
         { "k": 0, "n": 4, "hi": 7 },
         { "k": 1, "n": 4, "hi": 9 }
     ]);
-    let observed = validate_local_exact_snapshot(rows.as_array().expect("snapshot rows"), 12, 3, 2);
+    let observed =
+        validate_local_exact_snapshot(rows.as_array().expect("snapshot rows"), 12, 3, 2, true);
     assert_eq!(
         observed,
         BTreeMap::from([(0, (4, 7)), (1, (4, 9)), (2, (4, 11))])

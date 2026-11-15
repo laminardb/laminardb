@@ -23,7 +23,7 @@ fn statements() -> Vec<String> {
     ]
 }
 
-async fn open(storage: &Path) -> Arc<LaminarDB> {
+async fn open(storage: &Path, delivery: DeliveryGuarantee) -> Arc<LaminarDB> {
     let deadline = tokio::time::Instant::now() + CONVERGE;
     loop {
         let db = LaminarDB::builder()
@@ -32,7 +32,7 @@ async fn open(storage: &Path) -> Arc<LaminarDB> {
                 interval_ms: None,
                 ..Default::default()
             })
-            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .delivery_guarantee(delivery)
             .build()
             .await
             .expect("open database");
@@ -94,8 +94,17 @@ async fn checkpoint(db: &LaminarDB) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_split_generator_resumes_every_split_from_the_committed_cursor() {
+    resumes_every_split(DeliveryGuarantee::AtLeastOnce).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exactly_once_split_generator_resumes_every_split_from_the_committed_cursor() {
+    resumes_every_split(DeliveryGuarantee::ExactlyOnce).await;
+}
+
+async fn resumes_every_split(delivery: DeliveryGuarantee) {
     let storage = tempfile::tempdir().unwrap();
-    let db = open(storage.path()).await;
+    let db = open(storage.path(), delivery).await;
     db.start().await.expect("start");
     let deadline = tokio::time::Instant::now() + CONVERGE;
     while totals(&db).await.0 < ROWS / 8 {
@@ -108,7 +117,7 @@ async fn a_split_generator_resumes_every_split_from_the_committed_cursor() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let db = open(storage.path()).await;
+    let db = open(storage.path(), delivery).await;
     db.start().await.expect("restart from the committed cursor");
     let expected = (ROWS, ROWS * (ROWS - 1) / 2);
     let deadline = tokio::time::Instant::now() + CONVERGE;

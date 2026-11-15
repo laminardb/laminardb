@@ -41,7 +41,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | OpenTelemetry | BE | rejected |
 | FIX TagValue | EO, ALO | rejected |
 | Generator | EO, ALO, BE | rejected |
-| Generator (splits) | ALO, BE | ALO |
+| Generator (splits) | EO, ALO, BE | ALO |
 
 ### Sinks
 
@@ -79,7 +79,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | OpenTelemetry | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
 | FIX TagValue | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | Generator | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Generator (splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Generator (splits) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 
 ### Cluster: strongest guarantee per pair
 

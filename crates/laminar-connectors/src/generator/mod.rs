@@ -262,13 +262,14 @@ impl SourceConnector for GeneratorSource {
             .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
             .with_exact_delivery_certification());
         };
-        // A split sequence is not certified for exactly-once until its own suite passes.
+        // Certified on one node; cluster exactly-once needs its own certification.
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
             SourceInputMode::AppendOnly,
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        .with_exact_delivery_certification()
         .with_placement(SourceChannelPlacement {
             channels,
             route: split::ROUTE,
