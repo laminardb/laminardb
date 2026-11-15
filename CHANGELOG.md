@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- The generator source takes `splits = n`, which spreads its sequence over `n` input channels:
+  row `i` is on channel `i mod n`. In cluster mode each channel is read by the node that owns the
+  vnode a versioned, engine-owned route gives it, so a split generator runs on several nodes. A
+  split generator runs at-least-once in every mode and is not certified for exactly-once; without
+  `splits` the generator is unchanged. `SourceContract` gains `placement`
+  (`with_placement(SourceChannelPlacement { channels, route })`), which enters pipeline identity
+  only when a source declares it.
+
 ### Changed
 
 - `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a

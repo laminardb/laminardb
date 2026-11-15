@@ -25,6 +25,7 @@ fn canonical_source_digest(
             input_mode: canonical_source_input_mode(input_mode),
             row_positions: canonical_source_row_positions(row_positions),
             replay_order: None,
+            placement: None,
             schema_contract: None,
             schema: None,
             primary_key: Vec::new(),
@@ -174,6 +175,37 @@ fn source_replay_order_binds_identity_without_changing_undeclared_sources() {
         "single_channel_fixed_batches"
     );
     assert_ne!(Sha256::digest(&ordered), Sha256::digest(&cut));
+}
+
+#[test]
+fn source_placement_binds_identity_without_changing_unplaced_sources() {
+    let contract = SourceContract::new(
+        laminar_connectors::connector::SourceConsistency::Replayable,
+        laminar_connectors::connector::SourceTopology::Splittable,
+        SourceInputMode::AppendOnly,
+    );
+    let encode = |contract| {
+        serde_json::to_value(canonical_source(
+            "events".into(),
+            1,
+            "test".into(),
+            BTreeMap::new(),
+            contract,
+            None,
+        ))
+        .unwrap()
+    };
+    let placement = |channels| SourceChannelPlacement {
+        channels: std::num::NonZeroU32::new(channels).unwrap(),
+        route: laminar_core::state::SourceChannelRoute::V1,
+    };
+    assert!(encode(contract).get("placement").is_none());
+    let four = encode(contract.with_placement(placement(4)));
+    assert_eq!(
+        four["placement"],
+        serde_json::json!({"channels": 4, "route": "v1"})
+    );
+    assert_ne!(four, encode(contract.with_placement(placement(8))));
 }
 
 #[test]

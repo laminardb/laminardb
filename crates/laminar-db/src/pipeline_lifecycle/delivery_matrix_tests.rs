@@ -183,6 +183,12 @@ const SOURCES: &[Variant] = &[
         properties: &[],
         exact_properties: &[],
     },
+    Variant {
+        label: "Generator (splits)",
+        connector: "generator",
+        properties: &[("splits", "4")],
+        exact_properties: &[],
+    },
 ];
 
 const SINKS: &[Variant] = &[

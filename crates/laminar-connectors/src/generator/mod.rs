@@ -7,7 +7,11 @@
 //! sink completeness by recomputing the expected rows — its primary
 //! consumer is the cluster soak test, but it works anywhere a
 //! self-driving source is needed (demos, benchmarks).
+//!
+//! With `splits = n` the sequence is split over `n` input channels, row `i` on channel
+//! `i mod n`, and a cluster reads each channel on one node.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,8 +23,9 @@ use async_trait::async_trait;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConfigKeySpec, ConnectorConfig, ConnectorInfo};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
-    SourcePosition, SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
+    SourceBatch, SourceChannelPlacement, SourceConnector, SourceConsistency, SourceContract,
+    SourceDrainRequest, SourceDrainSettlement, SourceInputMode, SourcePosition,
+    SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
@@ -29,7 +34,9 @@ const GENERATOR_CHECKPOINT_CONNECTOR: &str = "generator";
 const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
 const GENERATOR_CHECKPOINT_VERSION: &str = "2";
 
-fn generator_input_channel(source_name: &str) -> Result<Vec<u8>, ConnectorError> {
+mod split;
+
+fn generator_input_channel(source_name: &str, index: u32) -> Result<Vec<u8>, ConnectorError> {
     let source_len = u32::try_from(source_name.len()).map_err(|_| {
         ConnectorError::ConfigurationError(
             "generator source identity exceeds the input-channel encoding limit".into(),
@@ -38,11 +45,29 @@ fn generator_input_channel(source_name: &str) -> Result<Vec<u8>, ConnectorError>
     let mut channel = Vec::with_capacity(source_name.len() + 8);
     channel.extend_from_slice(&source_len.to_be_bytes());
     channel.extend_from_slice(source_name.as_bytes());
-    channel.extend_from_slice(&0_u32.to_be_bytes());
+    channel.extend_from_slice(&index.to_be_bytes());
     Ok(channel)
 }
 
-fn validate_generator_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+fn configured_splits(config: &ConnectorConfig) -> Result<Option<NonZeroU32>, ConnectorError> {
+    use laminar_core::state::MAX_KEY_GROUP_COUNT;
+
+    match config.get_parsed::<u32>("splits")? {
+        None => Ok(None),
+        // More splits than the largest vnode count add no parallelism.
+        Some(splits) if splits > MAX_KEY_GROUP_COUNT => Err(ConnectorError::ConfigurationError(
+            format!("splits must be at most {MAX_KEY_GROUP_COUNT}"),
+        )),
+        Some(splits) => NonZeroU32::new(splits)
+            .map(Some)
+            .ok_or_else(|| ConnectorError::ConfigurationError("splits must be > 0".into())),
+    }
+}
+
+fn validate_generator_checkpoint(
+    checkpoint: &SourceCheckpoint,
+    version: &str,
+) -> Result<(), ConnectorError> {
     match checkpoint.get_metadata("connector") {
         Some(GENERATOR_CHECKPOINT_CONNECTOR) => {}
         Some(connector) => {
@@ -56,9 +81,9 @@ fn validate_generator_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), Co
             ));
         }
     }
-    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(GENERATOR_CHECKPOINT_VERSION) {
+    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(version) {
         return Err(ConnectorError::ConfigurationError(format!(
-            "generator checkpoint requires {CHECKPOINT_VERSION_METADATA}={GENERATOR_CHECKPOINT_VERSION}"
+            "generator checkpoint requires {CHECKPOINT_VERSION_METADATA}={version}"
         )));
     }
     Ok(())
@@ -79,6 +104,10 @@ pub struct GeneratorSource {
     /// Created only after `start` installs the initial or recovered sequence,
     /// so a restart cannot burst or stall against a stale anchor.
     anchor: Option<(Instant, u64)>,
+    /// Set by `splits`; replaces `input_channel` and `next_seq`.
+    split: Option<split::SplitInput>,
+    /// Cluster ownership, installed before `start`.
+    assignment: Option<split::SplitAssignment>,
 }
 
 impl GeneratorSource {
@@ -101,7 +130,12 @@ impl GeneratorSource {
         clippy::cast_precision_loss
     )]
     fn build_batch(&self, start: u64, n: usize) -> Result<RecordBatch, ConnectorError> {
-        let seqs: Vec<i64> = (0..n as u64).map(|i| (start + i) as i64).collect();
+        self.build_rows((0..n as u64).map(|i| (start + i) as i64).collect())
+    }
+
+    // Cast lints: see build_batch.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    fn build_rows(&self, seqs: Vec<i64>) -> Result<RecordBatch, ConnectorError> {
         let ts: Vec<i64> = seqs
             .iter()
             .map(|&s| {
@@ -127,29 +161,80 @@ impl GeneratorSource {
         start: u64,
         n: usize,
     ) -> Result<SourceRowPositions, ConnectorError> {
-        let mut partitions =
-            BinaryBuilder::with_capacity(n, self.input_channel.len().saturating_mul(n));
-        let mut order_keys = BinaryBuilder::with_capacity(n, 8_usize.saturating_mul(n));
-        for row in 0..n {
-            let sequence = start
-                .checked_add(u64::try_from(row).map_err(|_| {
-                    ConnectorError::Internal("generator batch row index exceeds u64".into())
-                })?)
-                .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))?;
-            partitions.append_value(&self.input_channel);
-            order_keys.append_value(sequence.to_be_bytes());
-        }
-        SourceRowPositions::try_new(
-            partitions.finish(),
-            order_keys.finish(),
-            UInt32Array::from(vec![0; n]),
-        )
+        let sequences = (0..n)
+            .map(|row| {
+                u64::try_from(row)
+                    .ok()
+                    .and_then(|row| start.checked_add(row))
+                    .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        row_positions(&self.input_channel, &sequences)
     }
+
+    // Cast lints: see build_batch.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn poll_split(&mut self, max_records: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+        let limit = max_records.min(self.batch_max);
+        let Some(split) = self.split.as_mut() else {
+            return Ok(None);
+        };
+        if split.is_draining() || !split.ready()? {
+            return Ok(None);
+        }
+        let Some(base) = split.min_next() else {
+            return Ok(None);
+        };
+        let (anchored_at, anchor_seq) = *self.anchor.get_or_insert_with(|| (Instant::now(), base));
+        let mut allowed = anchor_seq.saturating_add(
+            (anchored_at.elapsed().as_secs_f64() * self.rows_per_second as f64) as u64,
+        );
+        if let Some(max) = self.max_rows {
+            allowed = allowed.min(max);
+        }
+        let Some((channel, sequences)) = split.take(allowed, limit) else {
+            return Ok(None);
+        };
+        let records = self.build_rows(sequences.iter().map(|&seq| seq as i64).collect())?;
+        let split = self.split.as_ref().expect("the split input was read above");
+        let batch =
+            SourceBatch::positioned(records, row_positions(split.channel(channel), &sequences)?)?;
+        if split.is_cluster() {
+            return Ok(Some(batch.with_checkpoint(split.checkpoint())));
+        }
+        Ok(Some(batch))
+    }
+
+    fn split_mut(&mut self) -> Result<&mut split::SplitInput, ConnectorError> {
+        self.split.as_mut().ok_or_else(|| {
+            ConnectorError::ConfigurationError("only a generator with splits drains".into())
+        })
+    }
+}
+
+fn row_positions(channel: &[u8], sequences: &[u64]) -> Result<SourceRowPositions, ConnectorError> {
+    let rows = sequences.len();
+    let mut partitions = BinaryBuilder::with_capacity(rows, channel.len().saturating_mul(rows));
+    let mut order_keys = BinaryBuilder::with_capacity(rows, 8_usize.saturating_mul(rows));
+    for sequence in sequences {
+        partitions.append_value(channel);
+        order_keys.append_value(sequence.to_be_bytes());
+    }
+    SourceRowPositions::try_new(
+        partitions.finish(),
+        order_keys.finish(),
+        UInt32Array::from(vec![0; rows]),
+    )
 }
 
 impl Default for GeneratorSource {
     fn default() -> Self {
-        let input_channel = generator_input_channel("generator")
+        let input_channel = generator_input_channel("generator", 0)
             .expect("the built-in generator source identity is valid");
         Self {
             schema: Self::generator_schema(),
@@ -159,20 +244,35 @@ impl Default for GeneratorSource {
             input_channel,
             next_seq: 0,
             anchor: None,
+            split: None,
+            assignment: None,
         }
     }
 }
 
 #[async_trait]
 impl SourceConnector for GeneratorSource {
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        let Some(channels) = configured_splits(config)? else {
+            return Ok(SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Singleton,
+                SourceInputMode::AppendOnly,
+            )
+            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+            .with_exact_delivery_certification());
+        };
+        // A split sequence is not certified for exactly-once until its own suite passes.
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
-            SourceTopology::Singleton,
+            SourceTopology::Splittable,
             SourceInputMode::AppendOnly,
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
-        .with_exact_delivery_certification())
+        .with_placement(SourceChannelPlacement {
+            channels,
+            route: split::ROUTE,
+        }))
     }
 
     async fn resolve_schema(
@@ -191,7 +291,7 @@ impl SourceConnector for GeneratorSource {
             .get("laminar.source.name")
             .filter(|name| !name.is_empty())
             .unwrap_or("generator");
-        self.input_channel = generator_input_channel(source_name)?;
+        self.input_channel = generator_input_channel(source_name, 0)?;
         if let Some(rps) = config.get_parsed::<u64>("rows.per.second")? {
             if rps == 0 {
                 return Err(ConnectorError::ConfigurationError(
@@ -204,6 +304,31 @@ impl SourceConnector for GeneratorSource {
             self.batch_max = n.max(1);
         }
         self.max_rows = config.get_parsed::<u64>("max.rows")?;
+        self.split = None;
+        if let Some(splits) = configured_splits(&config)? {
+            let start = match &position {
+                SourcePosition::Initial => None,
+                SourcePosition::Initialized { .. } => {
+                    return Err(ConnectorError::ConfigurationError(
+                        "generator has no sealed topology startup contract".into(),
+                    ));
+                }
+                SourcePosition::Resume { checkpoint, .. } => Some(checkpoint),
+            };
+            self.split = Some(split::SplitInput::new(
+                source_name,
+                splits,
+                start,
+                self.assignment.clone(),
+            )?);
+            self.anchor = None;
+            return Ok(());
+        }
+        if self.assignment.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "a generator without splits cannot take a cluster vnode assignment".into(),
+            ));
+        }
 
         self.next_seq = match position {
             SourcePosition::Initial => 0,
@@ -216,7 +341,7 @@ impl SourceConnector for GeneratorSource {
                 attempt,
                 checkpoint,
             } => {
-                validate_generator_checkpoint(&checkpoint)?;
+                validate_generator_checkpoint(&checkpoint, GENERATOR_CHECKPOINT_VERSION)?;
                 if checkpoint.input_channels() != Some(std::slice::from_ref(&self.input_channel)) {
                     return Err(ConnectorError::ConfigurationError(format!(
                         "generator checkpoint {attempt:?} has the wrong input-channel inventory"
@@ -250,6 +375,9 @@ impl SourceConnector for GeneratorSource {
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
+        if self.split.is_some() {
+            return self.poll_split(max_records);
+        }
         let (anchored_at, anchor_seq) = *self
             .anchor
             .get_or_insert_with(|| (Instant::now(), self.next_seq));
@@ -280,6 +408,9 @@ impl SourceConnector for GeneratorSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        if let Some(split) = &self.split {
+            return split.checkpoint();
+        }
         let mut cp = SourceCheckpoint::new();
         cp.set_offset("seq", self.next_seq.to_string());
         cp.set_metadata("connector", GENERATOR_CHECKPOINT_CONNECTOR);
@@ -287,6 +418,68 @@ impl SourceConnector for GeneratorSource {
         cp.set_input_channels(vec![self.input_channel.clone()])
             .expect("the cached generator input-channel identity is valid");
         cp
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        match &self.split {
+            Some(split) if !split.ready()? => Ok(None),
+            _ => Ok(Some(self.checkpoint())),
+        }
+    }
+
+    fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+        self.split
+            .as_ref()
+            .map_or(Ok(true), split::SplitInput::ready)
+    }
+
+    fn drive_control_plane(&mut self) {
+        if let Some(split) = &mut self.split {
+            split.drive();
+        }
+    }
+
+    // Each poll hands over whole rows, so a paused generator holds nothing past the boundary.
+    fn begin_drain(
+        &mut self,
+        request: &SourceDrainRequest,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.split_mut()?.begin_drain(request.round)
+    }
+
+    fn poll_drain_ready(
+        &mut self,
+        round: laminar_core::checkpoint::AssignmentDrainId,
+    ) -> Result<bool, ConnectorError> {
+        self.split_mut()?.drain_ready(round)
+    }
+
+    async fn finish_drain(
+        &mut self,
+        settlement: SourceDrainSettlement,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.split_mut()?.finish_drain(&settlement)
+    }
+
+    fn set_vnode_assignment(
+        &mut self,
+        source_identity: &str,
+        registry: Arc<laminar_core::state::VnodeRegistry>,
+        self_id: laminar_core::state::NodeId,
+    ) -> Result<(), ConnectorError> {
+        if source_identity.is_empty() || self_id.is_unassigned() {
+            return Err(ConnectorError::ConfigurationError(
+                "generator vnode assignment requires a source and node identity".into(),
+            ));
+        }
+        self.assignment = Some(split::SplitAssignment {
+            source_identity: source_identity.to_owned(),
+            registry,
+            node: self_id,
+        });
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -313,6 +506,11 @@ pub fn register_generator_source(registry: &ConnectorRegistry) -> Result<(), Con
             ConfigKeySpec::optional(
                 "max.rows",
                 "Stop after this many rows (unbounded if unset)",
+                "",
+            ),
+            ConfigKeySpec::optional(
+                "splits",
+                "Split the sequence over this many input channels, row i on channel i mod splits",
                 "",
             ),
         ],

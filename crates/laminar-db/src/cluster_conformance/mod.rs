@@ -62,7 +62,11 @@ impl Case {
 
     /// Classify the case; `Err` is a conformance bug with its evidence.
     async fn run(&self) -> Result<Verdict, String> {
-        let embedded = match self.run_embedded().await? {
+        let truth = match self.ground_truth {
+            Some(sql) => Some(oracle::ground_truth(&self.sources, sql).await?),
+            None => None,
+        };
+        let embedded = match self.run_embedded(truth.as_ref()).await? {
             Ok(output) => output,
             Err(reason) => return Ok(Verdict::UnsupportedEverywhere(reason)),
         };
@@ -72,8 +76,19 @@ impl Case {
                 self.name
             ));
         }
-        if let Some(sql) = self.ground_truth {
-            let truth = oracle::ground_truth(&self.sources, sql).await?;
+        if let Some(source) = self.sources.iter().find(|source| {
+            source.generated
+                && (0..NODES)
+                    .filter(|node| reads_channel(source, *node))
+                    .count()
+                    < 2
+        }) {
+            return Err(format!(
+                "{}: every split of '{}' lands on one node",
+                self.name, source.name
+            ));
+        }
+        if let Some(truth) = truth {
             if truth != embedded {
                 return Err(format!(
                     "{}: embedded output diverges from batch ground truth; {}",
@@ -99,8 +114,23 @@ impl Case {
         Ok(Verdict::Equal)
     }
 
-    /// `Ok(Err(reason))` when embedded DDL rejects the catalog.
-    async fn run_embedded(&self) -> Result<Result<Consolidated, String>, String> {
+    /// `Ok(Err(reason))` when embedded DDL rejects the catalog. A generator delivers no
+    /// countable batches, so with one the output settles on `truth` instead.
+    async fn run_embedded(
+        &self,
+        truth: Option<&Consolidated>,
+    ) -> Result<Result<Consolidated, String>, String> {
+        let generated = self.sources.iter().any(|source| source.generated);
+        let truth = match truth {
+            Some(truth) => Some(truth),
+            None if generated => {
+                return Err(format!(
+                    "{}: a generated source needs ground truth",
+                    self.name
+                ));
+            }
+            None => None,
+        };
         let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
         let polled = Arc::new(AtomicU64::new(0));
         let db = embedded_db(&self.sources, &polled, directory.path()).await?;
@@ -114,8 +144,17 @@ impl Case {
         let started = db.start().await.map_err(|e| format!("embedded start: {e}"));
         let output = match started.and_then(|()| self.portal(&db, reader)) {
             Ok(portal) => {
-                self.drain(&[Arc::clone(&db)], &mut [portal], &[polled], &mut [0])
-                    .await
+                let (dbs, mut portals, mut published) = ([Arc::clone(&db)], [portal], [0]);
+                let output = self
+                    .drain(&dbs, &mut portals, &[polled], &mut published)
+                    .await;
+                match (output, truth.filter(|_| generated)) {
+                    (Ok(mut output), Some(truth)) => self
+                        .settle(&dbs, &mut portals, &mut output, &mut published, truth)
+                        .await
+                        .map(|_| output),
+                    (output, _) => output,
+                }
             }
             Err(error) => Err(error),
         };
@@ -154,10 +193,9 @@ impl Case {
                 self.name
             ));
         }
-        if let Some((idle, _)) = (0..NODES)
-            .zip(&cluster.polled)
-            .find(|(node, polled)| self.reads_input(*node) && polled.load(Ordering::Acquire) == 0)
-        {
+        if let Some((idle, _)) = (0..NODES).zip(&cluster.polled).find(|(node, polled)| {
+            self.reads_fixture_input(*node) && polled.load(Ordering::Acquire) == 0
+        }) {
             return Err(format!("{}: node {} read no input", self.name, idle + 1));
         }
         let observed = self
@@ -185,12 +223,18 @@ impl Case {
         Ok(observed)
     }
 
-    /// Whether node `node` (0-based) owns a fixture partition. Partition `p` is read by the owner
-    /// of vnode `p % VNODES`, and the conformance assignment gives vnode `v` to node `v % NODES`.
+    /// Whether node `node` (0-based) owns a partition of any source.
     fn reads_input(&self, node: u64) -> bool {
-        self.sources.iter().any(|source| {
-            (0..source.partitions.len() as u64).any(|p| p % u64::from(VNODES) % NODES == node)
-        })
+        self.sources
+            .iter()
+            .any(|source| reads_channel(source, node))
+    }
+
+    /// Whether node `node` (0-based) owns a partition the fixture connector delivers.
+    fn reads_fixture_input(&self, node: u64) -> bool {
+        self.sources
+            .iter()
+            .any(|source| !source.generated && reads_channel(source, node))
     }
 
     /// A cluster window closes only once its input's frontier has crossed each exchange, which the
@@ -306,6 +350,22 @@ impl Case {
         }
         Ok(())
     }
+}
+
+/// Whether node `node` (0-based) owns a partition of `source`. The conformance assignment gives
+/// vnode `v` to node `v % NODES`. The fixture connector reads partition `p` on the owner of vnode
+/// `p % VNODES`; the generator's splits follow the engine's channel route.
+fn reads_channel(source: &FixtureSource, node: u64) -> bool {
+    let vnodes = std::num::NonZeroU32::new(VNODES).expect("the conformance cluster has vnodes");
+    let partitions = u32::try_from(source.partitions.len()).expect("fixture partitions fit in u32");
+    (0..partitions).any(|partition| {
+        let vnode = if source.generated {
+            laminar_core::state::SourceChannelRoute::V1.vnode(source.name, partition, vnodes)
+        } else {
+            partition % VNODES
+        };
+        u64::from(vnode) % NODES == node
+    })
 }
 
 /// An embedded database that reads every fixture partition and checkpoints into `directory`.
