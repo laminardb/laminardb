@@ -282,6 +282,8 @@ pub(crate) use cluster_faults::report_cluster_terminal_halt;
 use cluster_faults::{queue_owned_cluster_compute_fault, report_cluster_compute_fault};
 #[cfg(feature = "cluster")]
 mod singleton_placement;
+#[cfg(feature = "cluster")]
+pub(crate) use singleton_placement::place as place_singleton;
 mod source_admission;
 #[cfg(feature = "cluster")]
 pub(crate) use source_admission::cluster_assignment_scoped;

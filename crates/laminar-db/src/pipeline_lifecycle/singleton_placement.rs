@@ -595,6 +595,15 @@ mod tests {
             Ok(())
         }
 
+        async fn resolve_initial_position(
+            &mut self,
+            _config: &ConnectorConfig,
+        ) -> Result<SourceCheckpoint, ConnectorError> {
+            let mut checkpoint = SourceCheckpoint::new();
+            checkpoint.set_offset("delivered", "0");
+            Ok(checkpoint)
+        }
+
         fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
             Ok(SourceContract::new(
                 SourceConsistency::CommitCoupled,
@@ -685,6 +694,25 @@ mod tests {
                 "a draining singleton reads nothing"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_sealed_start_cursor_names_the_one_channel() {
+        let mut node = Node::new(1).await;
+        let cursor = node
+            .source
+            .resolve_initial_position(&ConnectorConfig::new("recorder"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor.input_channels(),
+            Some(&[NAME.as_bytes().to_vec()][..])
+        );
+        assert_eq!(
+            cursor.assignment_version(),
+            None,
+            "a sealed cursor is unowned"
+        );
     }
 
     #[tokio::test]

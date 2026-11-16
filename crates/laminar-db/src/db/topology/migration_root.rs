@@ -119,12 +119,18 @@ impl LaminarDB {
             let config = candidate
                 .build_registered_source_config(&object.name, registration)
                 .map_err(map_error)?;
-            let mut connector = candidate
+            let connector = candidate
                 .connector_registry
                 .create_source(&config, None)
                 .map_err(|e| {
                     TopologyError::Unsupported(format!("source '{}': {e}", object.name))
                 })?;
+            // A placed singleton's sealed cursor names its one channel.
+            let mut connector =
+                crate::pipeline_lifecycle::place_singleton(&object.name, connector, &config)
+                    .map_err(|e| {
+                        TopologyError::Unsupported(format!("source '{}': {e}", object.name))
+                    })?;
             let checkpoint = connector
                 .resolve_initial_position(&config)
                 .await

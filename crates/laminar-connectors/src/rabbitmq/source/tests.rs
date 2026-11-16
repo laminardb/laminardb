@@ -157,3 +157,34 @@ fn stream_queue_deliveries_are_detected() {
     assert!(is_stream_delivery(&stream));
     assert!(!is_stream_delivery(&delivery(2, b"x")));
 }
+
+#[tokio::test]
+async fn a_sealed_start_records_only_that_the_queue_keeps_its_position() {
+    let mut config = ConnectorConfig::new("rabbitmq");
+    config.set("url", "amqp://127.0.0.1/%2f");
+    config.set("queue", "q");
+    config.set("format", "json");
+    let mut source = RabbitMqSource::new(ids(), None);
+    assert!(source.supports_initialized_start());
+    let cursor = source.resolve_initial_position(&config).await.unwrap();
+    assert_eq!(cursor.get_metadata("connector"), Some("rabbitmq"));
+    source
+        .validate_initial_position(&config, &cursor)
+        .await
+        .unwrap();
+
+    let mut running = SourceCheckpoint::new();
+    running.set_offset(GENERATION, "00000000000000ff");
+    running.set_offset(DELIVERY_TAG, "4");
+    assert!(source
+        .validate_initial_position(&config, &running)
+        .await
+        .is_err());
+    assert!(
+        source
+            .contract(&config)
+            .unwrap()
+            .supports_cluster_singleton_placement(),
+        "any one cluster node may consume the queue"
+    );
+}
