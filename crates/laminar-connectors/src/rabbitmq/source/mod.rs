@@ -692,17 +692,21 @@ impl SourceConnector for RabbitMqSource {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        RabbitMqSourceConfig::from_config(config)?;
+        let parsed = RabbitMqSourceConfig::from_config(config)?;
         // The queue releases a message only when the checkpoint containing it is durable.
         // Exactly-once is not certified: broker acknowledgement and sink commit are separate.
-        // Any one node may consume the queue: a delivery the committed cut did not cover stays
-        // unacknowledged and is redelivered to whichever node opens the queue next.
-        Ok(SourceContract::new(
+        let contract = SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
-        )
-        .with_cluster_singleton_placement())
+        );
+        // FpML is not qualified for cluster sources.
+        if parsed.format == Format::Fpml {
+            return Ok(contract);
+        }
+        // Any one node may consume the queue: a delivery the committed cut did not cover stays
+        // unacknowledged and is redelivered to whichever node opens the queue next.
+        Ok(contract.with_cluster_singleton_placement())
     }
 
     fn recovery_identity_options(

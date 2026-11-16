@@ -187,4 +187,15 @@ async fn a_sealed_start_records_only_that_the_queue_keeps_its_position() {
             .supports_cluster_singleton_placement(),
         "any one cluster node may consume the queue"
     );
+    #[cfg(feature = "fpml")]
+    {
+        config.set("format", "fpml");
+        assert!(
+            !source
+                .contract(&config)
+                .unwrap()
+                .supports_cluster_singleton_placement(),
+            "FpML is not qualified for cluster sources"
+        );
+    }
 }
