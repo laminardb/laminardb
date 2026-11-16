@@ -51,7 +51,7 @@ pub(super) fn event_operation(raw: &RawDocument) -> Result<ChangeOperation, Conn
     Ok(ChangeOperation::classify(operation))
 }
 
-/// Canonical JSON of the event's own `_id`, encoded exactly like a driver resume token.
+/// The event's own `_id`, encoded exactly like a driver resume token.
 pub(super) fn event_token(raw: &RawDocument) -> Result<String, ConnectorError> {
     #[derive(serde::Deserialize)]
     struct EventId {
@@ -60,7 +60,7 @@ pub(super) fn event_token(raw: &RawDocument) -> Result<String, ConnectorError> {
     }
     let id: EventId =
         mongodb::bson::from_slice(raw.as_bytes()).map_err(|error| malformed("_id", error))?;
-    serde_json::to_string(&id.id).map_err(|error| malformed("_id", error))
+    super::checkpoint::encode_resume_token(&id.id)
 }
 
 pub(super) fn decode_change(raw: &RawDocument) -> Result<DecodedChange<'_>, ConnectorError> {

@@ -5,9 +5,9 @@ use mongodb::bson::{doc, oid::ObjectId, Document};
 use super::admission::{await_mongo_reader_ready, source_client_options};
 use super::buffering::{buffered_retained_bytes, ChangeRecord, SnapshotRecord};
 use super::checkpoint::{
-    canonical_resume_token, parse_deployment_identity, set_emitted_offsets, RESUME_TOKEN_OFFSET,
-    SEQUENCE_OFFSET, SNAPSHOT_AFTER_KEY_OFFSET, SNAPSHOT_AT_OFFSET, START_AFTER_TOKEN_OFFSET,
-    START_AT_OFFSET,
+    canonical_resume_token, mongodb_stream_identity, parse_deployment_identity,
+    set_emitted_offsets, RESUME_TOKEN_OFFSET, SEQUENCE_OFFSET, SNAPSHOT_AFTER_KEY_OFFSET,
+    SNAPSHOT_AT_OFFSET, START_AFTER_TOKEN_OFFSET, START_AT_OFFSET,
 };
 use super::decoding::{event_operation, event_token};
 use super::reader::{
@@ -946,6 +946,35 @@ fn identity_probes_fail_fast_for_permanent_server_rejections() {
     ));
 }
 
+#[test]
+fn a_resume_token_keeps_its_binary_type_bits_through_the_checkpoint() {
+    // A document key holding a 64-bit integer gives the token generic-binary `_typeBits`.
+    let raw = mongodb::bson::to_vec(&doc! {
+        "_id": {
+            "_data": "826AFB4CDD000000182B042C0100296E5A1004",
+            "_typeBits": mongodb::bson::Binary {
+                subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                bytes: vec![130, 0, 1],
+            },
+        },
+        "operationType": "insert",
+    })
+    .unwrap();
+    let raw = mongodb::bson::RawDocument::from_bytes(&raw).unwrap();
+    let encoded = canonical_resume_token(&event_token(raw).unwrap()).unwrap();
+    assert!(encoded.contains(r#""$binary""#), "{encoded}");
+    let restored = super::checkpoint::decode_resume_token(&encoded).unwrap();
+    assert_eq!(
+        mongodb::bson::to_bson(&restored).unwrap(),
+        mongodb::bson::Bson::Document(raw.get_document("_id").unwrap().try_into().unwrap()),
+    );
+
+    // A token of `_data` alone keeps its existing encoding.
+    let plain = mongodb::bson::to_vec(&doc! { "_id": { "_data": "8263" } }).unwrap();
+    let plain = mongodb::bson::RawDocument::from_bytes(&plain).unwrap();
+    assert_eq!(event_token(plain).unwrap(), r#"{"_data":"8263"}"#);
+}
+
 // ── Contracts and configuration ──
 
 #[test]
@@ -987,6 +1016,53 @@ fn contracts_follow_the_output_and_snapshot_modes() {
         .unwrap_err()
         .to_string()
         .contains("max.poll.records"));
+}
+
+#[tokio::test]
+async fn only_a_history_stream_without_a_copy_runs_in_a_cluster_or_starts_sealed() {
+    let mut source = MongoDbCdcSource::new(MongoDbSourceConfig::default(), None);
+    let history = valid_connector_config();
+    assert!(
+        source
+            .contract(&history)
+            .unwrap()
+            .supports_cluster_singleton_placement(),
+        "any one node may follow the change stream"
+    );
+    assert!(source.supports_initialized_start());
+
+    let mut copied = valid_connector_config();
+    copied.set("snapshot.mode", "initial");
+    let mut document = valid_connector_config();
+    document.set("output.mode", "document");
+    document.set("full.document.mode", "required");
+    for config in [&copied, &document] {
+        assert!(!source
+            .contract(config)
+            .unwrap()
+            .supports_cluster_singleton_placement());
+        let error = source.resolve_initial_position(config).await.unwrap_err();
+        assert!(error.to_string().contains("starts sealed only"), "{error}");
+        let sealed = recovery_checkpoint(
+            &MongoDbSourceConfig::from_config(config).unwrap(),
+            &[
+                (RESUME_TOKEN_OFFSET, r#"{"_data":"01"}"#),
+                (SEQUENCE_OFFSET, "0"),
+            ],
+        );
+        let error = source
+            .start(
+                SourceStart::new(
+                    config.clone(),
+                    SourcePosition::Initialized { checkpoint: sealed },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("starts sealed only"), "{error}");
+    }
 }
 
 #[test]

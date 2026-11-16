@@ -552,6 +552,113 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
     source2.close().await.unwrap();
 }
 
+/// A cluster moves a source by closing it at the handoff cut and starting it again from that cut,
+/// on the same instance when the source comes back to a node. The keys are 64-bit integers, which
+/// give every resume token binary `_typeBits`.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_source_reopens_its_stream_after_a_handoff() {
+    let (_container, uri) = start_mongo().await;
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let db = client.database("test_handoff");
+    db.create_collection("docs").await.unwrap();
+    let docs = db.collection::<mongodb::bson::Document>("docs");
+    let config = ConnectorConfig::new("mongodb-cdc");
+    let mut source =
+        MongoDbCdcSource::new(MongoDbSourceConfig::new(&uri, "test_handoff", "docs"), None);
+    source.start(initial_source_start(&config)).await.unwrap();
+    for seq in 0..5_i64 {
+        docs.insert_one(doc! { "_id": seq, "seq": seq })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        collect_insert_sequences_until(&mut source, 4).await,
+        [0, 1, 2, 3, 4]
+    );
+
+    // The cut as the engine commits it: the cursor plus the channel and assignment it binds.
+    let mut handoff = source.checkpoint();
+    handoff
+        .set_input_channels(vec![b"history".to_vec()])
+        .unwrap();
+    handoff.bind_assignment_version(std::num::NonZeroU64::new(3).unwrap());
+    source.notify_epoch_committed(1, &handoff).await.unwrap();
+    source.close().await.unwrap();
+    for seq in 5..10_i64 {
+        docs.insert_one(doc! { "_id": seq, "seq": seq })
+            .await
+            .unwrap();
+    }
+
+    let resume = SourcePosition::Resume {
+        attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
+        checkpoint: handoff,
+    };
+    let start = SourceStart::new(config, resume, DeliveryGuarantee::AtLeastOnce).unwrap();
+    source.start(start).await.unwrap();
+    assert_eq!(
+        collect_insert_sequences_until(&mut source, 9).await,
+        [5, 6, 7, 8, 9],
+        "the reopened stream resumes exactly after the handoff cut"
+    );
+    source.close().await.unwrap();
+}
+
+/// A source added to a running cluster starts from the position sealed with the topology change,
+/// so changes made before its owner opens it are read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealed_start_reads_changes_made_after_it_was_resolved() {
+    let (_container, uri) = start_mongo().await;
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let db = client.database("test_sealed");
+    db.create_collection("docs").await.unwrap();
+    let docs = db.collection::<mongodb::bson::Document>("docs");
+    docs.insert_one(doc! { "seq": -1 }).await.unwrap();
+    let config = ConnectorConfig::new("mongodb-cdc");
+    let source_config = MongoDbSourceConfig::new(&uri, "test_sealed", "docs");
+
+    let mut sealed = MongoDbCdcSource::new(source_config.clone(), None)
+        .resolve_initial_position(&config)
+        .await
+        .unwrap();
+    for seq in 0..3 {
+        docs.insert_one(doc! { "seq": seq }).await.unwrap();
+    }
+    let mut source = MongoDbCdcSource::new(source_config.clone(), None);
+    source
+        .validate_initial_position(&config, &sealed)
+        .await
+        .unwrap();
+    sealed
+        .set_input_channels(vec![b"history".to_vec()])
+        .unwrap();
+    let start = SourceStart::new(
+        config.clone(),
+        SourcePosition::Initialized {
+            checkpoint: sealed.clone(),
+        },
+        DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap();
+    source.start(start).await.unwrap();
+    assert_eq!(
+        collect_insert_sequences_until(&mut source, 2).await,
+        [0, 1, 2]
+    );
+    source.close().await.unwrap();
+
+    docs.drop().await.unwrap();
+    db.create_collection("docs").await.unwrap();
+    let error = MongoDbCdcSource::new(source_config, None)
+        .validate_initial_position(&config, &sealed)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("UUID"),
+        "a recreated collection is a different stream: {error}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_resume_rejects_a_tampered_deployment_identity() {
     let (_container, uri) = start_mongo().await;

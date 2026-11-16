@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use super::super::change_event::ChangeOperation;
 use super::buffering::{buffered_retained_bytes, BufferedMongoPayload, ChangeRecord};
-use super::checkpoint::{canonical_resume_token, MongoCheckpointPosition, SnapshotCut};
+use super::checkpoint::{
+    canonical_resume_token, decode_resume_token, encode_resume_token, MongoCheckpointPosition,
+    SnapshotCut,
+};
 use super::decoding::{event_operation, event_token};
 use super::{
     observe_mongodb_admission, BufferedMongoEvent, ChangeStreamTx, ConnectorError,
@@ -206,8 +209,7 @@ pub(super) async fn forward_change_stream(
                 let operation = event_operation(&raw)?;
                 let token = canonical_resume_token(&event_token(&raw)?)?;
                 let invalidated = operation == ChangeOperation::Invalidate;
-                let event_resume_token: ResumeToken = serde_json::from_str(&token)
-                    .map_err(|error| ConnectorError::ReadError(format!("resume token: {error}")))?;
+                let event_resume_token = decode_resume_token(&token)?;
                 let record = ChangeRecord {
                     raw,
                     token,
@@ -282,12 +284,7 @@ pub(super) async fn forward_change_stream(
 }
 
 fn canonical_post_batch_token(token: &ResumeToken) -> Result<String, ConnectorError> {
-    let encoded = serde_json::to_string(token).map_err(|error| {
-        ConnectorError::ReadError(format!(
-            "serialize MongoDB post-batch resume token: {error}"
-        ))
-    })?;
-    canonical_resume_token(&encoded).map_err(|error| {
+    canonical_resume_token(&encode_resume_token(token)?).map_err(|error| {
         ConnectorError::ReadError(format!("invalid MongoDB post-batch resume token: {error}"))
     })
 }
@@ -444,6 +441,26 @@ pub(super) fn fresh_stream_anchor(
     })?;
     let encoded = canonical_post_batch_token(&token)?;
     Ok((token, encoded))
+}
+
+/// Open an empty change stream once, at `position` or at the current end of the stream.
+pub(super) async fn open_bootstrap_cursor(
+    db: &mongodb::Database,
+    config: &MongoDbSourceConfig,
+    position: Option<&MongoResumePosition>,
+) -> Result<MongoChangeStream, ConnectorError> {
+    db.collection::<mongodb::bson::Document>(&config.collection)
+        .watch()
+        .pipeline(parse_change_stream_pipeline(&config.pipeline)?)
+        .with_options(bootstrap_change_stream_options(config, position))
+        .await
+        .map(mongodb::change_stream::ChangeStream::with_type::<RawDocumentBuf>)
+        .map_err(
+            |error| match classify_stream_error(&error, &namespace(config)) {
+                ReadFailure::Permanent(error) => error,
+                ReadFailure::Transient(message) => ConnectorError::ConnectionFailed(message),
+            },
+        )
 }
 
 /// Background task that reads from the `MongoDB` change stream and sends

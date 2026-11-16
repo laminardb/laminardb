@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
@@ -17,13 +18,12 @@ use crate::error::ConnectorError;
 
 use super::super::config::{SnapshotMode, SourceOutputMode};
 use super::admission::ReaderLaunch;
-use super::checkpoint::set_emitted_offsets;
+use super::checkpoint::{decode_resume_token, encode_checkpoint};
 use super::{
-    mongodb_stream_identity, parse_mongodb_checkpoint, reap_mongo_reader, DocumentProjection,
-    MongoCheckpointPosition, MongoDbCdcSource, MongoDbSourceConfig, MongoResumePosition,
-    ParsedMongoCheckpoint, ReaderStart, StreamPosition, COLLECTION_UUID_METADATA,
-    DEPLOYMENT_IDENTITY_METADATA, MONGODB_CHECKPOINT_CONNECTOR, MONGODB_CHECKPOINT_VERSION,
-    READER_SHUTDOWN_TIMEOUT, STREAM_IDENTITY_METADATA,
+    parse_mongodb_checkpoint, reap_mongo_reader, DocumentProjection, EmittedPosition,
+    MongoCheckpointPosition, MongoDbCdcSource, MongoDbSourceConfig, MongoDeploymentIdentity,
+    MongoResumePosition, ParsedMongoCheckpoint, ReaderStart, StreamPosition,
+    READER_SHUTDOWN_TIMEOUT,
 };
 
 fn parsed_config(
@@ -74,14 +74,36 @@ pub(super) fn document_projection(
     .map(Some)
 }
 
-fn restored_start(checkpoint: &ParsedMongoCheckpoint) -> Result<ReaderStart, ConnectorError> {
-    let token = |token: &str| {
-        serde_json::from_str(token).map_err(|error| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid MongoDB CDC resume token in checkpoint: {error}"
-            ))
-        })
-    };
+/// The reader start, emitted position and admitted identity a stored cursor restores.
+type Restored = (
+    ReaderStart,
+    Option<EmittedPosition>,
+    Option<Uuid>,
+    Option<MongoDeploymentIdentity>,
+);
+
+fn restore(
+    checkpoint: &SourceCheckpoint,
+    config: &MongoDbSourceConfig,
+    origin: &str,
+) -> Result<Restored, ConnectorError> {
+    let parsed = parse_mongodb_checkpoint(checkpoint, config).map_err(|error| {
+        ConnectorError::ConfigurationError(format!(
+            "invalid MongoDB CDC checkpoint {origin}: {error}"
+        ))
+    })?;
+    Ok((
+        restored_start(&parsed)?,
+        Some(parsed.emitted),
+        Some(parsed.collection_uuid),
+        Some(parsed.deployment_identity),
+    ))
+}
+
+pub(super) fn restored_start(
+    checkpoint: &ParsedMongoCheckpoint,
+) -> Result<ReaderStart, ConnectorError> {
+    let token = decode_resume_token;
     Ok(match &checkpoint.emitted.position {
         MongoCheckpointPosition::Stream(StreamPosition::ResumeAfter(encoded)) => {
             ReaderStart::Stream(MongoResumePosition::ResumeAfter(token(encoded)?))
@@ -141,14 +163,19 @@ impl SourceConnector for MongoDbCdcSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        if self.state != ConnectorState::Created {
+        // A cluster placement closes the source when another node takes it over, and starts it
+        // again if it comes back.
+        if !matches!(self.state, ConnectorState::Created | ConnectorState::Closed) {
             return Err(ConnectorError::InvalidState {
-                expected: ConnectorState::Created.to_string(),
+                expected: "a created or closed source".into(),
                 actual: self.state.to_string(),
             });
         }
         let (config, position, _) = request.into_parts();
         let parsed = parsed_config(&self.config, &config)?;
+        if matches!(position, SourcePosition::Initialized { .. }) {
+            super::sealed_start::require(&parsed)?;
+        }
         let projection = document_projection(&parsed, &config, config.arrow_schema())?;
         let (start, restored, mut expected_collection_uuid, mut expected_deployment_identity) =
             match position {
@@ -161,28 +188,13 @@ impl SourceConnector for MongoDbCdcSource {
                     None,
                     None,
                 ),
-                SourcePosition::Initialized { .. } => {
-                    return Err(ConnectorError::ConfigurationError(
-                        "MongoDB has no sealed topology startup contract".into(),
-                    ));
+                SourcePosition::Initialized { checkpoint } => {
+                    restore(&checkpoint, &parsed, "of the sealed start")?
                 }
                 SourcePosition::Resume {
                     attempt,
                     checkpoint,
-                } => {
-                    let parsed_checkpoint = parse_mongodb_checkpoint(&checkpoint, &parsed)
-                        .map_err(|error| {
-                            ConnectorError::ConfigurationError(format!(
-                                "invalid MongoDB CDC checkpoint {attempt:?}: {error}"
-                            ))
-                        })?;
-                    (
-                        restored_start(&parsed_checkpoint)?,
-                        Some(parsed_checkpoint.emitted),
-                        Some(parsed_checkpoint.collection_uuid),
-                        Some(parsed_checkpoint.deployment_identity),
-                    )
-                }
+                } => restore(&checkpoint, &parsed, &format!("{attempt:?}"))?,
             };
 
         if let Some((collection, deployment)) =
@@ -240,7 +252,6 @@ impl SourceConnector for MongoDbCdcSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut checkpoint = SourceCheckpoint::new();
         // A configured namespace is not a physical replay identity until admission has read the
         // server-assigned collection UUID and deployment identity.
         let (Some(collection_uuid), Some(deployment_identity), Some(emitted)) = (
@@ -248,23 +259,9 @@ impl SourceConnector for MongoDbCdcSource {
             self.deployment_identity.as_ref(),
             self.emitted.as_ref(),
         ) else {
-            return checkpoint;
+            return SourceCheckpoint::new();
         };
-        set_emitted_offsets(&mut checkpoint, emitted);
-        checkpoint.set_metadata("connector", MONGODB_CHECKPOINT_CONNECTOR);
-        checkpoint.set_metadata("version", MONGODB_CHECKPOINT_VERSION);
-        checkpoint.set_metadata("database", &self.config.database);
-        checkpoint.set_metadata("collection", &self.config.collection);
-        checkpoint.set_metadata(
-            COLLECTION_UUID_METADATA,
-            collection_uuid.hyphenated().to_string(),
-        );
-        checkpoint.set_metadata(DEPLOYMENT_IDENTITY_METADATA, deployment_identity.encode());
-        checkpoint.set_metadata(
-            STREAM_IDENTITY_METADATA,
-            mongodb_stream_identity(&self.config),
-        );
-        checkpoint
+        encode_checkpoint(&self.config, collection_uuid, deployment_identity, emitted)
     }
 
     async fn notify_epoch_committed(
@@ -330,6 +327,27 @@ impl SourceConnector for MongoDbCdcSource {
         Ok(())
     }
 
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
+    async fn resolve_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        super::sealed_start::inspect(&parsed_config(&self.config, config)?, None).await
+    }
+
+    async fn validate_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        super::sealed_start::inspect(&parsed_config(&self.config, config)?, Some(checkpoint))
+            .await
+            .map(|_| ())
+    }
+
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
@@ -342,6 +360,16 @@ impl SourceConnector for MongoDbCdcSource {
             SnapshotMode::Initial => SourceConsistency::CommitCoupled,
         };
         Ok(match parsed.output_mode {
+            // Any one node may follow the change stream: it resumes after the committed token.
+            // The initial copy is not qualified for cluster sources.
+            SourceOutputMode::History if parsed.snapshot_mode == SnapshotMode::Never => {
+                SourceContract::new(
+                    consistency,
+                    SourceTopology::Singleton,
+                    SourceInputMode::AppendOnly,
+                )
+                .with_cluster_singleton_placement()
+            }
             SourceOutputMode::History => SourceContract::new(
                 consistency,
                 SourceTopology::Singleton,

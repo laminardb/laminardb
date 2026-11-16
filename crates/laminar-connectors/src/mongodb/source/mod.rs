@@ -50,14 +50,15 @@ mod history;
 mod lifecycle;
 mod reader;
 mod schema_resolution;
+mod sealed_start;
 
 pub use history::{mongodb_history_schema, MONGODB_HISTORY_VERSION, SNAPSHOT_OPERATION};
 
 use admission::observe_mongodb_admission;
 use buffering::{BufferedMongoEvent, BufferedMongoPayload};
 use checkpoint::{
-    mongodb_stream_identity, parse_mongodb_checkpoint, EmittedPosition, MongoCheckpointPosition,
-    MongoDeploymentIdentity, ParsedMongoCheckpoint, SnapshotCut, StreamPosition,
+    parse_mongodb_checkpoint, EmittedPosition, MongoCheckpointPosition, MongoDeploymentIdentity,
+    ParsedMongoCheckpoint, SnapshotCut, StreamPosition,
 };
 use decoding::decode_change;
 use document::{DocumentProjection, DocumentRow};

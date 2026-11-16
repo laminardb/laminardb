@@ -1026,6 +1026,49 @@ fn rabbitmq_runs_in_cluster_on_one_node_at_least_once() {
     .is_err());
 }
 
+#[cfg(feature = "mongodb-cdc")]
+#[test]
+fn a_mongodb_history_stream_runs_in_cluster_on_one_node_at_least_once() {
+    use super::{admit_source_recovery_contract, cluster_assignment_scoped};
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::mongodb::register_mongodb_cdc_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("mongodb-cdc");
+    for (key, value) in [
+        ("connection.uri", "mongodb://127.0.0.1:27017"),
+        ("database", "app"),
+        ("collection", "orders"),
+    ] {
+        config.set(key, value);
+    }
+    let source = registry.create_source(&config, None).unwrap();
+    let admit = |config: &ConnectorConfig, delivery| {
+        admit_source_recovery_contract(
+            source.contract(config).unwrap(),
+            delivery,
+            true,
+            RuntimeMode::Cluster,
+        )
+    };
+    assert!(cluster_assignment_scoped(source.contract(&config).unwrap()));
+    assert_eq!(admit(&config, DeliveryGuarantee::AtLeastOnce), Ok(()));
+    let error = admit(&config, DeliveryGuarantee::ExactlyOnce).unwrap_err();
+    assert!(error.contains("not production-certified"), "{error}");
+
+    // The initial copy and the keyed document mirror stay rejected in cluster.
+    let mut copied = config.clone();
+    copied.set("snapshot.mode", "initial");
+    let mut document = config.clone();
+    document.set("output.mode", "document");
+    document.set("full.document.mode", "required");
+    for config in [&copied, &document] {
+        assert_eq!(
+            admit(config, DeliveryGuarantee::AtLeastOnce),
+            Err("cluster singleton sources require a connector that one node at a time may run")
+        );
+    }
+}
+
 #[cfg(feature = "postgres-cdc")]
 #[test]
 fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {

@@ -50,7 +50,7 @@
 #[cfg(feature = "ibmmq")]
 mod ibmmq;
 #[cfg(feature = "mongodb-cdc")]
-mod mongo;
+pub(crate) mod mongo;
 #[cfg(feature = "nats")]
 mod nats;
 #[cfg(feature = "postgres-sink")]
