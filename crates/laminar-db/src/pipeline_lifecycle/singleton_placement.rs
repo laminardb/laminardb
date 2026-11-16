@@ -161,13 +161,13 @@ impl SingletonPlacement {
                 );
                 return;
             }
-            (false, true, None) => match &self.request {
-                Some(request) => Some(Pending::Open(request.clone().into_parts().1)),
-                None => {
+            (false, true, None) => {
+                let Some(request) = &self.request else {
                     self.fault = Some("singleton source assigned before it started".into());
                     return;
-                }
-            },
+                };
+                Some(Pending::Open(request.clone().into_parts().1))
+            }
             (true, true, _) | (false, false, _) => None,
         };
         self.reconciled = version;
@@ -227,7 +227,7 @@ impl SingletonPlacement {
     /// position, since nothing has been read from it yet.
     fn cursor(&self) -> SourceCheckpoint {
         match &self.pending {
-            Some(Pending::Open(SourcePosition::Initial)) | Some(Pending::Close { .. }) => {
+            Some(Pending::Open(SourcePosition::Initial) | Pending::Close { .. }) => {
                 SourceCheckpoint::new()
             }
             Some(Pending::Open(
