@@ -219,6 +219,28 @@ fn parse_snapshot_key(encoded: &str) -> Result<String, ConnectorError> {
     Ok(encoded.to_string())
 }
 
+/// The durable cursor of `emitted` on the collection and deployment the source was admitted to.
+pub(super) fn encode_checkpoint(
+    config: &MongoDbSourceConfig,
+    collection_uuid: Uuid,
+    deployment_identity: &MongoDeploymentIdentity,
+    emitted: &EmittedPosition,
+) -> SourceCheckpoint {
+    let mut checkpoint = SourceCheckpoint::new();
+    set_emitted_offsets(&mut checkpoint, emitted);
+    checkpoint.set_metadata("connector", MONGODB_CHECKPOINT_CONNECTOR);
+    checkpoint.set_metadata("version", MONGODB_CHECKPOINT_VERSION);
+    checkpoint.set_metadata("database", &config.database);
+    checkpoint.set_metadata("collection", &config.collection);
+    checkpoint.set_metadata(
+        COLLECTION_UUID_METADATA,
+        collection_uuid.hyphenated().to_string(),
+    );
+    checkpoint.set_metadata(DEPLOYMENT_IDENTITY_METADATA, deployment_identity.encode());
+    checkpoint.set_metadata(STREAM_IDENTITY_METADATA, mongodb_stream_identity(config));
+    checkpoint
+}
+
 pub(super) fn set_emitted_offsets(checkpoint: &mut SourceCheckpoint, emitted: &EmittedPosition) {
     match &emitted.position {
         MongoCheckpointPosition::Stream(StreamPosition::ResumeAfter(token)) => {

@@ -29,7 +29,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Kafka | EO, ALO, BE | EO, ALO |
 | Kafka (Debezium) | EO, ALO, BE | EO, ALO |
 | PostgreSQL CDC | ALO | rejected |
-| MongoDB change stream | ALO, BE | rejected |
+| MongoDB change stream | ALO, BE | ALO |
 | Delta Lake change feed | ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
@@ -88,7 +88,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Kafka | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | PostgreSQL CDC | — | — | — | — | — | — | — | — | — | — | — | — |
-| MongoDB change stream | — | — | — | — | — | — | — | — | — | — | — | — |
+| MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Delta Lake change feed | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -148,6 +148,13 @@ a durable classic queue from a confirmed publisher and forwards every row throug
 RabbitMQ sink. The leader and each follower are hard-killed while paused inside a checkpoint. An
 independent reader of the output queue must see every confirmed id, ids never published fail the
 run, duplicates are counted, and more than one node must have consumed the queue.
+
+A MongoDB change stream (`output.mode=history`, `snapshot.mode=never`) runs the same way and
+resumes after the committed resume token. `mongodb_source::three_node_mongodb_source_kill9_soak`
+(candidate) inserts documents acknowledged by the majority into a one-member replica set and
+forwards each insert's id through a stream to a MongoDB sink, through the same kills. Every
+acknowledged id must reach the output collection, ids never written fail the run, duplicates are
+counted, and more than one node must have read the stream.
 
 ## Materialized view reads
 

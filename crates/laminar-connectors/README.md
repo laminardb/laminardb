@@ -15,7 +15,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | Replayable ALO with typed record metadata; exact-certified input for coordinated EO pipelines | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
-| MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
+| MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node, and `history` without a snapshot in a cluster on one node at a time | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node, and in a cluster on one node at a time ([guide](../../docs/RABBITMQ.md)) | Implemented |
 | IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node ([guide](../../docs/IBMMQ.md)) | Implemented |
@@ -33,8 +33,8 @@ composition before any connector I/O.
 
 `mongodb-cdc` reads one collection's change stream with the official Rust driver and delivers it
 straight to sinks: MongoDB → LaminarDB → destinations, with no broker in between. It runs in
-embedded and single-node server mode; cluster mode rejects it (singleton sources and mutable
-sinks have no fenced placement).
+embedded and single-node server mode. A cluster runs `output.mode=history` with
+`snapshot.mode=never` on one node at a time ([Cluster](#cluster)) and rejects the rest.
 
 New to it? [Try it locally](#try-mongodb-cdc-locally) first.
 
@@ -279,6 +279,23 @@ history consumers tolerate that. Resume tokens are never decoded.
   3.x has no server-side time limit for `bulkWrite`, so only the server bounds that window.
 - Exactly-once is not available. Events are limited to 16 MiB unsplit;
   `$changeStreamSplitLargeEvent` is not supported.
+
+#### Cluster
+
+- One node at a time follows the change stream: the node that owns the source's home vnode.
+  When it fails, a survivor resumes after the committed resume token. When the source moves at
+  a rescale or a rejoin, the node giving it up stops at the handoff checkpoint and the node
+  taking it resumes from there.
+- A new source starts at the latest change when its first owner opens it. Until a checkpoint
+  commits its position, a restart starts at the latest change again, as a single node does
+  before its first checkpoint.
+- A source that a topology change adds to a running cluster starts at the stream position
+  recorded when the change was sealed. That position must still be in the oplog when the owner
+  opens the source.
+- A position MongoDB refuses, such as one the oplog no longer holds or one of a recreated
+  collection, faults the source. Cluster recovery restores the same checkpoint, so the cluster
+  keeps retrying recovery until the source is reset.
+- `output.mode=document` and `snapshot.mode=initial` are rejected in a cluster.
 
 ### PostgreSQL CDC
 

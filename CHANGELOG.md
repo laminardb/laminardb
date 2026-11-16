@@ -12,6 +12,14 @@
   (`with_placement(SourceChannelPlacement { channels, route })`), which enters pipeline identity
   only when a source declares it.
 
+- In cluster mode, a RabbitMQ source (classic or quorum queue) and a MongoDB change-stream source
+  with `output.mode = history` and `snapshot.mode = never` run at-least-once on one node at a
+  time: the node that owns the source's home vnode. When that node fails, a survivor takes the
+  source over from the committed checkpoint; when the source moves at a rescale or a rejoin, the
+  node giving it up stops at the handoff checkpoint and the next one resumes there. A topology
+  migration can add either source to a running cluster. RabbitMQ with `FORMAT FPML`, MongoDB
+  `document` mode and MongoDB's initial snapshot stay rejected in cluster mode.
+
 ### Changed
 
 - `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a

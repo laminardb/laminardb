@@ -443,6 +443,26 @@ pub(super) fn fresh_stream_anchor(
     Ok((token, encoded))
 }
 
+/// Open an empty change stream once, at `position` or at the current end of the stream.
+pub(super) async fn open_bootstrap_cursor(
+    db: &mongodb::Database,
+    config: &MongoDbSourceConfig,
+    position: Option<&MongoResumePosition>,
+) -> Result<MongoChangeStream, ConnectorError> {
+    db.collection::<mongodb::bson::Document>(&config.collection)
+        .watch()
+        .pipeline(parse_change_stream_pipeline(&config.pipeline)?)
+        .with_options(bootstrap_change_stream_options(config, position))
+        .await
+        .map(mongodb::change_stream::ChangeStream::with_type::<RawDocumentBuf>)
+        .map_err(
+            |error| match classify_stream_error(&error, &namespace(config)) {
+                ReadFailure::Permanent(error) => error,
+                ReadFailure::Transient(message) => ConnectorError::ConnectionFailed(message),
+            },
+        )
+}
+
 /// Background task that reads from the `MongoDB` change stream and sends
 /// events to the source via a channel.
 pub(super) async fn run_change_stream_reader(

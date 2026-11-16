@@ -5,9 +5,9 @@ use mongodb::bson::{doc, oid::ObjectId, Document};
 use super::admission::{await_mongo_reader_ready, source_client_options};
 use super::buffering::{buffered_retained_bytes, ChangeRecord, SnapshotRecord};
 use super::checkpoint::{
-    canonical_resume_token, parse_deployment_identity, set_emitted_offsets, RESUME_TOKEN_OFFSET,
-    SEQUENCE_OFFSET, SNAPSHOT_AFTER_KEY_OFFSET, SNAPSHOT_AT_OFFSET, START_AFTER_TOKEN_OFFSET,
-    START_AT_OFFSET,
+    canonical_resume_token, mongodb_stream_identity, parse_deployment_identity,
+    set_emitted_offsets, RESUME_TOKEN_OFFSET, SEQUENCE_OFFSET, SNAPSHOT_AFTER_KEY_OFFSET,
+    SNAPSHOT_AT_OFFSET, START_AFTER_TOKEN_OFFSET, START_AT_OFFSET,
 };
 use super::decoding::{event_operation, event_token};
 use super::reader::{
@@ -1016,6 +1016,53 @@ fn contracts_follow_the_output_and_snapshot_modes() {
         .unwrap_err()
         .to_string()
         .contains("max.poll.records"));
+}
+
+#[tokio::test]
+async fn only_a_history_stream_without_a_copy_runs_in_a_cluster_or_starts_sealed() {
+    let mut source = MongoDbCdcSource::new(MongoDbSourceConfig::default(), None);
+    let history = valid_connector_config();
+    assert!(
+        source
+            .contract(&history)
+            .unwrap()
+            .supports_cluster_singleton_placement(),
+        "any one node may follow the change stream"
+    );
+    assert!(source.supports_initialized_start());
+
+    let mut copied = valid_connector_config();
+    copied.set("snapshot.mode", "initial");
+    let mut document = valid_connector_config();
+    document.set("output.mode", "document");
+    document.set("full.document.mode", "required");
+    for config in [&copied, &document] {
+        assert!(!source
+            .contract(config)
+            .unwrap()
+            .supports_cluster_singleton_placement());
+        let error = source.resolve_initial_position(config).await.unwrap_err();
+        assert!(error.to_string().contains("starts sealed only"), "{error}");
+        let sealed = recovery_checkpoint(
+            &MongoDbSourceConfig::from_config(config).unwrap(),
+            &[
+                (RESUME_TOKEN_OFFSET, r#"{"_data":"01"}"#),
+                (SEQUENCE_OFFSET, "0"),
+            ],
+        );
+        let error = source
+            .start(
+                SourceStart::new(
+                    config.clone(),
+                    SourcePosition::Initialized { checkpoint: sealed },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("starts sealed only"), "{error}");
+    }
 }
 
 #[test]
