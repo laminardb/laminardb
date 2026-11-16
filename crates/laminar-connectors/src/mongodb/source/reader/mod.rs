@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use super::super::change_event::ChangeOperation;
 use super::buffering::{buffered_retained_bytes, BufferedMongoPayload, ChangeRecord};
-use super::checkpoint::{canonical_resume_token, MongoCheckpointPosition, SnapshotCut};
+use super::checkpoint::{
+    canonical_resume_token, decode_resume_token, encode_resume_token, MongoCheckpointPosition,
+    SnapshotCut,
+};
 use super::decoding::{event_operation, event_token};
 use super::{
     observe_mongodb_admission, BufferedMongoEvent, ChangeStreamTx, ConnectorError,
@@ -206,8 +209,7 @@ pub(super) async fn forward_change_stream(
                 let operation = event_operation(&raw)?;
                 let token = canonical_resume_token(&event_token(&raw)?)?;
                 let invalidated = operation == ChangeOperation::Invalidate;
-                let event_resume_token: ResumeToken = serde_json::from_str(&token)
-                    .map_err(|error| ConnectorError::ReadError(format!("resume token: {error}")))?;
+                let event_resume_token = decode_resume_token(&token)?;
                 let record = ChangeRecord {
                     raw,
                     token,
@@ -282,12 +284,7 @@ pub(super) async fn forward_change_stream(
 }
 
 fn canonical_post_batch_token(token: &ResumeToken) -> Result<String, ConnectorError> {
-    let encoded = serde_json::to_string(token).map_err(|error| {
-        ConnectorError::ReadError(format!(
-            "serialize MongoDB post-batch resume token: {error}"
-        ))
-    })?;
-    canonical_resume_token(&encoded).map_err(|error| {
+    canonical_resume_token(&encode_resume_token(token)?).map_err(|error| {
         ConnectorError::ReadError(format!("invalid MongoDB post-batch resume token: {error}"))
     })
 }

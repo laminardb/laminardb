@@ -30,6 +30,12 @@
 
 ### Fixed
 
+- A MongoDB CDC source could not resume from a checkpoint when its resume token carried binary
+  `_typeBits`, as it does when the collection's keys are 64-bit integers: the token was stored as
+  plain JSON, which turned `_typeBits` into an array of numbers, and MongoDB rejected it (error
+  40648) on every restart. Tokens are now stored as canonical Extended JSON, in checkpoints and in
+  the `resume_token` column of history records. Tokens without `_typeBits` are stored as before;
+  a checkpoint already written with the broken form still cannot be resumed.
 - In cluster mode, a Kafka partition that moved live between two running nodes, for example when
   a node drained for a graceful shutdown, was read again from where the new owner last knew it,
   or from the start of the partition, instead of after the records the previous owner had

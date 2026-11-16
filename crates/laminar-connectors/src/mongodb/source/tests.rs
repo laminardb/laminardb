@@ -946,6 +946,35 @@ fn identity_probes_fail_fast_for_permanent_server_rejections() {
     ));
 }
 
+#[test]
+fn a_resume_token_keeps_its_binary_type_bits_through_the_checkpoint() {
+    // A document key holding a 64-bit integer gives the token generic-binary `_typeBits`.
+    let raw = mongodb::bson::to_vec(&doc! {
+        "_id": {
+            "_data": "826AFB4CDD000000182B042C0100296E5A1004",
+            "_typeBits": mongodb::bson::Binary {
+                subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                bytes: vec![130, 0, 1],
+            },
+        },
+        "operationType": "insert",
+    })
+    .unwrap();
+    let raw = mongodb::bson::RawDocument::from_bytes(&raw).unwrap();
+    let encoded = canonical_resume_token(&event_token(raw).unwrap()).unwrap();
+    assert!(encoded.contains(r#""$binary""#), "{encoded}");
+    let restored = super::checkpoint::decode_resume_token(&encoded).unwrap();
+    assert_eq!(
+        mongodb::bson::to_bson(&restored).unwrap(),
+        mongodb::bson::Bson::Document(raw.get_document("_id").unwrap().try_into().unwrap()),
+    );
+
+    // A token of `_data` alone keeps its existing encoding.
+    let plain = mongodb::bson::to_vec(&doc! { "_id": { "_data": "8263" } }).unwrap();
+    let plain = mongodb::bson::RawDocument::from_bytes(&plain).unwrap();
+    assert_eq!(event_token(plain).unwrap(), r#"{"_data":"8263"}"#);
+}
+
 // ── Contracts and configuration ──
 
 #[test]

@@ -17,7 +17,7 @@ use crate::error::ConnectorError;
 
 use super::super::config::{SnapshotMode, SourceOutputMode};
 use super::admission::ReaderLaunch;
-use super::checkpoint::set_emitted_offsets;
+use super::checkpoint::{decode_resume_token, set_emitted_offsets};
 use super::{
     mongodb_stream_identity, parse_mongodb_checkpoint, reap_mongo_reader, DocumentProjection,
     MongoCheckpointPosition, MongoDbCdcSource, MongoDbSourceConfig, MongoResumePosition,
@@ -75,13 +75,7 @@ pub(super) fn document_projection(
 }
 
 fn restored_start(checkpoint: &ParsedMongoCheckpoint) -> Result<ReaderStart, ConnectorError> {
-    let token = |token: &str| {
-        serde_json::from_str(token).map_err(|error| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid MongoDB CDC resume token in checkpoint: {error}"
-            ))
-        })
-    };
+    let token = decode_resume_token;
     Ok(match &checkpoint.emitted.position {
         MongoCheckpointPosition::Stream(StreamPosition::ResumeAfter(encoded)) => {
             ReaderStart::Stream(MongoResumePosition::ResumeAfter(token(encoded)?))

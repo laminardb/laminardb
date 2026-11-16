@@ -1,6 +1,7 @@
 //! Checkpoint identity, canonical encoding, and fail-closed restore validation.
 
-use mongodb::bson::Timestamp;
+use mongodb::bson::{Bson, Timestamp};
+use mongodb::change_stream::event::ResumeToken;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -111,6 +112,30 @@ pub(super) fn mongodb_stream_identity(config: &MongoDbSourceConfig) -> String {
     update_framed("\0json");
     update_framed(config.document_json_column.as_deref().unwrap_or(""));
     format!("{:x}", digest.finalize())
+}
+
+/// Canonical Extended JSON of a resume token. Plain JSON turns a generic binary field such as
+/// `_typeBits`, which a token carries when the document key holds a 64-bit integer, into an array
+/// of numbers that the server rejects on resume. A token of `_data` alone encodes the same way in
+/// both.
+pub(super) fn encode_resume_token(token: &ResumeToken) -> Result<String, ConnectorError> {
+    let bson = mongodb::bson::to_bson(token).map_err(|error| {
+        ConnectorError::ReadError(format!("encode MongoDB resume token: {error}"))
+    })?;
+    Ok(bson.into_canonical_extjson().to_string())
+}
+
+/// The resume token an [`encode_resume_token`] string holds.
+pub(super) fn decode_resume_token(encoded: &str) -> Result<ResumeToken, ConnectorError> {
+    let invalid = |error: &dyn std::fmt::Display| {
+        ConnectorError::ConfigurationError(format!("invalid MongoDB CDC resume token: {error}"))
+    };
+    let value: serde_json::Value = serde_json::from_str(encoded).map_err(|e| invalid(&e))?;
+    let Bson::Document(document) = Bson::try_from(value).map_err(|e| invalid(&e))? else {
+        return Err(invalid(&"not a document"));
+    };
+    let bytes = mongodb::bson::to_vec(&document).map_err(|e| invalid(&e))?;
+    mongodb::bson::from_slice(&bytes).map_err(|e| invalid(&e))
 }
 
 pub(super) fn canonical_resume_token(token: &str) -> Result<String, ConnectorError> {
