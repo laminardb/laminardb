@@ -168,31 +168,42 @@ impl SingletonPlacement {
         }
     }
 
-    /// Perform the move [`Self::plan`] decided.
+    /// Perform the move [`Self::plan`] decided. A failed move stays pending, so the next read
+    /// retries it: the assignment it follows is already reconciled and will not be planned again.
     async fn settle(&mut self) -> Result<(), ConnectorError> {
         self.faulted()?;
-        match self.pending.take() {
-            None => Ok(()),
-            Some(Pending::Open(position)) => {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        let result = self.perform(&pending).await;
+        if result.is_err() {
+            self.pending = Some(pending);
+        }
+        result
+    }
+
+    async fn perform(&mut self, pending: &Pending) -> Result<(), ConnectorError> {
+        match pending {
+            Pending::Open(position) => {
                 let (config, _, delivery) = self
                     .request
                     .clone()
                     .ok_or_else(|| invalid("singleton source assigned before it started"))?
                     .into_parts();
                 self.inner
-                    .start(SourceStart::new(config, position, delivery)?)
+                    .start(SourceStart::new(config, position.clone(), delivery)?)
                     .await?;
                 self.open = true;
-                Ok(())
             }
-            Some(Pending::Close { handoff, committed }) => {
+            Pending::Close { handoff, committed } => {
                 self.inner
-                    .notify_epoch_committed(handoff.epoch, &committed)
+                    .notify_epoch_committed(handoff.epoch, committed)
                     .await?;
+                self.inner.close().await?;
                 self.open = false;
-                self.inner.close().await
             }
         }
+        Ok(())
     }
 
     /// The cursor of this node's share of the channel: before a planned start it is the start
@@ -534,6 +545,8 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         open: bool,
         delivered: u64,
+        /// Starts still to refuse as if the broker were unreachable.
+        refusals: usize,
     }
 
     fn position(position: &SourcePosition) -> String {
@@ -555,6 +568,12 @@ mod tests {
     impl SourceConnector for Recorder {
         async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
             let (_, start, _) = request.into_parts();
+            if self.refusals > 0 {
+                self.refusals -= 1;
+                return Err(ConnectorError::ConnectionFailed(
+                    "broker unreachable".into(),
+                ));
+            }
             self.events.lock().push(Event::Start(position(&start)));
             self.open = true;
             Ok(())
@@ -621,6 +640,11 @@ mod tests {
 
     impl Node {
         async fn new(id: u64) -> Self {
+            Self::refusing(id, 0).await
+        }
+
+        /// A node whose connector refuses its first `refusals` starts.
+        async fn refusing(id: u64, refusals: usize) -> Self {
             let events = Arc::new(Mutex::new(Vec::new()));
             let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
             let mut source = SingletonPlacement::new(
@@ -629,6 +653,7 @@ mod tests {
                     events: Arc::clone(&events),
                     open: false,
                     delivered: 0,
+                    refusals,
                 }),
             );
             source
@@ -836,5 +861,20 @@ mod tests {
         c.publish(3, 3);
         let error = c.source.poll_batch(8).await.unwrap_err();
         assert!(error.to_string().contains("moved back"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_is_retried_by_the_next_read() {
+        let mut a = Node::refusing(1, 1).await;
+        a.publish(1, 1);
+        let error = a.source.poll_batch(8).await.unwrap_err();
+        assert!(error.is_transient(), "{error}");
+        assert_eq!(
+            a.source.checkpoint().input_channels(),
+            Some(&[NAME.as_bytes().to_vec()][..]),
+            "the owner keeps claiming the channel it has not opened yet"
+        );
+        assert_eq!(a.poll().await.unwrap().get_offset("delivered"), Some("1"));
+        assert_eq!(a.events(), [Event::Start("initial".into())]);
     }
 }
