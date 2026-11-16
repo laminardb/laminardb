@@ -1245,7 +1245,7 @@ fn cluster_exact_delivery_requires_cluster_certification() {
 }
 
 #[test]
-fn split_generator_is_admitted_in_cluster_without_exact_delivery() {
+fn split_generator_is_admitted_for_every_delivery_in_every_mode() {
     let mut config = ConnectorConfig::new("generator");
     config.set("splits", "4");
     let contract = laminar_connectors::generator::GeneratorSource::default()
@@ -1254,14 +1254,15 @@ fn split_generator_is_admitted_in_cluster_without_exact_delivery() {
     let admit =
         |delivery, runtime| admit_source_contract(contract, false, false, delivery, true, runtime);
 
-    admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster)
-        .expect("a split generator runs at-least-once in cluster");
-    admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local)
-        .expect("a split generator runs at-least-once locally");
-    for runtime in [RuntimeMode::Local, RuntimeMode::Cluster] {
-        let error = admit(DeliveryGuarantee::ExactlyOnce, runtime)
-            .expect_err("a split generator is not certified for exactly-once");
-        assert!(error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED));
+    for delivery in [
+        DeliveryGuarantee::AtLeastOnce,
+        DeliveryGuarantee::ExactlyOnce,
+    ] {
+        for runtime in [RuntimeMode::Local, RuntimeMode::Cluster] {
+            admit(delivery, runtime).unwrap_or_else(|error| {
+                panic!("a split generator is admitted for {delivery:?} in {runtime:?}: {error}")
+            });
+        }
     }
 }
 

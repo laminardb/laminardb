@@ -317,7 +317,7 @@ mod splits {
     }
 
     #[test]
-    fn split_contract_is_placed_and_uncertified() {
+    fn split_contract_is_placed_and_certified_for_exactly_once() {
         let contract = GeneratorSource::default().contract(&config(4, 10)).unwrap();
         assert_eq!(contract.topology, SourceTopology::Splittable);
         assert_eq!(
@@ -327,7 +327,8 @@ mod splits {
                 route: laminar_core::state::SourceChannelRoute::V1,
             })
         );
-        assert!(!contract.is_exact_delivery_certified());
+        assert!(contract.is_exact_delivery_certified());
+        assert!(contract.is_cluster_exact_delivery_certified());
 
         let unsplit = GeneratorSource::default()
             .contract(&ConnectorConfig::new("generator"))
@@ -571,5 +572,29 @@ mod splits {
         a.drive_control_plane();
         let error = a.checkpoint_ready().unwrap_err();
         assert!(error.to_string().contains("outside a drain"), "{error}");
+    }
+
+    /// A recovery restart starts the same source again from the recovery cut, so a channel the
+    /// source gave up before the fault comes back from that cut rather than being refused.
+    #[tokio::test]
+    async fn a_restart_takes_back_a_channel_it_gave_up_from_the_resume_cut() {
+        let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
+        publish(&registry, [1; 4], 1);
+        let mut a = cluster_source(&registry, 1, config(4, 400), SourcePosition::Initial).await;
+        let mut rows = read(&mut a, 40).await;
+        let cut = a.checkpoint();
+        publish(&registry, [2; 4], 2);
+        a.drive_control_plane();
+        assert!(channels(&a.checkpoint()).is_empty());
+
+        a.start(start_request(config(4, 400), resume(cut.clone())))
+            .await
+            .unwrap();
+        publish(&registry, [1; 4], 3);
+        a.drive_control_plane();
+        assert!(a.checkpoint_ready().unwrap());
+        assert_eq!(a.checkpoint().offsets(), cut.offsets());
+        rows.extend(read(&mut a, 400).await);
+        assert_eq!(sorted(&rows), (0..400).collect::<Vec<_>>());
     }
 }

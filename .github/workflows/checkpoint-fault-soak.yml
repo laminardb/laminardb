@@ -89,6 +89,24 @@ jobs:
           LAMINAR_SOAK_INTERVAL_MS: "250"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
 
+      - name: Kill and restart exact single-node split generator recovery
+        # A candidate step: it gathers evidence for the split generator's exactly-once
+        # certification and cannot fail the job until it is promoted.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --profile soak -p laminar-server --no-default-features --features cluster --test cluster_soak "$SOAK_TEST" -- --ignored --exact --nocapture --color never 2>&1 | tee local-exact-splits-soak.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' local-exact-splits-soak.log
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          SOAK_TEST: local_exact_source_state_kill9_soak
+          LAMINAR_SOAK_SPLITS: "4"
+          LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
+          LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+          LAMINAR_SOAK_INTERVAL_MS: "250"
+          LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
+
       - name: Upload local node logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -96,6 +114,7 @@ jobs:
           name: local-exact-kill9-logs
           path: |
             local-exact-soak.log
+            local-exact-splits-soak.log
             target/tmp/**/soak-local-exact-*/*.log
           if-no-files-found: warn
           retention-days: 14
@@ -307,6 +326,38 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda nats nats-2 nats-3
+            candidate: "true"
+          - label: Cluster ALO split generator (gossip)
+            test: generator_splits::three_node_generator_splits_kill9_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster-generator
+            discovery: gossip
+            emulator: "0"
+            # One split per vnode into a keyed view; every committed read on every node must hold
+            # an exact prefix of each split through every kill and rejoin.
+            checkpoint_ms: "500"
+            rps: "400"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs
+            candidate: "true"
+          - label: Cluster EO split generator to Delta (gossip)
+            test: generator_splits::three_node_generator_splits_delta_eo_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: eo
+            topology: cluster-generator-eo
+            discovery: gossip
+            emulator: "1"
+            # A bounded split sequence written to Delta on S3 through a stream; every row must
+            # land exactly once through every kill and rejoin.
+            checkpoint_ms: "2000"
+            rps: "100"
+            visibility_ms: "120000"
+            slo_mode: observe
+            visibility_slo_mode: observe
+            services: seaweedfs
             candidate: "true"
     steps:
       - uses: actions/checkout@v6

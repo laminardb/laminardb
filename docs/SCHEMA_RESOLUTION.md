@@ -89,7 +89,7 @@ always emit JSON and reject `FORMAT` settings in both server and client mode.
 Embedded and single-node deployments use these contracts within their existing
 delivery constraints. Cluster admission remains fail-closed: whole-node reference
 tables/materialized views and unsupported distributed SQL remain rejected.
-Cluster exactly-once still requires Kafka input and the certified direct S3/S3A
+Cluster exactly-once still requires Kafka or split generator input and the certified direct S3/S3A
 append Delta sink or REST-catalog/direct-S3 append Iceberg sink. Kafka output
 remains at-least-once. Schema discovery alone cannot certify any composition.
 
