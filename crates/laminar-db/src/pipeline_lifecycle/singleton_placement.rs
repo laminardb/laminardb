@@ -31,6 +31,9 @@ pub(crate) struct SingletonPlacement {
     inner: Box<dyn SourceConnector>,
     /// The source's one channel: its catalog name.
     channel: Vec<u8>,
+    /// The schema the engine admitted. A connector may learn its schema only when it opens, so
+    /// a node that has not opened it reports this one.
+    admitted: Option<SchemaRef>,
     assignment: Option<Assignment>,
     request: Option<SourceStart>,
     open: bool,
@@ -66,10 +69,15 @@ enum Pending {
 }
 
 impl SingletonPlacement {
-    pub(crate) fn new(name: &str, inner: Box<dyn SourceConnector>) -> Self {
+    pub(crate) fn new(
+        name: &str,
+        inner: Box<dyn SourceConnector>,
+        admitted: Option<SchemaRef>,
+    ) -> Self {
         Self {
             inner,
             channel: name.as_bytes().to_vec(),
+            admitted,
             assignment: None,
             request: None,
             open: false,
@@ -194,6 +202,15 @@ impl SingletonPlacement {
                     .start(SourceStart::new(config, position.clone(), delivery)?)
                     .await?;
                 self.open = true;
+                if let Some(admitted) = &self.admitted {
+                    if self.inner.schema() != *admitted {
+                        let error = ConnectorError::SchemaMismatch(
+                            "the opened singleton's schema differs from its admitted schema".into(),
+                        );
+                        self.fault = Some(error.to_string());
+                        return Err(error);
+                    }
+                }
             }
             Pending::Close { handoff, committed } => {
                 self.inner
@@ -261,7 +278,11 @@ pub(crate) fn place(
     if contract.topology == SourceTopology::Singleton
         && super::source_admission::cluster_assignment_scoped(contract)
     {
-        return Ok(Box::new(SingletonPlacement::new(name, connector)));
+        return Ok(Box::new(SingletonPlacement::new(
+            name,
+            connector,
+            config.arrow_schema(),
+        )));
     }
     Ok(connector)
 }
@@ -356,7 +377,10 @@ impl SourceConnector for SingletonPlacement {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.inner.schema()
+        match &self.admitted {
+            Some(admitted) if !self.open => Arc::clone(admitted),
+            _ => self.inner.schema(),
+        }
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
@@ -540,6 +564,10 @@ mod tests {
         Close,
     }
 
+    fn recorded_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))
+    }
+
     /// A singleton whose only progress is how many rows it delivered; it records its lifecycle.
     struct Recorder {
         events: Arc<Mutex<Vec<Event>>>,
@@ -584,12 +612,16 @@ mod tests {
             self.delivered += 1;
             let rows = Int64Array::from(vec![i64::try_from(self.delivered).unwrap()]);
             Ok(Some(SourceBatch::new(
-                RecordBatch::try_new(self.schema(), vec![Arc::new(rows)]).unwrap(),
+                RecordBatch::try_new(recorded_schema(), vec![Arc::new(rows)]).unwrap(),
             )))
         }
 
         fn schema(&self) -> SchemaRef {
-            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))
+            if self.open {
+                recorded_schema()
+            } else {
+                Arc::new(Schema::empty())
+            }
         }
 
         fn checkpoint(&self) -> SourceCheckpoint {
@@ -640,11 +672,11 @@ mod tests {
 
     impl Node {
         async fn new(id: u64) -> Self {
-            Self::refusing(id, 0).await
+            Self::with(id, 0, recorded_schema()).await
         }
 
-        /// A node whose connector refuses its first `refusals` starts.
-        async fn refusing(id: u64, refusals: usize) -> Self {
+        /// A node whose connector refuses its first `refusals` starts, admitted with `admitted`.
+        async fn with(id: u64, refusals: usize, admitted: SchemaRef) -> Self {
             let events = Arc::new(Mutex::new(Vec::new()));
             let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
             let mut source = SingletonPlacement::new(
@@ -655,6 +687,7 @@ mod tests {
                     delivered: 0,
                     refusals,
                 }),
+                Some(admitted),
             );
             source
                 .set_vnode_assignment(NAME, Arc::clone(&registry), NodeId(id))
@@ -764,6 +797,11 @@ mod tests {
         assert!(idle.offsets().is_empty());
         assert!(a.source.checkpoint_ready().unwrap() && b.source.checkpoint_ready().unwrap());
         assert_eq!(a.events(), [Event::Start("initial".into())]);
+        assert_eq!(
+            b.source.schema(),
+            recorded_schema(),
+            "a node that never opens the connector reports the admitted schema"
+        );
     }
 
     #[tokio::test]
@@ -865,7 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_open_is_retried_by_the_next_read() {
-        let mut a = Node::refusing(1, 1).await;
+        let mut a = Node::with(1, 1, recorded_schema()).await;
         a.publish(1, 1);
         let error = a.source.poll_batch(8).await.unwrap_err();
         assert!(error.is_transient(), "{error}");
@@ -876,5 +914,25 @@ mod tests {
         );
         assert_eq!(a.poll().await.unwrap().get_offset("delivered"), Some("1"));
         assert_eq!(a.events(), [Event::Start("initial".into())]);
+    }
+
+    #[tokio::test]
+    async fn an_opened_singleton_must_produce_its_admitted_schema() {
+        let other = Arc::new(Schema::new(vec![Field::new("m", DataType::Utf8, true)]));
+        let mut a = Node::with(1, 0, Arc::clone(&other)).await;
+        assert_eq!(a.source.schema(), other);
+        a.publish(1, 1);
+        let error = a.source.poll_batch(8).await.unwrap_err();
+        assert!(
+            matches!(error, ConnectorError::SchemaMismatch(_)),
+            "{error}"
+        );
+        assert!(a.source.checkpoint_ready().is_err());
+        a.source.close().await.unwrap();
+        assert_eq!(
+            a.events(),
+            [Event::Start("initial".into()), Event::Close],
+            "the mismatched connector is still closed"
+        );
     }
 }
