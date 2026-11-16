@@ -298,6 +298,22 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs rabbitmq
             candidate: "true"
+          - label: Cluster ALO MongoDB source (gossip)
+            test: mongodb_source::three_node_mongodb_source_kill9_soak
+            features: cluster,aws,kafka,mongodb-cdc
+            delivery: alo
+            topology: cluster-mongodb-source
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # One node at a time follows the change stream, and the source moves through the kills
+            # and rejoins; the oracle requires every acknowledged id in the output collection.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs mongodb mongodb-rs
+            candidate: "true"
           - label: Cluster ALO PostgreSQL sink (gossip)
             test: multi_writer_sinks::three_node_postgres_sink_kill9_soak
             features: cluster,aws,kafka,postgres-sink
@@ -479,6 +495,7 @@ jobs:
           LAMINAR_SOAK_RABBITMQ_PASSWORD: guest
           LAMINAR_SOAK_POSTGRES_PASSWORD: laminar-test-secret
           LAMINAR_SOAK_MONGODB_URI: mongodb://127.0.0.1:27217/?directConnection=true&tls=false
+          LAMINAR_SOAK_MONGODB_SOURCE_URI: mongodb://127.0.0.1:27317/?directConnection=true&tls=false
 
       - name: Upload join soak logs
         if: always()

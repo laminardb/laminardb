@@ -17,12 +17,12 @@ use super::{block_on, setting, Destination, Observed, Oracle};
 const URI: &str = "LAMINAR_SOAK_MONGODB_URI";
 const DATABASE: &str = "laminar_soak";
 
-pub(super) struct MongoDb {
+pub(crate) struct MongoDb {
     uri: String,
 }
 
 impl MongoDb {
-    pub(super) fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         Self {
             uri: setting(URI, None),
         }

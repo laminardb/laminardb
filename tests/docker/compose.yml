@@ -118,6 +118,24 @@ services:
       timeout: 5s
       retries: 30
 
+  # A one-member replica set for the MongoDB CDC source, since change streams need a replica set.
+  # The member advertises 127.0.0.1 on its published port, which resolves inside the container and
+  # from the host alike.
+  mongodb-rs:
+    image: mongo:8.0
+    container_name: laminardb-mongodb-rs
+    environment:
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
+    command: ["mongod", "--replSet", "rs0", "--port", "27317", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27317:27317"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--port", "27317", "--eval",
+             "try { rs.status() } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: '127.0.0.1:27317'}]}) } if (!db.hello().isWritablePrimary) { quit(1) }"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
   # A three-server JetStream cluster: the NATS sink requires a file-backed stream with three
   # replicas. Clients reach it through `nats` only; `--no_advertise` keeps the other servers'
   # container addresses away from clients outside the network.
