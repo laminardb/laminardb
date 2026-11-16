@@ -76,7 +76,7 @@ impl DatabasePeer {
                     )
                     .await?;
             }
-            Runtime::Aggregate | Runtime::Generator => {
+            Runtime::Aggregate | Runtime::Sequence(_) => {
                 return Err(anyhow!("this fixture cannot install process code"))
             }
         }
@@ -190,6 +190,10 @@ impl DatabasePeer {
             .ok_or_else(|| anyhow!("checkpoint has no exact cluster outcome"))?;
         let index = index.ok_or_else(|| anyhow!("checkpoint has no committed index"))?;
         index.validate().map_err(anyhow::Error::msg)?;
+        let source = match self.runtime {
+            Runtime::Sequence(sequence) => sequence.source(),
+            _ => "recovery_input".to_owned(),
+        };
         if !outcome.is_commit() || !index.reassignment_portable {
             return Err(anyhow!(
                 "fixture checkpoint is not a portable committed cut"
@@ -199,7 +203,7 @@ impl DatabasePeer {
             reference: outcome
                 .committed_checkpoint
                 .ok_or_else(|| anyhow!("checkpoint reference is absent"))?,
-            offsets: index.source_offsets["recovery_input"]
+            offsets: index.source_offsets[&source]
                 .offsets
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -209,7 +213,7 @@ impl DatabasePeer {
                 .iter()
                 .map(|participant| participant.participant_id)
                 .collect(),
-            channels: index.source_offsets["recovery_input"]
+            channels: index.source_offsets[&source]
                 .input_channels
                 .clone()
                 .unwrap_or_default(),
@@ -381,9 +385,9 @@ impl DatabasePeer {
             Command::Catalog => {
                 match self.runtime {
                     Runtime::Aggregate => {}
-                    Runtime::Generator => {
+                    Runtime::Sequence(sequence) => {
                         self.db()?
-                            .execute_cluster_bootstrap_batch(&generator::catalog())
+                            .execute_cluster_bootstrap_batch(&sequence.catalog())
                             .await?;
                         return Ok(Response::Done);
                     }
@@ -445,7 +449,7 @@ impl DatabasePeer {
                     Runtime::Native => 7,
                     #[cfg(feature = "process-remote")]
                     Runtime::RemoteRust => 7,
-                    Runtime::Generator => 0,
+                    Runtime::Sequence(_) => 0,
                 };
                 if prefix > bound {
                     return Err(anyhow!("fixture source prefix exceeds its record bound"));

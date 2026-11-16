@@ -280,6 +280,63 @@ async fn source_acknowledges_only_committed_deliveries() {
         .unwrap();
 }
 
+/// In a cluster the same source instance reopens the queue when it comes back to its node: the
+/// handoff acknowledgement releases what the cut holds, and the reopened generation reads on.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_source_reopens_its_queue_after_a_handoff() {
+    let Some((url, admin)) = broker().await else {
+        return;
+    };
+    let channel = admin.create_channel().await.unwrap();
+    let queue = unique("reopen");
+    declare_queue(&channel, &queue, FieldTable::default()).await;
+    publish(&channel, &queue, &json(0..10)).await;
+
+    let registry = prometheus::Registry::new();
+    let config = connector_config(&url, &[("queue", queue.as_str()), ("format", "json")]);
+    let start = |position| {
+        SourceStart::new(config.clone(), position, DeliveryGuarantee::AtLeastOnce).unwrap()
+    };
+    let mut source = RabbitMqSource::new(ids_schema(), Some(&registry));
+    source.start(start(SourcePosition::Initial)).await.unwrap();
+    assert_eq!(
+        ids(&poll_rows(&mut source, 10, Duration::from_secs(10)).await),
+        (0..10).collect::<Vec<_>>()
+    );
+    let handoff = source.checkpoint();
+    source.notify_epoch_committed(1, &handoff).await.unwrap();
+    source.close().await.unwrap();
+    wait_ready(&channel, &queue, 0).await;
+
+    publish(&channel, &queue, &json(10..15)).await;
+    source
+        .start(start(SourcePosition::Resume {
+            attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+            checkpoint: handoff,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&poll_rows(&mut source, 5, Duration::from_secs(10)).await),
+        (10..15).collect::<Vec<_>>()
+    );
+    assert!(
+        registry
+            .gather()
+            .iter()
+            .any(|family| family.name() == "rabbitmq_source_messages_total"),
+        "the reopened generation exports its metrics"
+    );
+    let cut = source.checkpoint();
+    source.notify_epoch_committed(2, &cut).await.unwrap();
+    source.close().await.unwrap();
+    wait_ready(&channel, &queue, 0).await;
+    channel
+        .queue_delete(queue.as_str().into(), QueueDeleteOptions::default())
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn prefetch_bounds_unacknowledged_deliveries() {
     let Some((url, admin)) = broker().await else {

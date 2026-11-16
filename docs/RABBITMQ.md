@@ -27,7 +27,7 @@ because without checkpoints nothing would ever acknowledge its messages.
 | Queues (source) | Classic and quorum queues, existing or declared on request | Stream queues: declared ones are rejected at configuration; an existing one is detected by its `x-stream-offset` header and stops the source before anything is handed off |
 | Formats | `JSON`, `CSV` (a message may hold several lines), and `RAW` (`value BYTEA` keeps bytes exactly; `value VARCHAR` requires UTF-8). Sources also read `FPML` (the `fpml` build feature): one document per message | `AVRO` and `DEBEZIUM`; `FPML` sinks |
 | Delivery | At-least-once with checkpointing; a persistent sink is durable at-least-once | Exactly-once (neither direction is certified) and best-effort sources |
-| Deployment | Embedded and single-node server. In cluster mode the sink runs on every node as an independent at-least-once writer, under the same rule as Kafka and NATS output | Cluster mode rejects the source: it is a singleton |
+| Deployment | Embedded and single-node server. In cluster mode one node at a time reads the source: the node that owns the source's home vnode. When that node fails or the vnode moves, another node opens the queue, and the broker redelivers every message no committed checkpoint acknowledged. The sink runs on every node as an independent at-least-once writer, under the same rule as Kafka and NATS output | `FPML` sources in cluster mode |
 | TLS | `amqps://` with peer and hostname verification against the Web PKI roots plus an optional CA bundle, and mutual TLS with a PEM certificate and PKCS#8 key | Plain `amqp://` with TLS options |
 
 ## Reading a queue
@@ -269,6 +269,15 @@ sinks flushed. Every node published before the first kill and after it rejoined,
 published 25–40% of the rows in the 30 s steady phase that followed. Of 69,639 messages none was
 missing from the queue; 4,010 arrived more than once. This leg runs weekly in the `Checkpoint
 fault and soak` workflow.
+
+`crates/laminar-server/tests/cluster_soak/rabbitmq_source.rs` runs the source in a three-node
+cluster: a confirmed publisher feeds one durable classic queue, the node that owns the source's
+home vnode consumes it, and a stream forwards the rows to a RabbitMQ sink whose output queue an
+independent reader drains. The leader was hard-killed twice and each follower once, every time
+while paused inside a checkpoint. In a local run on 2026-11-16, none of 42,944 confirmed messages
+was missing from the output, 4,000 arrived more than once, and two of the three nodes consumed the
+queue as the source moved. The leg is a candidate: it runs weekly in the same workflow but does not
+yet fail it.
 Those results hold for durable, persistent messages on these queue types. They do not extend to
 other queue types, the stream protocol, or broker versions.
 

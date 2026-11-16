@@ -34,7 +34,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
 | Files | ALO, BE | rejected |
-| RabbitMQ | ALO | rejected |
+| RabbitMQ | ALO | ALO |
 | IBM MQ | ALO | rejected |
 | NATS JetStream | BE | rejected |
 | WebSocket | BE | rejected |
@@ -93,7 +93,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Files | — | — | — | — | — | — | — | — | — | — | — | — |
-| RabbitMQ | — | — | — | — | — | — | — | — | — | — | — | — |
+| RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | IBM MQ | — | — | — | — | — | — | — | — | — | — | — | — |
 | NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — |
 | WebSocket | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -138,6 +138,16 @@ and before each release, but do not yet fail the `Checkpoint fault and soak` wor
 | PostgreSQL append | Keyless table, rows counted per id | `three_node_postgres_sink_kill9_soak` |
 | MongoDB insert | Collection, documents counted per id | `three_node_mongodb_sink_kill9_soak` |
 | NATS JetStream | File-backed stream with three replicas, drained by a durable consumer | `three_node_nats_sink_kill9_soak` |
+
+## Evidence for cluster at-least-once sources
+
+Kafka and the split Generator read one channel per vnode owner. A RabbitMQ queue has no channels to
+split, so one node at a time consumes it, the owner of the source's home vnode, and the source
+moves with that vnode. `rabbitmq_source::three_node_rabbitmq_source_kill9_soak` (candidate) feeds
+a durable classic queue from a confirmed publisher and forwards every row through a stream to a
+RabbitMQ sink. The leader and each follower are hard-killed while paused inside a checkpoint. An
+independent reader of the output queue must see every confirmed id, ids never published fail the
+run, duplicates are counted, and more than one node must have consumed the queue.
 
 ## Materialized view reads
 

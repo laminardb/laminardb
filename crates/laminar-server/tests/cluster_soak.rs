@@ -114,6 +114,9 @@ mod iceberg_leg;
 ))]
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
+#[cfg(all(feature = "kafka", feature = "rabbitmq"))]
+#[path = "cluster_soak/rabbitmq_source.rs"]
+mod rabbitmq_source;
 // Shared with iceberg_cluster_soak, which uses every helper this soak does not.
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/generator_splits.rs"]

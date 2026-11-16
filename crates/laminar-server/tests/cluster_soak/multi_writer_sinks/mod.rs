@@ -56,7 +56,7 @@ mod nats;
 #[cfg(feature = "postgres-sink")]
 mod postgres;
 #[cfg(feature = "rabbitmq")]
-mod rabbitmq;
+pub(crate) mod rabbitmq;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -119,7 +119,7 @@ fn setting(name: &str, default: Option<&str>) -> String {
 }
 
 /// The external system the sink writes to, and how the test provisions and reads it.
-trait Destination {
+pub(crate) trait Destination {
     /// The `connector` of the sink.
     fn connector(&self) -> &'static str;
 
@@ -143,7 +143,7 @@ trait Destination {
     fn spawn_oracle(&self, name: &str) -> Oracle;
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -179,7 +179,7 @@ impl Observed {
 /// Independent reader of the destination. Queue readers acknowledge or commit only after
 /// recording, so a reconnect can add duplicates but never hide a loss; table readers count rows
 /// in full snapshots.
-struct Oracle {
+pub(crate) struct Oracle {
     observed: Observed,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -200,7 +200,7 @@ impl Oracle {
         }
     }
 
-    fn assert_running(&mut self) {
+    pub(crate) fn assert_running(&mut self) {
         if !self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
             return;
         }
@@ -502,7 +502,7 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
 }
 
 /// Wait until every produced id has reached the destination, then stop the oracle.
-fn wait_for_delivery(
+pub(crate) fn wait_for_delivery(
     mut oracle: Oracle,
     produced: u64,
     recovery_ceiling: Duration,

@@ -377,7 +377,10 @@ pub(super) fn register(
     move |registry| {
         match runtime {
             Runtime::Aggregate => {}
-            Runtime::Generator => return Ok(()),
+            Runtime::Sequence(generator::Sequence::Splits) => return Ok(()),
+            Runtime::Sequence(generator::Sequence::Singleton) => {
+                return generator::register_placed_sequence(registry)
+            }
             Runtime::Native => return process::register(probe, path)(registry),
             #[cfg(feature = "process-remote")]
             Runtime::RemoteRust => return process::register(probe, path)(registry),

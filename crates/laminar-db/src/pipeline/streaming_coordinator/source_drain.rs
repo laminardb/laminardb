@@ -442,8 +442,8 @@ async fn finish_provider_drain(
 ) -> Result<(), ConnectorError> {
     let round = pending.resolution.round;
     let settlement = match (pending.resolution.outcome, pending.committed.clone()) {
-        (SourceDrainOutcome::Commit, Some(committed)) => {
-            SourceDrainSettlement::commit(round, committed)
+        (SourceDrainOutcome::Commit, Some((handoff, committed))) => {
+            SourceDrainSettlement::commit(round, handoff, committed)
         }
         (SourceDrainOutcome::Abort, None) => SourceDrainSettlement::abort(round),
         (outcome, committed) => {

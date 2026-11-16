@@ -18,7 +18,7 @@ use crate::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal, Subsc
 use crate::LaminarDB;
 use cluster::{Cluster, Startup};
 use oracle::{Consolidated, OutputForm};
-use source::FixtureSource;
+use source::{FixtureKind, FixtureSource};
 
 pub(super) const DEADLINE: Duration = Duration::from_secs(40);
 const NODES: u64 = 3;
@@ -77,7 +77,7 @@ impl Case {
             ));
         }
         if let Some(source) = self.sources.iter().find(|source| {
-            source.generated
+            source.kind == FixtureKind::Generated
                 && (0..NODES)
                     .filter(|node| reads_channel(source, *node))
                     .count()
@@ -120,7 +120,10 @@ impl Case {
         &self,
         truth: Option<&Consolidated>,
     ) -> Result<Result<Consolidated, String>, String> {
-        let generated = self.sources.iter().any(|source| source.generated);
+        let generated = self
+            .sources
+            .iter()
+            .any(|source| source.kind == FixtureKind::Generated);
         let truth = match truth {
             Some(truth) => Some(truth),
             None if generated => {
@@ -234,7 +237,7 @@ impl Case {
     fn reads_fixture_input(&self, node: u64) -> bool {
         self.sources
             .iter()
-            .any(|source| !source.generated && reads_channel(source, node))
+            .any(|source| source.kind != FixtureKind::Generated && reads_channel(source, node))
     }
 
     /// A cluster window closes only once its input's frontier has crossed each exchange, which the
@@ -359,10 +362,14 @@ fn reads_channel(source: &FixtureSource, node: u64) -> bool {
     let vnodes = std::num::NonZeroU32::new(VNODES).expect("the conformance cluster has vnodes");
     let partitions = u32::try_from(source.partitions.len()).expect("fixture partitions fit in u32");
     (0..partitions).any(|partition| {
-        let vnode = if source.generated {
-            laminar_core::state::SourceChannelRoute::V1.vnode(source.name, partition, vnodes)
-        } else {
-            partition % VNODES
+        let vnode = match source.kind {
+            FixtureKind::Partitioned => partition % VNODES,
+            FixtureKind::Generated => {
+                laminar_core::state::SourceChannelRoute::V1.vnode(source.name, partition, vnodes)
+            }
+            FixtureKind::Queue => {
+                laminar_core::state::SourceChannelRoute::V1.vnode(source.name, 0, vnodes)
+            }
         };
         u64::from(vnode) % NODES == node
     })
@@ -385,6 +392,7 @@ async fn embedded_db(
             sources.to_vec(),
             Arc::clone(polled),
             Arc::new(AtomicU64::new(u64::MAX)),
+            source::Queues::new(sources),
         ))
         .build()
         .await

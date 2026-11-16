@@ -235,6 +235,7 @@ pub(crate) async fn resolve_owned_source_drain(
     tasks: &OwnedSourceTasks,
     resolution: SourceDrainResolution,
     committed: &std::collections::BTreeMap<String, Arc<SourceCheckpoint>>,
+    handoff: Option<laminar_core::checkpoint::CheckpointAttempt>,
     deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     let snapshot: Vec<(SourceTaskLease, SourceDrainLeaseControl)> = tasks
@@ -261,7 +262,7 @@ pub(crate) async fn resolve_owned_source_drain(
             .command_tx
             .send(Some(SourceDrainCommand::Resolve {
                 resolution,
-                committed: committed.get(task.name()).cloned(),
+                committed: handoff.zip(committed.get(task.name()).cloned()),
                 deadline,
             }))
             .is_ok();

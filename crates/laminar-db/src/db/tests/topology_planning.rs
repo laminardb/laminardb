@@ -198,7 +198,8 @@ impl SourceConnector for PlanningSource {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        let topology = if config.get("placement") == Some("singleton") {
+        let placement = config.get("placement");
+        let topology = if matches!(placement, Some("singleton" | "placed")) {
             SourceTopology::Singleton
         } else {
             SourceTopology::Splittable
@@ -213,8 +214,12 @@ impl SourceConnector for PlanningSource {
         } else {
             SourceInputMode::AppendOnly
         };
-        Ok(SourceContract::new(consistency, topology, input)
-            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
+        let contract = SourceContract::new(consistency, topology, input);
+        if placement == Some("placed") {
+            // Like a broker queue: one node at a time may consume it, and rows carry no positions.
+            return Ok(laminar_connectors::testing::with_cluster_singleton_placement(contract));
+        }
+        Ok(contract.with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {

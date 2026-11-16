@@ -459,7 +459,11 @@ mod splits {
         for source in [&mut a, &mut b] {
             source
                 .finish_drain(
-                    SourceDrainSettlement::commit(round(1), Arc::clone(&handoff)),
+                    SourceDrainSettlement::commit(
+                        round(1),
+                        CheckpointAttempt::canonical(1),
+                        Arc::clone(&handoff),
+                    ),
                     deadline(),
                 )
                 .await
@@ -477,7 +481,11 @@ mod splits {
         for source in [&mut a, &mut b] {
             source
                 .finish_drain(
-                    SourceDrainSettlement::commit(round(2), Arc::clone(&handoff)),
+                    SourceDrainSettlement::commit(
+                        round(2),
+                        CheckpointAttempt::canonical(2),
+                        Arc::clone(&handoff),
+                    ),
                     deadline(),
                 )
                 .await
@@ -501,9 +509,12 @@ mod splits {
         let _ = read(&mut a, 40).await;
         begin(&mut [&mut a], round(1)).await;
         let handoff = merge(&[a.checkpoint()], 1);
-        a.finish_drain(SourceDrainSettlement::commit(round(1), handoff), deadline())
-            .await
-            .unwrap();
+        a.finish_drain(
+            SourceDrainSettlement::commit(round(1), CheckpointAttempt::canonical(1), handoff),
+            deadline(),
+        )
+        .await
+        .unwrap();
         assert!(a.checkpoint_ready().unwrap(), "the predecessor still holds");
 
         publish(&registry, [1, 1, 2, 2], 2);

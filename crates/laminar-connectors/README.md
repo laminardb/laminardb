@@ -17,7 +17,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
-| RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node ([guide](../../docs/RABBITMQ.md)) | Implemented |
+| RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node, and in a cluster on one node at a time ([guide](../../docs/RABBITMQ.md)) | Implemented |
 | IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node ([guide](../../docs/IBMMQ.md)) | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |

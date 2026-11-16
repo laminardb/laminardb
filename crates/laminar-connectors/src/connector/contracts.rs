@@ -189,6 +189,7 @@ pub struct SourceContract {
     pub placement: Option<SourceChannelPlacement>,
     exact_delivery_certified: bool,
     cluster_exact_delivery_certified: bool,
+    cluster_singleton_placement: bool,
 }
 
 impl SourceContract {
@@ -210,6 +211,7 @@ impl SourceContract {
             placement: None,
             exact_delivery_certified: false,
             cluster_exact_delivery_certified: false,
+            cluster_singleton_placement: false,
         }
     }
 
@@ -290,6 +292,26 @@ impl SourceContract {
     #[must_use]
     pub const fn is_cluster_exact_delivery_certified(self) -> bool {
         self.cluster_exact_delivery_certified
+    }
+
+    /// Mark a built-in singleton connector that one cluster node at a time may run: it can be
+    /// closed on one node and started with `Resume` on another, and it acknowledges upstream only
+    /// in `notify_epoch_committed`.
+    #[cfg_attr(
+        not(any(feature = "rabbitmq", feature = "testing", test)),
+        allow(dead_code)
+    )]
+    #[must_use]
+    pub(crate) const fn with_cluster_singleton_placement(mut self) -> Self {
+        self.cluster_singleton_placement = true;
+        self
+    }
+
+    /// Whether the engine may place this singleton source on one cluster node at a time.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_cluster_singleton_placement(self) -> bool {
+        self.cluster_singleton_placement
     }
 
     /// Whether a persisted source position can be replayed after recovery.

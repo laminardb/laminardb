@@ -17,13 +17,13 @@ use super::{block_on, setting, Destination, Observed, Oracle};
 
 const PASSWORD: &str = "LAMINAR_SOAK_RABBITMQ_PASSWORD";
 
-pub(super) struct RabbitMq {
+pub(crate) struct RabbitMq {
     url: String,
     username: String,
 }
 
 impl RabbitMq {
-    pub(super) fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         setting(PASSWORD, None);
         Self {
             url: setting(
@@ -34,7 +34,7 @@ impl RabbitMq {
         }
     }
 
-    fn uri(&self) -> AMQPUri {
+    pub(crate) fn uri(&self) -> AMQPUri {
         let mut uri: AMQPUri = self
             .url
             .parse()
@@ -44,6 +44,23 @@ impl RabbitMq {
             password: setting(PASSWORD, None),
         };
         uri
+    }
+
+    /// The `[source.properties]` entries that consume `queue`.
+    pub(crate) fn source_properties(&self, queue: &str) -> String {
+        format!("{}queue = \"{queue}\"\n", self.credentials())
+    }
+
+    /// The broker and account entries; each node resolves the password from its environment.
+    fn credentials(&self) -> String {
+        format!(
+            r#"url = "{url}"
+username = "{username}"
+password = "$${{{PASSWORD}}}"
+"#,
+            url = self.url,
+            username = self.username,
+        )
     }
 }
 
@@ -65,15 +82,7 @@ impl Destination for RabbitMq {
     }
 
     fn sink_properties(&self, queue: &str) -> String {
-        format!(
-            r#"url = "{url}"
-username = "{username}"
-password = "$${{{PASSWORD}}}"
-"routing.key" = "{queue}"
-"#,
-            url = self.url,
-            username = self.username,
-        )
+        format!("{}\"routing.key\" = \"{queue}\"\n", self.credentials())
     }
 
     fn create(&self, queue: &str) {

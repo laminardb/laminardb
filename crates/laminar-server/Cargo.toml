@@ -157,8 +157,9 @@ mimalloc = { workspace = true, optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
-# Exercise the existing Kafka initialization contract from the real-process soak.
-laminar-connectors = { path = "../laminar-connectors", version = "0.40.2", default-features = false }
+# Exercise the existing Kafka initialization contract from the real-process soak; `testing` lets
+# the two-process tests place a fixture singleton.
+laminar-connectors = { path = "../laminar-connectors", version = "0.40.2", default-features = false, features = ["testing"] }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
 sha2 = { workspace = true }

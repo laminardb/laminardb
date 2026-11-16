@@ -377,7 +377,11 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
     let commit_resolution_deadline = TokioInstant::now() + Duration::from_secs(15);
     source
         .finish_drain(
-            SourceDrainSettlement::commit(commit_round, Arc::new(successor_checkpoint.clone())),
+            SourceDrainSettlement::commit(
+                commit_round,
+                laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                Arc::new(successor_checkpoint.clone()),
+            ),
             commit_resolution_deadline,
         )
         .await

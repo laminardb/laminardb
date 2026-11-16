@@ -3,8 +3,8 @@ use laminar_connectors::connector::SourceConnector as _;
 use super::{
     admit_routed_source, admit_source_contract, exact_table_reference,
     schema_has_reserved_mutation_columns, Arc, ConnectorTaskFenceRegistration, DbError, FxHashMap,
-    HashMap, LaminarDB, RuntimeMode, SourceInputMode, SourceRoute, SourceTopology,
-    TemporalSourceRole, TrackedSourceRegistration,
+    HashMap, LaminarDB, RuntimeMode, SourceInputMode, SourceRoute, TemporalSourceRole,
+    TrackedSourceRegistration,
 };
 
 impl LaminarDB {
@@ -293,6 +293,14 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            #[cfg(feature = "cluster")]
+            let source = if runtime_mode == RuntimeMode::Cluster {
+                super::singleton_placement::place(name, source, &config).map_err(|error| {
+                    DbError::Config(format!("source '{name}' has an invalid contract: {error}"))
+                })?
+            } else {
+                source
+            };
             let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                 Arc::<str>::from(format!("source:{name}")),
                 source.terminal_task_tracker(),
@@ -358,7 +366,7 @@ impl LaminarDB {
             }
             let assignment_scoped = cfg!(feature = "cluster")
                 && runtime_mode == RuntimeMode::Cluster
-                && contract.topology == SourceTopology::Splittable;
+                && super::source_admission::cluster_assignment_scoped(contract);
             source.assignment_scoped = assignment_scoped;
             #[cfg(feature = "cluster")]
             if assignment_scoped {

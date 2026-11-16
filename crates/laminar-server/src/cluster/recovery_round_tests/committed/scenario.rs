@@ -449,7 +449,7 @@ enum Scenario {
     Migration,
     Drain,
     Process(u64),
-    Generator(generator::Handover),
+    Generator(generator::Sequence, generator::Handover),
 }
 
 pub(super) async fn run() -> Result<()> {
@@ -470,10 +470,16 @@ pub(super) async fn run_drain() -> Result<()> {
         .map(|_| ())
 }
 
-pub(super) async fn run_generator(handover: generator::Handover) -> Result<()> {
-    run_pair(Runtime::Generator, Scenario::Generator(handover))
-        .await
-        .map(|_| ())
+pub(super) async fn run_generator(
+    sequence: generator::Sequence,
+    handover: generator::Handover,
+) -> Result<()> {
+    run_pair(
+        Runtime::Sequence(sequence),
+        Scenario::Generator(sequence, handover),
+    )
+    .await
+    .map(|_| ())
 }
 
 pub(super) async fn run_process(runtime: Runtime, failed: u64) -> Result<process::Transcript> {
@@ -528,9 +534,11 @@ async fn run_pair(runtime: Runtime, scenario: Scenario) -> Result<process::Trans
                 .await
                 .map(|()| (Vec::new(), Vec::new())),
             Scenario::Process(failed) => process::qualify(&mut processes, failed).await,
-            Scenario::Generator(handover) => generator::qualify(&mut processes, handover)
-                .await
-                .map(|()| (Vec::new(), Vec::new())),
+            Scenario::Generator(sequence, handover) => {
+                generator::qualify(&mut processes, sequence, handover)
+                    .await
+                    .map(|()| (Vec::new(), Vec::new()))
+            }
         }
     })
     .catch_unwind()

@@ -30,14 +30,17 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
     ConnectorTaskAdmission, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
-    SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
 
 const GENERATION: &str = "generation";
 const DELIVERY_TAG: &str = "delivery_tag";
+/// The sealed start cursor: a queue keeps its own position, so a new source reads whatever the
+/// queue holds when it starts.
+const SEALED_START: (&str, &str) = ("start", "queue");
+const CHECKPOINT_CONNECTOR: &str = "rabbitmq";
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// RabbitMQ AMQP 0-9-1 queue source.
@@ -689,14 +692,21 @@ impl SourceConnector for RabbitMqSource {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        RabbitMqSourceConfig::from_config(config)?;
+        let parsed = RabbitMqSourceConfig::from_config(config)?;
         // The queue releases a message only when the checkpoint containing it is durable.
         // Exactly-once is not certified: broker acknowledgement and sink commit are separate.
-        Ok(SourceContract::new(
+        let contract = SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
-        ))
+        );
+        // FpML is not qualified for cluster sources.
+        if parsed.format == Format::Fpml {
+            return Ok(contract);
+        }
+        // Any one node may consume the queue: a delivery the committed cut did not cover stays
+        // unacknowledged and is redelivered to whichever node opens the queue next.
+        Ok(contract.with_cluster_singleton_placement())
     }
 
     fn recovery_identity_options(
@@ -706,15 +716,43 @@ impl SourceConnector for RabbitMqSource {
         Ok(Some(RabbitMqSourceConfig::from_config(config)?.identity()))
     }
 
-    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let (config, position, _) = request.into_parts();
-        if matches!(position, SourcePosition::Initialized { .. }) {
-            return Err(ConnectorError::ConfigurationError(
-                "RabbitMQ has no sealed topology startup contract".into(),
-            ));
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
+    async fn resolve_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        RabbitMqSourceConfig::from_config(config)?;
+        let mut cursor = SourceCheckpoint::new();
+        cursor.set_offset(SEALED_START.0, SEALED_START.1);
+        cursor.set_metadata("connector", CHECKPOINT_CONNECTOR);
+        Ok(cursor)
+    }
+
+    async fn validate_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        RabbitMqSourceConfig::from_config(config)?;
+        if checkpoint.get_metadata("connector") != Some(CHECKPOINT_CONNECTOR)
+            || checkpoint.get_offset(SEALED_START.0) != Some(SEALED_START.1)
+        {
+            return Err(ConnectorError::InvalidState {
+                expected: "a RabbitMQ sealed start cursor".into(),
+                actual: format!("{:?}", checkpoint.offsets()),
+            });
         }
-        // A resume needs no positioning: every delivery the committed cut did not cover is still
-        // unacknowledged, and the broker redelivered it when the previous channel closed.
+        Ok(())
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        // No start position needs placing: a sealed start reads what the queue holds, and every
+        // delivery a committed cut did not cover is still unacknowledged, so the broker
+        // redelivered it when the previous channel closed.
+        let (config, _, _) = request.into_parts();
         let parsed = RabbitMqSourceConfig::from_config(&config)?;
         let name = config.get("laminar.source.name").unwrap_or("rabbitmq");
         let metrics = SourceMetrics::new(name, self.registry.as_ref())?;

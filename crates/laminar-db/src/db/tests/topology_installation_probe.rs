@@ -41,7 +41,11 @@ impl RuntimeSource {
     }
 
     pub async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let (_, position, _) = request.into_parts();
+        let (config, position, _) = request.into_parts();
+        // A placed singleton never learns its name from a vnode assignment.
+        if let Some(queue) = config.get("queue") {
+            queue.clone_into(&mut self.name);
+        }
         self.probe
             .starts
             .lock()
