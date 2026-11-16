@@ -1936,3 +1936,83 @@ async fn topology_sql_script_is_one_atomic_migration_and_a_mixed_script_admits_n
     .await;
     Box::pin(fixture.db.shutdown()).await.unwrap();
 }
+
+#[tokio::test]
+async fn topology_adds_a_placed_singleton_at_its_sealed_start_and_resumes_it_after_recovery() {
+    let (fixture, probe) = running_parent().await;
+    let addition = request(
+        1601,
+        vec![
+            source_ddl(
+                "placed",
+                "'topic' = 'new', 'start' = 'latest', 'placement' = 'placed', 'queue' = 'placed'",
+            ),
+            "CREATE STREAM placed_total AS SELECT id, SUM(value) AS total FROM placed GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
+            "CREATE SINK placed_sink FROM placed_total INTO \"planning-sink\" ('topic' = 'placed-output')".into(),
+        ],
+    );
+    Box::pin(fixture.db.submit_cluster_topology_change(&addition))
+        .await
+        .unwrap();
+    active(&fixture, addition.operation_id).await;
+    let placed_total = || {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "placed-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let starts = || {
+        probe
+            .starts
+            .lock()
+            .iter()
+            .filter(|(name, _)| name == "placed")
+            .map(|(_, position)| position.clone())
+            .collect::<Vec<_>>()
+    };
+    let queued = |value| {
+        std::collections::VecDeque::from([SourceBatch::new(input(value)["trades"][0].clone())])
+    };
+    probe.input.lock().insert("placed".into(), queued(5));
+    wait_until(|| placed_total() == 15).await;
+    let [SourcePosition::Initialized { checkpoint: sealed }] = &starts()[..] else {
+        panic!(
+            "the placed singleton opens once, at its sealed start: {:?}",
+            starts()
+        );
+    };
+    assert_eq!(sealed.input_channels(), Some(&[b"placed".to_vec()][..]));
+    let first = sealed
+        .get_offset("partition-0-next")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let committed = latest_index(&fixture).await.source_offsets["placed"].clone();
+    assert_eq!(
+        committed.offsets["partition-0-next"],
+        (first + 3).to_string()
+    );
+    assert_eq!(committed.input_channels, Some(vec![b"placed".to_vec()]));
+
+    probe.output.lock().clear();
+    let prior_starts = probe.starts.lock().len();
+    super::recovery::restart_settled_target(&fixture, &probe, prior_starts).await;
+    probe.input.lock().insert("placed".into(), queued(7));
+    super::recovery::released(&fixture).await;
+    wait_until(|| placed_total() == 36).await;
+    let [_, SourcePosition::Resume { checkpoint, .. }] = &starts()[..] else {
+        panic!("recovery resumes the placed singleton: {:?}", starts());
+    };
+    assert_eq!(
+        checkpoint.get_offset("partition-0-next"),
+        Some((first + 3).to_string().as_str())
+    );
+    Box::pin(fixture.db.shutdown()).await.unwrap();
+}
