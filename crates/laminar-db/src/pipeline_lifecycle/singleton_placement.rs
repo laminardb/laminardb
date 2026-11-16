@@ -199,7 +199,11 @@ impl SingletonPlacement {
                     .ok_or_else(|| invalid("singleton source assigned before it started"))?
                     .into_parts();
                 self.inner
-                    .start(SourceStart::new(config, position.clone(), delivery)?)
+                    .start(SourceStart::new(
+                        config,
+                        start_position(position),
+                        delivery,
+                    )?)
                     .await?;
                 self.open = true;
                 if let Some(admitted) = &self.admitted {
@@ -287,6 +291,17 @@ pub(crate) fn place(
         )));
     }
     Ok(connector)
+}
+
+/// A cut taken while the owner's first open was still pending names the channel but holds no
+/// cursor: nothing was read from it, so the connector starts where that open would have.
+fn start_position(position: &SourcePosition) -> SourcePosition {
+    match position {
+        SourcePosition::Resume { checkpoint, .. } if checkpoint.is_empty() => {
+            SourcePosition::Initial
+        }
+        position => position.clone(),
+    }
 }
 
 fn owns_home(
@@ -785,6 +800,32 @@ mod tests {
             None,
             "a sealed cursor is unowned"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cut_taken_before_the_owner_opened_resumes_at_the_initial_position() {
+        let mut owner = Node::new(1).await;
+        owner.publish(1, 1);
+        owner.source.drive_control_plane();
+        let cut = owner.source.checkpoint();
+        assert_eq!(cut.input_channels(), Some(&[NAME.as_bytes().to_vec()][..]));
+        assert!(cut.is_empty(), "nothing was read before the first open");
+
+        let mut recovered = Node::new(1).await;
+        let resume = SourcePosition::Resume {
+            attempt: CheckpointAttempt::canonical(1),
+            checkpoint: cut,
+        };
+        let request = SourceStart::new(
+            ConnectorConfig::new("recorder"),
+            resume,
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
+        recovered.source.start(request).await.unwrap();
+        recovered.publish(1, 1);
+        recovered.poll().await.expect("the owner reads");
+        assert_eq!(recovered.events(), [Event::Start("initial".into())]);
     }
 
     #[tokio::test]
