@@ -1,5 +1,7 @@
-//! Replayable, splittable fixture source whose partitions follow vnode ownership.
+//! Fixture sources: a replayable, splittable source whose partitions follow vnode ownership, and
+//! a queue the engine runs on the owner of its home vnode.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -15,20 +17,32 @@ use laminar_connectors::connector::{
 use laminar_connectors::error::ConnectorError;
 use laminar_connectors::registry::ConnectorRegistry;
 use laminar_core::state::{NodeId, VnodeRegistry};
+use parking_lot::Mutex;
 
 /// Generator rate in generated fixtures; the rows' `ts_ms` is `seq * 1000 / rate`.
 pub(super) const GENERATED_ROWS_PER_SECOND: i64 = 1_000_000;
 
-/// One fixture source: partition `p` is read by the owner of vnode `p % vnode_count`.
+/// How a fixture source's rows reach the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FixtureKind {
+    /// The fixture connector: partition `p` is read by the owner of vnode `p % vnode_count`.
+    Partitioned,
+    /// The built-in generator with one split per partition; partition `c` holds the rows split
+    /// `c` emits.
+    Generated,
+    /// One queue of batches, read by the owner of the source's home vnode. A delivery leaves the
+    /// queue when a checkpoint covering it commits and returns to it when its reader closes.
+    Queue,
+}
+
+/// One fixture source.
 #[derive(Clone)]
 pub(super) struct FixtureSource {
     pub name: &'static str,
     /// Column list and watermark clause of `CREATE SOURCE`, including parentheses.
     pub columns: &'static str,
     pub partitions: Arc<[Vec<RecordBatch>]>,
-    /// Read by the built-in generator with one split per partition rather than by the fixture
-    /// connector; partition `c` holds the rows split `c` emits.
-    pub generated: bool,
+    pub kind: FixtureKind,
 }
 
 impl FixtureSource {
@@ -37,7 +51,7 @@ impl FixtureSource {
     }
 
     pub fn ddl(&self) -> String {
-        if self.generated {
+        if self.kind == FixtureKind::Generated {
             return format!(
                 "CREATE SOURCE {} FROM GENERATOR ('splits' = '{}', 'max.rows' = '{}', \
                  'rows.per.second' = '{GENERATED_ROWS_PER_SECOND}', 'batch.max.size' = '64')",
@@ -68,7 +82,7 @@ impl FixtureSource {
 
     /// Batches the fixture connector delivers; the generator's are not counted.
     pub fn batch_count(&self) -> u64 {
-        if self.generated {
+        if self.kind == FixtureKind::Generated {
             return 0;
         }
         self.partitions.iter().map(|p| p.len() as u64).sum()
@@ -79,18 +93,53 @@ impl FixtureSource {
     }
 }
 
+/// The queues of one database or cluster: every node of a cluster shares them.
+pub(super) struct Queues(BTreeMap<&'static str, Arc<Mutex<Queue>>>);
+
+impl Queues {
+    pub fn new(sources: &[FixtureSource]) -> Arc<Self> {
+        Arc::new(Self(
+            sources
+                .iter()
+                .filter(|source| source.kind == FixtureKind::Queue)
+                .map(|source| {
+                    let batches = source.all_batches();
+                    let queue = Queue {
+                        ready: (0..batches.len()).collect(),
+                        batches,
+                        consumers: 0,
+                    };
+                    (source.name, Arc::new(Mutex::new(queue)))
+                })
+                .collect(),
+        ))
+    }
+}
+
+pub(super) struct Queue {
+    batches: Vec<RecordBatch>,
+    /// Batches no open reader holds, in delivery order.
+    ready: VecDeque<usize>,
+    consumers: u64,
+}
+
 /// Register every fixture source for one node; `polled` counts batches that node delivered, and
 /// the node delivers no more than `allowance` of them.
 pub(super) fn register(
     sources: Vec<FixtureSource>,
     polled: Arc<AtomicU64>,
     allowance: Arc<AtomicU64>,
+    queues: Arc<Queues>,
 ) -> impl FnOnce(&ConnectorRegistry) -> Result<(), ConnectorError> + Send + 'static {
     move |registry| {
-        for source in sources.into_iter().filter(|source| !source.generated) {
+        for source in sources
+            .into_iter()
+            .filter(|source| source.kind != FixtureKind::Generated)
+        {
             let name = source.connector_type();
             let polled = Arc::clone(&polled);
             let allowance = Arc::clone(&allowance);
+            let queue = queues.0.get(source.name).cloned();
             registry.register_source(
                 &name,
                 ConnectorInfo {
@@ -104,6 +153,18 @@ pub(super) fn register(
                     config_keys: Vec::new(),
                 },
                 Arc::new(move |_| {
+                    let (polled, allowance) = (Arc::clone(&polled), Arc::clone(&allowance));
+                    if let Some(queue) = &queue {
+                        return Ok(Box::new(QueueSource {
+                            queue: Arc::clone(queue),
+                            schema: source.schema(),
+                            consumer: None,
+                            delivered: 0,
+                            unacked: VecDeque::new(),
+                            polled,
+                            allowance,
+                        }));
+                    }
                     Ok(Box::new(PartitionedSource {
                         schema: source.schema(),
                         owned: (0..source.partitions.len()).collect(),
@@ -111,12 +172,107 @@ pub(super) fn register(
                         partitions: Arc::clone(&source.partitions),
                         next: 0,
                         assignment: 0,
-                        polled: Arc::clone(&polled),
-                        allowance: Arc::clone(&allowance),
+                        polled,
+                        allowance,
                     }))
                 }),
             )?;
         }
+        Ok(())
+    }
+}
+
+/// A queue reader that acknowledges cumulatively, like a broker channel: its cursor names the
+/// reader and the last delivery it handed over.
+struct QueueSource {
+    queue: Arc<Mutex<Queue>>,
+    schema: SchemaRef,
+    consumer: Option<u64>,
+    /// The last tag this reader handed over.
+    delivered: u64,
+    /// Deliveries not yet acknowledged, as `(tag, batch)`, oldest first.
+    unacked: VecDeque<(u64, usize)>,
+    polled: Arc<AtomicU64>,
+    allowance: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl SourceConnector for QueueSource {
+    fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(
+            laminar_connectors::testing::with_cluster_singleton_placement(SourceContract::new(
+                SourceConsistency::CommitCoupled,
+                SourceTopology::Singleton,
+                SourceInputMode::AppendOnly,
+            )),
+        )
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        if let (_, SourcePosition::Initialized { .. }, _) = request.into_parts() {
+            return Err(ConnectorError::ConfigurationError(
+                "conformance queue has no sealed start".into(),
+            ));
+        }
+        let mut queue = self.queue.lock();
+        queue.consumers += 1;
+        self.consumer = Some(queue.consumers);
+        self.delivered = 0;
+        Ok(())
+    }
+
+    async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+        if self.polled.load(Ordering::Acquire) >= self.allowance.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut queue = self.queue.lock();
+        let Some(batch) = queue.ready.pop_front() else {
+            return Ok(None);
+        };
+        self.delivered += 1;
+        self.unacked.push_back((self.delivered, batch));
+        self.polled.fetch_add(1, Ordering::AcqRel);
+        Ok(Some(SourceBatch::new(queue.batches[batch].clone())))
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        if let Some(consumer) = self.consumer {
+            checkpoint.set_offset("consumer", consumer.to_string());
+            checkpoint.set_offset("tag", self.delivered.to_string());
+        }
+        checkpoint
+    }
+
+    async fn notify_epoch_committed(
+        &mut self,
+        _: u64,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        let mine = self.consumer.map(|consumer| consumer.to_string());
+        if checkpoint.get_offset("consumer") != mine.as_deref() {
+            return Ok(());
+        }
+        let tag: u64 = checkpoint
+            .get_offset("tag")
+            .and_then(|tag| tag.parse().ok())
+            .unwrap_or(0);
+        while self.unacked.front().is_some_and(|(acked, _)| *acked <= tag) {
+            self.unacked.pop_front();
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        let mut queue = self.queue.lock();
+        for (_, batch) in self.unacked.drain(..).rev() {
+            queue.ready.push_front(batch);
+        }
+        self.consumer = None;
         Ok(())
     }
 }

@@ -5361,6 +5361,47 @@ async fn empty_idle_source_gaining_a_channel_activates_at_the_pinned_committed_c
 }
 
 #[tokio::test]
+async fn a_source_without_row_positions_owning_no_channel_is_idle_until_it_reads() {
+    let mut callback = empty_callback_fixture();
+    callback.source_ids.insert("queue".into(), 0);
+    callback.source_name_arcs.insert(0, Arc::from("queue"));
+    callback.watermark_states.insert(
+        "queue".into(),
+        SourceWatermarkState::new(
+            laminar_core::time::EventTimeExtractor::from_column("ts"),
+            Box::new(laminar_core::time::BoundedOutOfOrdernessGenerator::new(0)),
+            "ts".into(),
+        ),
+    );
+    callback.tracker = Some(laminar_core::time::WatermarkTracker::new(1));
+
+    crate::pipeline::PipelineCallback::reconcile_source_input_channels(
+        &mut callback,
+        "queue",
+        Some(Arc::from([b"queue".to_vec()])),
+    )
+    .unwrap();
+    assert!(
+        !callback.tracker.as_ref().unwrap().is_idle(0),
+        "an owned channel is not idle"
+    );
+
+    crate::pipeline::PipelineCallback::reconcile_source_input_channels(
+        &mut callback,
+        "queue",
+        Some(Arc::from(Vec::<Vec<u8>>::new())),
+    )
+    .unwrap();
+    assert!(callback.tracker.as_ref().unwrap().is_idle(0));
+
+    callback.tracker.as_mut().unwrap().update_source(0, 900);
+    assert!(
+        !callback.tracker.as_ref().unwrap().is_idle(0),
+        "its rows clear the flag"
+    );
+}
+
+#[tokio::test]
 async fn local_empty_partition_inventory_emits_its_logical_watermark_marker() {
     use laminar_core::checkpoint::SINGLETON_WATERMARK_CHANNEL;
     use std::time::Duration;

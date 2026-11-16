@@ -983,6 +983,49 @@ fn source_contract_admission_matrix_is_fail_closed() {
     }
 }
 
+#[cfg(feature = "rabbitmq")]
+#[test]
+fn rabbitmq_runs_in_cluster_on_one_node_at_least_once() {
+    use super::{admit_source_recovery_contract, cluster_assignment_scoped};
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::rabbitmq::register_rabbitmq_source(&registry).unwrap();
+    let mut config = laminar_connectors::config::ConnectorConfig::new("rabbitmq");
+    for (key, value) in [
+        ("url", "amqp://127.0.0.1/%2f"),
+        ("queue", "orders"),
+        ("format", "json"),
+    ] {
+        config.set(key, value);
+    }
+    let contract = registry
+        .create_source(&config, None)
+        .unwrap()
+        .contract(&config)
+        .unwrap();
+    assert!(cluster_assignment_scoped(contract));
+    let admit =
+        |delivery| admit_source_recovery_contract(contract, delivery, true, RuntimeMode::Cluster);
+    assert_eq!(admit(DeliveryGuarantee::AtLeastOnce), Ok(()));
+    let error = admit(DeliveryGuarantee::ExactlyOnce).unwrap_err();
+    assert!(error.contains("not production-certified"), "{error}");
+
+    // Another singleton without the declaration stays rejected in cluster.
+    let generator = laminar_connectors::generator::GeneratorSource::default()
+        .contract(&laminar_connectors::config::ConnectorConfig::new(
+            "generator",
+        ))
+        .unwrap();
+    assert!(!cluster_assignment_scoped(generator));
+    assert!(admit_source_recovery_contract(
+        generator,
+        DeliveryGuarantee::AtLeastOnce,
+        true,
+        RuntimeMode::Cluster
+    )
+    .is_err());
+}
+
 #[cfg(feature = "postgres-cdc")]
 #[test]
 fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
@@ -1014,7 +1057,7 @@ fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
         );
         assert_eq!(
             admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster),
-            Err("cluster singleton sources require fenced singleton placement, which is not implemented"),
+            Err("cluster singleton sources require a connector that one node at a time may run"),
             "{mode}"
         );
         assert!(

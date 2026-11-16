@@ -5760,7 +5760,10 @@ async fn process_lease_loss_cancels_blocking_finish_drain_without_later_hooks() 
                     round,
                     outcome: SourceDrainOutcome::Commit,
                 },
-                committed: Some(Arc::new(SourceCheckpoint::default())),
+                committed: Some((
+                    laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                    Arc::new(SourceCheckpoint::default()),
+                )),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             }),
         });
@@ -5859,7 +5862,10 @@ async fn ready_source_drain_outlives_prepare_deadline() {
                 round,
                 outcome: SourceDrainOutcome::Commit,
             },
-            committed: Some(Arc::new(SourceCheckpoint::default())),
+            committed: Some((
+                laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                Arc::new(SourceCheckpoint::default()),
+            )),
             deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         }))
         .unwrap();

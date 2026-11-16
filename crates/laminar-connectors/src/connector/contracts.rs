@@ -297,7 +297,10 @@ impl SourceContract {
     /// Mark a built-in singleton connector that one cluster node at a time may run: it can be
     /// closed on one node and started with `Resume` on another, and it acknowledges upstream only
     /// in `notify_epoch_committed`.
-    #[cfg_attr(not(feature = "rabbitmq"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "rabbitmq", feature = "testing", test)),
+        allow(dead_code)
+    )]
     #[must_use]
     pub(crate) const fn with_cluster_singleton_placement(mut self) -> Self {
         self.cluster_singleton_placement = true;

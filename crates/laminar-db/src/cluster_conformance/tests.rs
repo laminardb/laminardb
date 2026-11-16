@@ -7,7 +7,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use super::oracle::OutputForm;
-use super::source::FixtureSource;
+use super::source::{FixtureKind, FixtureSource};
 use super::{Case, Verdict};
 
 const PARTITIONS: i64 = 6;
@@ -77,7 +77,7 @@ pub(super) fn events_in(
         name,
         columns: EVENT_COLUMNS,
         partitions: partitions.into(),
-        generated: false,
+        kind: FixtureKind::Partitioned,
     }
 }
 
@@ -918,7 +918,7 @@ fn generated(name: &'static str, splits: u32, rows: i64) -> FixtureSource {
         name,
         columns: "",
         partitions: partitions.into(),
-        generated: true,
+        kind: FixtureKind::Generated,
     }
 }
 
@@ -1383,4 +1383,58 @@ async fn nested_window_aggregate_is_rejected_in_cluster() {
         ),
     );
     assert_rejected(verdict(case).await, "EMIT ON WINDOW CLOSE");
+}
+
+/// `events_in` delivered through one queue, which only the owner of its home vnode reads.
+fn queued(name: &'static str) -> FixtureSource {
+    let batches = events_in(name, 0, PARTITIONS, BATCHES_PER_PARTITION).all_batches();
+    FixtureSource {
+        name,
+        columns: EVENT_COLUMNS,
+        partitions: vec![batches].into(),
+        kind: FixtureKind::Queue,
+    }
+}
+
+// A placed singleton: one node reads the queue, acknowledging each checkpoint, and the merged
+// cursor claims its one channel once while the rows reach their aggregate owners on every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn singleton_queue_keyed_aggregate_checkpoints_are_equal() {
+    let case = Case {
+        sources: vec![queued("events")],
+        checkpoint_under_load: true,
+        ..case(
+            "singleton_queue_keyed_aggregate",
+            &[
+                "CREATE STREAM out AS SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events \
+               GROUP BY k EMIT CHANGES",
+            ],
+            OutputForm::Changelog,
+            Some("SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k"),
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// The two nodes that do not run the queue report it idle, so neither holds back the windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_close_past_the_nodes_without_a_singleton() {
+    let case = Case {
+        sources: vec![queued("events")],
+        ..case(
+            "windows_past_nodes_without_a_singleton",
+            &[
+                "CREATE STREAM out AS SELECT k, tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
+               COUNT(*) AS n, SUM(v) AS s FROM events \
+               GROUP BY k, tumble(ts, INTERVAL '100' MILLISECOND) EMIT ON WINDOW CLOSE",
+            ],
+            OutputForm::Rows,
+            Some(
+                "SELECT k, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n, \
+                 SUM(v) AS s FROM events WHERE ts < CAST(1400000 AS TIMESTAMP(6)) \
+                 GROUP BY k, tumble(ts, INTERVAL '100' MILLISECOND)",
+            ),
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }

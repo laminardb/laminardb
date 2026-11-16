@@ -34,9 +34,11 @@ pub(crate) struct SingletonPlacement {
     assignment: Option<Assignment>,
     request: Option<SourceStart>,
     open: bool,
+    /// A move the control plane decided; the next read or drain settlement performs it.
+    pending: Option<Pending>,
     /// Set once this node gives the channel up: its start position is older than its own reads.
     released: bool,
-    /// Assignment version the open/closed state follows; 0 until the first publication.
+    /// Assignment version the open/closed decision follows; 0 until the first publication.
     reconciled: u64,
     drain: Option<Drain>,
     fault: Option<String>,
@@ -53,6 +55,16 @@ struct Drain {
     committed: Option<(CheckpointAttempt, Arc<SourceCheckpoint>)>,
 }
 
+enum Pending {
+    /// Start the connector at this position.
+    Open(SourcePosition),
+    /// Release what the handoff cut holds, then close: the next owner reads after the cut.
+    Close {
+        handoff: CheckpointAttempt,
+        committed: Arc<SourceCheckpoint>,
+    },
+}
+
 impl SingletonPlacement {
     pub(crate) fn new(name: &str, inner: Box<dyn SourceConnector>) -> Self {
         Self {
@@ -61,6 +73,7 @@ impl SingletonPlacement {
             assignment: None,
             request: None,
             open: false,
+            pending: None,
             released: false,
             reconciled: 0,
             drain: None,
@@ -77,17 +90,14 @@ impl SingletonPlacement {
         })
     }
 
-    fn fail(&mut self, fault: String) -> Result<(), ConnectorError> {
-        self.fault = Some(fault);
-        self.faulted()
-    }
-
-    /// Follow a new assignment publication: start the connector when this node takes the home
-    /// vnode and close it when this node gives it up.
-    async fn follow(&mut self) -> Result<(), ConnectorError> {
-        self.faulted()?;
+    /// Follow a new assignment publication: decide whether this node starts or closes the
+    /// connector. The move runs in [`Self::settle`], which needs I/O.
+    fn plan(&mut self) {
+        if self.fault.is_some() || self.pending.is_some() {
+            return;
+        }
         let Some(assignment) = &self.assignment else {
-            return Ok(());
+            return;
         };
         let snapshot = assignment.registry.versioned_snapshot();
         let version = snapshot.version();
@@ -95,85 +105,120 @@ impl SingletonPlacement {
             || version == self.reconciled
             || snapshot.owners().iter().any(NodeId::is_unassigned)
         {
-            return Ok(());
+            return;
         }
-        let owns = owns_home(assignment, &snapshot)?;
+        let owns = match owns_home(assignment, &snapshot) {
+            Ok(owns) => owns,
+            Err(error) => {
+                self.fault = Some(error.to_string());
+                return;
+            }
+        };
         let handoff = match &self.drain {
             None => None,
             Some(drain) if version == drain.round.predecessor_version => None,
             Some(drain) if version == drain.round.target_version => match &drain.committed {
                 // The target is published before its round resolves; wait for the settlement.
-                None => return Ok(()),
+                None => return,
                 Some(committed) => Some(committed.clone()),
             },
             Some(drain) => {
-                let round = drain.round;
-                return self.fail(format!(
-                    "assignment {version} was published during drain {round:?}"
+                self.fault = Some(format!(
+                    "assignment {version} was published during drain {:?}",
+                    drain.round
                 ));
+                return;
             }
         };
-        match (self.open, owns, handoff.clone()) {
+        self.pending = match (self.open, owns, handoff.clone()) {
             (true, false, Some((handoff, committed))) => {
-                // The next owner reads after the handoff cut: release what the cut holds first.
-                self.inner
-                    .notify_epoch_committed(handoff.epoch, &committed)
-                    .await?;
-                self.inner.close().await?;
-                self.open = false;
                 self.released = true;
+                Some(Pending::Close { handoff, committed })
             }
             (true, false, None) => {
-                return self.fail("this node lost the singleton channel outside a drain".into());
+                self.fault = Some("this node lost the singleton channel outside a drain".into());
+                return;
             }
             (false, true, Some((attempt, committed))) => {
-                self.start_inner(SourcePosition::Resume {
+                Some(Pending::Open(SourcePosition::Resume {
                     attempt,
                     checkpoint: (*committed).clone(),
-                })
-                .await?;
+                }))
             }
             (false, true, None) if self.released => {
-                return self.fail(
+                self.fault = Some(
                     "the singleton channel moved back to this node outside a drain; its start \
                      position is older than this node's own reads"
                         .into(),
                 );
+                return;
             }
-            (false, true, None) => {
-                let position = self
-                    .request
-                    .clone()
-                    .ok_or_else(|| invalid("singleton source assigned before it started"))?
-                    .into_parts()
-                    .1;
-                self.start_inner(position).await?;
-            }
-            (true, true, _) | (false, false, _) => {}
-        }
+            (false, true, None) => match &self.request {
+                Some(request) => Some(Pending::Open(request.clone().into_parts().1)),
+                None => {
+                    self.fault = Some("singleton source assigned before it started".into());
+                    return;
+                }
+            },
+            (true, true, _) | (false, false, _) => None,
+        };
         self.reconciled = version;
         if handoff.is_some() {
             self.drain = None;
         }
-        Ok(())
     }
 
-    async fn start_inner(&mut self, position: SourcePosition) -> Result<(), ConnectorError> {
-        let (config, _, delivery) = self
-            .request
-            .clone()
-            .ok_or_else(|| invalid("singleton source assigned before it started"))?
-            .into_parts();
-        self.inner
-            .start(SourceStart::new(config, position, delivery)?)
-            .await?;
-        self.open = true;
-        Ok(())
+    /// Perform the move [`Self::plan`] decided.
+    async fn settle(&mut self) -> Result<(), ConnectorError> {
+        self.faulted()?;
+        match self.pending.take() {
+            None => Ok(()),
+            Some(Pending::Open(position)) => {
+                let (config, _, delivery) = self
+                    .request
+                    .clone()
+                    .ok_or_else(|| invalid("singleton source assigned before it started"))?
+                    .into_parts();
+                self.inner
+                    .start(SourceStart::new(config, position, delivery)?)
+                    .await?;
+                self.open = true;
+                Ok(())
+            }
+            Some(Pending::Close { handoff, committed }) => {
+                self.inner
+                    .notify_epoch_committed(handoff.epoch, &committed)
+                    .await?;
+                self.open = false;
+                self.inner.close().await
+            }
+        }
+    }
+
+    /// The cursor of this node's share of the channel: before a planned start it is the start
+    /// position, since nothing has been read from it yet.
+    fn cursor(&self) -> SourceCheckpoint {
+        match &self.pending {
+            Some(Pending::Open(SourcePosition::Initial)) | Some(Pending::Close { .. }) => {
+                SourceCheckpoint::new()
+            }
+            Some(Pending::Open(
+                SourcePosition::Initialized { checkpoint }
+                | SourcePosition::Resume { checkpoint, .. },
+            )) => checkpoint.clone(),
+            None if self.open => self.inner.checkpoint(),
+            None => SourceCheckpoint::new(),
+        }
     }
 
     /// Bind this node's share of the channel and the assignment it follows to a cursor.
     fn bind(&self, mut checkpoint: SourceCheckpoint) -> SourceCheckpoint {
-        let channels = if self.open {
+        let owns = match &self.pending {
+            Some(Pending::Open(_)) => true,
+            Some(Pending::Close { .. }) => false,
+            None => self.open,
+        };
+        let channels = if owns {
             vec![self.channel.clone()]
         } else {
             Vec::new()
@@ -250,7 +295,8 @@ impl SourceConnector for SingletonPlacement {
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
-        self.follow().await?;
+        self.plan();
+        self.settle().await?;
         if !self.open || self.drain.is_some() || !self.follows_current_assignment() {
             return Ok(None);
         }
@@ -303,17 +349,12 @@ impl SourceConnector for SingletonPlacement {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let checkpoint = if self.open {
-            self.inner.checkpoint()
-        } else {
-            SourceCheckpoint::new()
-        };
-        self.bind(checkpoint)
+        self.bind(self.cursor())
     }
 
     fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
-        if !self.open {
-            return Ok(Some(self.bind(SourceCheckpoint::new())));
+        if !self.open || self.pending.is_some() {
+            return Ok(Some(self.checkpoint()));
         }
         Ok(self
             .inner
@@ -330,10 +371,14 @@ impl SourceConnector for SingletonPlacement {
         if !self.follows_current_assignment() {
             return Ok(false);
         }
-        if self.open {
+        if self.open && self.pending.is_none() {
             return self.inner.checkpoint_ready();
         }
         Ok(true)
+    }
+
+    fn drive_control_plane(&mut self) {
+        self.plan();
     }
 
     fn begin_drain(
@@ -393,7 +438,8 @@ impl SourceConnector for SingletonPlacement {
             }
             (SourceDrainOutcome::Commit, Some(handoff), Some(committed)) => {
                 drain.committed = Some((handoff, Arc::clone(committed)));
-                self.follow().await
+                self.plan();
+                self.settle().await
             }
             (outcome, _, committed) => Err(ConnectorError::InvalidState {
                 expected: format!("{outcome:?} settlement"),
@@ -417,6 +463,7 @@ impl SourceConnector for SingletonPlacement {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
+        self.pending = None;
         if !self.open {
             return Ok(());
         }
@@ -455,5 +502,311 @@ impl SourceConnector for SingletonPlacement {
             return Ok(());
         }
         self.inner.notify_epoch_committed(epoch, checkpoint).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use laminar_connectors::connector::{
+        DeliveryGuarantee, SourceConsistency, SourceInputMode, SourceTopology,
+    };
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    const VNODES: u32 = 4;
+    const NAME: &str = "queue_input";
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Event {
+        Start(String),
+        Ack(String),
+        Close,
+    }
+
+    /// A singleton whose only progress is how many rows it delivered; it records its lifecycle.
+    struct Recorder {
+        events: Arc<Mutex<Vec<Event>>>,
+        open: bool,
+        delivered: u64,
+    }
+
+    fn position(position: &SourcePosition) -> String {
+        match position {
+            SourcePosition::Initial => "initial".into(),
+            SourcePosition::Initialized { .. } => "initialized".into(),
+            SourcePosition::Resume {
+                attempt,
+                checkpoint,
+            } => format!(
+                "resume {} at {}",
+                attempt.epoch,
+                checkpoint.get_offset("delivered").unwrap_or("-")
+            ),
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for Recorder {
+        async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+            let (_, start, _) = request.into_parts();
+            self.events.lock().push(Event::Start(position(&start)));
+            self.open = true;
+            Ok(())
+        }
+
+        async fn poll_batch(&mut self, _max: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+            assert!(self.open, "a closed singleton was polled");
+            self.delivered += 1;
+            let rows = Int64Array::from(vec![i64::try_from(self.delivered).unwrap()]);
+            Ok(Some(SourceBatch::new(
+                RecordBatch::try_new(self.schema(), vec![Arc::new(rows)]).unwrap(),
+            )))
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            let mut checkpoint = SourceCheckpoint::new();
+            checkpoint.set_offset("delivered", self.delivered.to_string());
+            checkpoint
+        }
+
+        async fn notify_epoch_committed(
+            &mut self,
+            _epoch: u64,
+            checkpoint: &SourceCheckpoint,
+        ) -> Result<(), ConnectorError> {
+            let delivered = checkpoint.get_offset("delivered").unwrap_or("-");
+            self.events.lock().push(Event::Ack(delivered.into()));
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.events.lock().push(Event::Close);
+            self.open = false;
+            Ok(())
+        }
+
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            Ok(SourceContract::new(
+                SourceConsistency::CommitCoupled,
+                SourceTopology::Singleton,
+                SourceInputMode::AppendOnly,
+            ))
+        }
+    }
+
+    struct Node {
+        source: SingletonPlacement,
+        registry: Arc<VnodeRegistry>,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl Node {
+        async fn new(id: u64) -> Self {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
+            let mut source = SingletonPlacement::new(
+                NAME,
+                Box::new(Recorder {
+                    events: Arc::clone(&events),
+                    open: false,
+                    delivered: 0,
+                }),
+            );
+            source
+                .set_vnode_assignment(NAME, Arc::clone(&registry), NodeId(id))
+                .unwrap();
+            let request = SourceStart::new(
+                ConnectorConfig::new("recorder"),
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap();
+            source.start(request).await.unwrap();
+            Self {
+                source,
+                registry,
+                events,
+            }
+        }
+
+        /// Publish an assignment that gives the home vnode to `owner` and every other to 9.
+        fn publish(&self, owner: u64, version: u64) {
+            let home = ROUTE.vnode(NAME, 0, NonZeroU32::new(VNODES).unwrap()) as usize;
+            let mut owners = vec![NodeId(9); VNODES as usize];
+            owners[home] = NodeId(owner);
+            self.registry
+                .set_assignment_and_version(owners.into(), version);
+        }
+
+        async fn poll(&mut self) -> Option<SourceCheckpoint> {
+            let mut batch = self.source.poll_batch(8).await.unwrap()?;
+            match batch.take_cursor() {
+                Some(laminar_connectors::connector::SourceBatchCursor::Complete(cursor)) => {
+                    Some(cursor)
+                }
+                other => panic!("a placed singleton batch carries a complete cursor: {other:?}"),
+            }
+        }
+
+        fn events(&self) -> Vec<Event> {
+            self.events.lock().clone()
+        }
+    }
+
+    fn round(predecessor: u64) -> AssignmentDrainId {
+        AssignmentDrainId {
+            predecessor_version: predecessor,
+            target_version: predecessor + 1,
+            digest: [7; 32],
+        }
+    }
+
+    fn deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+    }
+
+    async fn begin(nodes: &mut [&mut Node], round: AssignmentDrainId) {
+        let request = SourceDrainRequest::new(round).unwrap();
+        for node in nodes {
+            node.source.begin_drain(&request, deadline()).unwrap();
+            assert!(node.source.poll_drain_ready(round).unwrap());
+            assert!(
+                node.poll().await.is_none(),
+                "a draining singleton reads nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_home_vnode_owner_runs_the_singleton() {
+        let (mut a, mut b) = (Node::new(1).await, Node::new(2).await);
+        for node in [&a, &b] {
+            node.publish(1, 1);
+        }
+        let cursor = a.poll().await.expect("the owner reads");
+        assert_eq!(
+            cursor.input_channels(),
+            Some(&[NAME.as_bytes().to_vec()][..])
+        );
+        assert_eq!(cursor.assignment_version().map(NonZeroU64::get), Some(1));
+        assert_eq!(cursor.get_offset("delivered"), Some("1"));
+        assert!(b.poll().await.is_none());
+        assert!(
+            b.events().is_empty(),
+            "a non-owner never starts the connector"
+        );
+        let idle = b.source.checkpoint();
+        assert_eq!(idle.input_channels(), Some(&[][..]));
+        assert_eq!(idle.assignment_version().map(NonZeroU64::get), Some(1));
+        assert!(idle.offsets().is_empty());
+        assert!(a.source.checkpoint_ready().unwrap() && b.source.checkpoint_ready().unwrap());
+        assert_eq!(a.events(), [Event::Start("initial".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_committed_drain_moves_the_singleton_at_the_handoff_cut() {
+        let (mut a, mut b) = (Node::new(1).await, Node::new(2).await);
+        for node in [&a, &b] {
+            node.publish(1, 1);
+        }
+        a.poll().await.unwrap();
+        a.poll().await.unwrap();
+        b.poll().await;
+        begin(&mut [&mut a, &mut b], round(1)).await;
+        let handoff = Arc::new(a.source.checkpoint());
+        let attempt = CheckpointAttempt::canonical(5);
+        // The settlement arrives before the target publication: nothing moves until both.
+        for node in [&mut a, &mut b] {
+            node.source
+                .finish_drain(
+                    SourceDrainSettlement::commit(round(1), attempt, Arc::clone(&handoff)),
+                    deadline(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(a.events(), [Event::Start("initial".into())]);
+        for node in [&a, &b] {
+            node.publish(2, 2);
+        }
+        assert!(a.poll().await.is_none());
+        let cursor = b.poll().await.expect("the acquirer reads");
+        assert_eq!(
+            a.events(),
+            [
+                Event::Start("initial".into()),
+                Event::Ack("2".into()),
+                Event::Close
+            ],
+            "the donor releases the handoff cut before it closes"
+        );
+        assert_eq!(b.events(), [Event::Start("resume 5 at 2".into())]);
+        assert_eq!(cursor.assignment_version().map(NonZeroU64::get), Some(2));
+        assert_eq!(a.source.checkpoint().input_channels(), Some(&[][..]));
+    }
+
+    #[tokio::test]
+    async fn an_aborted_drain_keeps_the_owner_reading() {
+        let mut a = Node::new(1).await;
+        a.publish(1, 1);
+        a.poll().await.unwrap();
+        begin(&mut [&mut a], round(1)).await;
+        a.source
+            .finish_drain(SourceDrainSettlement::abort(round(1)), deadline())
+            .await
+            .unwrap();
+        assert_eq!(a.poll().await.unwrap().get_offset("delivered"), Some("2"));
+        assert_eq!(a.events(), [Event::Start("initial".into())]);
+    }
+
+    #[tokio::test]
+    async fn outside_a_drain_only_a_node_that_never_held_the_channel_takes_it() {
+        // A node new to the assignment starts the connector from its start position.
+        let mut b = Node::new(2).await;
+        b.publish(1, 1);
+        assert!(b.poll().await.is_none());
+        b.publish(2, 2);
+        assert!(b.poll().await.is_some());
+
+        // The owner losing the channel without a drain faults rather than reading twice.
+        let mut a = Node::new(1).await;
+        a.publish(1, 1);
+        a.poll().await.unwrap();
+        a.publish(2, 2);
+        let error = a.source.poll_batch(8).await.unwrap_err();
+        assert!(error.to_string().contains("outside a drain"), "{error}");
+        assert!(a.source.checkpoint_ready().is_err());
+
+        // A channel given up at a drain may come back only through another drain.
+        let mut c = Node::new(3).await;
+        c.publish(3, 1);
+        c.poll().await.unwrap();
+        begin(&mut [&mut c], round(1)).await;
+        c.source
+            .finish_drain(
+                SourceDrainSettlement::commit(
+                    round(1),
+                    CheckpointAttempt::canonical(4),
+                    Arc::new(c.source.checkpoint()),
+                ),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        c.publish(2, 2);
+        assert!(c.poll().await.is_none());
+        c.publish(3, 3);
+        let error = c.source.poll_batch(8).await.unwrap_err();
+        assert!(error.to_string().contains("moved back"), "{error}");
     }
 }

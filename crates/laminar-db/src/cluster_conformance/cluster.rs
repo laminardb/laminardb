@@ -73,6 +73,7 @@ impl Cluster {
             .map(|_| Arc::new(AtomicU64::new(0)))
             .collect::<Vec<_>>();
         let allowance = Arc::new(AtomicU64::new(u64::MAX));
+        let queues = source::Queues::new(sources);
         let mut dbs = Vec::new();
         for (index, control) in controls.iter().enumerate() {
             let registry = Arc::new(VnodeRegistry::new_unassigned(vnodes));
@@ -97,6 +98,7 @@ impl Cluster {
                     sources.to_vec(),
                     Arc::clone(&polled[index]),
                     Arc::clone(&allowance),
+                    Arc::clone(&queues),
                 ))
                 .build()
                 .await

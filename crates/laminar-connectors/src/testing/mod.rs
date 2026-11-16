@@ -22,6 +22,15 @@ use crate::connector::{
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
 
+/// Declare cluster singleton placement on a test connector's contract. Built-in connectors
+/// declare it themselves; this lets engine tests place a fixture singleton.
+#[must_use]
+pub fn with_cluster_singleton_placement(
+    contract: crate::connector::SourceContract,
+) -> crate::connector::SourceContract {
+    contract.with_cluster_singleton_placement()
+}
+
 /// Creates a test schema with `id` (Int64) and `value` (Utf8) columns.
 #[must_use]
 pub fn mock_schema() -> SchemaRef {

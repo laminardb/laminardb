@@ -34,7 +34,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
 | Files | ALO, BE | rejected |
-| RabbitMQ | ALO | rejected |
+| RabbitMQ | ALO | ALO |
 | IBM MQ | ALO | rejected |
 | NATS JetStream | BE | rejected |
 | WebSocket | BE | rejected |
@@ -93,7 +93,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Files | — | — | — | — | — | — | — | — | — | — | — | — |
-| RabbitMQ | — | — | — | — | — | — | — | — | — | — | — | — |
+| RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | IBM MQ | — | — | — | — | — | — | — | — | — | — | — | — |
 | NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — |
 | WebSocket | — | — | — | — | — | — | — | — | — | — | — | — |
