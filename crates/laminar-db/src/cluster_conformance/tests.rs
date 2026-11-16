@@ -1386,8 +1386,19 @@ async fn nested_window_aggregate_is_rejected_in_cluster() {
 }
 
 /// `events_in` delivered through one queue, which only the owner of its home vnode reads.
+/// Every partition's rows in one queue, in event-time order: the queue is one channel with one
+/// watermark, and the partitions repeat the same timestamps, so a row behind it would be late.
 fn queued(name: &'static str) -> FixtureSource {
-    let batches = events_in(name, 0, PARTITIONS, BATCHES_PER_PARTITION).all_batches();
+    let source = events_in(name, 0, PARTITIONS, BATCHES_PER_PARTITION);
+    let rows = arrow::compute::concat_batches(&source.schema(), &source.all_batches()).unwrap();
+    let order =
+        arrow::compute::sort_to_indices(rows.column_by_name("ts").unwrap(), None, None).unwrap();
+    let rows = arrow::compute::take_record_batch(&rows, &order).unwrap();
+    let size = usize::try_from(ROWS_PER_BATCH).unwrap();
+    let batches = (0..rows.num_rows())
+        .step_by(size)
+        .map(|offset| rows.slice(offset, size.min(rows.num_rows() - offset)))
+        .collect();
     FixtureSource {
         name,
         columns: EVENT_COLUMNS,
