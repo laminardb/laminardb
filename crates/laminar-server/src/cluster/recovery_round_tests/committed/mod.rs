@@ -38,8 +38,8 @@ enum Runtime {
     Native,
     #[cfg(feature = "process-remote")]
     RemoteRust,
-    /// The built-in generator with splits, read into a keyed view.
-    Generator,
+    /// A sequence read into a keyed view.
+    Sequence(generator::Sequence),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,15 +163,37 @@ async fn a_draining_database_hands_its_views_over_live() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
 async fn a_failed_databases_generator_splits_resume_on_the_survivor_from_the_committed_cut() {
-    scenario::run_generator(generator::Handover::FailedOwner)
+    scenario::run_generator(
+        generator::Sequence::Splits,
+        generator::Handover::FailedOwner,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_hands_its_generator_splits_over_at_the_handoff_cut() {
+    scenario::run_generator(generator::Sequence::Splits, generator::Handover::Drain)
         .await
         .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
-async fn a_draining_database_hands_its_generator_splits_over_at_the_handoff_cut() {
-    scenario::run_generator(generator::Handover::Drain)
+async fn a_failed_databases_singleton_resumes_on_the_survivor_from_the_committed_cut() {
+    scenario::run_generator(
+        generator::Sequence::Singleton,
+        generator::Handover::FailedOwner,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_hands_its_singleton_over_at_the_handoff_cut() {
+    scenario::run_generator(generator::Sequence::Singleton, generator::Handover::Drain)
         .await
         .unwrap();
 }
