@@ -88,15 +88,26 @@ pub(super) fn admit_source_recovery_contract(
                     "cluster node-local ingress has no defined rebalance/state-loss contract",
                 );
             }
+            SourceTopology::Singleton if contract.supports_cluster_singleton_placement() => {}
             SourceTopology::Singleton => {
                 return Err(
-                    "cluster singleton sources require fenced singleton placement, which is not implemented",
+                    "cluster singleton sources require a connector that one node at a time may run",
                 );
             }
         }
     }
 
     Ok(())
+}
+
+/// Whether a cluster source follows the vnode assignment: a split source, or a singleton the
+/// engine runs on the owner of its home vnode.
+pub(crate) fn cluster_assignment_scoped(contract: SourceContract) -> bool {
+    match contract.topology {
+        SourceTopology::Splittable => true,
+        SourceTopology::Singleton => contract.supports_cluster_singleton_placement(),
+        SourceTopology::NodeLocalIngress => false,
+    }
 }
 
 /// The admitted consumer route of one configured source.

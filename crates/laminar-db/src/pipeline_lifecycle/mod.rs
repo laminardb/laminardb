@@ -280,7 +280,11 @@ mod cluster_faults;
 pub(crate) use cluster_faults::report_cluster_terminal_halt;
 #[cfg(feature = "cluster")]
 use cluster_faults::{queue_owned_cluster_compute_fault, report_cluster_compute_fault};
+#[cfg(feature = "cluster")]
+mod singleton_placement;
 mod source_admission;
+#[cfg(feature = "cluster")]
+pub(crate) use source_admission::cluster_assignment_scoped;
 use source_admission::{
     admit_routed_source, admit_source_contract, admit_source_recovery_contract,
     admit_temporal_source_contract, has_only_ordered_interval_consumers,

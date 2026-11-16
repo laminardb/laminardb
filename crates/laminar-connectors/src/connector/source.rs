@@ -167,15 +167,20 @@ pub struct SourceDrainResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDrainSettlement {
     resolution: SourceDrainResolution,
-    committed: Option<Arc<SourceCheckpoint>>,
+    committed: Option<(
+        laminar_core::checkpoint::CheckpointAttempt,
+        Arc<SourceCheckpoint>,
+    )>,
 }
 
 impl SourceDrainSettlement {
-    /// The target committed; channels this node acquires resume from `committed`, the cursor
-    /// every participant merged into the handoff checkpoint, not from this node's own history.
+    /// The target committed at the `handoff` checkpoint; channels this node acquires resume from
+    /// `committed`, the cursor every participant merged into that checkpoint, not from this
+    /// node's own history.
     #[must_use]
     pub fn commit(
         round: laminar_core::checkpoint::AssignmentDrainId,
+        handoff: laminar_core::checkpoint::CheckpointAttempt,
         committed: Arc<SourceCheckpoint>,
     ) -> Self {
         Self {
@@ -183,7 +188,7 @@ impl SourceDrainSettlement {
                 round,
                 outcome: SourceDrainOutcome::Commit,
             },
-            committed: Some(committed),
+            committed: Some((handoff, committed)),
         }
     }
 
@@ -208,7 +213,13 @@ impl SourceDrainSettlement {
     /// The committed handoff cursor; present exactly when the drain commits.
     #[must_use]
     pub fn committed(&self) -> Option<&Arc<SourceCheckpoint>> {
-        self.committed.as_ref()
+        self.committed.as_ref().map(|(_, committed)| committed)
+    }
+
+    /// The handoff checkpoint the committed cursor belongs to.
+    #[must_use]
+    pub fn handoff(&self) -> Option<laminar_core::checkpoint::CheckpointAttempt> {
+        self.committed.as_ref().map(|(handoff, _)| *handoff)
     }
 }
 

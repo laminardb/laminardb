@@ -40,6 +40,9 @@ impl LaminarDB {
                 outcome,
             },
             &committed,
+            handoff.map(|cut| {
+                laminar_core::checkpoint::CheckpointAttempt::new(cut.epoch, cut.checkpoint_id)
+            }),
             deadline,
         )
         .await

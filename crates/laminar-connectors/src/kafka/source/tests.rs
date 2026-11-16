@@ -870,7 +870,11 @@ async fn captured_cut_outlives_prepare_deadline_and_uses_resolution_deadline() {
     let mut committed = SourceCheckpoint::default();
     committed.set_metadata("connector", "kafka");
     committed.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
-    let settlement = SourceDrainSettlement::commit(request.round, Arc::new(committed));
+    let settlement = SourceDrainSettlement::commit(
+        request.round,
+        laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+        Arc::new(committed),
+    );
     let resolution = settlement.resolution();
     let resolution_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     let finish = source.finish_drain(settlement, resolution_deadline);
@@ -3564,7 +3568,11 @@ async fn committed_drain_resumes_acquired_partitions_after_the_donor_progress() 
     for source in [&mut a, &mut b] {
         source
             .finish_drain(
-                SourceDrainSettlement::commit(round, Arc::clone(&committed)),
+                SourceDrainSettlement::commit(
+                    round,
+                    laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                    Arc::clone(&committed),
+                ),
                 tokio::time::Instant::now() + Duration::from_secs(10),
             )
             .await

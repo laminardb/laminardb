@@ -561,8 +561,8 @@ pub(super) async fn prepare_source_positions_at_cut(
             .get(&name)
             .filter(|_| target_cut || preserved)
         {
-            let scoped = connector.contract(&config)?.topology
-                == laminar_connectors::connector::SourceTopology::Splittable;
+            let scoped =
+                crate::pipeline_lifecycle::cluster_assignment_scoped(connector.contract(&config)?);
             crate::pipeline_lifecycle::validate_source_recovery_assignment(
                 &name,
                 scoped,

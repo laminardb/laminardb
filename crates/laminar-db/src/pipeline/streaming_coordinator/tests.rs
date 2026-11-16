@@ -6978,6 +6978,7 @@ async fn finished_source_retains_its_exact_resolved_drain_terminal() {
             "resolved-source".to_string(),
             Arc::new(SourceCheckpoint::default()),
         )]),
+        Some(laminar_core::checkpoint::CheckpointAttempt::canonical(1)),
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
     .await

@@ -300,8 +300,11 @@ pub(super) enum SourceDrainCommand {
     },
     Resolve {
         resolution: SourceDrainResolution,
-        /// This source's merged cursor at the committed handoff cut; present for a commit.
-        committed: Option<Arc<SourceCheckpoint>>,
+        /// The committed handoff cut and this source's merged cursor at it; present for a commit.
+        committed: Option<(
+            laminar_core::checkpoint::CheckpointAttempt,
+            Arc<SourceCheckpoint>,
+        )>,
         deadline: tokio::time::Instant,
     },
 }
@@ -388,7 +391,10 @@ pub(super) struct ActiveSourceDrain {
 #[derive(Clone)]
 pub(super) struct PendingSourceDrainResolution {
     pub(super) resolution: SourceDrainResolution,
-    pub(super) committed: Option<Arc<SourceCheckpoint>>,
+    pub(super) committed: Option<(
+        laminar_core::checkpoint::CheckpointAttempt,
+        Arc<SourceCheckpoint>,
+    )>,
     pub(super) deadline: tokio::time::Instant,
 }
 

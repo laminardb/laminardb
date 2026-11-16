@@ -5279,6 +5279,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return Ok(());
         };
         if !state.is_partitioned() {
+            // A source that owns no channel on this node produces no rows here, so it must not
+            // hold back this node's watermark; its rows clear the flag when it owns one again.
+            if input_channels.as_deref().is_some_and(<[Vec<u8>]>::is_empty) {
+                if let (Some(tracker), Some(source_id)) =
+                    (self.tracker.as_mut(), self.source_ids.get(source_name))
+                {
+                    if let Some(global) = tracker.mark_idle(*source_id) {
+                        self.pipeline_watermark
+                            .store(global.timestamp(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
             return Ok(());
         }
         #[cfg(feature = "cluster")]
