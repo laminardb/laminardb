@@ -282,6 +282,22 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda rabbitmq
+          - label: Cluster ALO RabbitMQ source (gossip)
+            test: rabbitmq_source::three_node_rabbitmq_source_kill9_soak
+            features: cluster,aws,kafka,rabbitmq
+            delivery: alo
+            topology: cluster-rabbitmq-source
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # One node at a time consumes the queue, and the source moves through the kills and
+            # rejoins; the oracle requires every confirmed id in the output queue.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs rabbitmq
+            candidate: "true"
           - label: Cluster ALO PostgreSQL sink (gossip)
             test: multi_writer_sinks::three_node_postgres_sink_kill9_soak
             features: cluster,aws,kafka,postgres-sink
@@ -459,7 +475,7 @@ jobs:
           LAMINAR_SOAK_ICEBERG_S3_SECRET_KEY: minioadmin
           LAMINAR_SOAK_ALLOW_S3_EMULATOR: ${{ matrix.emulator }}
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
-          # The compose services' test accounts; only the matching sink leg reads each one.
+          # The compose services' test accounts; only the legs using each service read it.
           LAMINAR_SOAK_RABBITMQ_PASSWORD: guest
           LAMINAR_SOAK_POSTGRES_PASSWORD: laminar-test-secret
           LAMINAR_SOAK_MONGODB_URI: mongodb://127.0.0.1:27217/?directConnection=true&tls=false
