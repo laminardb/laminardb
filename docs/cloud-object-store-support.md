@@ -57,8 +57,8 @@ operation and return an actionable error. No object-store sink was added because
 needs deterministic keys, conditional publication, content validation on retry, and a durable
 visibility manifest; POSIX rename semantics are not emulated over object storage.
 
-Cluster exact-delivery admission remains limited to Kafka input with an S3/S3A append-mode Delta
-sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom
+Cluster exact-delivery admission remains limited to Kafka or split generator input with an S3/S3A
+append-mode Delta sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom
 S3 endpoint's atomic conditional create before new table creation; failure closes admission. Azure
 and GCS remain at-least-once in cluster mode.
 

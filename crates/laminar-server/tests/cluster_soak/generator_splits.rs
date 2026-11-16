@@ -11,17 +11,28 @@
 //! breaks the read. The same epoch must read the same prefixes on every node, a later epoch may not
 //! hold fewer rows of any split, and every split must advance after the last rejoin.
 //!
+//! The exactly-once leg runs the same rounds with `delivery = exactly_once` over a bounded
+//! generator whose rows also go to a Delta table on S3 through a stream. After every round the
+//! table may hold no `seq` twice, and once the sequence ends it must hold each of its rows exactly
+//! once, as must the view.
+//!
 //! ```text
 //! cargo test --profile soak -p laminar-server --no-default-features \
 //!   --features cluster,aws,kafka --test cluster_soak \
 //!   generator_splits::three_node_generator_splits_kill9_soak -- --ignored --exact --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features \
+//!   --features cluster,aws,kafka,delta-lake-s3 --test cluster_soak \
+//!   generator_splits::three_node_generator_splits_delta_eo_kill9_soak -- --ignored --exact \
+//!   --nocapture
 //! ```
 //!
 //! It reads the shared `LAMINAR_SOAK_CHECKPOINT_URL`, `LAMINAR_SOAK_S3_*`,
 //! `LAMINAR_SOAK_KEY_GROUPS`, `LAMINAR_SOAK_INTERVAL_MS`, `LAMINAR_SOAK_MAX_RECOVERY_MS` and
 //! `LAMINAR_SOAK_DISCOVERY` knobs, plus `LAMINAR_SOAK_KILLS` (default 4), `LAMINAR_SOAK_SECONDS`
 //! (steady phase after the kills, default 30) and `LAMINAR_SOAK_RPS` (the generator's
-//! `rows.per.second`, default 400).
+//! `rows.per.second`, default 400). The exactly-once leg also reads `LAMINAR_SOAK_DELTA_BUCKET`
+//! and `LAMINAR_SOAK_GENERATOR_SECONDS` (default 480): the sequence holds that many seconds of
+//! rows, so every kill round must end before it does.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -34,7 +45,7 @@ use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSett
 use super::view_reads::{http_post, RETRYABLE_HTTP_ERRORS};
 use super::{
     assert_running_nodes, scoped_soak_storage_url, soak_run_id, wait_for,
-    wait_for_converged_durable_checkpoint, Node, ResolvedExecutable, NODES,
+    wait_for_converged_durable_checkpoint, JoinDelivery, Node, ResolvedExecutable, NODES,
 };
 
 const VIEW: &str = "generator_lanes";
@@ -49,7 +60,7 @@ fn three_node_generator_splits_kill9_soak() {
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
     );
     executable.describe();
-    let settings = SoakSettings::from_environment();
+    let settings = SoakSettings::from_environment(JoinDelivery::AtLeastOnce);
     let splits = u64::from(settings.key_groups);
     let run_id = soak_run_id();
     let checkpoint_url =
@@ -65,7 +76,7 @@ fn three_node_generator_splits_kill9_soak() {
         &settings,
         &checkpoint_url,
         &view(splits),
-        &source(splits, settings.rps),
+        &source(splits, settings.rps, None),
     );
     let mut reader = LaneReader::spawn(splits);
 
@@ -136,6 +147,257 @@ fn three_node_generator_splits_kill9_soak() {
     );
 }
 
+#[cfg(feature = "delta-lake-s3")]
+#[test]
+#[ignore = "spawns 3 real laminardb processes with S3 and a Delta sink"]
+fn three_node_generator_splits_delta_eo_kill9_soak() {
+    use super::{
+        delta_append_sink_config, delta_soak_table_uri, env_u64, wait_until, DeltaSoakStorage,
+    };
+
+    let executable = Arc::new(
+        ResolvedExecutable::from_environment()
+            .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
+    );
+    executable.describe();
+    let settings = SoakSettings::from_environment(JoinDelivery::ExactlyOnce);
+    let splits = u64::from(settings.key_groups);
+    let rows = settings.rps * env_u64("LAMINAR_SOAK_GENERATOR_SECONDS", 480);
+    let run_id = soak_run_id();
+    let checkpoint_url =
+        scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
+    let storage = DeltaSoakStorage::from_environment();
+    let table_uri = delta_soak_table_uri(&run_id, "generator");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
+    std::fs::create_dir(&log_dir).expect("create exclusive soak log directory");
+    eprintln!(
+        "soak: exactly-once split generator node logs in {}",
+        log_dir.display()
+    );
+    // A cluster sink may not read a source directly.
+    let workload = format!(
+        r#"{}
+[[pipeline]]
+name = "generator_forwarded"
+sql = "SELECT seq, ts_ms FROM gen"
+{}"#,
+        source(splits, settings.rps, Some(rows)),
+        delta_append_sink_config(
+            "generator_delta",
+            "generator_forwarded",
+            &table_uri,
+            &storage
+        )
+    );
+    let mut nodes = cluster_nodes(
+        &executable,
+        dir.path(),
+        &log_dir,
+        &settings,
+        &checkpoint_url,
+        &view(splits),
+        &workload,
+    );
+    let delta = delta::Rows::new(table_uri, &storage);
+    let mut reader = LaneReader::spawn(splits);
+
+    let mut latest = boot(
+        &mut nodes,
+        &mut || reader.assert_running(),
+        &settings,
+        INGESTED,
+    );
+    let mut killed_followers = BTreeSet::new();
+    for round in 0..settings.kills {
+        let (victim, committed) = kill_round(
+            &mut nodes,
+            &mut || reader.assert_running(),
+            round,
+            &mut killed_followers,
+            &settings,
+            INGESTED,
+            latest,
+        );
+        latest = committed;
+        let seen = delta
+            .counts(rows)
+            .unwrap_or_else(|error| panic!("read the Delta output after round {round}: {error}"));
+        seen.assert_no_duplicates();
+        eprintln!(
+            "soak round {round}: node {victim} rejoined; Delta holds {} of {rows} rows once",
+            seen.distinct
+        );
+    }
+
+    let deadline = settings.recovery_ceiling + Duration::from_secs(rows / settings.rps + 60);
+    let mut seen = None;
+    let complete = wait_until(deadline, || {
+        assert_running_nodes(&mut nodes);
+        reader.assert_running();
+        seen = delta.counts(rows).ok();
+        seen.as_ref().is_some_and(|seen| {
+            seen.assert_no_duplicates();
+            seen.distinct == rows
+        })
+    });
+    let seen = seen.expect("the Delta output was never read");
+    assert!(
+        complete,
+        "Delta holds {} of the {rows} generated rows once, first missing {:?}",
+        seen.distinct, seen.first_missing
+    );
+    // The prefix oracle already bounds every read, so a read holding every row holds each once.
+    reader.newest_where(
+        &mut nodes,
+        &format!("a committed view read holding all {rows} rows"),
+        settings.recovery_ceiling,
+        |_, read| read.iter().sum::<u64>() == rows,
+    );
+    let evidence = reader.finish();
+    assert!(
+        evidence.reads_by_node.iter().all(|reads| *reads > 0),
+        "every node must serve a committed read: {:?}",
+        evidence.reads_by_node
+    );
+    eprintln!(
+        "soak: exactly-once split generator across {NODES} nodes: {splits} splits, {rows} rows in \
+         Delta and the view exactly once, {} checked epochs, kills={}",
+        evidence.prefixes.len(),
+        settings.kills
+    );
+}
+
+#[cfg(feature = "delta-lake-s3")]
+mod delta {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{Array as _, Int64Array};
+    use arrow_schema::DataType;
+
+    use super::super::DeltaSoakStorage;
+
+    /// Reads the generator rows committed to the Delta output.
+    pub(super) struct Rows {
+        table_uri: String,
+        options: HashMap<String, String>,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    /// How often the table holds each `seq` of a sequence of `rows` rows.
+    pub(super) struct Seen {
+        pub distinct: u64,
+        pub first_missing: Option<u64>,
+        duplicates: Vec<u64>,
+        outside: Vec<i64>,
+    }
+
+    impl Seen {
+        pub fn assert_no_duplicates(&self) {
+            assert!(
+                self.duplicates.is_empty() && self.outside.is_empty(),
+                "Delta holds rows twice {:?} or outside the sequence {:?}",
+                &self.duplicates[..self.duplicates.len().min(8)],
+                &self.outside[..self.outside.len().min(8)]
+            );
+        }
+    }
+
+    impl Rows {
+        pub fn new(table_uri: String, storage: &DeltaSoakStorage) -> Self {
+            Self {
+                table_uri,
+                options: storage.options(),
+                runtime: tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Delta reader runtime"),
+            }
+        }
+
+        pub fn counts(&self, rows: u64) -> Result<Seen, String> {
+            let batches = self.runtime.block_on(async {
+                let uri = deltalake::ensure_table_uri(&self.table_uri)
+                    .map_err(|error| format!("invalid Delta table URI: {error}"))?;
+                let table = deltalake::open_table_with_storage_options(uri, self.options.clone())
+                    .await
+                    .map_err(|error| format!("open Delta output: {error}"))?;
+                let context = deltalake::datafusion::prelude::SessionContext::new();
+                table
+                    .update_datafusion_session(&context.state())
+                    .map_err(|error| format!("register Delta object store: {error}"))?;
+                let provider = table
+                    .table_provider()
+                    .build()
+                    .await
+                    .map_err(|error| format!("build Delta table provider: {error}"))?;
+                context
+                    .register_table("generator_delta", Arc::new(provider))
+                    .map_err(|error| format!("register Delta output: {error}"))?;
+                context
+                    .sql("SELECT seq FROM generator_delta")
+                    .await
+                    .map_err(|error| format!("plan Delta scan: {error}"))?
+                    .collect()
+                    .await
+                    .map_err(|error| format!("scan Delta output: {error}"))
+            })?;
+            let mut seqs = Vec::new();
+            for batch in batches {
+                let column = arrow_cast::cast(batch.column(0), &DataType::Int64)
+                    .map_err(|error| format!("cast Delta seq: {error}"))?;
+                let column = column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("Delta seq did not cast to Int64")?;
+                seqs.extend((0..column.len()).map(|row| column.value(row)));
+            }
+            Seen::count(rows, seqs)
+        }
+    }
+
+    impl Seen {
+        pub fn count(rows: u64, seqs: impl IntoIterator<Item = i64>) -> Result<Self, String> {
+            let size = usize::try_from(rows).map_err(|_| "row count exceeds usize")?;
+            let mut counts = vec![0_u32; size];
+            let mut outside = Vec::new();
+            for seq in seqs {
+                match usize::try_from(seq).ok().filter(|seq| *seq < size) {
+                    Some(seq) => counts[seq] += 1,
+                    None => outside.push(seq),
+                }
+            }
+            Ok(Self {
+                distinct: counts.iter().filter(|count| **count > 0).count() as u64,
+                first_missing: counts
+                    .iter()
+                    .position(|count| *count == 0)
+                    .map(|seq| seq as u64),
+                duplicates: (0_u64..)
+                    .zip(&counts)
+                    .filter(|(_, count)| **count > 1)
+                    .map(|(seq, _)| seq)
+                    .collect(),
+                outside,
+            })
+        }
+    }
+
+    #[test]
+    fn delta_rows_are_counted_once_each() {
+        let once = Seen::count(4, [2, 0, 3, 1]).unwrap();
+        assert_eq!((once.distinct, once.first_missing), (4, None));
+        once.assert_no_duplicates();
+        let partial = Seen::count(4, [0, 2]).unwrap();
+        assert_eq!((partial.distinct, partial.first_missing), (2, Some(1)));
+        let doubled = Seen::count(4, [0, 1, 1]).unwrap();
+        assert!(std::panic::catch_unwind(|| doubled.assert_no_duplicates()).is_err());
+        let outside = Seen::count(4, [0, 4]).unwrap();
+        assert!(std::panic::catch_unwind(|| outside.assert_no_duplicates()).is_err());
+    }
+}
+
 /// Top-level server configuration declaring the view; it must precede every TOML table.
 fn view(splits: u64) -> String {
     let lanes = 2 * splits;
@@ -148,7 +410,8 @@ SELECT seq % {lanes} AS lane, COUNT(*) AS n, SUM(seq) AS total FROM gen GROUP BY
     )
 }
 
-fn source(splits: u64, rps: u64) -> String {
+fn source(splits: u64, rps: u64, max_rows: Option<u64>) -> String {
+    let max_rows = max_rows.map_or_else(String::new, |rows| format!("\"max.rows\" = \"{rows}\"\n"));
     format!(
         r#"
 [[source]]
@@ -158,7 +421,7 @@ connector = "generator"
 splits = "{splits}"
 "rows.per.second" = "{rps}"
 "batch.max.size" = "64"
-"#
+{max_rows}"#
     )
 }
 
@@ -304,19 +567,31 @@ impl LaneReader {
         epoch: u64,
         within: Duration,
     ) -> (u64, Vec<u64>) {
-        let mut newest = None;
-        wait_for(
+        self.newest_where(
+            nodes,
             &format!("a committed read above epoch {epoch}"),
             within,
-            || {
-                assert_running_nodes(nodes);
-                self.assert_running();
-                newest = lock(&self.evidence)
-                    .newest()
-                    .filter(|(read, _)| *read > epoch);
-                newest.is_some()
-            },
-        );
+            |read, _| read > epoch,
+        )
+    }
+
+    /// The newest checked epoch once it satisfies `accept`.
+    fn newest_where(
+        &mut self,
+        nodes: &mut [Node],
+        what: &str,
+        within: Duration,
+        accept: impl Fn(u64, &[u64]) -> bool,
+    ) -> (u64, Vec<u64>) {
+        let mut newest = None;
+        wait_for(what, within, || {
+            assert_running_nodes(nodes);
+            self.assert_running();
+            newest = lock(&self.evidence)
+                .newest()
+                .filter(|(epoch, read)| accept(*epoch, read));
+            newest.is_some()
+        });
         newest.expect("committed read wait completed without a read")
     }
 

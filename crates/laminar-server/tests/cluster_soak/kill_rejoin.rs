@@ -22,6 +22,7 @@ use super::{
 };
 
 pub(super) struct SoakSettings {
+    pub delivery: JoinDelivery,
     pub interval_ms: u64,
     pub checkpoint_timeout: Duration,
     pub recovery_ceiling: Duration,
@@ -32,17 +33,15 @@ pub(super) struct SoakSettings {
 }
 
 impl SoakSettings {
-    pub fn from_environment() -> Self {
+    pub fn from_environment(delivery: JoinDelivery) -> Self {
         let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
         assert!(
             interval_ms >= 100,
             "LAMINAR_SOAK_INTERVAL_MS must be at least 100"
         );
         let recovery_ceiling = recovery_ceiling();
-        let checkpoint_timeout = configured_cluster_checkpoint_timeout(
-            JoinDelivery::AtLeastOnce,
-            custom_s3_endpoint_configured(),
-        );
+        let checkpoint_timeout =
+            configured_cluster_checkpoint_timeout(delivery, custom_s3_endpoint_configured());
         validate_checkpoint_liveness(interval_ms, checkpoint_timeout, recovery_ceiling);
         let kills = env_u64("LAMINAR_SOAK_KILLS", 4);
         assert!(
@@ -52,6 +51,7 @@ impl SoakSettings {
         let rps = env_u64("LAMINAR_SOAK_RPS", 400);
         assert!(rps > 0, "LAMINAR_SOAK_RPS must be greater than zero");
         Self {
+            delivery,
             interval_ms,
             checkpoint_timeout,
             recovery_ceiling,
@@ -63,7 +63,7 @@ impl SoakSettings {
     }
 }
 
-/// Write each node's at-least-once configuration: `preamble` holds the top-level keys that must
+/// Write each node's configuration: `preamble` holds the top-level keys that must
 /// precede every TOML table, `workload` the source, pipeline and sink tables.
 pub(super) fn cluster_nodes(
     executable: &Arc<ResolvedExecutable>,
@@ -84,7 +84,7 @@ pub(super) fn cluster_nodes(
                     settings.checkpoint_timeout,
                     settings.key_groups,
                     checkpoint_url,
-                    JoinDelivery::AtLeastOnce,
+                    settings.delivery,
                 )
             );
             let config_path = dir.join(format!("node{id}.toml"));

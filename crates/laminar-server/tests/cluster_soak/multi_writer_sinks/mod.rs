@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSettings};
 use super::{
     cluster_kafka_partition_count, kafka_create_topic, scoped_soak_storage_url, soak_run_id,
-    wait_for_converged_durable_checkpoint, wait_until, ResolvedExecutable, NODES,
+    wait_for_converged_durable_checkpoint, wait_until, JoinDelivery, ResolvedExecutable, NODES,
     SOAK_PRODUCER_MAX_IN_FLIGHT,
 };
 
@@ -404,7 +404,7 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
     );
     executable.describe();
-    let settings = SoakSettings::from_environment();
+    let settings = SoakSettings::from_environment(JoinDelivery::AtLeastOnce);
     let partitions = cluster_kafka_partition_count();
     let brokers = setting("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS", None);
     let run_id = soak_run_id();

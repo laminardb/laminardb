@@ -317,7 +317,7 @@ mod splits {
     }
 
     #[test]
-    fn split_contract_is_placed_and_certified_on_one_node_only() {
+    fn split_contract_is_placed_and_certified_for_exactly_once() {
         let contract = GeneratorSource::default().contract(&config(4, 10)).unwrap();
         assert_eq!(contract.topology, SourceTopology::Splittable);
         assert_eq!(
@@ -328,7 +328,7 @@ mod splits {
             })
         );
         assert!(contract.is_exact_delivery_certified());
-        assert!(!contract.is_cluster_exact_delivery_certified());
+        assert!(contract.is_cluster_exact_delivery_certified());
 
         let unsplit = GeneratorSource::default()
             .contract(&ConnectorConfig::new("generator"))

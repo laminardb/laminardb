@@ -262,7 +262,6 @@ impl SourceConnector for GeneratorSource {
             .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
             .with_exact_delivery_certification());
         };
-        // Certified on one node; cluster exactly-once needs its own certification.
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
@@ -270,6 +269,7 @@ impl SourceConnector for GeneratorSource {
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
         .with_exact_delivery_certification()
+        .with_cluster_exact_delivery_certification()
         .with_placement(SourceChannelPlacement {
             channels,
             route: split::ROUTE,

@@ -41,7 +41,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | OpenTelemetry | BE | rejected |
 | FIX TagValue | EO, ALO | rejected |
 | Generator | EO, ALO, BE | rejected |
-| Generator (splits) | EO, ALO, BE | ALO |
+| Generator (splits) | EO, ALO, BE | EO, ALO |
 
 ### Sinks
 
@@ -100,7 +100,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — |
 | FIX TagValue | — | — | — | — | — | — | — | — | — | — | — | — |
 | Generator | — | — | — | — | — | — | — | — | — | — | — | — |
-| Generator (splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Generator (splits) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 
 <!-- delivery-matrix:end -->
 
@@ -113,9 +113,12 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 |---|---|---|
 | Kafka → Delta Lake append (S3/S3A) | Cluster | `three_node_eo_join_kill9_soak`: repeated `kill -9` of the leader and followers inside checkpoints, and leaders frozen with `SIGSTOP` at the committed-index and sink-commit gates, then resumed after a successor commits; the stale leader must fence itself and exit. Frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Iceberg append (REST + S3) | Cluster | `three_node_eo_join_kill9_soak`: the same join also writes to Iceberg through every `kill -9` and paused-leader round; the table's data files must hold every join pair exactly once, and every snapshot must belong to exactly one checkpoint. `iceberg_cluster_soak`: leader killed at the external commit gate and restarted; one snapshot per checkpoint and an exact data-file oracle. |
+| Generator (splits) → Delta Lake append (S3/S3A) | Cluster | `generator_splits::three_node_generator_splits_delta_eo_kill9_soak` (candidate): `kill -9` of the leader and each follower inside a checkpoint, each restarted and rejoining while the bounded sequence still runs. After every round the Delta table may hold no row twice, and when the sequence ends it must hold each row exactly once; committed view reads on every node must hold an exact prefix of every split. It has no paused-leader or sink-commit-gate faults. Emulated S3 (SeaweedFS). |
+| Generator (splits) → Iceberg append (REST + S3) | Cluster | Admitted through the Iceberg sink's certification (the Kafka → Iceberg row); no leg writes a split generator to Iceberg. |
 | Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |
+| Generator (splits) → managed state | Embedded / single-node | `local_exact_source_state_kill9_soak` with `LAMINAR_SOAK_SPLITS=4` (candidate step): `kill -9` inside a checkpoint while the finite source moves and three times after it is exhausted; each recovery must restore the exact aggregate of the finite prefix, from a cursor with one offset per split, without replaying input. `crates/laminar-db/tests/generator_splits.rs` restarts an embedded split generator under exactly-once. |
 
 ## Evidence for cluster at-least-once sinks
 
