@@ -253,7 +253,7 @@ impl SingletonPlacement {
         };
         checkpoint
             .set_input_channels(channels)
-            .expect("at most one channel is always ordered");
+            .expect("the channel identity was validated at placement");
         if let Some(version) = NonZeroU64::new(self.reconciled) {
             checkpoint.bind_assignment_version(version);
         }
@@ -278,6 +278,8 @@ pub(crate) fn place(
     if contract.topology == SourceTopology::Singleton
         && super::source_admission::cluster_assignment_scoped(contract)
     {
+        // The catalog name is the channel identity; refuse one the cursor format reserves.
+        SourceCheckpoint::new().set_input_channels(vec![name.as_bytes().to_vec()])?;
         return Ok(Box::new(SingletonPlacement::new(
             name,
             connector,
@@ -362,7 +364,7 @@ impl SourceConnector for SingletonPlacement {
         let mut checkpoint = self.inner.resolve_initial_position(config).await?;
         checkpoint
             .set_input_channels(vec![self.channel.clone()])
-            .expect("one channel is always ordered");
+            .expect("the channel identity was validated at placement");
         Ok(checkpoint)
     }
 
@@ -575,6 +577,8 @@ mod tests {
         delivered: u64,
         /// Starts still to refuse as if the broker were unreachable.
         refusals: usize,
+        /// Acknowledgements still to refuse the same way.
+        ack_refusals: usize,
     }
 
     fn position(position: &SourcePosition) -> String {
@@ -635,6 +639,12 @@ mod tests {
             _epoch: u64,
             checkpoint: &SourceCheckpoint,
         ) -> Result<(), ConnectorError> {
+            if self.ack_refusals > 0 {
+                self.ack_refusals -= 1;
+                return Err(ConnectorError::ConnectionFailed(
+                    "broker unreachable".into(),
+                ));
+            }
             let delivered = checkpoint.get_offset("delivered").unwrap_or("-");
             self.events.lock().push(Event::Ack(delivered.into()));
             Ok(())
@@ -656,11 +666,13 @@ mod tests {
         }
 
         fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-            Ok(SourceContract::new(
-                SourceConsistency::CommitCoupled,
-                SourceTopology::Singleton,
-                SourceInputMode::AppendOnly,
-            ))
+            Ok(
+                laminar_connectors::testing::with_cluster_singleton_placement(SourceContract::new(
+                    SourceConsistency::CommitCoupled,
+                    SourceTopology::Singleton,
+                    SourceInputMode::AppendOnly,
+                )),
+            )
         }
     }
 
@@ -672,11 +684,12 @@ mod tests {
 
     impl Node {
         async fn new(id: u64) -> Self {
-            Self::with(id, 0, recorded_schema()).await
+            Self::with(id, 0, 0, recorded_schema()).await
         }
 
-        /// A node whose connector refuses its first `refusals` starts, admitted with `admitted`.
-        async fn with(id: u64, refusals: usize, admitted: SchemaRef) -> Self {
+        /// A node whose connector refuses its first `refusals` starts and `ack_refusals`
+        /// acknowledgements, admitted with `admitted`.
+        async fn with(id: u64, refusals: usize, ack_refusals: usize, admitted: SchemaRef) -> Self {
             let events = Arc::new(Mutex::new(Vec::new()));
             let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
             let mut source = SingletonPlacement::new(
@@ -686,6 +699,7 @@ mod tests {
                     open: false,
                     delivered: 0,
                     refusals,
+                    ack_refusals,
                 }),
                 Some(admitted),
             );
@@ -903,7 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_open_is_retried_by_the_next_read() {
-        let mut a = Node::with(1, 1, recorded_schema()).await;
+        let mut a = Node::with(1, 1, 0, recorded_schema()).await;
         a.publish(1, 1);
         let error = a.source.poll_batch(8).await.unwrap_err();
         assert!(error.is_transient(), "{error}");
@@ -919,7 +933,7 @@ mod tests {
     #[tokio::test]
     async fn an_opened_singleton_must_produce_its_admitted_schema() {
         let other = Arc::new(Schema::new(vec![Field::new("m", DataType::Utf8, true)]));
-        let mut a = Node::with(1, 0, Arc::clone(&other)).await;
+        let mut a = Node::with(1, 0, 0, Arc::clone(&other)).await;
         assert_eq!(a.source.schema(), other);
         a.publish(1, 1);
         let error = a.source.poll_batch(8).await.unwrap_err();
@@ -934,5 +948,50 @@ mod tests {
             [Event::Start("initial".into()), Event::Close],
             "the mismatched connector is still closed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_handoff_acknowledgement_is_retried_before_the_close() {
+        let mut a = Node::with(1, 0, 1, recorded_schema()).await;
+        a.publish(1, 1);
+        a.poll().await.unwrap();
+        begin(&mut [&mut a], round(1)).await;
+        let handoff = Arc::new(a.source.checkpoint());
+        a.source
+            .finish_drain(
+                SourceDrainSettlement::commit(round(1), CheckpointAttempt::canonical(3), handoff),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        a.publish(2, 2);
+        let error = a.source.poll_batch(8).await.unwrap_err();
+        assert!(error.is_transient(), "{error}");
+        assert_eq!(
+            a.source.checkpoint().input_channels(),
+            Some(&[][..]),
+            "the donor no longer claims the channel it is releasing"
+        );
+        assert!(a.poll().await.is_none());
+        assert_eq!(
+            a.events(),
+            [
+                Event::Start("initial".into()),
+                Event::Ack("1".into()),
+                Event::Close
+            ]
+        );
+    }
+
+    #[test]
+    fn a_source_named_like_the_reserved_channel_is_refused() {
+        let recorder = Recorder {
+            events: Arc::default(),
+            open: false,
+            delivered: 0,
+            refusals: 0,
+            ack_refusals: 0,
+        };
+        assert!(place("\0", Box::new(recorder), &ConnectorConfig::new("recorder")).is_err());
     }
 }
