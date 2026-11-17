@@ -2,10 +2,12 @@
 
 Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27,
 re-approved 2026-10-31, two unmaintained-crate exceptions added 2026-11-05, instant and
-pin-utils exceptions removed 2026-11-10; all expire at
+pin-utils exceptions removed 2026-11-10, chrono, chrono-tz and humantime exceptions added
+2026-11-17; all expire at
 2026-11-30 UTC (CI fails on that date).
 Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
-The four residual exceptions below were re-reviewed and accepted for this interval under S4.
+The four residual exceptions below were re-reviewed and accepted for this interval under S4; the
+chrono, chrono-tz and humantime exceptions joined them on 2026-11-17.
 Machine-readable versions, sources, checksums and reasons are in `dependency-exceptions.json`.
 
 | Advisory | Pinned crate | Accepted residual risk |
@@ -14,6 +16,9 @@ Machine-readable versions, sources, checksums and reasons are in `dependency-exc
 | [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | paste 1.0.15 | Unmaintained compile-time dependency through DataFusion/Parquet/tokenizers. |
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | proc-macro-error2 2.0.1 | Unmaintained compile-time dependency through validator_derive in Delta Lake. |
 | [RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440.html) | astral-tokio-tar 0.6.2 | Unmaintained since 2026-11-03, no maintained release. Test-only: reached through testcontainers 0.27.2 (0.28.0 still requires it), a laminar-connectors dev-dependency; no shipped build compiles it. |
+| [RUSTSEC-2026-0542](https://rustsec.org/advisories/RUSTSEC-2026-0542.html) | humantime 2.3.0 | Unmaintained with chrono, no maintained release. Reached through deltalake-core, object_store 0.13 and humantime-serde (laminar-server's duration settings). |
+| [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html) | chrono 0.4.45 | Unmaintained, no maintained release. A foundational dependency of Arrow, DataFusion, Parquet, iceberg, Delta Lake and the workspace. |
+| [RUSTSEC-2026-0555](https://rustsec.org/advisories/RUSTSEC-2026-0555.html) | chrono-tz 0.10.4 | Unmaintained with chrono, no maintained release. Reached through arrow-array's time-zone support. |
 
 Thirteen zstd advisories published in October 2026 were excepted on 2026-10-27 ([PR #637](https://github.com/laminardb/laminardb/pull/637)),
 with the same deadline. They are fixed only in zstd 0.14.3 and zstd-safe 8.2.0, but DataFusion
@@ -60,7 +65,7 @@ only while the explicit XML publication exception is current; missing acceptance
 blocks upload. `--publication` on the guard checks that exception without uploading anything.
 Remove the patch and XML exceptions when the
 current object_store/OpenDAL generation accepts a fixed release, or after a separately
-validated analytical dependency migration. Revisit the four residual findings before expiry;
+validated analytical dependency migration. Revisit the seven residual findings before expiry;
 there is no automatic extension.
 
 Re-review on 2026-09-21: crates.io still lists object_store 0.13.2 as the latest 0.13 release,
