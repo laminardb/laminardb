@@ -1,7 +1,7 @@
 //! File source connector implementing [`SourceConnector`].
 //!
-//! Watches a local directory for new files, decodes them using the
-//! configured format (CSV, JSON, text, Parquet), and produces `RecordBatch`es.
+//! Watches a local directory or lists an object-store directory for new files, decodes them
+//! using the configured format (CSV, JSON, text, Parquet), and produces `RecordBatch`es.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -22,41 +22,18 @@ use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
-use super::config::{local_files_path, FileFormat, FileSourceConfig};
+use super::config::{FileFormat, FileSourceConfig};
 use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
+use super::ingestion_position::{ingestion_checkpoint, restore_ingestion_position, FileProgress};
 use super::json_documents::JsonDocumentsDecoder;
 use super::manifest::FileIngestionManifest;
+use super::remote::ObjectStoreReader;
 use super::text_decoder::TextLineDecoder;
 
 const DISCOVERY_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const FILE_CHECKPOINT_CONNECTOR: &str = "files";
-const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
-const FILE_CHECKPOINT_VERSION: &str = "1";
-
-fn validate_file_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-    match checkpoint.get_metadata("connector") {
-        Some(FILE_CHECKPOINT_CONNECTOR) => {}
-        Some(connector) => {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "file checkpoint belongs to connector '{connector}'"
-            )));
-        }
-        None => {
-            return Err(ConnectorError::ConfigurationError(
-                "file checkpoint is missing connector identity".into(),
-            ));
-        }
-    }
-    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(FILE_CHECKPOINT_VERSION) {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "file checkpoint requires {CHECKPOINT_VERSION_METADATA}={FILE_CHECKPOINT_VERSION}"
-        )));
-    }
-    Ok(())
-}
 
 #[async_trait]
-trait FileReader: Send + Sync {
+pub(super) trait FileReader: Send + Sync {
     async fn read(
         &self,
         path: &str,
@@ -75,16 +52,6 @@ impl FileReader for LocalFileReader {
     ) -> Result<Vec<u8>, ConnectorError> {
         read_file_bytes(path, task_guard).await
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileProgress {
-    path: String,
-    size: u64,
-    modified_ms: u64,
-    content_sha256: String,
-    next_row: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +94,8 @@ pub struct FileSource {
     current_file: Option<DecodedFile>,
     /// File bytes provider. Local filesystem I/O in production; injectable in tests.
     reader: Arc<dyn FileReader>,
+    /// Replaces the store a remote `path` names; tests install an in-memory one.
+    remote_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Whether the connector has started.
     is_open: bool,
     /// A failed, timed-out, or cancelled shutdown permanently retires this instance.
@@ -160,6 +129,7 @@ impl FileSource {
             pending_files: VecDeque::new(),
             current_file: None,
             reader: Arc::new(LocalFileReader),
+            remote_store: None,
             is_open: false,
             restart_forbidden: false,
             task_owner,
@@ -252,7 +222,8 @@ impl SourceConnector for FileSource {
         #[cfg_attr(not(feature = "fpml"), allow(unused_mut))]
         let mut src_config = FileSourceConfig::from_connector_config(&config)?;
         // Validate cursor evidence before metadata I/O. Never repair corrupt progress by discovery.
-        let (manifest, progress) = restore_ingestion_position(position)?;
+        let (manifest, progress) =
+            restore_ingestion_position(position, src_config.remote.is_some())?;
         self.prepare_reader_contract(&mut config, saved, resumed, &src_config)
             .await?;
         let format = src_config
@@ -302,28 +273,7 @@ impl SourceConnector for FileSource {
             None => super::schema_resolution::output_schema(&schema, src_config.include_metadata)?,
         };
 
-        // Start discovery engine with a snapshot of the current manifest for dedup.
-        let discovery_config = DiscoveryConfig {
-            path: src_config.path.clone(),
-            poll_interval: src_config.poll_interval,
-            stabilisation_delay: src_config.stabilisation_delay,
-            glob_pattern: src_config.glob_pattern.clone(),
-        };
-        let known = Arc::new(manifest.snapshot_for_dedup());
-        let discovery_guard = self
-            .task_owner
-            .track()
-            .expect("live file source cannot have a retired task owner");
-        let initial_scan_guard = self
-            .task_owner
-            .track()
-            .expect("live file source cannot have a retired task owner");
-        let discovery = FileDiscoveryEngine::start(
-            discovery_config,
-            known,
-            discovery_guard,
-            initial_scan_guard,
-        );
+        let discovery = self.start_discovery(&src_config, &config, &manifest)?;
 
         self.config = Some(src_config);
         self.schema = final_schema;
@@ -444,29 +394,19 @@ impl SourceConnector for FileSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new();
-        cp.set_metadata("connector", FILE_CHECKPOINT_CONNECTOR);
-        cp.set_metadata(CHECKPOINT_VERSION_METADATA, FILE_CHECKPOINT_VERSION);
-        if let Some(binding) = &self.schema_contract {
-            cp.set_metadata("schema.contract", binding);
-        }
-        self.manifest.to_checkpoint(&mut cp);
-        if let Some(file) = &self.current_file {
-            let progress = FileProgress {
-                path: file.discovered.path.clone(),
-                size: file.discovered.size,
-                modified_ms: file.discovered.modified_ms,
-                content_sha256: file.content_sha256.clone(),
-                next_row: u64::try_from(file.next_row)
-                    .expect("Arrow record counts are representable as u64"),
-            };
-            cp.set_offset(
-                "file_progress",
-                serde_json::to_string(&progress)
-                    .expect("file progress contains only infallibly serializable fields"),
-            );
-        }
-        cp
+        let progress = self.current_file.as_ref().map(|file| FileProgress {
+            path: file.discovered.path.clone(),
+            size: file.discovered.size,
+            modified_ms: file.discovered.modified_ms,
+            content_sha256: file.content_sha256.clone(),
+            next_row: u64::try_from(file.next_row)
+                .expect("Arrow record counts are representable as u64"),
+        });
+        ingestion_checkpoint(
+            &self.manifest,
+            progress.as_ref(),
+            self.schema_contract.as_deref(),
+        )
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -474,16 +414,26 @@ impl SourceConnector for FileSource {
             .await
     }
 
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        // Replayability is backed by an exact processed-path inventory plus an
-        // exact file/row cursor for a partially emitted file. Configuration rejects remote
-        // backends, so the files are always on the local filesystem.
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        // Replayability is backed by an exact processed-path inventory plus an exact file/row
+        // cursor for a partially emitted file. An object-store directory is reachable from every
+        // node; a local one only from the node whose disk holds it.
+        let remote = config
+            .get("path")
+            .map(|path| super::remote::RemoteDirectory::parse(path, config.get("glob_pattern")))
+            .transpose()?
+            .flatten()
+            .is_some();
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
         )
-        .with_locality(SourceLocality::LocalFiles))
+        .with_locality(if remote {
+            SourceLocality::Portable
+        } else {
+            SourceLocality::LocalFiles
+        }))
     }
 }
 
@@ -537,6 +487,53 @@ impl FileSource {
             .map_err(|_| ConnectorError::Internal("schema encoding is not UTF8".into()))?;
 
         Ok(())
+    }
+
+    /// Starts listing the source directory, skipping the files `manifest` holds. A remote
+    /// directory also switches the reader to its object store.
+    fn start_discovery(
+        &mut self,
+        src_config: &FileSourceConfig,
+        config: &ConnectorConfig,
+        manifest: &FileIngestionManifest,
+    ) -> Result<FileDiscoveryEngine, ConnectorError> {
+        let known = Arc::new(manifest.snapshot_for_dedup());
+        let discovery_guard = self
+            .task_owner
+            .track()
+            .expect("live file source cannot have a retired task owner");
+        let Some(directory) = &src_config.remote else {
+            let initial_scan_guard = self
+                .task_owner
+                .track()
+                .expect("live file source cannot have a retired task owner");
+            return Ok(FileDiscoveryEngine::start(
+                DiscoveryConfig {
+                    path: src_config.path.clone(),
+                    poll_interval: src_config.poll_interval,
+                    stabilisation_delay: src_config.stabilisation_delay,
+                    glob_pattern: src_config.glob_pattern.clone(),
+                },
+                known,
+                discovery_guard,
+                initial_scan_guard,
+            ));
+        };
+        let store = match &self.remote_store {
+            Some(store) => Arc::clone(store),
+            None => directory.connect(&config.properties_with_prefix("storage."))?,
+        };
+        self.reader = Arc::new(ObjectStoreReader::new(
+            Arc::clone(&store),
+            u64::try_from(src_config.max_file_bytes).unwrap_or(u64::MAX),
+        ));
+        Ok(FileDiscoveryEngine::start_remote(
+            store,
+            directory.clone(),
+            src_config.poll_interval,
+            known,
+            discovery_guard,
+        ))
     }
 
     async fn load_file(
@@ -848,60 +845,11 @@ pub(super) fn append_metadata_column(
     .map_err(|e| ConnectorError::ReadError(format!("metadata append error: {e}")))
 }
 
-fn restore_ingestion_position(
-    position: SourcePosition,
-) -> Result<(FileIngestionManifest, Option<FileProgress>), ConnectorError> {
-    Ok(match position {
-        SourcePosition::Initial => (FileIngestionManifest::new(), None),
-        SourcePosition::Initialized { .. } => {
-            return Err(ConnectorError::ConfigurationError(
-                "file source has no sealed topology startup contract".into(),
-            ));
-        }
-        SourcePosition::Resume {
-            attempt,
-            checkpoint,
-        } => {
-            validate_file_checkpoint(&checkpoint)?;
-            if checkpoint.get_offset("manifest").is_none() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file checkpoint {attempt:?} is missing required manifest state"
-                )));
-            }
-            let manifest = FileIngestionManifest::from_checkpoint(&checkpoint).map_err(|e| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid file manifest in checkpoint {attempt:?}: {e}"
-                ))
-            })?;
-            let progress = checkpoint
-                .get_offset("file_progress")
-                .map(serde_json::from_str::<FileProgress>)
-                .transpose()
-                .map_err(|e| {
-                    ConnectorError::ConfigurationError(format!(
-                        "invalid file progress in checkpoint {attempt:?}: {e}"
-                    ))
-                })?
-                .map(|mut progress| {
-                    progress.path = local_files_path(&progress.path)?;
-                    Ok::<_, ConnectorError>(progress)
-                })
-                .transpose()?;
-            if progress
-                .as_ref()
-                .is_some_and(|p| manifest.contains(&p.path) || p.next_row == 0)
-            {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file checkpoint {attempt:?} contains contradictory progress"
-                )));
-            }
-            (manifest, progress)
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::ingestion_position::{
+        CHECKPOINT_VERSION_METADATA, FILE_CHECKPOINT_CONNECTOR, FILE_CHECKPOINT_VERSION,
+    };
     use super::*;
     use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
     use laminar_core::checkpoint::CheckpointAttempt;
@@ -1544,5 +1492,122 @@ mod tests {
             .expect("static file contract");
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
+
+    #[test]
+    fn only_a_local_directory_is_bound_to_one_node() {
+        let locality = |path: &str| {
+            let mut config = ConnectorConfig::new("files");
+            config.set("path", path);
+            config.set("format", "json");
+            FileSource::new().contract(&config).unwrap().locality
+        };
+        assert_eq!(locality("/data/landing"), SourceLocality::LocalFiles);
+        assert_eq!(locality("s3://bucket/landing"), SourceLocality::Portable);
+    }
+
+    async fn put(store: &object_store::memory::InMemory, key: &str, body: &[u8]) {
+        use object_store::ObjectStoreExt as _;
+        store
+            .put(
+                &object_store::path::Path::from(key),
+                object_store::PutPayload::from(body.to_vec()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A text source over `store` as the directory `s3://bucket/landing`.
+    async fn started_object_store_source(
+        store: &Arc<object_store::memory::InMemory>,
+        position: SourcePosition,
+    ) -> FileSource {
+        let mut config = ConnectorConfig::new("files");
+        config.set("path", "s3://bucket/landing");
+        config.set("format", "text");
+        config.set("poll_interval", "5ms");
+        let mut source = FileSource::new();
+        source.remote_store = Some(Arc::clone(store) as Arc<dyn object_store::ObjectStore>);
+        source.start(start_request(config, position)).await.unwrap();
+        source
+    }
+
+    fn resume_from(checkpoint: SourceCheckpoint) -> SourcePosition {
+        SourcePosition::Resume {
+            attempt: CheckpointAttempt::canonical(3),
+            checkpoint,
+        }
+    }
+
+    fn text_lines(batch: &SourceBatch) -> Vec<String> {
+        let column = batch
+            .records
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        column.iter().flatten().map(str::to_owned).collect()
+    }
+
+    /// The next batch of at most `max_records` lines, waiting for discovery.
+    async fn next_lines(source: &mut FileSource, max_records: usize) -> Vec<String> {
+        for _ in 0..200 {
+            if let Some(batch) = source.poll_batch(max_records).await.unwrap() {
+                return text_lines(&batch);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("no batch within a second");
+    }
+
+    /// Lines read until the source stays empty.
+    async fn read_lines(source: &mut FileSource) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut idle = 0;
+        while idle < 20 {
+            let Some(batch) = source.poll_batch(64).await.unwrap() else {
+                idle += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            };
+            idle = 0;
+            lines.extend(text_lines(&batch));
+        }
+        lines
+    }
+
+    #[tokio::test]
+    async fn an_object_store_directory_is_read_and_resumed_by_object_key() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        put(&store, "a.txt", b"one\ntwo\n").await;
+        put(&store, "b.txt", b"three\n").await;
+
+        let mut first = started_object_store_source(&store, SourcePosition::Initial).await;
+        assert_eq!(read_lines(&mut first).await, ["one", "two", "three"]);
+        assert!(first.manifest.contains("a.txt") && first.manifest.contains("b.txt"));
+        let checkpoint = first.checkpoint();
+        first.close().await.unwrap();
+
+        put(&store, "c.txt", b"four\n").await;
+        let mut resumed = started_object_store_source(&store, resume_from(checkpoint)).await;
+        assert_eq!(read_lines(&mut resumed).await, ["four"]);
+        resumed.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_object_store_file_resumes_at_its_next_row() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        put(&store, "a.txt", b"one\ntwo\nthree\n").await;
+
+        let mut first = started_object_store_source(&store, SourcePosition::Initial).await;
+        assert_eq!(next_lines(&mut first, 1).await, ["one"]);
+        let checkpoint = first.checkpoint();
+        assert!(checkpoint.get_offset("file_progress").is_some());
+        first.close().await.unwrap();
+
+        let mut resumed = started_object_store_source(&store, resume_from(checkpoint)).await;
+        assert_eq!(read_lines(&mut resumed).await, ["two", "three"]);
+        assert!(resumed.manifest.contains("a.txt"));
+        resumed.close().await.unwrap();
     }
 }

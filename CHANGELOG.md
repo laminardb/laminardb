@@ -27,6 +27,16 @@
   checkpoint has a new format, so a source cannot resume across adding or removing `read.splits`.
   Without `read.splits` the source is unchanged.
 
+- The files source reads an object-store directory: `path` may be an `s3://`, `s3a://`, `gs://`,
+  `az://`, `abfss://` or `wasbs://` URL, with credentials from `storage.*` options or the
+  environment, as for Delta Lake. The source lists the directory's direct children every
+  `poll_interval` (which must be greater than zero), reads new objects in key order, and records
+  each object's key relative to the directory in its checkpoint, so a resume reads only new objects
+  and continues a partly read one at its next row. Object-store paths take CSV, JSON or text with
+  declared columns; Parquet, Arrow IPC, FpML and schema inference still need a local path, and the
+  files sink stays local. Such a source is at-least-once in embedded and single-node mode; cluster
+  mode still rejects it.
+
 ### Changed
 
 - `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a

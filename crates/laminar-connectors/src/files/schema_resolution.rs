@@ -103,6 +103,13 @@ fn resolve_files(
                 &output_schema(&explicit, parsed.include_metadata)?,
             );
         }
+        if parsed.remote.is_some() {
+            return Err(ConnectorError::FeatureUnsupported(
+                "an object-store CSV/JSON file source needs declared columns; schema inference \
+                 reads local files only"
+                    .into(),
+            ));
+        }
         if !config
             .get_parsed::<bool>("schema.inference")?
             .unwrap_or(false)

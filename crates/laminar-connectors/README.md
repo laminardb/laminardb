@@ -23,7 +23,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; `read.splits` reads appends in parallel, across cluster nodes too; changelog fails closed | Implemented |
-| File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
+| File Auto-Loader | `files` | Local directory watch/glob discovery (Parquet/CSV/JSON), or a listed S3/GCS/Azure directory (CSV/JSON/text) | Implemented |
 | FpML documents | `fpml` | `FORMAT FPML` on the files, Kafka, RabbitMQ, and IBM MQ sources, and `fpml.field` on the FIX source: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
 
 Feature flags compile connector implementations; startup validates the complete source/SQL/sink
@@ -1109,7 +1109,7 @@ requirements:
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
-| `files` | Local file source (auto-loader) and sink (rolling files); remote URLs are rejected |
+| `files` | File source (auto-loader) over a local or object-store directory, and local sink (rolling files); object-store providers come from the `aws`, `gcs` and `azure` features of `laminar-db` or `laminar-server` |
 | `fpml` | FpML format for the files, Kafka, RabbitMQ, and IBM MQ sources and FIX fields; builds a vendored libxml2 with CMake |
 
 ## Custom Connectors

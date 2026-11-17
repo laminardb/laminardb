@@ -8,9 +8,11 @@ use crate::registry::ConnectorRegistry;
 pub mod arrow_ipc_codec;
 pub mod config;
 pub mod discovery;
+mod ingestion_position;
 mod json_documents;
 pub mod manifest;
 mod output_directory;
+mod remote;
 mod schema_resolution;
 pub mod sink;
 pub mod source;
@@ -56,7 +58,11 @@ pub fn register_file_source(
         is_source: true,
         is_sink: false,
         config_keys: vec![
-            ConfigKeySpec::required("path", "Local directory path or glob pattern"),
+            ConfigKeySpec::required(
+                "path",
+                "Local directory path or glob pattern, or an s3://, gs:// or az:// directory \
+                 (credentials from storage.* options or the environment)",
+            ),
             ConfigKeySpec::optional(
                 "format",
                 "Data format (csv, tsv, json, jsonl, text, txt, parquet, arrow)",

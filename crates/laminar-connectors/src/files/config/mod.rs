@@ -11,8 +11,11 @@ use laminar_core::time::parse_duration_str;
 /// Parsed configuration for [`super::source::FileSource`].
 #[derive(Debug, Clone)]
 pub struct FileSourceConfig {
-    /// Local directory path or glob pattern.
+    /// Local directory path or glob pattern, or the object-store URL `remote` was parsed from.
     pub path: String,
+
+    /// Object-store directory when `path` is an `s3://`, `gs://` or `az://` URL.
+    pub(in crate::files) remote: Option<super::remote::RemoteDirectory>,
 
     /// Data format (`csv`, `json`, `text`, `parquet`). `None` = auto-detect.
     pub format: Option<FileFormat>,
@@ -52,17 +55,39 @@ impl FileSourceConfig {
     pub fn from_connector_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let props = config.properties();
 
-        let path = props
+        let raw_path = props
             .get("path")
-            .ok_or_else(|| ConnectorError::ConfigurationError("'path' is required".into()))
-            .and_then(|path| local_files_path(path))?;
+            .ok_or_else(|| ConnectorError::ConfigurationError("'path' is required".into()))?;
+        let glob_pattern = props.get("glob_pattern").cloned();
+        let remote = super::remote::RemoteDirectory::parse(raw_path, glob_pattern.as_deref())?;
+        let path = match &remote {
+            Some(_) => raw_path.clone(),
+            None => local_files_path(raw_path)?,
+        };
 
         let format = props
             .get("format")
             .map(|s| FileFormat::parse(s))
             .transpose()?;
+        if remote.is_some()
+            && !matches!(
+                format.or_else(|| FileFormat::from_extension(&path)),
+                Some(FileFormat::Csv | FileFormat::Json | FileFormat::Text)
+            )
+        {
+            return Err(ConnectorError::FeatureUnsupported(
+                "an object-store file source needs format 'csv', 'json' or 'text'; Parquet, Arrow \
+                 IPC and FpML need a local path"
+                    .into(),
+            ));
+        }
 
         let poll_interval = parse_duration(props, "poll_interval", Duration::from_secs(10))?;
+        if remote.is_some() && poll_interval.is_zero() {
+            return Err(ConnectorError::ConfigurationError(
+                "'poll_interval' must be greater than zero for an object-store directory".into(),
+            ));
+        }
         let stabilisation_delay =
             parse_duration(props, "stabilisation_delay", Duration::from_secs(1))?;
         let max_files_per_poll = parse_usize(props, "max_files_per_poll", 100)?;
@@ -89,8 +114,6 @@ impl FileSourceConfig {
                 "'max_file_bytes' must be greater than zero".into(),
             ));
         }
-        let glob_pattern = props.get("glob_pattern").cloned();
-
         // Default delimiter: tab for tsv, comma otherwise.
         let is_tsv = props
             .get("format")
@@ -103,6 +126,7 @@ impl FileSourceConfig {
 
         Ok(Self {
             path,
+            remote,
             format,
             poll_interval,
             stabilisation_delay,

@@ -1225,6 +1225,21 @@ fn files_source_is_admitted_only_locally() {
         admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster),
         Err("cluster sources cannot read files from one node's local filesystem")
     );
+
+    // Every node can reach an object-store directory, but one directory is one stream.
+    config.set("path", "s3://bucket/in/*.json");
+    let contract = source.contract(&config).unwrap();
+    assert_eq!(contract.locality, SourceLocality::Portable);
+    let admit =
+        |delivery, runtime| admit_source_recovery_contract(contract, delivery, true, runtime);
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local),
+        Ok(())
+    );
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster),
+        Err("cluster singleton sources require a connector that one node at a time may run")
+    );
 }
 
 /// The rejection follows the source's state, not its topology, so it holds for a splittable
