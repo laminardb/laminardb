@@ -20,6 +20,13 @@
   migration can add either source to a running cluster. RabbitMQ with `FORMAT FPML`, MongoDB
   `document` mode and MongoDB's initial snapshot stay rejected in cluster mode.
 
+- The Iceberg source takes `read.splits = n` in append mode. Each data file belongs to one of `n`
+  input channels by a hash of its path, and each channel keeps its own position in the snapshot
+  lineage, so a cluster reads one table on several nodes, each channel on the node that owns the
+  vnode the engine's route gives it. A split Iceberg read runs at-least-once in every mode; its
+  checkpoint has a new format, so a source cannot resume across adding or removing `read.splits`.
+  Without `read.splits` the source is unchanged.
+
 ### Changed
 
 - `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a

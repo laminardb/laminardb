@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
@@ -48,6 +49,8 @@ pub struct IcebergSourceConfig {
     pub scan_channel_capacity: usize,
     /// Maximum concurrent manifest and data-file reads.
     pub scan_concurrency: usize,
+    /// `read.splits`: input channels the data files are hashed into (append mode only).
+    pub splits: Option<NonZeroU32>,
 }
 
 impl IcebergSourceConfig {
@@ -108,6 +111,7 @@ impl IcebergSourceConfig {
             )?,
             scan_channel_capacity: parse_nonzero(config, "read.channel.capacity", 2)?,
             scan_concurrency: parse_nonzero(config, "read.scan.concurrency", 4)?,
+            splits: parse_splits(config, read_mode)?,
         };
         parsed.validate_read_limits()?;
         Ok(parsed)
@@ -169,4 +173,29 @@ impl IcebergSourceConfig {
         }
         Ok(())
     }
+}
+
+fn parse_splits(
+    config: &ConnectorConfig,
+    read_mode: IcebergReadMode,
+) -> Result<Option<NonZeroU32>, ConnectorError> {
+    use laminar_core::state::MAX_KEY_GROUP_COUNT;
+
+    let Some(splits) = config.get_parsed::<u32>("read.splits")? else {
+        return Ok(None);
+    };
+    if read_mode != IcebergReadMode::Append {
+        return Err(ConnectorError::ConfigurationError(
+            "read.splits is only valid when read.mode=append".into(),
+        ));
+    }
+    // More splits than the largest vnode count add no parallelism.
+    if splits > MAX_KEY_GROUP_COUNT {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "read.splits must be at most {MAX_KEY_GROUP_COUNT}"
+        )));
+    }
+    NonZeroU32::new(splits)
+        .map(Some)
+        .ok_or_else(|| ConnectorError::ConfigurationError("read.splits must be > 0".into()))
 }

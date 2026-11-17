@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroU32;
 
 use iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestStatus, Operation,
@@ -11,6 +12,7 @@ use crate::lakehouse::iceberg_config::IcebergSourceConfig;
 use crate::lakehouse::iceberg_scan::{load_manifest, load_manifest_list, ManifestReadLimits};
 
 use super::cursor::IcebergSourceCursorV1;
+use super::split::data_file_channel;
 
 #[derive(Debug)]
 pub(super) struct AddedDataFile {
@@ -44,6 +46,84 @@ pub(super) async fn plan_appends(
         plans.push(AppendSnapshotPlan {
             snapshot,
             added_files,
+            manifest_count,
+        });
+    }
+    Ok(plans)
+}
+
+/// One snapshot of a split source's append lineage: the added files of each owned channel that
+/// has not read this snapshot yet.
+#[derive(Debug)]
+pub(super) struct SplitAppendPlan {
+    pub snapshot: SnapshotRef,
+    pub channels: Vec<(u32, Vec<AddedDataFile>)>,
+    pub manifest_count: usize,
+}
+
+/// Plan the appends after every channel's cursor. Every channel follows the same ref, so each
+/// one's lineage is a suffix of the longest, and one manifest pass serves all of them. A channel
+/// with no added file in a snapshot still gets that snapshot, so every channel advances.
+pub(super) async fn plan_split_appends(
+    table: &Table,
+    cursors: &BTreeMap<u32, IcebergSourceCursorV1>,
+    splits: NonZeroU32,
+    config: &IcebergSourceConfig,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<SplitAppendPlan>, ConnectorError> {
+    let lineages = cursors
+        .iter()
+        .map(|(channel, cursor)| {
+            lineage_after(table, cursor, config.max_snapshots_per_poll)
+                .map(|lineage| (*channel, lineage))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(base) = lineages
+        .iter()
+        .map(|(_, lineage)| lineage)
+        .max_by_key(|lineage| lineage.len())
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    let first_unread_index: Vec<(u32, usize)> = lineages
+        .iter()
+        .map(|(channel, lineage)| {
+            let first = base.len() - lineage.len();
+            let suffix = base[first..].iter().map(|snapshot| snapshot.snapshot_id());
+            if suffix.ne(lineage.iter().map(|snapshot| snapshot.snapshot_id())) {
+                return Err(ConnectorError::ConfigurationError(
+                    "[LDB-ICEBERG-CURSOR-DIVERGED] split channel cursors are not on one lineage"
+                        .into(),
+                ));
+            }
+            Ok((*channel, first))
+        })
+        .collect::<Result<_, _>>()?;
+    let limits = ManifestReadLimits::from_source(config);
+    let mut remaining_files = config.max_planned_files;
+    let mut plans = Vec::with_capacity(base.len());
+    for (index, snapshot) in base.into_iter().enumerate() {
+        let (added_files, manifest_count) =
+            added_files_for_snapshot(table, &snapshot, remaining_files, limits, deadline).await?;
+        remaining_files = remaining_files
+            .checked_sub(added_files.len())
+            .ok_or_else(file_limit_error)?;
+        let mut channels: BTreeMap<u32, Vec<AddedDataFile>> = first_unread_index
+            .iter()
+            .filter(|(_, first_unread)| index >= *first_unread)
+            .map(|(channel, _)| (*channel, Vec::new()))
+            .collect();
+        for added in added_files {
+            if let Some(files) =
+                channels.get_mut(&data_file_channel(added.data_file.file_path(), splits))
+            {
+                files.push(added);
+            }
+        }
+        plans.push(SplitAppendPlan {
+            snapshot,
+            channels: channels.into_iter().collect(),
             manifest_count,
         });
     }

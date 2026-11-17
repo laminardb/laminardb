@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,16 +18,29 @@ use crate::lakehouse::iceberg_scan::{
     bind_filter, connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
 };
 
-use super::append_lineage::{AddedDataFile, AppendSnapshotPlan};
+use super::append_lineage::{AddedDataFile, AppendSnapshotPlan, SplitAppendPlan};
 use super::cursor::IcebergSourceCursorV1;
 use super::read_schema::{ReadProjection, ReadSchemaBinding};
+use super::split::{data_file_channel, ChannelPosition, SnapshotPosition};
+
+/// The position a replay unit makes durable once all of its rows are emitted.
+pub(super) enum Completion {
+    /// A whole snapshot, for an unsplit source.
+    Snapshot(IcebergSourceCursorV1),
+    /// One channel's files of a snapshot.
+    Channel {
+        channel: u32,
+        position: ChannelPosition,
+    },
+}
 
 pub(super) enum ScanOutput {
     Batch {
         batch: RecordBatch,
-        completed_cursor: Option<IcebergSourceCursorV1>,
+        completed: Option<Completion>,
     },
-    Cursor(IcebergSourceCursorV1),
+    /// A replay unit without rows.
+    Completed(Completion),
     ReadMetrics {
         files: u64,
         storage_bytes: u64,
@@ -46,7 +61,17 @@ enum ScanFiles {
 struct ScanPlan {
     snapshot_id: i64,
     files: ScanFiles,
-    cursor: IcebergSourceCursorV1,
+    completion: Completion,
+}
+
+enum ScanStep {
+    Unit(ScanPlan),
+    /// Plan a whole snapshot once and read each listed channel's files as its own replay unit.
+    SplitBootstrap {
+        snapshot: SnapshotPosition,
+        splits: NonZeroU32,
+        channels: Vec<u32>,
+    },
 }
 
 pub(super) fn full_snapshot_task(
@@ -71,11 +96,11 @@ pub(super) fn full_snapshot_task(
         config,
         read_schema,
         predicate,
-        vec![ScanPlan {
+        vec![ScanStep::Unit(ScanPlan {
             snapshot_id,
             files: ScanFiles::All,
-            cursor,
-        }],
+            completion: Completion::Snapshot(cursor),
+        })],
     ))
 }
 
@@ -98,11 +123,11 @@ pub(super) fn append_task(
                 &plan.snapshot,
                 read_schema.schema_id(),
             )?;
-            Ok(ScanPlan {
+            Ok(ScanStep::Unit(ScanPlan {
                 snapshot_id: plan.snapshot.snapshot_id(),
                 files: ScanFiles::Added(plan.added_files),
-                cursor,
-            })
+                completion: Completion::Snapshot(cursor),
+            }))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     Ok(Some(spawn_scan(
@@ -114,12 +139,68 @@ pub(super) fn append_task(
     )))
 }
 
+/// Read the files of `channels` in the whole `snapshot`, one replay unit per channel.
+pub(super) fn split_bootstrap_task(
+    table: Table,
+    config: &IcebergSourceConfig,
+    read_schema: &ReadSchemaBinding,
+    predicate: Option<Predicate>,
+    snapshot: SnapshotPosition,
+    splits: NonZeroU32,
+    channels: Vec<u32>,
+) -> ScanTask {
+    spawn_scan(
+        table,
+        config,
+        read_schema,
+        predicate,
+        vec![ScanStep::SplitBootstrap {
+            snapshot,
+            splits,
+            channels,
+        }],
+    )
+}
+
+/// Read each channel's added files of each snapshot as its own replay unit, in lineage order.
+pub(super) fn split_append_task(
+    table: Table,
+    config: &IcebergSourceConfig,
+    read_schema: &ReadSchemaBinding,
+    predicate: Option<Predicate>,
+    plans: Vec<SplitAppendPlan>,
+) -> Option<ScanTask> {
+    let steps: Vec<ScanStep> = plans
+        .into_iter()
+        .flat_map(|plan| {
+            let snapshot = SnapshotPosition {
+                snapshot_id: plan.snapshot.snapshot_id(),
+                sequence_number: plan.snapshot.sequence_number(),
+            };
+            plan.channels.into_iter().map(move |(channel, files)| {
+                ScanStep::Unit(ScanPlan {
+                    snapshot_id: snapshot.snapshot_id,
+                    files: ScanFiles::Added(files),
+                    completion: Completion::Channel {
+                        channel,
+                        position: ChannelPosition::After(snapshot),
+                    },
+                })
+            })
+        })
+        .collect();
+    if steps.is_empty() {
+        return None;
+    }
+    Some(spawn_scan(table, config, read_schema, predicate, steps))
+}
+
 fn spawn_scan(
     table: Table,
     config: &IcebergSourceConfig,
     read_schema: &ReadSchemaBinding,
     predicate: Option<Predicate>,
-    plans: Vec<ScanPlan>,
+    steps: Vec<ScanStep>,
 ) -> ScanTask {
     let concurrency = config.scan_concurrency;
     let request_timeout = config.storage.request_timeout;
@@ -128,20 +209,29 @@ fn spawn_scan(
     let read_schema = read_schema.clone();
     let (sender, receiver) = mpsc::channel(config.scan_channel_capacity);
     let handle = tokio::spawn(async move {
-        for plan in plans {
-            if let Err(error) = run_plan(
-                &table,
-                predicate.clone(),
-                concurrency,
-                request_timeout,
-                max_planned_files,
-                metadata_limits,
-                plan,
-                &read_schema,
-                &sender,
-            )
-            .await
-            {
+        let reader = ScanReader {
+            table: &table,
+            concurrency,
+            request_timeout,
+            max_planned_files,
+            metadata_limits,
+            read_schema: &read_schema,
+            sender: &sender,
+        };
+        for step in steps {
+            let result = match step {
+                ScanStep::Unit(plan) => reader.run_plan(predicate.clone(), plan).await,
+                ScanStep::SplitBootstrap {
+                    snapshot,
+                    splits,
+                    channels,
+                } => {
+                    reader
+                        .run_split_bootstrap(predicate.clone(), snapshot, splits, channels)
+                        .await
+                }
+            };
+            if let Err(error) = result {
                 let _ = sender.send(Err(error)).await;
                 return;
             }
@@ -154,69 +244,178 @@ fn spawn_scan(
     }
 }
 
-async fn run_plan(
-    table: &Table,
-    predicate: Option<Predicate>,
+/// What every step of one scan task reads with.
+struct ScanReader<'a> {
+    table: &'a Table,
     concurrency: usize,
     request_timeout: std::time::Duration,
     max_planned_files: usize,
     metadata_limits: ManifestReadLimits,
-    plan: ScanPlan,
-    read_schema: &ReadSchemaBinding,
-    sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
-) -> Result<(), ConnectorError> {
-    let ScanPlan {
-        snapshot_id,
-        files,
-        cursor,
-    } = plan;
-    let snapshot = table
-        .metadata()
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| {
-            ConnectorError::ReadError(format!(
-                "[LDB-ICEBERG-SNAPSHOT-MISSING] snapshot {snapshot_id} does not exist"
-            ))
-        })?;
-    let snapshot_schema = snapshot.schema(table.metadata()).map_err(|error| {
-        connector_scan_error(
-            &format!("resolve Iceberg snapshot {snapshot_id} schema"),
-            &error,
-        )
-    })?;
-    let projection = read_schema.projection(&snapshot_schema)?;
-    let tasks = match files {
-        ScanFiles::All => {
-            full_snapshot_tasks(
-                table,
-                snapshot,
-                &projection,
-                predicate,
-                concurrency,
-                max_planned_files,
-                metadata_limits,
-                request_timeout,
+    read_schema: &'a ReadSchemaBinding,
+    sender: &'a mpsc::Sender<Result<ScanOutput, ConnectorError>>,
+}
+
+struct ResolvedSnapshot<'a> {
+    snapshot: &'a SnapshotRef,
+    schema: SchemaRef,
+    projection: Arc<ReadProjection>,
+}
+
+impl ScanReader<'_> {
+    fn resolve_snapshot(&self, snapshot_id: i64) -> Result<ResolvedSnapshot<'_>, ConnectorError> {
+        let snapshot = self
+            .table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| {
+                ConnectorError::ReadError(format!(
+                    "[LDB-ICEBERG-SNAPSHOT-MISSING] snapshot {snapshot_id} does not exist"
+                ))
+            })?;
+        let snapshot_schema = snapshot.schema(self.table.metadata()).map_err(|error| {
+            connector_scan_error(
+                &format!("resolve Iceberg snapshot {snapshot_id} schema"),
+                &error,
             )
-            .await?
-        }
-        ScanFiles::Added(files) => added_file_tasks(
-            table,
-            snapshot_schema,
-            read_schema.field_ids(),
-            predicate.as_ref(),
+        })?;
+        let projection = self.read_schema.projection(&snapshot_schema)?;
+        Ok(ResolvedSnapshot {
+            snapshot,
+            schema: snapshot_schema,
+            projection,
+        })
+    }
+
+    async fn run_plan(
+        &self,
+        predicate: Option<Predicate>,
+        plan: ScanPlan,
+    ) -> Result<(), ConnectorError> {
+        let ScanPlan {
+            snapshot_id,
             files,
-        )?,
-    };
-    read_tasks(
-        table,
-        tasks,
-        cursor,
-        projection,
-        concurrency,
-        request_timeout,
-        sender,
-    )
-    .await
+            completion,
+        } = plan;
+        let resolved = self.resolve_snapshot(snapshot_id)?;
+        let tasks = match files {
+            ScanFiles::All => {
+                full_snapshot_tasks(
+                    self.table,
+                    resolved.snapshot,
+                    &resolved.projection,
+                    predicate,
+                    self.concurrency,
+                    self.max_planned_files,
+                    self.metadata_limits,
+                    self.request_timeout,
+                )
+                .await?
+            }
+            ScanFiles::Added(files) if files.is_empty() => {
+                return send(self.sender, ScanOutput::Completed(completion)).await;
+            }
+            ScanFiles::Added(files) => added_file_tasks(
+                self.table,
+                resolved.schema,
+                self.read_schema.field_ids(),
+                predicate.as_ref(),
+                files,
+            )?,
+        };
+        self.read(tasks, completion, resolved.projection).await
+    }
+
+    /// Plan the whole snapshot once, then read each channel's files as its own replay unit.
+    async fn run_split_bootstrap(
+        &self,
+        predicate: Option<Predicate>,
+        snapshot: SnapshotPosition,
+        splits: NonZeroU32,
+        channels: Vec<u32>,
+    ) -> Result<(), ConnectorError> {
+        let resolved = self.resolve_snapshot(snapshot.snapshot_id)?;
+        let planned = full_snapshot_tasks(
+            self.table,
+            resolved.snapshot,
+            &resolved.projection,
+            predicate,
+            self.concurrency,
+            self.max_planned_files,
+            self.metadata_limits,
+            self.request_timeout,
+        )
+        .await?;
+        let planned: Vec<FileScanTask> =
+            tokio::time::timeout(self.request_timeout, planned.try_collect())
+                .await
+                .map_err(|_| scan_timeout(self.request_timeout))?
+                .map_err(|error| connector_scan_error("Iceberg scan planning failed", &error))?;
+        let mut by_channel: BTreeMap<u32, Vec<FileScanTask>> = channels
+            .into_iter()
+            .map(|channel| (channel, Vec::new()))
+            .collect();
+        for task in planned {
+            if let Some(tasks) =
+                by_channel.get_mut(&data_file_channel(task.data_file_path(), splits))
+            {
+                tasks.push(task);
+            }
+        }
+        for (channel, tasks) in by_channel {
+            let completion = Completion::Channel {
+                channel,
+                position: ChannelPosition::After(snapshot),
+            };
+            if tasks.is_empty() {
+                send(self.sender, ScanOutput::Completed(completion)).await?;
+                continue;
+            }
+            let tasks: FileScanTaskStream =
+                Box::pin(futures_util::stream::iter(tasks.into_iter().map(Ok)));
+            self.read(tasks, completion, Arc::clone(&resolved.projection))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn read(
+        &self,
+        tasks: FileScanTaskStream,
+        completion: Completion,
+        projection: Arc<ReadProjection>,
+    ) -> Result<(), ConnectorError> {
+        let read_files = Arc::new(AtomicU64::new(0));
+        let read_file_counter = Arc::clone(&read_files);
+        let counted_tasks: FileScanTaskStream = Box::pin(tasks.map_ok(move |task| {
+            read_file_counter.fetch_add(1, Ordering::Relaxed);
+            task
+        }));
+        let result = self
+            .table
+            .reader_builder()
+            .with_batch_size(8_192)
+            .with_data_file_concurrency_limit(self.concurrency)
+            .build()
+            .read(counted_tasks)
+            .map_err(|error| connector_scan_error("Iceberg reader creation failed", &error))?;
+        let scan_metrics = result.metrics().clone();
+        send_stream(
+            result.stream(),
+            completion,
+            projection,
+            self.sender,
+            self.request_timeout,
+        )
+        .await?;
+        send(
+            self.sender,
+            ScanOutput::ReadMetrics {
+                files: read_files.load(Ordering::Relaxed),
+                storage_bytes: scan_metrics.bytes_read(),
+            },
+        )
+        .await
+    }
 }
 
 async fn full_snapshot_tasks(
@@ -318,43 +517,9 @@ fn added_file_tasks(
     Ok(Box::pin(futures_util::stream::iter(tasks)))
 }
 
-async fn read_tasks(
-    table: &Table,
-    tasks: FileScanTaskStream,
-    cursor: IcebergSourceCursorV1,
-    projection: Arc<ReadProjection>,
-    concurrency: usize,
-    request_timeout: std::time::Duration,
-    sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
-) -> Result<(), ConnectorError> {
-    let read_files = Arc::new(AtomicU64::new(0));
-    let read_file_counter = Arc::clone(&read_files);
-    let counted_tasks: FileScanTaskStream = Box::pin(tasks.map_ok(move |task| {
-        read_file_counter.fetch_add(1, Ordering::Relaxed);
-        task
-    }));
-    let result = table
-        .reader_builder()
-        .with_batch_size(8_192)
-        .with_data_file_concurrency_limit(concurrency)
-        .build()
-        .read(counted_tasks)
-        .map_err(|error| connector_scan_error("Iceberg reader creation failed", &error))?;
-    let scan_metrics = result.metrics().clone();
-    send_stream(result.stream(), cursor, projection, sender, request_timeout).await?;
-    send(
-        sender,
-        ScanOutput::ReadMetrics {
-            files: read_files.load(Ordering::Relaxed),
-            storage_bytes: scan_metrics.bytes_read(),
-        },
-    )
-    .await
-}
-
 async fn send_stream(
     mut stream: ArrowRecordBatchStream,
-    cursor: IcebergSourceCursorV1,
+    completion: Completion,
     projection: Arc<ReadProjection>,
     sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
     request_timeout: std::time::Duration,
@@ -378,7 +543,7 @@ async fn send_stream(
                 sender,
                 ScanOutput::Batch {
                     batch,
-                    completed_cursor: None,
+                    completed: None,
                 },
             )
             .await?;
@@ -389,12 +554,12 @@ async fn send_stream(
             sender,
             ScanOutput::Batch {
                 batch,
-                completed_cursor: Some(cursor),
+                completed: Some(completion),
             },
         )
         .await
     } else {
-        send(sender, ScanOutput::Cursor(cursor)).await
+        send(sender, ScanOutput::Completed(completion)).await
     }
 }
 

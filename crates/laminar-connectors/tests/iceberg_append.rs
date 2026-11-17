@@ -172,7 +172,13 @@ fn source_config(table: &str) -> ConnectorConfig {
 }
 
 async fn start_source(table: &str, position: SourcePosition) -> IcebergSource {
-    let config = source_config(table);
+    start_configured_source(source_config(table), position).await
+}
+
+async fn start_configured_source(
+    config: ConnectorConfig,
+    position: SourcePosition,
+) -> IcebergSource {
     let mut source = IcebergSource::new(IcebergSourceConfig::from_config(&config).unwrap(), None);
     source
         .start(SourceStart::new(config, position, DeliveryGuarantee::AtLeastOnce).unwrap())
@@ -273,6 +279,40 @@ async fn append_source_bootstrap_and_resume_do_not_duplicate_snapshots() {
     .await;
     assert!(drain_ids(&mut replay).await.is_empty());
     replay.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Docker: tests/docker/iceberg-compose.yml"]
+async fn split_append_source_reads_every_row_once_across_a_resume() {
+    require_catalog();
+    let table = format!("split_{}", uuid::Uuid::new_v4().simple());
+    append_ids(&table, (0..6).collect()).await;
+    append_ids(&table, (6..12).collect()).await;
+    let mut config = source_config(&table);
+    config.set("read.splits", "3");
+    config.set("laminar.source.name", "split_source");
+
+    let mut initial = start_configured_source(config.clone(), SourcePosition::Initial).await;
+    let mut ids = drain_ids(&mut initial).await;
+    ids.sort_unstable();
+    assert_eq!(ids, (0..12).collect::<Vec<_>>());
+    let checkpoint = initial.try_checkpoint().unwrap().unwrap();
+    assert_eq!(checkpoint.input_channels().map(<[_]>::len), Some(3));
+    initial.close().await.unwrap();
+
+    append_ids(&table, (12..18).collect()).await;
+    let mut resumed = start_configured_source(
+        config,
+        SourcePosition::Resume {
+            attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(2),
+            checkpoint,
+        },
+    )
+    .await;
+    let mut ids = drain_ids(&mut resumed).await;
+    ids.sort_unstable();
+    assert_eq!(ids, (12..18).collect::<Vec<_>>());
+    resumed.close().await.unwrap();
 }
 
 #[tokio::test]

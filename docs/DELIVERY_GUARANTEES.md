@@ -33,6 +33,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake change feed | ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
+| Iceberg (append read, splits) | ALO, BE | ALO |
 | Files | ALO, BE | rejected |
 | RabbitMQ | ALO | ALO |
 | IBM MQ | ALO | rejected |
@@ -71,6 +72,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake change feed | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
 | Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
@@ -92,6 +94,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake change feed | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Files | — | — | — | — | — | — | — | — | — | — | — | — |
 | RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | IBM MQ | — | — | — | — | — | — | — | — | — | — | — | — |

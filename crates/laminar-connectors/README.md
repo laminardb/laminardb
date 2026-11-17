@@ -22,7 +22,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
-| Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
+| Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; `read.splits` reads appends in parallel, across cluster nodes too; changelog fails closed | Implemented |
 | File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
 | FpML documents | `fpml` | `FORMAT FPML` on the files, Kafka, RabbitMQ, and IBM MQ sources, and `fpml.field` on the FIX source: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
 
@@ -893,6 +893,21 @@ A recreated table (new table id), a log that regressed behind the cursor, an exp
 commit or snapshot file, or a schema change fails the source instead of reading another position.
 Reset the source (DROP/CREATE) to start again. Reference tables stream their snapshot batch by
 batch; lookups are separate.
+
+### Iceberg append splits
+
+With `read.mode = 'append'`, `read.splits = n` hashes each data file's path into one of `n` input
+channels, and each channel keeps its own position in the table's snapshot lineage. One node reads
+every channel; in a cluster each channel is read by the node that owns its vnode, so several nodes
+read one table, at-least-once.
+
+- `n` is part of the source's identity: changing it is an incompatible change that needs a reset.
+- A new source starts each channel where an unsplit source would (`read.bootstrap`). With
+  `read.bootstrap = 'none'`, nodes that start at different table heads start their channels after
+  different snapshots.
+- A node whose channels receive no new data files does not advance its watermark. For event-time
+  windows over the source, set `[server] source_idle_timeout` so such a node counts as idle.
+- Exactly-once and adding the source to a running cluster are rejected.
 
 ### On-demand lookup sources (partial cache mode)
 
