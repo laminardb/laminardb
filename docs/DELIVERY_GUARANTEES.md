@@ -159,6 +159,14 @@ forwards each insert's id through a stream to a MongoDB sink, through the same k
 acknowledged id must reach the output collection, ids never written fail the run, duplicates are
 counted, and more than one node must have read the stream.
 
+An Iceberg append read with `read.splits = n` hashes each data file into one of `n` channels, and
+each channel keeps its own position in the table's snapshot lineage, so every node reads part of
+the table. `iceberg_source::three_node_iceberg_source_kill9_soak` (candidate) appends snapshots of
+ids to a REST-catalog table on S3, seeded before the nodes start, and forwards each id through a
+stream to a MongoDB sink, through the same kills. Every appended id must reach the output
+collection, ids never appended fail the run, duplicates are counted, and more than one node must
+have read the table.
+
 ## Materialized view reads
 
 A materialized view is not a sink, so the pipeline's delivery guarantee does not describe it.
