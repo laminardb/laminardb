@@ -927,6 +927,11 @@ CREATE SOURCE landing (id BIGINT NOT NULL, payload VARCHAR) FROM FILES (
 - The checkpoint records each object's key relative to the directory. A resume reads only new
   objects and continues a partly read one at its next row. Nothing is ever removed from that
   record, and each checkpoint writes it whole.
+- The source reads each key once: an object written over a key it has already read is skipped, so
+  producers write every object under a new key. An object that changes while it is part way read
+  stops the source.
+- The record names keys, not a dataset. Resuming against another bucket or prefix is only valid
+  when it holds the same objects; otherwise reset the source.
 - Object-store paths take CSV, JSON or text with declared columns. Parquet, Arrow IPC, FpML and
   schema inference need a local path, and the files sink writes only to a local path.
 - `splits = n` hashes each object's key into one of `n` input channels; each channel keeps its own

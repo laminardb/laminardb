@@ -54,7 +54,10 @@ current commit. “ALO” means at-least-once only in cluster mode.
 
 The Files source reads an object-store directory: it lists the directory's direct children every
 `poll_interval`, reads each object whole, and checkpoints object keys relative to the directory, so
-a resume does not depend on the bucket, endpoint, or URL form. Credentials come from `storage.*`
+a resume does not depend on the endpoint or URL form. The keys do not identify a dataset: a resume
+against another bucket or prefix is valid only when it holds the same objects, because keys already
+recorded are skipped as read; otherwise reset the source. Each key is read once, so producers write
+every object under a new key. Credentials come from `storage.*`
 options or the environment, as for Delta Lake. Object-store paths take CSV, JSON, or text with
 declared columns; Parquet, Arrow IPC, FpML, and schema inference still need a local path. The Files
 sink stays local-only: remote URLs are detected before any `std::fs` operation and return an

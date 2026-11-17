@@ -124,11 +124,9 @@ impl ListingFilter {
     fn ownership_moved(&mut self) -> bool {
         match self {
             Self::Unprocessed(_) => false,
-            Self::OwnedChannels { owned, .. } => {
-                let moved = owned.has_changed().unwrap_or(false);
-                owned.mark_unchanged();
-                moved
-            }
+            // Observe and acknowledge in one step: every publication bumps the version, so a
+            // release and a re-acquisition between two listings still read as a move.
+            Self::OwnedChannels { owned, .. } => owned.borrow_and_update().has_changed(),
         }
     }
 

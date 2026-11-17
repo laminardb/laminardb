@@ -700,6 +700,7 @@ impl FileSource {
             .track()
             .expect("live file source cannot have a retired task owner");
         let Some(directory) = &src_config.remote else {
+            self.reader = Arc::new(LocalFileReader);
             let initial_scan_guard = self
                 .task_owner
                 .track()
@@ -1565,6 +1566,27 @@ mod tests {
         let mut resumed = started_object_store_source(&store, resume_from(checkpoint)).await;
         assert_eq!(read_lines(&mut resumed).await, ["four"]);
         resumed.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_source_restarted_on_a_local_directory_reads_local_files() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        put_object(&store, "a.txt", b"remote\n").await;
+        let mut source = started_object_store_source(&store, SourcePosition::Initial).await;
+        assert_eq!(read_lines(&mut source).await, ["remote"]);
+        source.close().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("b.txt"), b"local\n").unwrap();
+        let mut config = text_source_config(directory.path());
+        config.set("stabilisation_delay", "0s");
+        config.set("poll_interval", "5ms");
+        source
+            .start(start_request(config, SourcePosition::Initial))
+            .await
+            .unwrap();
+        assert_eq!(read_lines(&mut source).await, ["local"]);
+        source.close().await.unwrap();
     }
 
     #[tokio::test]

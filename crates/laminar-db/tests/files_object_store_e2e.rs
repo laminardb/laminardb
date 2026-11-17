@@ -174,7 +174,11 @@ async fn reads_each_object_once_across_a_checkpointed_restart(splits: Option<u32
     put_ids(store.as_ref(), &format!("{prefix}/c.json"), &[6]).await;
     let db = reopen(&storage, &ddl).await;
     db.start().await.expect("restart");
-    let deliveries = wait_for_ids(&db, 1..=6).await;
+    wait_for_ids(&db, 1..=6).await;
+    // Objects are read in key order, so a re-read of `a.json` or `b.json` would come before
+    // `c.json`; the barrier of a checkpoint after id 6 settles anything still in flight.
+    checkpoint(&db).await;
+    let deliveries = deliveries(&db).await;
     db.shutdown().await.expect("shutdown");
     assert_eq!(deliveries, (1..=6).map(|id| (id, 1)).collect());
 }
