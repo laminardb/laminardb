@@ -38,6 +38,11 @@
 
 ### Fixed
 
+- A stream that selects source columns carrying field metadata, such as an Iceberg column's field
+  ID, emitted batches without that metadata while its planned schema kept it, so a MongoDB or files
+  sink reading the stream rejected every batch and the pipeline kept recovering. The compiled
+  projection now emits the planned fields.
+
 - A MongoDB CDC source could not resume from a checkpoint when its resume token carried binary
   `_typeBits`, as it does when the collection's keys are 64-bit integers: the token was stored as
   plain JSON, which turned `_typeBits` into an array of numbers, and MongoDB rejected it (error
