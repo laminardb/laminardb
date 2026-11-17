@@ -1,58 +1,26 @@
 //! `splits = n`: channel `c` emits sequence numbers `c, c + n, c + 2n, …`. In a cluster each
 //! channel is read by the owner of the vnode the engine's channel route gives it.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::num::{NonZeroU32, NonZeroU64};
-use std::sync::Arc;
+use std::num::NonZeroU32;
 
 use laminar_core::checkpoint::AssignmentDrainId;
-use laminar_core::state::{NodeId, SourceChannelRoute, VnodeAssignmentSnapshot, VnodeRegistry};
 
-use super::{generator_input_channel, validate_generator_checkpoint};
+use super::validate_generator_checkpoint;
 use crate::checkpoint::SourceCheckpoint;
-use crate::connector::{SourceDrainOutcome, SourceDrainSettlement};
+use crate::connector::split_ownership::{
+    source_input_channel, OwnershipChange, SplitAssignment, SplitOwnership,
+};
+use crate::connector::SourceDrainSettlement;
 use crate::error::ConnectorError;
 
 pub(super) const SPLIT_CHECKPOINT_VERSION: &str = "3";
 pub(super) const SPLITS_METADATA: &str = "splits";
-pub(super) const ROUTE: SourceChannelRoute = SourceChannelRoute::V1;
-
-/// Cluster ownership installed by `set_vnode_assignment`.
-#[derive(Clone)]
-pub(super) struct SplitAssignment {
-    pub source_identity: String,
-    pub registry: Arc<VnodeRegistry>,
-    pub node: NodeId,
-}
 
 pub(super) struct SplitInput {
-    count: NonZeroU32,
-    /// Encoded identity of each channel, in channel order.
-    channels: Vec<Vec<u8>>,
     /// Next sequence number of each channel this node reads.
-    owned: BTreeMap<u32, u64>,
-    /// Next sequence number of every channel when the source started.
-    start: Vec<u64>,
-    /// Position in `owned` the next poll tries first.
+    ownership: SplitOwnership<u64>,
+    /// Position in the owned channels the next poll tries first.
     next_slot: usize,
-    cluster: Option<ClusterOwnership>,
-}
-
-struct ClusterOwnership {
-    assignment: SplitAssignment,
-    /// Assignment version `owned` follows; 0 until the first complete publication.
-    reconciled: u64,
-    /// Channels this source gave up since it started. Its start cursor is older than its own
-    /// reads of them, so it can take them back only from a committed handoff cursor.
-    released: BTreeSet<u32>,
-    drain: Option<SplitDrain>,
-    fault: Option<String>,
-}
-
-struct SplitDrain {
-    round: AssignmentDrainId,
-    /// The committed handoff cursor, once the round commits.
-    committed: Option<Arc<SourceCheckpoint>>,
 }
 
 fn sequence_key(channel: u32) -> String {
@@ -72,77 +40,56 @@ impl SplitInput {
         start: Option<&SourceCheckpoint>,
         assignment: Option<SplitAssignment>,
     ) -> Result<Self, ConnectorError> {
-        let channels = (0..count.get())
-            .map(|channel| generator_input_channel(source_name, channel))
-            .collect::<Result<Vec<_>, _>>()?;
         let start = match start {
             None => (0..count.get()).map(u64::from).collect(),
-            Some(checkpoint) => complete_cursor(checkpoint, count, &channels)?,
-        };
-        let owned = if assignment.is_some() {
-            BTreeMap::new()
-        } else {
-            (0..count.get()).zip(start.iter().copied()).collect()
+            Some(checkpoint) => {
+                let channels = (0..count.get())
+                    .map(|channel| source_input_channel(source_name, channel))
+                    .collect::<Result<Vec<_>, _>>()?;
+                complete_cursor(checkpoint, count, &channels)?
+            }
         };
         Ok(Self {
-            count,
-            channels,
-            owned,
-            start,
+            ownership: SplitOwnership::new(source_name, start, assignment)?,
             next_slot: 0,
-            cluster: assignment.map(|assignment| ClusterOwnership {
-                assignment,
-                reconciled: 0,
-                released: BTreeSet::new(),
-                drain: None,
-                fault: None,
-            }),
         })
     }
 
     pub fn is_cluster(&self) -> bool {
-        self.cluster.is_some()
+        self.ownership.is_cluster()
     }
 
     pub fn channel(&self, channel: u32) -> &[u8] {
-        &self.channels[channel as usize]
+        self.ownership.channel(channel)
     }
 
-    /// Whether `owned` follows the published assignment. A cluster source reads nothing and
-    /// admits no barrier until it does.
+    /// Whether the owned channels follow the published assignment. A cluster source reads
+    /// nothing and admits no barrier until they do.
     pub fn ready(&self) -> Result<bool, ConnectorError> {
-        let Some(cluster) = &self.cluster else {
-            return Ok(true);
-        };
-        if let Some(fault) = &cluster.fault {
-            return Err(ConnectorError::InvalidState {
-                expected: "generator split ownership".into(),
-                actual: fault.clone(),
-            });
-        }
-        let version = cluster.assignment.registry.assignment_version();
-        Ok(version != 0 && cluster.reconciled == version)
+        self.ownership.ready()
     }
 
     pub fn is_draining(&self) -> bool {
-        self.cluster
-            .as_ref()
-            .is_some_and(|cluster| cluster.drain.is_some())
+        self.ownership.is_draining()
     }
 
     /// The lowest next sequence number among owned channels.
     pub fn min_next(&self) -> Option<u64> {
-        self.owned.values().copied().min()
+        self.ownership.owned().values().copied().min()
     }
 
     /// Take up to `limit` rows below `allowed` from the next owned channel that has any.
     pub fn take(&mut self, allowed: u64, limit: usize) -> Option<(u32, Vec<u64>)> {
-        let owned: Vec<u32> = self.owned.keys().copied().collect();
-        let step = u64::from(self.count.get());
+        let owned: Vec<(u32, u64)> = self
+            .ownership
+            .owned()
+            .iter()
+            .map(|(channel, next)| (*channel, *next))
+            .collect();
+        let step = u64::from(self.ownership.count().get());
         for offset in 0..owned.len() {
             let slot = (self.next_slot + offset) % owned.len();
-            let channel = owned[slot];
-            let next = self.owned[&channel];
+            let (channel, next) = owned[slot];
             if next >= allowed {
                 continue;
             }
@@ -151,7 +98,9 @@ impl SplitInput {
                 .take(limit)
                 .collect();
             let last = *sequences.last()?;
-            self.owned.insert(channel, last.saturating_add(step));
+            self.ownership
+                .advance(channel, last.saturating_add(step))
+                .expect("the channel was read from the owned set");
             self.next_slot = (slot + 1) % owned.len();
             return Some((channel, sequences));
         }
@@ -160,161 +109,33 @@ impl SplitInput {
 
     pub fn checkpoint(&self) -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
-        for (channel, next) in &self.owned {
+        for (channel, next) in self.ownership.owned() {
             checkpoint.set_offset(sequence_key(*channel), next.to_string());
         }
         checkpoint.set_metadata("connector", super::GENERATOR_CHECKPOINT_CONNECTOR);
         checkpoint.set_metadata(super::CHECKPOINT_VERSION_METADATA, SPLIT_CHECKPOINT_VERSION);
-        checkpoint.set_metadata(SPLITS_METADATA, self.count.to_string());
-        checkpoint
-            .set_input_channels(
-                self.owned
-                    .keys()
-                    .map(|channel| self.channels[*channel as usize].clone())
-                    .collect::<Vec<_>>(),
-            )
-            .expect("generator channels share a prefix and sort by their big-endian index");
-        if let Some(version) = self
-            .cluster
-            .as_ref()
-            .and_then(|cluster| NonZeroU64::new(cluster.reconciled))
-        {
-            checkpoint.bind_assignment_version(version);
-        }
+        checkpoint.set_metadata(SPLITS_METADATA, self.ownership.count().to_string());
+        self.ownership.bind_checkpoint(&mut checkpoint);
         checkpoint
     }
 
-    /// Follow a new assignment publication. Outside a drain, an acquired channel starts from the
-    /// start cursor: the source is new to this assignment, as at startup or after recovery.
     pub fn drive(&mut self) {
-        let Some(cluster) = &mut self.cluster else {
-            return;
-        };
-        if cluster.fault.is_some() {
-            return;
+        let count = self.ownership.count();
+        let change = self
+            .ownership
+            .drive(|checkpoint, channels| complete_cursor(checkpoint, count, channels));
+        if change == OwnershipChange::Moved {
+            self.next_slot = 0;
         }
-        let snapshot = cluster.assignment.registry.versioned_snapshot();
-        let version = snapshot.version();
-        if version == 0
-            || version == cluster.reconciled
-            || snapshot.owners().iter().any(NodeId::is_unassigned)
-        {
-            return;
-        }
-        let committed = match &cluster.drain {
-            None => None,
-            Some(drain) if version == drain.round.predecessor_version => None,
-            Some(drain) if version == drain.round.target_version => match &drain.committed {
-                // The target is published before its round resolves; wait for the settlement.
-                None => return,
-                Some(committed) => Some(Arc::clone(committed)),
-            },
-            Some(drain) => {
-                cluster.fault = Some(format!(
-                    "assignment {version} was published during drain {:?}",
-                    drain.round
-                ));
-                return;
-            }
-        };
-        let settled = committed.is_some();
-        if let Err(error) = self.reconcile(&snapshot, committed.as_deref()) {
-            if let Some(cluster) = &mut self.cluster {
-                cluster.fault = Some(error.to_string());
-            }
-            return;
-        }
-        if let Some(cluster) = self.cluster.as_mut().filter(|_| settled) {
-            cluster.drain = None;
-        }
-    }
-
-    fn reconcile(
-        &mut self,
-        snapshot: &VnodeAssignmentSnapshot,
-        committed: Option<&SourceCheckpoint>,
-    ) -> Result<(), ConnectorError> {
-        let cluster = self
-            .cluster
-            .as_ref()
-            .expect("reconcile runs only with a cluster assignment");
-        let owners = snapshot.owners();
-        let vnode_count = u32::try_from(owners.len())
-            .ok()
-            .and_then(NonZeroU32::new)
-            .ok_or_else(|| invalid("generator assignment has no vnodes"))?;
-        let committed = committed
-            .map(|checkpoint| complete_cursor(checkpoint, self.count, &self.channels))
-            .transpose()?;
-        let mut owned = BTreeMap::new();
-        for channel in 0..self.count.get() {
-            let vnode = ROUTE.vnode(&cluster.assignment.source_identity, channel, vnode_count);
-            if owners[vnode as usize] != cluster.assignment.node {
-                continue;
-            }
-            let next = match (self.owned.get(&channel), &committed) {
-                (Some(next), _) => *next,
-                (None, Some(committed)) => committed[channel as usize],
-                (None, None) if cluster.released.contains(&channel) => {
-                    return Err(invalid(format!(
-                        "generator channel {channel} moved back to this node outside a drain; \
-                         its start cursor is older than this node's own reads"
-                    )));
-                }
-                (None, None) => self.start[channel as usize],
-            };
-            owned.insert(channel, next);
-        }
-        let released: Vec<u32> = self
-            .owned
-            .keys()
-            .filter(|channel| !owned.contains_key(channel))
-            .copied()
-            .collect();
-        let cluster = self
-            .cluster
-            .as_mut()
-            .expect("reconcile runs only with a cluster assignment");
-        cluster.released.extend(released);
-        cluster.reconciled = snapshot.version();
-        self.owned = owned;
-        self.next_slot = 0;
-        Ok(())
     }
 
     pub fn begin_drain(&mut self, round: AssignmentDrainId) -> Result<(), ConnectorError> {
-        let cluster = self
-            .cluster
-            .as_mut()
-            .ok_or_else(|| invalid("generator drain requires a cluster assignment"))?;
-        match &cluster.drain {
-            Some(active) if active.round != round => Err(ConnectorError::InvalidState {
-                expected: format!("generator drain {:?}", active.round),
-                actual: format!("drain {round:?}"),
-            }),
-            Some(_) => Ok(()),
-            None => {
-                cluster.drain = Some(SplitDrain {
-                    round,
-                    committed: None,
-                });
-                Ok(())
-            }
-        }
+        self.ownership.begin_drain(round)
     }
 
+    // Each poll hands over whole rows, so the generator is ready as soon as it drains.
     pub fn drain_ready(&self, round: AssignmentDrainId) -> Result<bool, ConnectorError> {
-        match self
-            .cluster
-            .as_ref()
-            .and_then(|cluster| cluster.drain.as_ref())
-        {
-            Some(active) if active.round == round => Ok(true),
-            active => Err(ConnectorError::InvalidState {
-                expected: format!("generator drain {round:?}"),
-                actual: format!("{:?}", active.map(|active| active.round)),
-            }),
-        }
+        self.ownership.ensure_active_drain(round).map(|()| true)
     }
 
     /// Resolve the drain. A commit moves acquired channels to the committed handoff cursor once
@@ -323,35 +144,16 @@ impl SplitInput {
         &mut self,
         settlement: &SourceDrainSettlement,
     ) -> Result<(), ConnectorError> {
-        let resolution = settlement.resolution();
-        let cluster = self
-            .cluster
-            .as_mut()
-            .ok_or_else(|| invalid("generator drain requires a cluster assignment"))?;
-        let drain = cluster
-            .drain
-            .as_mut()
-            .filter(|drain| drain.round == resolution.round)
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: format!("generator drain {:?}", resolution.round),
-                actual: "no matching drain".into(),
+        let count = self.ownership.count();
+        let change = self
+            .ownership
+            .finish_drain(settlement, |checkpoint, channels| {
+                complete_cursor(checkpoint, count, channels)
             })?;
-        match (resolution.outcome, settlement.committed()) {
-            (SourceDrainOutcome::Abort, None) => {
-                cluster.drain = None;
-                Ok(())
-            }
-            (SourceDrainOutcome::Commit, Some(committed)) => {
-                complete_cursor(committed, self.count, &self.channels)?;
-                drain.committed = Some(Arc::clone(committed));
-                self.drive();
-                self.ready().map(|_| ())
-            }
-            (outcome, committed) => Err(ConnectorError::InvalidState {
-                expected: format!("{outcome:?} settlement"),
-                actual: format!("settlement with cursor: {}", committed.is_some()),
-            }),
+        if change == OwnershipChange::Moved {
+            self.next_slot = 0;
         }
+        Ok(())
     }
 }
 

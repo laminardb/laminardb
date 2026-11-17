@@ -6,6 +6,7 @@ mod recency;
 mod sink;
 mod source;
 mod source_batch;
+pub(crate) mod split_ownership;
 mod task_tracking;
 
 pub use contracts::{

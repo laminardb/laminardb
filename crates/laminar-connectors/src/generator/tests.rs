@@ -25,7 +25,7 @@ fn source_contract_is_replayable_singleton() {
 #[test]
 fn row_positions_bind_source_partition_and_sequence() {
     let mut source = GeneratorSource::default();
-    source.input_channel = generator_input_channel("prices", 0).unwrap();
+    source.input_channel = source_input_channel("prices", 0).unwrap();
     let positions = source.build_row_positions(7, 2).unwrap();
     let checkpoint = source.checkpoint();
     let expected_channel = positions.partition().value(0).to_vec();
@@ -186,6 +186,7 @@ mod splits {
     use laminar_core::state::{NodeId, VnodeRegistry};
 
     use super::*;
+    use crate::connector::split_ownership::test_support::{merge, publish, round, routed};
     use crate::connector::{SourceBatchCursor, SourceDrainRequest, SourceDrainSettlement};
 
     const VNODES: u32 = 4;
@@ -204,17 +205,6 @@ mod splits {
             attempt: CheckpointAttempt::new(1, 1),
             checkpoint,
         }
-    }
-
-    fn publish(registry: &VnodeRegistry, owners: [u64; VNODES as usize], version: u64) {
-        registry.set_assignment_and_version(owners.map(NodeId).to_vec().into(), version);
-    }
-
-    fn channels_owned_by(owners: [u64; VNODES as usize], node: u64) -> Vec<u32> {
-        let vnodes = NonZeroU32::new(VNODES).unwrap();
-        (0..VNODES)
-            .filter(|channel| owners[split::ROUTE.vnode("gen", *channel, vnodes) as usize] == node)
-            .collect()
     }
 
     fn channels(checkpoint: &SourceCheckpoint) -> Vec<u32> {
@@ -268,33 +258,6 @@ mod splits {
             }
         }
         read
-    }
-
-    /// The cursor every participant merges into a cluster checkpoint.
-    fn merge(parts: &[SourceCheckpoint], version: u64) -> Arc<SourceCheckpoint> {
-        let mut merged = SourceCheckpoint::new();
-        let mut channels = Vec::new();
-        for part in parts {
-            for (key, value) in part.offsets() {
-                merged.set_offset(key.clone(), value.clone());
-            }
-            channels.extend(part.input_channels().unwrap().iter().cloned());
-        }
-        for (key, value) in parts[0].metadata() {
-            merged.set_metadata(key.clone(), value.clone());
-        }
-        channels.sort_unstable();
-        merged.set_input_channels(channels).unwrap();
-        merged.bind_assignment_version(NonZeroU64::new(version).unwrap());
-        Arc::new(merged)
-    }
-
-    fn round(predecessor: u64) -> AssignmentDrainId {
-        AssignmentDrainId {
-            predecessor_version: predecessor,
-            target_version: predecessor + 1,
-            digest: [7; 32],
-        }
     }
 
     fn deadline() -> tokio::time::Instant {
@@ -412,7 +375,7 @@ mod splits {
         assert!(source.poll_batch(64).await.unwrap().is_none());
 
         let owners = [1, 2, 1, 2];
-        publish(&registry, owners, 1);
+        publish(&registry, &owners, 1);
         source.drive_control_plane();
         assert!(source.checkpoint_ready().unwrap());
         let checkpoint = source.try_checkpoint().unwrap().unwrap();
@@ -420,7 +383,7 @@ mod splits {
             checkpoint.assignment_version().map(NonZeroU64::get),
             Some(1)
         );
-        let expected = channels_owned_by(owners, 1);
+        let expected = routed("gen", &owners, 1, VNODES);
         assert_eq!(channels(&checkpoint), expected);
 
         // The first poll anchors the rate limit.
@@ -444,8 +407,8 @@ mod splits {
             Arc::new(VnodeRegistry::new_unassigned(VNODES)),
             Arc::new(VnodeRegistry::new_unassigned(VNODES)),
         );
-        publish(&left, [1; 4], 1);
-        publish(&right, [1; 4], 1);
+        publish(&left, &[1; 4], 1);
+        publish(&right, &[1; 4], 1);
         let mut a = cluster_source(&left, 1, config.clone(), SourcePosition::Initial).await;
         let mut b = cluster_source(&right, 2, config, SourcePosition::Initial).await;
         let mut rows = read(&mut a, 100).await;
@@ -454,8 +417,8 @@ mod splits {
         // Every channel moves to node 2.
         begin(&mut [&mut a, &mut b], round(1)).await;
         let handoff = merge(&[a.checkpoint(), b.checkpoint()], 1);
-        publish(&left, [2; 4], 2);
-        publish(&right, [2; 4], 2);
+        publish(&left, &[2; 4], 2);
+        publish(&right, &[2; 4], 2);
         for source in [&mut a, &mut b] {
             source
                 .finish_drain(
@@ -476,8 +439,8 @@ mod splits {
         // And back to node 1, which must not resume from what it read before.
         begin(&mut [&mut a, &mut b], round(2)).await;
         let handoff = merge(&[a.checkpoint(), b.checkpoint()], 2);
-        publish(&left, [1; 4], 3);
-        publish(&right, [1; 4], 3);
+        publish(&left, &[1; 4], 3);
+        publish(&right, &[1; 4], 3);
         for source in [&mut a, &mut b] {
             source
                 .finish_drain(
@@ -504,7 +467,7 @@ mod splits {
     #[tokio::test]
     async fn a_commit_before_the_target_publication_waits_for_it() {
         let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
-        publish(&registry, [1; 4], 1);
+        publish(&registry, &[1; 4], 1);
         let mut a = cluster_source(&registry, 1, config(4, 400), SourcePosition::Initial).await;
         let _ = read(&mut a, 40).await;
         begin(&mut [&mut a], round(1)).await;
@@ -517,20 +480,20 @@ mod splits {
         .unwrap();
         assert!(a.checkpoint_ready().unwrap(), "the predecessor still holds");
 
-        publish(&registry, [1, 1, 2, 2], 2);
+        publish(&registry, &[1, 1, 2, 2], 2);
         assert!(!a.checkpoint_ready().unwrap());
         a.drive_control_plane();
         assert!(a.checkpoint_ready().unwrap());
         assert_eq!(
             channels(&a.checkpoint()),
-            channels_owned_by([1, 1, 2, 2], 1)
+            routed("gen", &[1, 1, 2, 2], 1, VNODES)
         );
     }
 
     #[tokio::test]
     async fn an_aborted_drain_keeps_reading_the_same_channels() {
         let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
-        publish(&registry, [1; 4], 1);
+        publish(&registry, &[1; 4], 1);
         let mut a = cluster_source(&registry, 1, config(4, 400), SourcePosition::Initial).await;
         let mut rows = read(&mut a, 40).await;
         begin(&mut [&mut a], round(1)).await;
@@ -546,7 +509,7 @@ mod splits {
     #[tokio::test]
     async fn outside_a_drain_only_a_channel_new_to_the_source_starts_from_its_start_cursor() {
         let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
-        publish(&registry, [2; 4], 1);
+        publish(&registry, &[2; 4], 1);
         let start = {
             let mut cursor = SourceCheckpoint::new();
             for channel in 0..VNODES {
@@ -561,7 +524,7 @@ mod splits {
             cursor
                 .set_input_channels(
                     (0..VNODES)
-                        .map(|channel| generator_input_channel("gen", channel).unwrap())
+                        .map(|channel| source_input_channel("gen", channel).unwrap())
                         .collect::<Vec<_>>(),
                 )
                 .unwrap();
@@ -570,16 +533,16 @@ mod splits {
         // A source restarted by recovery takes the target assignment from its resume cut.
         let mut a = cluster_source(&registry, 1, config(4, 400), resume(start.clone())).await;
         assert!(channels(&a.checkpoint()).is_empty());
-        publish(&registry, [1; 4], 2);
+        publish(&registry, &[1; 4], 2);
         a.drive_control_plane();
         assert_eq!(a.checkpoint().offsets(), start.offsets());
 
         // A channel it gave up comes back only through a committed drain.
         let _ = read(&mut a, 40).await;
-        publish(&registry, [2; 4], 3);
+        publish(&registry, &[2; 4], 3);
         a.drive_control_plane();
         assert!(a.checkpoint_ready().unwrap());
-        publish(&registry, [1; 4], 4);
+        publish(&registry, &[1; 4], 4);
         a.drive_control_plane();
         let error = a.checkpoint_ready().unwrap_err();
         assert!(error.to_string().contains("outside a drain"), "{error}");
@@ -590,18 +553,18 @@ mod splits {
     #[tokio::test]
     async fn a_restart_takes_back_a_channel_it_gave_up_from_the_resume_cut() {
         let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
-        publish(&registry, [1; 4], 1);
+        publish(&registry, &[1; 4], 1);
         let mut a = cluster_source(&registry, 1, config(4, 400), SourcePosition::Initial).await;
         let mut rows = read(&mut a, 40).await;
         let cut = a.checkpoint();
-        publish(&registry, [2; 4], 2);
+        publish(&registry, &[2; 4], 2);
         a.drive_control_plane();
         assert!(channels(&a.checkpoint()).is_empty());
 
         a.start(start_request(config(4, 400), resume(cut.clone())))
             .await
             .unwrap();
-        publish(&registry, [1; 4], 3);
+        publish(&registry, &[1; 4], 3);
         a.drive_control_plane();
         assert!(a.checkpoint_ready().unwrap());
         assert_eq!(a.checkpoint().offsets(), cut.offsets());
