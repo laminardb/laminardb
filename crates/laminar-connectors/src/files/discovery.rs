@@ -116,22 +116,20 @@ impl FileDiscoveryEngine {
         }
     }
 
-    /// Starts listing an object-store directory every `poll_interval`.
-    ///
-    /// Objects already present in `known_files` are skipped.
+    /// Starts listing an object-store directory every `poll_interval`, sending the objects
+    /// `filter` wants.
     pub(super) fn start_remote(
         store: Arc<dyn object_store::ObjectStore>,
         directory: super::remote::RemoteDirectory,
         poll_interval: Duration,
-        known_files: Arc<FileInventorySnapshot>,
+        filter: super::remote::ListingFilter,
         task_guard: ConnectorTaskGuard,
     ) -> Self {
         let (tx, rx) = mpsc::bounded_async::<DiscoveredFile>(256);
         let handle = tokio::spawn(async move {
             let _task_guard = task_guard;
             let result =
-                super::remote::discovery_loop(store, directory, poll_interval, tx, known_files)
-                    .await;
+                super::remote::discovery_loop(store, directory, poll_interval, tx, filter).await;
             if let Err(error) = &result {
                 error!(%error, "file discovery listing failed");
             }

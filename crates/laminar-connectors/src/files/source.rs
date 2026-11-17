@@ -7,28 +7,32 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
+use crate::connector::split_ownership::{OwnershipChange, SplitAssignment, SPLIT_ROUTE};
 use crate::connector::{
-    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourceLocality, SourcePosition,
-    SourceStart, SourceTopology,
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch,
+    SourceChannelPlacement, SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest,
+    SourceDrainSettlement, SourceInputMode, SourceLocality, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
 use super::config::{FileFormat, FileSourceConfig};
+#[cfg(feature = "fpml")]
+use super::decoding::start_fpml_decoder;
+use super::decoding::{append_metadata_column, build_decoder_and_schema};
 use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
 use super::ingestion_position::{ingestion_checkpoint, restore_ingestion_position, FileProgress};
-use super::json_documents::JsonDocumentsDecoder;
 use super::manifest::FileIngestionManifest;
-use super::remote::ObjectStoreReader;
-use super::text_decoder::TextLineDecoder;
+use super::remote::{ListingFilter, ObjectStoreReader};
+use super::split::SplitObjects;
 
 const DISCOVERY_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -60,6 +64,20 @@ struct PendingFile {
     resume: Option<FileProgress>,
 }
 
+impl PendingFile {
+    /// The rest of a file a checkpoint recorded as read part way.
+    fn resume(progress: FileProgress) -> Self {
+        Self {
+            discovered: DiscoveredFile {
+                path: progress.path.clone(),
+                size: progress.size,
+                modified_ms: progress.modified_ms,
+            },
+            resume: Some(progress),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DecodedFile {
     discovered: DiscoveredFile,
@@ -70,8 +88,8 @@ struct DecodedFile {
 
 /// AutoLoader-style file source connector.
 ///
-/// Watches a local directory for new files, infers schema if
-/// needed, and produces `RecordBatch`es via `poll_batch()`.
+/// Watches a local directory or lists an object-store directory for new files, infers schema
+/// for a local directory if needed, and produces `RecordBatch`es via `poll_batch()`.
 pub struct FileSource {
     /// Parsed configuration.
     config: Option<FileSourceConfig>,
@@ -85,8 +103,12 @@ pub struct FileSource {
     registry: Option<prometheus::Registry>,
     /// File discovery engine (started in `start()` after cursor validation).
     discovery: Option<FileDiscoveryEngine>,
-    /// File ingestion manifest (tracks processed files).
+    /// File ingestion manifest (tracks processed files) without `splits`.
     manifest: FileIngestionManifest,
+    /// With `splits`: the channels this node reads and what each has read.
+    split: Option<SplitObjects>,
+    /// Cluster ownership, installed before `start` for a source with `splits`.
+    assignment: Option<SplitAssignment>,
     /// Discovered files staged in connector-owned memory. The front entry is
     /// retained across cancellation until it has been published or rejected.
     pending_files: VecDeque<PendingFile>,
@@ -126,6 +148,8 @@ impl FileSource {
             registry: registry.cloned(),
             discovery: None,
             manifest: FileIngestionManifest::new(),
+            split: None,
+            assignment: None,
             pending_files: VecDeque::new(),
             current_file: None,
             reader: Arc::new(LocalFileReader),
@@ -135,6 +159,14 @@ impl FileSource {
             task_owner,
             task_tracker,
         }
+    }
+
+    /// A source that reads a remote `path` from `store`.
+    #[cfg(test)]
+    pub(super) fn with_object_store(store: Arc<dyn object_store::ObjectStore>) -> Self {
+        let mut source = Self::new();
+        source.remote_store = Some(store);
+        source
     }
 
     async fn close_until(&mut self, deadline: tokio::time::Instant) -> Result<(), ConnectorError> {
@@ -222,8 +254,27 @@ impl SourceConnector for FileSource {
         #[cfg_attr(not(feature = "fpml"), allow(unused_mut))]
         let mut src_config = FileSourceConfig::from_connector_config(&config)?;
         // Validate cursor evidence before metadata I/O. Never repair corrupt progress by discovery.
-        let (manifest, progress) =
-            restore_ingestion_position(position, src_config.remote.is_some())?;
+        let (manifest, progress, split) = match src_config.splits {
+            Some(count) => {
+                let source_name = config
+                    .get("laminar.source.name")
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("files");
+                let split =
+                    SplitObjects::restore(source_name, count, &position, self.assignment.clone())?;
+                (FileIngestionManifest::new(), None, Some(split))
+            }
+            None if self.assignment.is_some() => {
+                return Err(ConnectorError::ConfigurationError(
+                    "a files source without splits cannot take a cluster vnode assignment".into(),
+                ));
+            }
+            None => {
+                let (manifest, progress) =
+                    restore_ingestion_position(position, src_config.remote.is_some())?;
+                (manifest, progress, None)
+            }
+        };
         self.prepare_reader_contract(&mut config, saved, resumed, &src_config)
             .await?;
         let format = src_config
@@ -273,6 +324,7 @@ impl SourceConnector for FileSource {
             None => super::schema_resolution::output_schema(&schema, src_config.include_metadata)?,
         };
 
+        self.split = split;
         let discovery = self.start_discovery(&src_config, &config, &manifest)?;
 
         self.config = Some(src_config);
@@ -283,15 +335,9 @@ impl SourceConnector for FileSource {
         self.pending_files.clear();
         self.current_file = None;
         if let Some(progress) = progress {
-            self.pending_files.push_back(PendingFile {
-                discovered: DiscoveredFile {
-                    path: progress.path.clone(),
-                    size: progress.size,
-                    modified_ms: progress.modified_ms,
-                },
-                resume: Some(progress),
-            });
+            self.pending_files.push_back(PendingFile::resume(progress));
         }
+        self.queue_unfinished_objects();
         self.is_open = true;
 
         info!(
@@ -324,6 +370,11 @@ impl SourceConnector for FileSource {
                 actual: "no decoder".into(),
             });
         }
+        if let Some(split) = &self.split {
+            if split.is_draining() || !split.ready()? {
+                return Ok(None);
+            }
+        }
 
         loop {
             if let Some(mut decoded) = self.current_file.take() {
@@ -333,14 +384,14 @@ impl SourceConnector for FileSource {
                 decoded.next_row += row_count;
 
                 if decoded.next_row == decoded.records.num_rows() {
-                    self.manifest.insert(decoded.discovered.path);
+                    self.complete_file(decoded.discovered.path)?;
                 } else {
                     self.current_file = Some(decoded);
                 }
 
                 // No await is permitted between advancing the row/file cursor
                 // above and returning the corresponding zero-copy slice.
-                return Ok(Some(SourceBatch::new(result)));
+                return Ok(Some(self.bind_cursor(SourceBatch::new(result))));
             }
 
             if self.pending_files.is_empty() {
@@ -369,7 +420,7 @@ impl SourceConnector for FileSource {
                 return Ok(None);
             };
 
-            if self.manifest.contains(&pending.discovered.path) {
+            if !self.is_unread(&pending.discovered.path) {
                 self.pending_files.pop_front();
                 continue;
             }
@@ -381,7 +432,7 @@ impl SourceConnector for FileSource {
                     "file source: empty batch from '{}'",
                     pending.discovered.path
                 );
-                self.manifest.insert(pending.discovered.path);
+                self.complete_file(pending.discovered.path)?;
                 return Ok(None);
             }
             self.current_file = Some(decoded);
@@ -394,7 +445,7 @@ impl SourceConnector for FileSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let progress = self.current_file.as_ref().map(|file| FileProgress {
+        let reading = self.current_file.as_ref().map(|file| FileProgress {
             path: file.discovered.path.clone(),
             size: file.discovered.size,
             modified_ms: file.discovered.modified_ms,
@@ -402,11 +453,64 @@ impl SourceConnector for FileSource {
             next_row: u64::try_from(file.next_row)
                 .expect("Arrow record counts are representable as u64"),
         });
-        ingestion_checkpoint(
-            &self.manifest,
-            progress.as_ref(),
-            self.schema_contract.as_deref(),
-        )
+        let schema_contract = self.schema_contract.as_deref();
+        match &self.split {
+            Some(split) => split.checkpoint(reading.as_ref(), schema_contract),
+            None => ingestion_checkpoint(&self.manifest, reading.as_ref(), schema_contract),
+        }
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        match &self.split {
+            Some(split) if !split.ready()? => Ok(None),
+            _ => Ok(Some(self.checkpoint())),
+        }
+    }
+
+    fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+        self.split.as_ref().map_or(Ok(true), SplitObjects::ready)
+    }
+
+    fn drive_control_plane(&mut self) {
+        if let Some(split) = &mut self.split {
+            let change = split.drive();
+            self.follow_ownership(change);
+        }
+    }
+
+    fn begin_drain(
+        &mut self,
+        request: &SourceDrainRequest,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.split_mut()?.begin_drain(request.round)
+    }
+
+    fn poll_drain_ready(
+        &mut self,
+        round: laminar_core::checkpoint::AssignmentDrainId,
+    ) -> Result<bool, ConnectorError> {
+        self.split_mut()?.drain_ready(round)
+    }
+
+    async fn finish_drain(
+        &mut self,
+        settlement: SourceDrainSettlement,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        let change = self.split_mut()?.finish_drain(&settlement)?;
+        self.follow_ownership(change);
+        Ok(())
+    }
+
+    fn set_vnode_assignment(
+        &mut self,
+        source_identity: &str,
+        registry: Arc<laminar_core::state::VnodeRegistry>,
+        self_id: laminar_core::state::NodeId,
+    ) -> Result<(), ConnectorError> {
+        self.assignment = Some(SplitAssignment::new(source_identity, registry, self_id)?);
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -418,26 +522,119 @@ impl SourceConnector for FileSource {
         // Replayability is backed by an exact processed-path inventory plus an exact file/row
         // cursor for a partially emitted file. An object-store directory is reachable from every
         // node; a local one only from the node whose disk holds it.
-        let remote = config
+        let is_remote = config
             .get("path")
             .map(|path| super::remote::RemoteDirectory::parse(path, config.get("glob_pattern")))
             .transpose()?
             .flatten()
             .is_some();
-        Ok(SourceContract::new(
-            SourceConsistency::Replayable,
-            SourceTopology::Singleton,
-            SourceInputMode::AppendOnly,
-        )
-        .with_locality(if remote {
+        let locality = if is_remote {
             SourceLocality::Portable
         } else {
             SourceLocality::LocalFiles
-        }))
+        };
+        let splits = super::config::configured_splits(config, is_remote)?;
+        let topology = if splits.is_some() {
+            SourceTopology::Splittable
+        } else {
+            SourceTopology::Singleton
+        };
+        let contract = SourceContract::new(
+            SourceConsistency::Replayable,
+            topology,
+            SourceInputMode::AppendOnly,
+        )
+        .with_locality(locality);
+        Ok(match splits {
+            Some(channels) => contract.with_placement(SourceChannelPlacement {
+                channels,
+                route: SPLIT_ROUTE,
+            }),
+            None => contract,
+        })
     }
 }
 
 impl FileSource {
+    /// Whether this node reads the file at `path` and has not read it whole.
+    fn is_unread(&self, path: &str) -> bool {
+        match &self.split {
+            Some(split) => split.is_unread(path),
+            None => !self.manifest.contains(path),
+        }
+    }
+
+    fn complete_file(&mut self, path: String) -> Result<(), ConnectorError> {
+        if let Some(split) = &mut self.split {
+            return split.complete(path);
+        }
+        self.manifest.insert(path);
+        Ok(())
+    }
+
+    /// In a cluster every batch carries the exact cursor after it.
+    fn bind_cursor(&self, batch: SourceBatch) -> SourceBatch {
+        match &self.split {
+            Some(split) if split.is_cluster() => batch.with_checkpoint(self.checkpoint()),
+            _ => batch,
+        }
+    }
+
+    fn split_mut(&mut self) -> Result<&mut SplitObjects, ConnectorError> {
+        self.split.as_mut().ok_or_else(|| {
+            ConnectorError::ConfigurationError("only a files source with splits drains".into())
+        })
+    }
+
+    /// Forget the files of channels this node gave up, and finish the partly read objects of the
+    /// channels it took over before any new object.
+    fn follow_ownership(&mut self, change: OwnershipChange) {
+        let Some(split) = self
+            .split
+            .as_ref()
+            .filter(|_| change == OwnershipChange::Moved)
+        else {
+            return;
+        };
+        self.pending_files
+            .retain(|file| split.owns(&file.discovered.path));
+        if self
+            .current_file
+            .as_ref()
+            .is_some_and(|file| !split.owns(&file.discovered.path))
+        {
+            self.current_file = None;
+        }
+        self.queue_unfinished_objects();
+    }
+
+    /// Queue every owned channel's partly read object ahead of new objects, unless it is already
+    /// being read or queued.
+    fn queue_unfinished_objects(&mut self) {
+        let Some(split) = &self.split else {
+            return;
+        };
+        let reading = self
+            .current_file
+            .as_ref()
+            .map(|file| file.discovered.path.as_str());
+        let unfinished: Vec<FileProgress> = split
+            .unfinished()
+            .filter(|progress| {
+                Some(progress.path.as_str()) != reading
+                    && !self.pending_files.iter().any(|file| {
+                        file.resume
+                            .as_ref()
+                            .is_some_and(|queued| queued.path == progress.path)
+                    })
+            })
+            .cloned()
+            .collect();
+        for progress in unfinished.into_iter().rev() {
+            self.pending_files.push_front(PendingFile::resume(progress));
+        }
+    }
+
     async fn prepare_reader_contract(
         &mut self,
         config: &mut ConnectorConfig,
@@ -527,11 +724,18 @@ impl FileSource {
             Arc::clone(&store),
             u64::try_from(src_config.max_file_bytes).unwrap_or(u64::MAX),
         ));
+        let filter = match &self.split {
+            Some(split) => ListingFilter::OwnedChannels {
+                splits: split.count(),
+                owned: split.watch_owned_channels(),
+            },
+            None => ListingFilter::Unprocessed(known),
+        };
         Ok(FileDiscoveryEngine::start_remote(
             store,
             directory.clone(),
             src_config.poll_interval,
-            known,
+            filter,
             discovery_guard,
         ))
     }
@@ -644,108 +848,6 @@ impl FileSource {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
-fn build_decoder_and_schema(
-    format: FileFormat,
-    src_config: &FileSourceConfig,
-    connector_config: &ConnectorConfig,
-) -> Result<(Arc<dyn FormatDecoder>, SchemaRef), ConnectorError> {
-    match format {
-        FileFormat::Csv => {
-            let schema = connector_config.arrow_schema().unwrap_or_else(|| {
-                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
-            });
-            let csv_config = crate::schema::CsvDecoderConfig {
-                delimiter: src_config.csv_delimiter,
-                has_header: src_config.csv_has_header,
-                ..crate::schema::CsvDecoderConfig::default()
-            };
-            let decoder = crate::schema::CsvDecoder::with_config(schema.clone(), csv_config);
-            Ok((Arc::new(decoder), schema))
-        }
-        FileFormat::Json => {
-            let schema = connector_config.arrow_schema().unwrap_or_else(|| {
-                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
-            });
-            let json_config = crate::schema::JsonDecoderConfig::default();
-            let decoder = crate::schema::JsonDecoder::with_config(schema.clone(), json_config);
-            Ok((Arc::new(JsonDocumentsDecoder::new(decoder)), schema))
-        }
-        FileFormat::Text => {
-            let decoder = TextLineDecoder::new();
-            let schema = decoder.output_schema();
-            Ok((Arc::new(decoder), schema))
-        }
-        FileFormat::Parquet => {
-            // For Parquet, schema comes from the file footer (authoritative).
-            // Use a placeholder schema; it will be refined on the first file read.
-            let schema = connector_config.arrow_schema().unwrap_or_else(|| {
-                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
-            });
-            let decoder = crate::schema::parquet::ParquetDecoder::new(schema.clone());
-            Ok((Arc::new(decoder), schema))
-        }
-        FileFormat::ArrowIpc => {
-            // Arrow IPC files embed their schema in the header — use it as
-            // authoritative. The DDL schema is used as placeholder until
-            // the first file is read.
-            let schema = connector_config.arrow_schema().unwrap_or_else(|| {
-                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
-            });
-            let decoder = super::arrow_ipc_codec::ArrowIpcDecoder::new(schema.clone());
-            Ok((Arc::new(decoder), schema))
-        }
-        #[cfg(feature = "fpml")]
-        FileFormat::Fpml => Err(ConnectorError::Internal(
-            "FpML decoders are started asynchronously".into(),
-        )),
-    }
-}
-
-/// Resolve the closure and profile off the runtime, check them against the committed schema
-/// contract, and start the validator worker. Files larger than one document are rejected before
-/// they are read.
-#[cfg(feature = "fpml")]
-async fn start_fpml_decoder(
-    src_config: &mut FileSourceConfig,
-    config: &ConnectorConfig,
-    registry: Option<prometheus::Registry>,
-    guard: ConnectorTaskGuard,
-) -> Result<(Arc<dyn FormatDecoder>, SchemaRef), ConnectorError> {
-    let fpml = crate::fpml::FpmlConfig::from_connector_config(config)?;
-    src_config.max_file_bytes = src_config
-        .max_file_bytes
-        .min(fpml.limits.max_document_bytes);
-    let resolving = fpml.clone();
-    let (artifact, profile) = tokio::task::spawn_blocking(move || resolving.resolve())
-        .await
-        .map_err(|error| {
-            ConnectorError::Internal(format!("FpML profile loader failed: {error}"))
-        })??;
-    if let Some(committed) = config
-        .schema_binding()
-        .and_then(|binding| binding.value.as_ref())
-    {
-        if committed.identity != profile.native_schema(&artifact).identity {
-            return Err(ConnectorError::SchemaMismatch(
-                "the FpML profile or schema closure differs from the one this source was created with; recreate the source to change it".into(),
-            ));
-        }
-    }
-    let source = config.get("laminar.source.name").unwrap_or("files");
-    let decoder = crate::fpml::FpmlDecoder::start(
-        artifact,
-        &profile,
-        &fpml,
-        source,
-        registry.as_ref(),
-        Some(guard),
-    )
-    .await?;
-    Ok((Arc::new(decoder), profile.schema()))
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -767,86 +869,12 @@ async fn read_file_bytes(
     .map_err(|e| ConnectorError::ReadError(format!("cannot read file '{error_path}': {e}")))
 }
 
-pub(super) fn append_metadata_column(
-    batch: &RecordBatch,
-    file_path: &str,
-    file_size: u64,
-    modified_ms: u64,
-) -> Result<RecordBatch, ConnectorError> {
-    use arrow_array::{ArrayRef, StringArray, StructArray, UInt64Array};
-
-    let n = batch.num_rows();
-    let file_name = std::path::Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_path);
-
-    let path_array: ArrayRef = Arc::new(StringArray::from(vec![file_path; n]));
-    let name_array: ArrayRef = Arc::new(StringArray::from(vec![file_name; n]));
-    let size_array: ArrayRef = Arc::new(UInt64Array::from(vec![file_size; n]));
-    #[allow(clippy::cast_possible_wrap)]
-    let mod_array: ArrayRef = Arc::new(arrow_array::TimestampMillisecondArray::from(vec![
-        modified_ms as i64;
-        n
-    ]));
-
-    let fields = vec![
-        Field::new("file_path", DataType::Utf8, false),
-        Field::new("file_name", DataType::Utf8, false),
-        Field::new("file_size", DataType::UInt64, false),
-        Field::new(
-            "file_modification_time",
-            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
-            true,
-        ),
-    ];
-    let struct_array = StructArray::try_new(
-        fields.into(),
-        vec![path_array, name_array, size_array, mod_array],
-        None,
-    )
-    .map_err(|e| ConnectorError::ReadError(format!("metadata struct error: {e}")))?;
-
-    // Append struct column to batch.
-    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    columns.push(Arc::new(struct_array));
-
-    let mut fields: Vec<Field> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
-    fields.push(Field::new(
-        "_metadata",
-        DataType::Struct(
-            vec![
-                Field::new("file_path", DataType::Utf8, false),
-                Field::new("file_name", DataType::Utf8, false),
-                Field::new("file_size", DataType::UInt64, false),
-                Field::new(
-                    "file_modification_time",
-                    DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
-                    true,
-                ),
-            ]
-            .into(),
-        ),
-        false,
-    ));
-
-    RecordBatch::try_new(
-        Arc::new(Schema::new_with_metadata(
-            fields,
-            batch.schema().metadata().clone(),
-        )),
-        columns,
-    )
-    .map_err(|e| ConnectorError::ReadError(format!("metadata append error: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
+    use arrow_schema::{DataType, Field};
+
+    use super::super::test_support::{next_lines, put_object, read_lines, resume_from};
+
     use super::super::ingestion_position::{
         CHECKPOINT_VERSION_METADATA, FILE_CHECKPOINT_CONNECTOR, FILE_CHECKPOINT_VERSION,
     };
@@ -1506,17 +1534,6 @@ mod tests {
         assert_eq!(locality("s3://bucket/landing"), SourceLocality::Portable);
     }
 
-    async fn put(store: &object_store::memory::InMemory, key: &str, body: &[u8]) {
-        use object_store::ObjectStoreExt as _;
-        store
-            .put(
-                &object_store::path::Path::from(key),
-                object_store::PutPayload::from(body.to_vec()),
-            )
-            .await
-            .unwrap();
-    }
-
     /// A text source over `store` as the directory `s3://bucket/landing`.
     async fn started_object_store_source(
         store: &Arc<object_store::memory::InMemory>,
@@ -1526,61 +1543,17 @@ mod tests {
         config.set("path", "s3://bucket/landing");
         config.set("format", "text");
         config.set("poll_interval", "5ms");
-        let mut source = FileSource::new();
-        source.remote_store = Some(Arc::clone(store) as Arc<dyn object_store::ObjectStore>);
+        let mut source =
+            FileSource::with_object_store(Arc::clone(store) as Arc<dyn object_store::ObjectStore>);
         source.start(start_request(config, position)).await.unwrap();
         source
-    }
-
-    fn resume_from(checkpoint: SourceCheckpoint) -> SourcePosition {
-        SourcePosition::Resume {
-            attempt: CheckpointAttempt::canonical(3),
-            checkpoint,
-        }
-    }
-
-    fn text_lines(batch: &SourceBatch) -> Vec<String> {
-        let column = batch
-            .records
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap();
-        column.iter().flatten().map(str::to_owned).collect()
-    }
-
-    /// The next batch of at most `max_records` lines, waiting for discovery.
-    async fn next_lines(source: &mut FileSource, max_records: usize) -> Vec<String> {
-        for _ in 0..200 {
-            if let Some(batch) = source.poll_batch(max_records).await.unwrap() {
-                return text_lines(&batch);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        panic!("no batch within a second");
-    }
-
-    /// Lines read until the source stays empty.
-    async fn read_lines(source: &mut FileSource) -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut idle = 0;
-        while idle < 20 {
-            let Some(batch) = source.poll_batch(64).await.unwrap() else {
-                idle += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                continue;
-            };
-            idle = 0;
-            lines.extend(text_lines(&batch));
-        }
-        lines
     }
 
     #[tokio::test]
     async fn an_object_store_directory_is_read_and_resumed_by_object_key() {
         let store = Arc::new(object_store::memory::InMemory::new());
-        put(&store, "a.txt", b"one\ntwo\n").await;
-        put(&store, "b.txt", b"three\n").await;
+        put_object(&store, "a.txt", b"one\ntwo\n").await;
+        put_object(&store, "b.txt", b"three\n").await;
 
         let mut first = started_object_store_source(&store, SourcePosition::Initial).await;
         assert_eq!(read_lines(&mut first).await, ["one", "two", "three"]);
@@ -1588,7 +1561,7 @@ mod tests {
         let checkpoint = first.checkpoint();
         first.close().await.unwrap();
 
-        put(&store, "c.txt", b"four\n").await;
+        put_object(&store, "c.txt", b"four\n").await;
         let mut resumed = started_object_store_source(&store, resume_from(checkpoint)).await;
         assert_eq!(read_lines(&mut resumed).await, ["four"]);
         resumed.close().await.unwrap();
@@ -1597,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn an_object_store_file_resumes_at_its_next_row() {
         let store = Arc::new(object_store::memory::InMemory::new());
-        put(&store, "a.txt", b"one\ntwo\nthree\n").await;
+        put_object(&store, "a.txt", b"one\ntwo\nthree\n").await;
 
         let mut first = started_object_store_source(&store, SourcePosition::Initial).await;
         assert_eq!(next_lines(&mut first, 1).await, ["one"]);

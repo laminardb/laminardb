@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use iceberg::table::Table;
 use laminar_core::checkpoint::AssignmentDrainId;
-use laminar_core::state::key_hash;
 
 use super::append_lineage::{plan_split_appends, validate_cursor_lineage};
 use super::cursor::{
@@ -19,7 +18,7 @@ use super::cursor::{
 use super::{planner, IcebergSource};
 use crate::checkpoint::SourceCheckpoint;
 use crate::connector::split_ownership::{
-    source_input_channel, OwnershipChange, SplitAssignment, SplitOwnership,
+    path_channel, source_input_channel, OwnershipChange, SplitAssignment, SplitOwnership,
 };
 use crate::connector::SourceDrainSettlement;
 use crate::error::ConnectorError;
@@ -38,13 +37,7 @@ const TABLE_REF_METADATA: &str = "iceberg.table_ref";
 const READ_SCHEMA_ID_METADATA: &str = "iceberg.read_schema_id";
 
 pub(super) fn data_file_channel(path: &str, splits: NonZeroU32) -> u32 {
-    let mut key = Vec::with_capacity(DATA_FILE_CHANNEL_HASH_V1.len() + path.len());
-    key.extend_from_slice(DATA_FILE_CHANNEL_HASH_V1);
-    key.extend_from_slice(path.as_bytes());
-    // The remainder of a division by a u32 count fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
-    let channel = (key_hash(&key) % u64::from(splits.get())) as u32;
-    channel
+    path_channel(DATA_FILE_CHANNEL_HASH_V1, path, splits)
 }
 
 /// A snapshot of the followed ref.

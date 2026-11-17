@@ -6,14 +6,49 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
 use laminar_core::checkpoint::AssignmentDrainId;
-use laminar_core::state::{NodeId, SourceChannelRoute, VnodeAssignmentSnapshot, VnodeRegistry};
+use laminar_core::state::{
+    NodeId, SourceChannelRoute, VnodeAssignmentSnapshot, VnodeRegistry, MAX_KEY_GROUP_COUNT,
+};
 
 use crate::checkpoint::SourceCheckpoint;
+use crate::config::ConnectorConfig;
 use crate::connector::{SourceDrainOutcome, SourceDrainSettlement};
 use crate::error::ConnectorError;
 
 /// The route from a split source's channel to the vnode whose owner reads it.
 pub(crate) const SPLIT_ROUTE: SourceChannelRoute = SourceChannelRoute::V1;
+
+/// The split count the option `key` sets, if any. More splits than the largest vnode count add
+/// no parallelism.
+pub(crate) fn configured_split_count(
+    config: &ConnectorConfig,
+    key: &str,
+) -> Result<Option<NonZeroU32>, ConnectorError> {
+    match config.get_parsed::<u32>(key)? {
+        None => Ok(None),
+        Some(splits) if splits > MAX_KEY_GROUP_COUNT => Err(invalid(format!(
+            "{key} must be at most {MAX_KEY_GROUP_COUNT}"
+        ))),
+        Some(splits) => NonZeroU32::new(splits)
+            .map(Some)
+            .ok_or_else(|| invalid(format!("{key} must be > 0"))),
+    }
+}
+
+/// The channel of `path` among `splits`, hashed after `domain`: a versioned separator that keeps
+/// each connector's assignment of paths to channels its own.
+#[cfg(any(feature = "files", feature = "iceberg-core"))]
+pub(crate) fn path_channel(domain: &[u8], path: &str, splits: NonZeroU32) -> u32 {
+    use laminar_core::state::key_hash;
+
+    let mut key = Vec::with_capacity(domain.len() + path.len());
+    key.extend_from_slice(domain);
+    key.extend_from_slice(path.as_bytes());
+    // The remainder of a division by a u32 count fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let channel = (key_hash(&key) % u64::from(splits.get())) as u32;
+    channel
+}
 
 /// Cluster ownership installed by `set_vnode_assignment`.
 #[derive(Clone)]
@@ -71,6 +106,16 @@ pub(crate) fn source_input_channel(
     Ok(channel)
 }
 
+/// Identities of channels `0..count` of the source named `source_name`, in channel order.
+pub(crate) fn split_input_channels(
+    source_name: &str,
+    count: NonZeroU32,
+) -> Result<Vec<Vec<u8>>, ConnectorError> {
+    (0..count.get())
+        .map(|channel| source_input_channel(source_name, channel))
+        .collect()
+}
+
 /// Positions of the owned channels, `P` being the connector's per-channel cursor.
 ///
 /// A connector decodes positions from a cursor that covers every channel (a single-node
@@ -81,7 +126,7 @@ pub(crate) struct SplitOwnership<P> {
     /// Encoded identity of each channel, in channel order.
     channels: Vec<Vec<u8>>,
     owned: BTreeMap<u32, P>,
-    /// Position of every channel when the source started.
+    /// Position of every channel when a cluster source started; empty on one node.
     start: Vec<P>,
     cluster: Option<ClusterOwnership>,
 }
@@ -119,13 +164,13 @@ impl<P: Clone> SplitOwnership<P> {
             .ok()
             .and_then(NonZeroU32::new)
             .ok_or_else(|| invalid("a split source needs between 1 and u32::MAX channels"))?;
-        let channels = (0..count.get())
-            .map(|channel| source_input_channel(source_name, channel))
-            .collect::<Result<Vec<_>, _>>()?;
-        let owned = if assignment.is_some() {
-            BTreeMap::new()
+        let channels = split_input_channels(source_name, count)?;
+        // Only a cluster source takes channels back at their start position; one node owns every
+        // channel from the start and needs no second copy.
+        let (owned, start) = if assignment.is_some() {
+            (BTreeMap::new(), start)
         } else {
-            (0..).zip(start.iter().cloned()).collect()
+            ((0..).zip(start).collect(), Vec::new())
         };
         Ok(Self {
             count,
@@ -159,11 +204,14 @@ impl<P: Clone> SplitOwnership<P> {
     }
 
     pub fn advance(&mut self, channel: u32, position: P) -> Result<(), ConnectorError> {
-        let owned = self.owned.get_mut(&channel).ok_or_else(|| {
-            ConnectorError::Internal(format!("split channel {channel} is not owned here"))
-        })?;
-        *owned = position;
+        *self.position_mut(channel)? = position;
         Ok(())
+    }
+
+    pub fn position_mut(&mut self, channel: u32) -> Result<&mut P, ConnectorError> {
+        self.owned.get_mut(&channel).ok_or_else(|| {
+            ConnectorError::Internal(format!("split channel {channel} is not owned here"))
+        })
     }
 
     /// Whether `owned` follows the published assignment. A cluster source reads nothing and

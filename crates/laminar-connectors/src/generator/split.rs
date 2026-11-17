@@ -8,7 +8,7 @@ use laminar_core::checkpoint::AssignmentDrainId;
 use super::validate_generator_checkpoint;
 use crate::checkpoint::SourceCheckpoint;
 use crate::connector::split_ownership::{
-    source_input_channel, OwnershipChange, SplitAssignment, SplitOwnership,
+    split_input_channels, OwnershipChange, SplitAssignment, SplitOwnership,
 };
 use crate::connector::SourceDrainSettlement;
 use crate::error::ConnectorError;
@@ -42,12 +42,11 @@ impl SplitInput {
     ) -> Result<Self, ConnectorError> {
         let start = match start {
             None => (0..count.get()).map(u64::from).collect(),
-            Some(checkpoint) => {
-                let channels = (0..count.get())
-                    .map(|channel| source_input_channel(source_name, channel))
-                    .collect::<Result<Vec<_>, _>>()?;
-                complete_cursor(checkpoint, count, &channels)?
-            }
+            Some(checkpoint) => complete_cursor(
+                checkpoint,
+                count,
+                &split_input_channels(source_name, count)?,
+            )?,
         };
         Ok(Self {
             ownership: SplitOwnership::new(source_name, start, assignment)?,

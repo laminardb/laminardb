@@ -34,8 +34,14 @@
   each object's key relative to the directory in its checkpoint, so a resume reads only new objects
   and continues a partly read one at its next row. Object-store paths take CSV, JSON or text with
   declared columns; Parquet, Arrow IPC, FpML and schema inference still need a local path, and the
-  files sink stays local. Such a source is at-least-once in embedded and single-node mode; cluster
-  mode still rejects it.
+  files sink stays local. Such a source is at-least-once in every mode.
+
+  With `splits = n` (object-store directories only) each object belongs to one of `n` input
+  channels by a hash of its key, and each channel keeps its own processed keys and partly read
+  object. In cluster mode each channel is read by the node that owns the vnode the engine's route
+  gives it, so several nodes read one directory. Without `splits` cluster mode rejects the source.
+  A split source's checkpoint has a new format, so a source cannot resume across adding or
+  removing `splits`.
 
 ### Changed
 

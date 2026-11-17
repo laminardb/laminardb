@@ -428,7 +428,7 @@ pub(super) fn output_schema(
         ));
     }
     let empty = arrow_array::RecordBatch::new_empty(Arc::clone(payload));
-    super::source::append_metadata_column(&empty, "", 0, 0).map(|batch| batch.schema())
+    super::decoding::append_metadata_column(&empty, "", 0, 0).map(|batch| batch.schema())
 }
 
 #[allow(clippy::needless_pass_by_value)] // Adapter for owned Result::map_err errors.

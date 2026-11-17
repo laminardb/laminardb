@@ -142,6 +142,16 @@ const SOURCES: &[Variant] = &[
         exact_properties: &[],
     },
     Variant {
+        label: "Files (object store, splits)",
+        connector: "files",
+        properties: &[
+            ("path", "s3://lake/in/*.json"),
+            ("format", "json"),
+            ("splits", "4"),
+        ],
+        exact_properties: &[],
+    },
+    Variant {
         label: "RabbitMQ",
         connector: "rabbitmq",
         properties: &[("url", "amqp://localhost:5672/%2f"), ("queue", "orders")],

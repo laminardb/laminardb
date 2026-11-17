@@ -1242,6 +1242,30 @@ fn files_source_is_admitted_only_locally() {
     );
 }
 
+#[cfg(all(feature = "cluster", feature = "files"))]
+#[test]
+fn a_split_object_store_files_source_runs_in_cluster_at_least_once() {
+    use super::{admit_source_recovery_contract, cluster_assignment_scoped};
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::files::register_file_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", "s3://bucket/in/*.json");
+    config.set("format", "json");
+    config.set("splits", "4");
+    let source = registry.create_source(&config, None).unwrap();
+    let contract = source.contract(&config).unwrap();
+    assert!(cluster_assignment_scoped(contract));
+    let admit =
+        |delivery| admit_source_recovery_contract(contract, delivery, true, RuntimeMode::Cluster);
+    assert_eq!(admit(DeliveryGuarantee::AtLeastOnce), Ok(()));
+    let error = admit(DeliveryGuarantee::ExactlyOnce).unwrap_err();
+    assert!(
+        error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED),
+        "{error}"
+    );
+}
+
 /// The rejection follows the source's state, not its topology, so it holds for a splittable
 /// source and after cluster singleton placement exists.
 #[test]

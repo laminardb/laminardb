@@ -909,6 +909,37 @@ read one table, at-least-once.
   windows over the source, set `[server] source_idle_timeout` so such a node counts as idle.
 - Exactly-once and adding the source to a running cluster are rejected.
 
+### Files on object storage
+
+A files source `path` may be an `s3://`, `gs://` or `az://` directory (also `s3a://`, `abfss://`
+and `wasbs://`), with credentials from `storage.*` options or the environment, as for Delta Lake:
+
+```sql
+CREATE SOURCE landing (id BIGINT NOT NULL, payload VARCHAR) FROM FILES (
+    'path' = 's3://bucket/landing/*.json',
+    'storage.aws_region' = 'us-east-1',
+    'splits' = '64'
+) FORMAT JSON;
+```
+
+- Every `poll_interval` (default 10 s, must be greater than zero) the source lists the
+  directory's direct children and reads new objects in key order, each with one request.
+- The checkpoint records each object's key relative to the directory. A resume reads only new
+  objects and continues a partly read one at its next row. Nothing is ever removed from that
+  record, and each checkpoint writes it whole.
+- Object-store paths take CSV, JSON or text with declared columns. Parquet, Arrow IPC, FpML and
+  schema inference need a local path, and the files sink writes only to a local path.
+- `splits = n` hashes each object's key into one of `n` input channels; each channel keeps its own
+  processed keys and partly read object. One node reads every channel; in a cluster each channel
+  is read by the node that owns its vnode, so several nodes read one directory, at-least-once.
+  Every node lists the whole directory each `poll_interval`.
+- `n` is part of the source's identity: changing it, or adding or removing it, is an incompatible
+  change that needs a reset.
+- A node whose channels receive no new objects does not advance its watermark. For event-time
+  windows over the source, set `[server] source_idle_timeout` so such a node counts as idle.
+- Exactly-once and adding the source to a running cluster are rejected. Without `splits`, cluster
+  mode rejects the source.
+
 ### On-demand lookup sources (partial cache mode)
 
 `CREATE LOOKUP TABLE ... WITH ('strategy' = 'on-demand', 'cache.memory' = '64mb')`

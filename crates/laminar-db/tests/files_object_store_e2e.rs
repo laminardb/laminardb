@@ -41,7 +41,10 @@ async fn put_ids(store: &dyn ObjectStore, key: &str, ids: &[i64]) {
         .expect("put object");
 }
 
-fn statements(prefix: &str) -> Vec<String> {
+fn statements(prefix: &str, splits: Option<u32>) -> Vec<String> {
+    let splits = splits.map_or_else(String::new, |splits| {
+        format!(",\n                'splits' = '{splits}'")
+    });
     vec![
         format!(
             "CREATE SOURCE events (id BIGINT NOT NULL) FROM FILES (
@@ -51,7 +54,7 @@ fn statements(prefix: &str) -> Vec<String> {
                 'storage.aws_access_key_id' = 'minioadmin',
                 'storage.aws_secret_access_key' = '${{E2E_S3_SECRET}}',
                 'storage.aws_region' = 'us-east-1',
-                'storage.aws_allow_http' = 'true'
+                'storage.aws_allow_http' = 'true'{splits}
              ) FORMAT JSON"
         ),
         "CREATE MATERIALIZED VIEW deliveries AS \
@@ -145,9 +148,9 @@ async fn deliveries(db: &LaminarDB) -> BTreeMap<i64, i64> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs S3 on localhost:9000 (tests/docker/iceberg-compose.yml)"]
-async fn an_s3_directory_feeds_sql_and_resumes_after_its_checkpoint() {
+/// Objects read before the checkpoint are in its manifest by key, so none is read again after the
+/// restart; objects below the directory are not read at all.
+async fn reads_each_object_once_across_a_checkpointed_restart(splits: Option<u32>) {
     let store = bucket();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -159,7 +162,7 @@ async fn an_s3_directory_feeds_sql_and_resumes_after_its_checkpoint() {
     put_ids(store.as_ref(), &format!("{prefix}/nested/x.json"), &[99]).await;
     let dir = tempfile::tempdir().expect("dir");
     let storage = dir.path().join("storage");
-    let ddl = statements(&prefix);
+    let ddl = statements(&prefix, splits);
 
     let db = reopen(&storage, &ddl).await;
     db.start().await.expect("start");
@@ -173,7 +176,17 @@ async fn an_s3_directory_feeds_sql_and_resumes_after_its_checkpoint() {
     db.start().await.expect("restart");
     let deliveries = wait_for_ids(&db, 1..=6).await;
     db.shutdown().await.expect("shutdown");
-    // Every object read before the checkpoint is in its manifest by key, so none is read again;
-    // objects below the directory are not read at all.
     assert_eq!(deliveries, (1..=6).map(|id| (id, 1)).collect());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs S3 on localhost:9000 (tests/docker/iceberg-compose.yml)"]
+async fn an_s3_directory_feeds_sql_and_resumes_after_its_checkpoint() {
+    reads_each_object_once_across_a_checkpointed_restart(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs S3 on localhost:9000 (tests/docker/iceberg-compose.yml)"]
+async fn a_split_s3_directory_feeds_sql_and_resumes_after_its_checkpoint() {
+    reads_each_object_once_across_a_checkpointed_restart(Some(4)).await;
 }

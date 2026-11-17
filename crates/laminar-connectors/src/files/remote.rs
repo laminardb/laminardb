@@ -5,7 +5,8 @@
 //! directory. That key is what the manifest records, independent of the bucket, endpoint or URL
 //! form the path was written in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use crossfire::{mpsc, MAsyncTx};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt as _};
+use tokio::sync::watch;
 use tracing::warn;
 
 use super::discovery::DiscoveredFile;
@@ -105,7 +107,42 @@ impl RemoteDirectory {
     }
 }
 
-/// List the directory every `poll_interval` and send each object not yet processed, in key
+/// Which listed objects discovery sends.
+pub(super) enum ListingFilter {
+    /// Objects the manifest does not hold.
+    Unprocessed(Arc<FileInventorySnapshot>),
+    /// Objects of the split channels this node owns; the source skips those it has read.
+    OwnedChannels {
+        splits: NonZeroU32,
+        owned: watch::Receiver<Arc<BTreeSet<u32>>>,
+    },
+}
+
+impl ListingFilter {
+    /// Whether the owned channels changed since the last call, so that objects refused or
+    /// dropped before may be wanted now.
+    fn ownership_moved(&mut self) -> bool {
+        match self {
+            Self::Unprocessed(_) => false,
+            Self::OwnedChannels { owned, .. } => {
+                let moved = owned.has_changed().unwrap_or(false);
+                owned.mark_unchanged();
+                moved
+            }
+        }
+    }
+
+    fn wants(&self, key: &str) -> bool {
+        match self {
+            Self::Unprocessed(known) => !known.contains(key),
+            Self::OwnedChannels { splits, owned } => owned
+                .borrow()
+                .contains(&super::split::object_channel(key, *splits)),
+        }
+    }
+}
+
+/// List the directory every `poll_interval` and send each object `filter` wants once, in key
 /// order. Only direct children are read, as for a local directory. Objects are complete once
 /// listed, so there is no stabilisation delay, and an object deleted before it was read drops out
 /// at the next listing.
@@ -114,36 +151,22 @@ pub(super) async fn discovery_loop(
     directory: RemoteDirectory,
     poll_interval: Duration,
     tx: MAsyncTx<mpsc::Array<DiscoveredFile>>,
-    known: Arc<FileInventorySnapshot>,
+    mut filter: ListingFilter,
 ) -> Result<(), ConnectorError> {
     let mut sent: HashSet<String> = HashSet::new();
     let mut failures = 0;
     loop {
+        if filter.ownership_moved() {
+            sent.clear();
+        }
         match list(store.as_ref()).await {
-            Ok(mut objects) => {
+            Ok(objects) => {
                 failures = 0;
-                objects.retain(|object| directory.matches(object));
-                objects.sort_by(|left, right| left.location.cmp(&right.location));
-                let listed: HashSet<String> = objects
-                    .iter()
-                    .map(|object| object.location.to_string())
-                    .collect();
-                sent.retain(|key| listed.contains(key));
-                for object in objects {
-                    let key = object.location.to_string();
-                    if known.contains(&key) || sent.contains(&key) {
-                        continue;
-                    }
-                    let file = DiscoveredFile {
-                        path: key.clone(),
-                        size: object.size,
-                        modified_ms: u64::try_from(object.last_modified.timestamp_millis())
-                            .unwrap_or_default(),
-                    };
-                    if tx.send(file).await.is_err() {
-                        return Ok(());
-                    }
-                    sent.insert(key);
+                let objects = objects
+                    .into_iter()
+                    .filter(|object| directory.matches(object));
+                if !send_new(objects, &filter, &mut sent, &tx).await {
+                    return Ok(());
                 }
             }
             Err(error) => {
@@ -156,6 +179,39 @@ pub(super) async fn discovery_loop(
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Send the listed objects `filter` wants that are not in `sent`, in key order, and forget sent
+/// keys no longer listed. Returns `false` once the source has stopped receiving.
+async fn send_new(
+    objects: impl Iterator<Item = ObjectMeta>,
+    filter: &ListingFilter,
+    sent: &mut HashSet<String>,
+    tx: &MAsyncTx<mpsc::Array<DiscoveredFile>>,
+) -> bool {
+    let mut objects: Vec<ObjectMeta> = objects.collect();
+    objects.sort_by(|left, right| left.location.cmp(&right.location));
+    let listed: HashSet<String> = objects
+        .iter()
+        .map(|object| object.location.to_string())
+        .collect();
+    sent.retain(|key| listed.contains(key));
+    for object in objects {
+        let key = object.location.to_string();
+        if sent.contains(&key) || !filter.wants(&key) {
+            continue;
+        }
+        let file = DiscoveredFile {
+            path: key.clone(),
+            size: object.size,
+            modified_ms: u64::try_from(object.last_modified.timestamp_millis()).unwrap_or_default(),
+        };
+        if tx.send(file).await.is_err() {
+            return false;
+        }
+        sent.insert(key);
+    }
+    true
 }
 
 async fn list(store: &dyn ObjectStore) -> Result<Vec<ObjectMeta>, ConnectorError> {
@@ -202,7 +258,7 @@ impl FileReader for ObjectStoreReader {
             .bytes()
             .await
             .map_err(|error| ConnectorError::ReadError(format!("cannot read '{path}': {error}")))?;
-        Ok(bytes.to_vec())
+        Ok(Vec::from(bytes))
     }
 }
 
@@ -219,13 +275,7 @@ mod tests {
     use crate::connector::ConnectorTaskOwner;
     use crate::files::discovery::FileDiscoveryEngine;
     use crate::files::manifest::FileIngestionManifest;
-
-    async fn put(store: &InMemory, key: &str, body: &[u8]) {
-        store
-            .put(&ObjectPath::from(key), PutPayload::from(body.to_vec()))
-            .await
-            .unwrap();
-    }
+    use crate::files::test_support::put_object;
 
     fn directory(path: &str) -> RemoteDirectory {
         RemoteDirectory::parse(path, None).unwrap().unwrap()
@@ -245,17 +295,34 @@ mod tests {
         let known = Arc::new(manifest.snapshot_for_dedup());
         let directory = directory(path);
         let handle = tokio::spawn(async move {
-            discovery_loop(store, directory, Duration::from_millis(5), tx, known)
-                .await
-                .unwrap();
+            discovery_loop(
+                store,
+                directory,
+                Duration::from_millis(5),
+                tx,
+                ListingFilter::Unprocessed(known),
+            )
+            .await
+            .unwrap();
         });
         (rx, handle)
     }
 
-    /// The keys sent within a few polls.
-    async fn sent(rx: &AsyncRx<mpsc::Array<DiscoveredFile>>) -> Vec<(String, u64)> {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    /// The keys sent once `expected` have arrived (within five seconds), plus any sent within a few
+    /// more polls.
+    async fn sent(
+        rx: &AsyncRx<mpsc::Array<DiscoveredFile>>,
+        expected: usize,
+    ) -> Vec<(String, u64)> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut files = Vec::new();
+        while files.len() < expected {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(file)) => files.push((file.path, file.size)),
+                _ => break,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
         while let Ok(file) = rx.try_recv() {
             files.push((file.path, file.size));
         }
@@ -282,36 +349,36 @@ mod tests {
     #[tokio::test]
     async fn listing_sends_matching_direct_children_once_in_key_order() {
         let store = Arc::new(InMemory::new());
-        put(&store, "b.json", b"{}").await;
-        put(&store, "a.json", b"{}\n{}").await;
-        put(&store, "empty.json", b"").await;
-        put(&store, "notes.txt", b"skip").await;
-        put(&store, "nested/c.json", b"{}").await;
+        put_object(&store, "b.json", b"{}").await;
+        put_object(&store, "a.json", b"{}\n{}").await;
+        put_object(&store, "empty.json", b"").await;
+        put_object(&store, "notes.txt", b"skip").await;
+        put_object(&store, "nested/c.json", b"{}").await;
         let (rx, handle) = listen(&store, "s3://bucket/*.json", &FileIngestionManifest::new());
 
         assert_eq!(
-            sent(&rx).await,
+            sent(&rx, 3).await,
             [
                 ("a.json".into(), 5),
                 ("b.json".into(), 2),
                 ("empty.json".into(), 0)
             ]
         );
-        put(&store, "d.json", b"{}").await;
-        assert_eq!(sent(&rx).await, [("d.json".into(), 2)]);
+        put_object(&store, "d.json", b"{}").await;
+        assert_eq!(sent(&rx, 1).await, [("d.json".into(), 2)]);
         handle.abort();
     }
 
     #[tokio::test]
     async fn processed_objects_are_not_sent() {
         let store = Arc::new(InMemory::new());
-        put(&store, "a.json", b"{}").await;
-        put(&store, "b.json", b"{}").await;
+        put_object(&store, "a.json", b"{}").await;
+        put_object(&store, "b.json", b"{}").await;
         let mut manifest = FileIngestionManifest::new();
         manifest.insert("a.json".into());
         let (rx, handle) = listen(&store, "s3://bucket", &manifest);
 
-        assert_eq!(sent(&rx).await, [("b.json".into(), 2)]);
+        assert_eq!(sent(&rx, 1).await, [("b.json".into(), 2)]);
         handle.abort();
     }
 
@@ -400,7 +467,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             directory("s3://bucket/landing"),
             Duration::from_millis(1),
-            Arc::new(FileIngestionManifest::new().snapshot_for_dedup()),
+            ListingFilter::Unprocessed(Arc::new(FileIngestionManifest::new().snapshot_for_dedup())),
             owner.track().unwrap(),
         );
 
@@ -422,10 +489,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn objects_of_channels_owned_again_are_sent_again() {
+        let store = Arc::new(InMemory::new());
+        for key in ["a.json", "b.json", "c.json", "d.json"] {
+            put_object(&store, key, b"{}").await;
+        }
+        let splits = NonZeroU32::new(2).unwrap();
+        let every_channel = Arc::new(BTreeSet::from([0, 1]));
+        let (owned, receiver) = watch::channel(Arc::new(BTreeSet::new()));
+        let (tx, rx) = mpsc::bounded_async::<DiscoveredFile>(16);
+        let filter = ListingFilter::OwnedChannels {
+            splits,
+            owned: receiver,
+        };
+        let handle = tokio::spawn(discovery_loop(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            directory("s3://bucket"),
+            Duration::from_millis(5),
+            tx,
+            filter,
+        ));
+        assert!(sent(&rx, 0).await.is_empty());
+
+        owned.send_replace(Arc::clone(&every_channel));
+        assert_eq!(sent(&rx, 4).await.len(), 4);
+        // Released and taken back between two listings: the source dropped what it had queued.
+        owned.send_replace(Arc::new(BTreeSet::new()));
+        owned.send_replace(every_channel);
+        assert_eq!(sent(&rx, 4).await.len(), 4);
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn the_reader_refuses_an_object_larger_than_max_file_bytes() {
         let store = Arc::new(InMemory::new());
-        put(&store, "small.json", b"{}").await;
-        put(&store, "large.json", b"0123456789").await;
+        put_object(&store, "small.json", b"{}").await;
+        put_object(&store, "large.json", b"0123456789").await;
         let reader = ObjectStoreReader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, 4);
         let (owner, _tracker) = ConnectorTaskOwner::new();
 

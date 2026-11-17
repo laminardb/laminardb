@@ -44,6 +44,11 @@ impl fmt::Debug for FileInventorySnapshot {
     }
 }
 
+/// One path as a fragment of the serialized manifest, a JSON array of paths.
+pub(super) fn manifest_fragment(path: &str) -> String {
+    serde_json::Value::String(path.to_owned()).to_string()
+}
+
 /// Tracks every ingested file with exact membership.
 pub struct FileIngestionManifest {
     paths: Arc<RwLock<BTreeSet<String>>>,
@@ -70,7 +75,7 @@ impl FileIngestionManifest {
 
     /// Inserts an immutable file identity in `O(log N)`.
     pub fn insert(&mut self, path: String) {
-        let fragment = serde_json::Value::String(path.clone()).to_string();
+        let fragment = manifest_fragment(&path);
         let inserted = self
             .paths
             .write()

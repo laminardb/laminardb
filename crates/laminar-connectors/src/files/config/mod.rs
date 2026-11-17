@@ -1,6 +1,7 @@
 //! Configuration types for the file source and sink connectors.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
@@ -16,6 +17,9 @@ pub struct FileSourceConfig {
 
     /// Object-store directory when `path` is an `s3://`, `gs://` or `az://` URL.
     pub(in crate::files) remote: Option<super::remote::RemoteDirectory>,
+
+    /// Input channels an object-store directory's objects are hashed into (`splits`).
+    pub splits: Option<NonZeroU32>,
 
     /// Data format (`csv`, `json`, `text`, `parquet`). `None` = auto-detect.
     pub format: Option<FileFormat>,
@@ -88,6 +92,7 @@ impl FileSourceConfig {
                 "'poll_interval' must be greater than zero for an object-store directory".into(),
             ));
         }
+        let splits = configured_splits(config, remote.is_some())?;
         let stabilisation_delay =
             parse_duration(props, "stabilisation_delay", Duration::from_secs(1))?;
         let max_files_per_poll = parse_usize(props, "max_files_per_poll", 100)?;
@@ -127,6 +132,7 @@ impl FileSourceConfig {
         Ok(Self {
             path,
             remote,
+            splits,
             format,
             poll_interval,
             stabilisation_delay,
@@ -256,6 +262,21 @@ impl FileSinkConfig {
             max_buffered_batches,
         })
     }
+}
+
+/// The `splits` option. Objects are hashed into channels by their key relative to the source
+/// directory, so splits need an object-store directory.
+pub(super) fn configured_splits(
+    config: &ConnectorConfig,
+    is_remote: bool,
+) -> Result<Option<NonZeroU32>, ConnectorError> {
+    let splits = crate::connector::split_ownership::configured_split_count(config, "splits")?;
+    if splits.is_some() && !is_remote {
+        return Err(ConnectorError::FeatureUnsupported(
+            "'splits' needs an object-store directory (s3://, gs:// or az://)".into(),
+        ));
+    }
+    Ok(splits)
 }
 
 pub(super) fn local_files_path(path: &str) -> Result<String, ConnectorError> {

@@ -23,25 +23,45 @@ pub(super) struct FileProgress {
     pub(super) next_row: u64,
 }
 
+impl FileProgress {
+    pub(super) fn encode(&self) -> String {
+        serde_json::to_string(self)
+            .expect("file progress contains only infallibly serializable fields")
+    }
+}
+
+/// An empty files checkpoint of `version`, bound to the reader's schema contract.
+pub(super) fn file_checkpoint(version: &str, schema_contract: Option<&str>) -> SourceCheckpoint {
+    let mut checkpoint = SourceCheckpoint::new();
+    checkpoint.set_metadata("connector", FILE_CHECKPOINT_CONNECTOR);
+    checkpoint.set_metadata(CHECKPOINT_VERSION_METADATA, version);
+    if let Some(binding) = schema_contract {
+        checkpoint.set_metadata("schema.contract", binding);
+    }
+    checkpoint
+}
+
+/// Refuse file progress whose path is not an object key.
+pub(super) fn validate_object_key(progress: &FileProgress) -> Result<(), ConnectorError> {
+    object_store::path::Path::parse(&progress.path)
+        .map(|_| ())
+        .map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid object key in file progress: {error}"
+            ))
+        })
+}
+
 /// The checkpoint of the processed files and the file in flight.
 pub(super) fn ingestion_checkpoint(
     manifest: &FileIngestionManifest,
     progress: Option<&FileProgress>,
     schema_contract: Option<&str>,
 ) -> SourceCheckpoint {
-    let mut checkpoint = SourceCheckpoint::new();
-    checkpoint.set_metadata("connector", FILE_CHECKPOINT_CONNECTOR);
-    checkpoint.set_metadata(CHECKPOINT_VERSION_METADATA, FILE_CHECKPOINT_VERSION);
-    if let Some(binding) = schema_contract {
-        checkpoint.set_metadata("schema.contract", binding);
-    }
+    let mut checkpoint = file_checkpoint(FILE_CHECKPOINT_VERSION, schema_contract);
     manifest.to_checkpoint(&mut checkpoint);
     if let Some(progress) = progress {
-        checkpoint.set_offset(
-            FILE_PROGRESS_OFFSET,
-            serde_json::to_string(progress)
-                .expect("file progress contains only infallibly serializable fields"),
-        );
+        checkpoint.set_offset(FILE_PROGRESS_OFFSET, progress.encode());
     }
     checkpoint
 }
@@ -63,7 +83,7 @@ pub(super) fn restore_ingestion_position(
             attempt,
             checkpoint,
         } => {
-            validate_file_checkpoint(&checkpoint)?;
+            validate_file_checkpoint(&checkpoint, FILE_CHECKPOINT_VERSION)?;
             if checkpoint.get_offset("manifest").is_none() {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "file checkpoint {attempt:?} is missing required manifest state"
@@ -85,11 +105,7 @@ pub(super) fn restore_ingestion_position(
                 })?
                 .map(|mut progress| {
                     if is_remote {
-                        object_store::path::Path::parse(&progress.path).map_err(|error| {
-                            ConnectorError::ConfigurationError(format!(
-                                "invalid object key in file progress: {error}"
-                            ))
-                        })?;
+                        validate_object_key(&progress)?;
                     } else {
                         progress.path = local_files_path(&progress.path)?;
                     }
@@ -109,7 +125,12 @@ pub(super) fn restore_ingestion_position(
     })
 }
 
-fn validate_file_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+/// Refuse a checkpoint of another connector or of another files checkpoint `version`: an unsplit
+/// source and a source with `splits` cannot resume from each other.
+pub(super) fn validate_file_checkpoint(
+    checkpoint: &SourceCheckpoint,
+    version: &str,
+) -> Result<(), ConnectorError> {
     match checkpoint.get_metadata("connector") {
         Some(FILE_CHECKPOINT_CONNECTOR) => {}
         Some(connector) => {
@@ -123,9 +144,9 @@ fn validate_file_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), Connect
             ));
         }
     }
-    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(FILE_CHECKPOINT_VERSION) {
+    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(version) {
         return Err(ConnectorError::ConfigurationError(format!(
-            "file checkpoint requires {CHECKPOINT_VERSION_METADATA}={FILE_CHECKPOINT_VERSION}"
+            "file checkpoint requires {CHECKPOINT_VERSION_METADATA}={version}"
         )));
     }
     Ok(())
