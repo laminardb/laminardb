@@ -11,7 +11,6 @@
 //! With `splits = n` the sequence is split over `n` input channels, row `i` on channel
 //! `i mod n`, and a cluster reads each channel on one node.
 
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,7 +21,9 @@ use async_trait::async_trait;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConfigKeySpec, ConnectorConfig, ConnectorInfo};
-use crate::connector::split_ownership::{source_input_channel, SplitAssignment, SPLIT_ROUTE};
+use crate::connector::split_ownership::{
+    configured_split_count, source_input_channel, SplitAssignment, SPLIT_ROUTE,
+};
 use crate::connector::{
     SourceBatch, SourceChannelPlacement, SourceConnector, SourceConsistency, SourceContract,
     SourceDrainRequest, SourceDrainSettlement, SourceInputMode, SourcePosition,
@@ -36,21 +37,6 @@ const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
 const GENERATOR_CHECKPOINT_VERSION: &str = "2";
 
 mod split;
-
-fn configured_splits(config: &ConnectorConfig) -> Result<Option<NonZeroU32>, ConnectorError> {
-    use laminar_core::state::MAX_KEY_GROUP_COUNT;
-
-    match config.get_parsed::<u32>("splits")? {
-        None => Ok(None),
-        // More splits than the largest vnode count add no parallelism.
-        Some(splits) if splits > MAX_KEY_GROUP_COUNT => Err(ConnectorError::ConfigurationError(
-            format!("splits must be at most {MAX_KEY_GROUP_COUNT}"),
-        )),
-        Some(splits) => NonZeroU32::new(splits)
-            .map(Some)
-            .ok_or_else(|| ConnectorError::ConfigurationError("splits must be > 0".into())),
-    }
-}
 
 fn validate_generator_checkpoint(
     checkpoint: &SourceCheckpoint,
@@ -241,7 +227,7 @@ impl Default for GeneratorSource {
 #[async_trait]
 impl SourceConnector for GeneratorSource {
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        let Some(channels) = configured_splits(config)? else {
+        let Some(channels) = configured_split_count(config, "splits")? else {
             return Ok(SourceContract::new(
                 SourceConsistency::Replayable,
                 SourceTopology::Singleton,
@@ -294,7 +280,7 @@ impl SourceConnector for GeneratorSource {
         }
         self.max_rows = config.get_parsed::<u64>("max.rows")?;
         self.split = None;
-        if let Some(splits) = configured_splits(&config)? {
+        if let Some(splits) = configured_split_count(&config, "splits")? {
             let start = match &position {
                 SourcePosition::Initial => None,
                 SourcePosition::Initialized { .. } => {

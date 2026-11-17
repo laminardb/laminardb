@@ -160,7 +160,7 @@ fn test_removed_sink_mode_option_is_rejected() {
 }
 
 #[test]
-fn remote_source_and_sink_urls_fail_before_filesystem_io() {
+fn object_store_urls_are_remote_sources_and_rejected_sinks() {
     for location in [
         "s3://bucket/path",
         "s3a://bucket/path",
@@ -169,15 +169,12 @@ fn remote_source_and_sink_urls_fail_before_filesystem_io() {
         "az://container/path",
         "abfss://filesystem@account.dfs.core.windows.net/path",
         "wasbs://container@account.blob.core.windows.net/path",
-        "https://storage.example/path",
     ] {
         let mut source = ConnectorConfig::new("files");
         source.set("path", location);
         source.set("format", "json");
-        let source_error = FileSourceConfig::from_connector_config(&source).unwrap_err();
-        assert!(source_error
-            .to_string()
-            .contains("remote Files connector backends are not enabled"));
+        let parsed = FileSourceConfig::from_connector_config(&source).unwrap();
+        assert!(parsed.remote.is_some(), "{location}");
 
         let mut sink = ConnectorConfig::new("files");
         sink.set("path", location);
@@ -187,6 +184,32 @@ fn remote_source_and_sink_urls_fail_before_filesystem_io() {
             .to_string()
             .contains("remote Files connector backends are not enabled"));
     }
+}
+
+#[test]
+fn an_http_source_url_is_rejected() {
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", "https://storage.example/path");
+    config.set("format", "json");
+    let error = FileSourceConfig::from_connector_config(&config).unwrap_err();
+    assert!(
+        error.to_string().contains("invalid file source path"),
+        "{error}"
+    );
+}
+
+#[test]
+fn object_store_sources_read_only_csv_json_or_text() {
+    for format in ["parquet", "arrow"] {
+        let mut config = ConnectorConfig::new("files");
+        config.set("path", "s3://bucket/landing");
+        config.set("format", format);
+        let error = FileSourceConfig::from_connector_config(&config).unwrap_err();
+        assert!(error.to_string().contains("need a local path"), "{error}");
+    }
+    let mut by_extension = ConnectorConfig::new("files");
+    by_extension.set("path", "s3://bucket/landing/*.parquet");
+    assert!(FileSourceConfig::from_connector_config(&by_extension).is_err());
 }
 
 #[test]

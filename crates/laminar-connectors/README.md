@@ -23,7 +23,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; `read.splits` reads appends in parallel, across cluster nodes too; changelog fails closed | Implemented |
-| File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
+| File Auto-Loader | `files` | Local directory watch/glob discovery (Parquet/CSV/JSON), or a listed S3/GCS/Azure directory (CSV/JSON/text) | Implemented |
 | FpML documents | `fpml` | `FORMAT FPML` on the files, Kafka, RabbitMQ, and IBM MQ sources, and `fpml.field` on the FIX source: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
 
 Feature flags compile connector implementations; startup validates the complete source/SQL/sink
@@ -909,6 +909,43 @@ read one table, at-least-once.
   windows over the source, set `[server] source_idle_timeout` so such a node counts as idle.
 - Exactly-once and adding the source to a running cluster are rejected.
 
+### Files on object storage
+
+A files source `path` may be an `s3://`, `gs://` or `az://` directory (also `s3a://`, `abfss://`
+and `wasbs://`), with credentials from `storage.*` options or the environment, as for Delta Lake:
+
+```sql
+CREATE SOURCE landing (id BIGINT NOT NULL, payload VARCHAR) FROM FILES (
+    'path' = 's3://bucket/landing/*.json',
+    'storage.aws_region' = 'us-east-1',
+    'splits' = '64'
+) FORMAT JSON;
+```
+
+- Every `poll_interval` (default 10 s, must be greater than zero) the source lists the
+  directory's direct children and reads new objects in key order, each with one request.
+- The checkpoint records each object's key relative to the directory. A resume reads only new
+  objects and continues a partly read one at its next row. Nothing is ever removed from that
+  record, and each checkpoint writes it whole.
+- The source reads each key once: an object written over a key it has already read is skipped, so
+  producers write every object under a new key. A run reads each object whole, in one request, and
+  delivers its rows from that copy. A resume of a partly read object, after a restart or a handoff
+  to another node, checks the object's hash and stops the source if it has changed.
+- The record names keys, not a dataset. Resuming against another bucket or prefix is only valid
+  when it holds the same objects; otherwise reset the source.
+- Object-store paths take CSV, JSON or text with declared columns. Parquet, Arrow IPC, FpML and
+  schema inference need a local path, and the files sink writes only to a local path.
+- `splits = n` hashes each object's key into one of `n` input channels; each channel keeps its own
+  processed keys and partly read object. One node reads every channel; in a cluster each channel
+  is read by the node that owns its vnode, so several nodes read one directory, at-least-once.
+  Every node lists the whole directory each `poll_interval`.
+- `n` is part of the source's identity: changing it, or adding or removing it, is an incompatible
+  change that needs a reset.
+- A node whose channels receive no new objects does not advance its watermark. For event-time
+  windows over the source, set `[server] source_idle_timeout` so such a node counts as idle.
+- Exactly-once and adding the source to a running cluster are rejected. Without `splits`, cluster
+  mode rejects the source.
+
 ### On-demand lookup sources (partial cache mode)
 
 `CREATE LOOKUP TABLE ... WITH ('strategy' = 'on-demand', 'cache.memory' = '64mb')`
@@ -1109,7 +1146,7 @@ requirements:
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
-| `files` | Local file source (auto-loader) and sink (rolling files); remote URLs are rejected |
+| `files` | File source (auto-loader) over a local or object-store directory, and local sink (rolling files); object-store providers come from the `aws`, `gcs` and `azure` features of `laminar-db` or `laminar-server` |
 | `fpml` | FpML format for the files, Kafka, RabbitMQ, and IBM MQ sources and FIX fields; builds a vendored libxml2 with CMake |
 
 ## Custom Connectors

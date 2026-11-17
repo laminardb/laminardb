@@ -49,13 +49,21 @@ current commit. “ALO” means at-least-once only in cluster mode.
 | Delta sink | URI/config; MinIO smoke; native job; S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; keyless native job enabled; no current native artifact; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; S3/S3A cluster exact requires native ETag conditional put and a successful atomic conditional-create startup probe. Any configured `s3_locking_provider` and enabled unsafe-rename mode are rejected; a lock provider is not required. |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
-| Files source (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
+| Files source (Parquet/CSV/JSON) | CSV/JSON/text with declared columns; cluster ALO with `splits` | URI/config only; no emulator or native evidence | URI/config only; no emulator or native evidence | Supported | SeaweedFS end-to-end restart test and a three-node split soak leg (candidate); compatibility tier only |
 | Files sink (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
 
-The Files connector is deliberately local-only. Remote URLs are detected before any `std::fs`
-operation and return an actionable error. No object-store sink was added because a safe remote sink
-needs deterministic keys, conditional publication, content validation on retry, and a durable
-visibility manifest; POSIX rename semantics are not emulated over object storage.
+The Files source reads an object-store directory: it lists the directory's direct children every
+`poll_interval`, reads each object whole, and checkpoints object keys relative to the directory, so
+a resume does not depend on the endpoint or URL form. The keys do not identify a dataset: a resume
+against another bucket or prefix is valid only when it holds the same objects, because keys already
+recorded are skipped as read; otherwise reset the source. Each key is read once, so producers write
+every object under a new key. Credentials come from `storage.*`
+options or the environment, as for Delta Lake. Object-store paths take CSV, JSON, or text with
+declared columns; Parquet, Arrow IPC, FpML, and schema inference still need a local path. The Files
+sink stays local-only: remote URLs are detected before any `std::fs` operation and return an
+actionable error. No object-store sink was added because a safe remote sink needs deterministic
+keys, conditional publication, content validation on retry, and a durable visibility manifest;
+POSIX rename semantics are not emulated over object storage.
 
 Cluster exact-delivery admission remains limited to Kafka or split generator input with an S3/S3A
 append-mode Delta sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom

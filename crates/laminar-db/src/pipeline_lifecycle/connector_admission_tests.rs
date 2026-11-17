@@ -1225,6 +1225,45 @@ fn files_source_is_admitted_only_locally() {
         admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster),
         Err("cluster sources cannot read files from one node's local filesystem")
     );
+
+    // Every node can reach an object-store directory, but one directory is one stream.
+    config.set("path", "s3://bucket/in/*.json");
+    let contract = source.contract(&config).unwrap();
+    assert_eq!(contract.locality, SourceLocality::Portable);
+    let admit =
+        |delivery, runtime| admit_source_recovery_contract(contract, delivery, true, runtime);
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local),
+        Ok(())
+    );
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster),
+        Err("cluster singleton sources require a connector that one node at a time may run")
+    );
+}
+
+#[cfg(all(feature = "cluster", feature = "files"))]
+#[test]
+fn a_split_object_store_files_source_runs_in_cluster_at_least_once() {
+    use super::{admit_source_recovery_contract, cluster_assignment_scoped};
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::files::register_file_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", "s3://bucket/in/*.json");
+    config.set("format", "json");
+    config.set("splits", "4");
+    let source = registry.create_source(&config, None).unwrap();
+    let contract = source.contract(&config).unwrap();
+    assert!(cluster_assignment_scoped(contract));
+    let admit =
+        |delivery| admit_source_recovery_contract(contract, delivery, true, RuntimeMode::Cluster);
+    assert_eq!(admit(DeliveryGuarantee::AtLeastOnce), Ok(()));
+    let error = admit(DeliveryGuarantee::ExactlyOnce).unwrap_err();
+    assert!(
+        error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED),
+        "{error}"
+    );
 }
 
 /// The rejection follows the source's state, not its topology, so it holds for a splittable

@@ -331,6 +331,22 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs mongodb
             candidate: "true"
+          - label: Cluster ALO files split source (gossip)
+            test: files_source::three_node_files_source_kill9_soak
+            features: cluster,aws,kafka,files,mongodb-cdc
+            delivery: alo
+            topology: cluster-files-source
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # Every node reads the objects hashed to its channels; kills and rejoins move the
+            # channels, and the oracle requires every written id in the output collection.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs mongodb
+            candidate: "true"
           - label: Cluster ALO PostgreSQL sink (gossip)
             test: multi_writer_sinks::three_node_postgres_sink_kill9_soak
             features: cluster,aws,kafka,postgres-sink

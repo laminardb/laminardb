@@ -103,6 +103,13 @@ fn resolve_files(
                 &output_schema(&explicit, parsed.include_metadata)?,
             );
         }
+        if parsed.remote.is_some() {
+            return Err(ConnectorError::FeatureUnsupported(
+                "an object-store CSV/JSON file source needs declared columns; schema inference \
+                 reads local files only"
+                    .into(),
+            ));
+        }
         if !config
             .get_parsed::<bool>("schema.inference")?
             .unwrap_or(false)
@@ -421,7 +428,7 @@ pub(super) fn output_schema(
         ));
     }
     let empty = arrow_array::RecordBatch::new_empty(Arc::clone(payload));
-    super::source::append_metadata_column(&empty, "", 0, 0).map(|batch| batch.schema())
+    super::decoding::append_metadata_column(&empty, "", 0, 0).map(|batch| batch.schema())
 }
 
 #[allow(clippy::needless_pass_by_value)] // Adapter for owned Result::map_err errors.

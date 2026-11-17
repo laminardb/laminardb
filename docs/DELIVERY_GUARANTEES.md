@@ -35,6 +35,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (append read) | ALO, BE | rejected |
 | Iceberg (append read, splits) | ALO, BE | ALO |
 | Files | ALO, BE | rejected |
+| Files (object store, splits) | ALO, BE | ALO |
 | RabbitMQ | ALO | ALO |
 | IBM MQ | ALO | rejected |
 | NATS JetStream | BE | rejected |
@@ -74,6 +75,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Files (object store, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | NATS JetStream | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
@@ -96,6 +98,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Files | — | — | — | — | — | — | — | — | — | — | — | — |
+| Files (object store, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | IBM MQ | — | — | — | — | — | — | — | — | — | — | — | — |
 | NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -166,6 +169,14 @@ ids to a REST-catalog table on S3, seeded before the nodes start, and forwards e
 stream to a MongoDB sink, through the same kills. Every appended id must reach the output
 collection, ids never appended fail the run, duplicates are counted, and more than one node must
 have read the table.
+
+A files source over an object-store directory with `splits = n` hashes each object's key into one
+of `n` channels, and each channel keeps its own processed keys and partly read object, so every
+node reads part of the directory. `files_source::three_node_files_source_kill9_soak` (candidate)
+puts objects of ids into an S3 prefix, seeded before the nodes start, and forwards each id through
+a stream to a MongoDB sink, through the same kills. Every written id must reach the output
+collection, ids never written fail the run, duplicates are counted, and more than one node must
+have read the directory.
 
 ## Materialized view reads
 

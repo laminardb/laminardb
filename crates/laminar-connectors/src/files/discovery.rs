@@ -26,7 +26,7 @@ struct InitialScanInput {
 /// A file discovered by the discovery engine.
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
-    /// Full local path to the file.
+    /// Full local path, or the object key relative to a remote source directory.
     pub path: String,
     /// File size in bytes.
     pub size: u64,
@@ -112,6 +112,33 @@ impl FileDiscoveryEngine {
             rx,
             handle: Some(handle),
             initial_scan_handle: Some(initial_scan_handle),
+            terminal_error: None,
+        }
+    }
+
+    /// Starts listing an object-store directory every `poll_interval`, sending the objects
+    /// `filter` wants.
+    pub(super) fn start_remote(
+        store: Arc<dyn object_store::ObjectStore>,
+        directory: super::remote::RemoteDirectory,
+        poll_interval: Duration,
+        filter: super::remote::ListingFilter,
+        task_guard: ConnectorTaskGuard,
+    ) -> Self {
+        let (tx, rx) = mpsc::bounded_async::<DiscoveredFile>(256);
+        let handle = tokio::spawn(async move {
+            let _task_guard = task_guard;
+            let result =
+                super::remote::discovery_loop(store, directory, poll_interval, tx, filter).await;
+            if let Err(error) = &result {
+                error!(%error, "file discovery listing failed");
+            }
+            result
+        });
+        Self {
+            rx,
+            handle: Some(handle),
+            initial_scan_handle: None,
             terminal_error: None,
         }
     }
