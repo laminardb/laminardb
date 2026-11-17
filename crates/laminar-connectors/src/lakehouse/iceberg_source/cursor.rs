@@ -8,7 +8,7 @@ use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSourceConfig};
 
 const CURSOR_KEY: &str = "iceberg.cursor";
-const CURSOR_VERSION: u8 = 1;
+pub(super) const CURSOR_VERSION: u8 = 1;
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 
 /// Origin represented by an Iceberg source cursor.
@@ -265,7 +265,7 @@ impl IcebergSourceCursorV1 {
         Ok(encoded)
     }
 
-    fn validate_payload(&self) -> Result<(), ConnectorError> {
+    pub(super) fn validate_payload(&self) -> Result<(), ConnectorError> {
         if self.version != CURSOR_VERSION {
             return Err(cursor_error(
                 "LDB-ICEBERG-CURSOR-VERSION",
@@ -343,7 +343,7 @@ impl IcebergSourceCursorV1 {
     }
 }
 
-fn durable_metadata_location(table: &Table) -> Result<&str, ConnectorError> {
+pub(super) fn durable_metadata_location(table: &Table) -> Result<&str, ConnectorError> {
     table
         .metadata_location()
         .filter(|location| !location.is_empty())
@@ -355,7 +355,7 @@ fn durable_metadata_location(table: &Table) -> Result<&str, ConnectorError> {
         })
 }
 
-fn cursor_error(code: &str, detail: &str) -> ConnectorError {
+pub(super) fn cursor_error(code: &str, detail: &str) -> ConnectorError {
     ConnectorError::ConfigurationError(format!("[{code}] {detail}"))
 }
 

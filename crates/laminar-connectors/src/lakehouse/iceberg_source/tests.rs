@@ -189,7 +189,7 @@ fn split_snapshot_batches_block_barriers_until_the_completed_cursor() {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
         )
         .unwrap(),
-        completed_cursor: Some(replay_cursor(2)),
+        completed: Some(Completion::Snapshot(replay_cursor(2))),
     });
 
     for expected_snapshot in [1, 1] {

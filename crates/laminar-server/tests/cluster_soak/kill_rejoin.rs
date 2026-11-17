@@ -21,6 +21,23 @@ use super::{
     ResolvedExecutable, BASE_PORT, NODES,
 };
 
+/// Grows on every node that commits checkpoints.
+#[cfg(any(feature = "rabbitmq", feature = "mongodb-cdc"))]
+pub(super) const CHECKPOINTS_COMPLETED: &str = "laminardb_checkpoints_completed_total";
+/// Grows only on the nodes that read the source.
+pub(super) const EVENTS_INGESTED: &str = "laminardb_events_ingested_total";
+
+/// Add every node that has read the source since it last started.
+#[cfg(any(feature = "rabbitmq", feature = "mongodb-cdc"))]
+pub(super) fn record_consumers(nodes: &[Node], consumers: &mut BTreeSet<usize>) {
+    consumers.extend(
+        nodes
+            .iter()
+            .filter(|node| node.metric(EVENTS_INGESTED).is_some_and(|rows| rows > 0.0))
+            .map(|node| node.id),
+    );
+}
+
 pub(super) struct SoakSettings {
     pub delivery: JoinDelivery,
     pub interval_ms: u64,

@@ -34,17 +34,17 @@ use lapin::options::{BasicPublishOptions, ConfirmSelectOptions};
 use lapin::uri::AMQPUri;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 
-use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSettings};
+use super::kill_rejoin::{
+    boot, cluster_nodes, kill_round, record_consumers, steady_phase, SoakSettings,
+    CHECKPOINTS_COMPLETED,
+};
 use super::multi_writer_sinks::rabbitmq::RabbitMq;
 use super::multi_writer_sinks::{block_on, wait_for_delivery, Destination as _};
 use super::{
     scoped_soak_storage_url, soak_run_id, wait_for_converged_durable_checkpoint, JoinDelivery,
-    Node, ResolvedExecutable, NODES,
+    ResolvedExecutable, NODES,
 };
 
-/// Every node commits checkpoints, while only the node holding the source ingests.
-const COMMITS: &str = "laminardb_checkpoints_completed_total";
-const INGESTED: &str = "laminardb_events_ingested_total";
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const PUBLISH_ATTEMPTS: u32 = 40;
 
@@ -86,7 +86,7 @@ fn three_node_rabbitmq_source_kill9_soak() {
     };
 
     let mut consumers = BTreeSet::new();
-    let mut latest = boot(&mut nodes, &mut live, &settings, COMMITS);
+    let mut latest = boot(&mut nodes, &mut live, &settings, CHECKPOINTS_COMPLETED);
     record_consumers(&nodes, &mut consumers);
     let mut killed_followers = BTreeSet::new();
     for round in 0..settings.kills {
@@ -96,12 +96,17 @@ fn three_node_rabbitmq_source_kill9_soak() {
             round,
             &mut killed_followers,
             &settings,
-            COMMITS,
+            CHECKPOINTS_COMPLETED,
             latest,
         );
         record_consumers(&nodes, &mut consumers);
     }
-    steady_phase(&mut nodes, &mut live, settings.steady, COMMITS);
+    steady_phase(
+        &mut nodes,
+        &mut live,
+        settings.steady,
+        CHECKPOINTS_COMPLETED,
+    );
     wait_for_converged_durable_checkpoint(
         &mut nodes,
         Instant::now() + settings.recovery_ceiling,
@@ -172,16 +177,6 @@ format = "json"
         source = rabbitmq.source_properties(input),
         sink = rabbitmq.sink_properties(output),
     )
-}
-
-/// Add every node that has consumed the queue since it last started.
-fn record_consumers(nodes: &[Node], consumers: &mut BTreeSet<usize>) {
-    consumers.extend(
-        nodes
-            .iter()
-            .filter(|node| node.metric(INGESTED).is_some_and(|rows| rows > 0.0))
-            .map(|node| node.id),
-    );
 }
 
 /// Paced publisher of ids `0..`. An id is retried until the broker confirms it, so the confirmed

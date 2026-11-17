@@ -10,6 +10,10 @@ mod metrics;
 mod planner;
 #[cfg(feature = "iceberg-core")]
 mod read_schema;
+#[cfg(feature = "iceberg-core")]
+mod split;
+#[cfg(feature = "iceberg-core")]
+mod start_position;
 
 use std::sync::Arc;
 #[cfg(feature = "iceberg-core")]
@@ -28,9 +32,13 @@ use tracing::info;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
+use crate::connector::split_ownership::SPLIT_ROUTE;
+#[cfg(feature = "iceberg-core")]
+use crate::connector::split_ownership::{OwnershipChange, SplitAssignment};
 use crate::connector::{
-    SourceBatch, SourceCheckpointUnavailablePolicy, SourceConnector, SourceConsistency,
-    SourceContract, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
+    SourceBatch, SourceChannelPlacement, SourceCheckpointUnavailablePolicy, SourceConnector,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 
@@ -40,7 +48,7 @@ use super::iceberg_config::{IcebergReadMode, IcebergSourceConfig};
 #[cfg(feature = "iceberg-core")]
 use metrics::IcebergSourceMetrics;
 #[cfg(feature = "iceberg-core")]
-use planner::{ScanOutput, ScanTask};
+use planner::{Completion, ScanOutput, ScanTask};
 #[cfg(feature = "iceberg-core")]
 use read_schema::ReadSchemaBinding;
 
@@ -53,7 +61,7 @@ const PARTIAL_SCAN_ERROR: &str = "[LDB-ICEBERG-PARTIAL-SCAN] Iceberg scan failed
 #[cfg(feature = "iceberg-core")]
 struct PendingBatch {
     batch: RecordBatch,
-    completed_cursor: Option<IcebergSourceCursorV1>,
+    completed: Option<Completion>,
 }
 
 /// Apache Iceberg source with bounded scan-to-ingestion backpressure.
@@ -90,6 +98,12 @@ pub struct IcebergSource {
     read_schema: Option<ReadSchemaBinding>,
     #[cfg(feature = "iceberg-core")]
     filter_predicate: Option<Predicate>,
+    /// Set by `read.splits`; replaces `cursor`.
+    #[cfg(feature = "iceberg-core")]
+    split: Option<split::IcebergSplitInput>,
+    /// Cluster ownership, installed before `start`.
+    #[cfg(feature = "iceberg-core")]
+    assignment: Option<SplitAssignment>,
 }
 
 impl IcebergSource {
@@ -133,6 +147,10 @@ impl IcebergSource {
             read_schema: None,
             #[cfg(feature = "iceberg-core")]
             filter_predicate: None,
+            #[cfg(feature = "iceberg-core")]
+            split: None,
+            #[cfg(feature = "iceberg-core")]
+            assignment: None,
         }
     }
 
@@ -167,19 +185,67 @@ impl IcebergSource {
     fn install_cursor(&mut self, cursor: IcebergSourceCursorV1) -> Result<(), ConnectorError> {
         let checkpoint = cursor.to_checkpoint()?;
         self.replay_unit_in_progress = false;
-        self.metrics.processed_snapshot_id.set(cursor.snapshot_id);
-        self.pending_snapshots = self.pending_snapshots.saturating_sub(1);
-        self.metrics
-            .snapshot_lag
-            .set(i64::try_from(self.pending_snapshots).unwrap_or(i64::MAX));
-        if let Some(current) = self.current_sequence_number {
-            self.metrics
-                .sequence_lag
-                .set(current.saturating_sub(cursor.sequence_number));
-        }
+        self.observe_processed(cursor.snapshot_id, cursor.sequence_number);
+        self.set_pending_snapshots(self.pending_snapshots.saturating_sub(1));
         self.checkpoint = checkpoint;
         self.cursor = Some(cursor);
         Ok(())
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn observe_processed(&mut self, snapshot_id: i64, sequence_number: i64) {
+        self.metrics.processed_snapshot_id.set(snapshot_id);
+        if let Some(current) = self.current_sequence_number {
+            self.metrics
+                .sequence_lag
+                .set(current.saturating_sub(sequence_number));
+        }
+    }
+
+    /// Run append planning under `storage.request_timeout` and observe how long it took.
+    #[cfg(feature = "iceberg-core")]
+    async fn plan_within_request_timeout<T, F>(
+        &self,
+        plan: impl FnOnce(tokio::time::Instant) -> F,
+    ) -> Result<T, ConnectorError>
+    where
+        F: std::future::Future<Output = Result<T, ConnectorError>>,
+    {
+        let started = Instant::now();
+        let deadline = super::iceberg_io::checked_deadline(
+            self.config.storage.request_timeout,
+            "storage.request_timeout",
+        )?;
+        let planned = tokio::time::timeout_at(deadline, plan(deadline))
+            .await
+            .map_err(|_| {
+                ConnectorError::ReadError(
+                    "[LDB-ICEBERG-APPEND-PLANNING-TIMEOUT] append manifest planning exceeded storage.request_timeout"
+                        .into(),
+                )
+            })??;
+        self.metrics
+            .planning_duration
+            .observe(started.elapsed().as_secs_f64());
+        Ok(planned)
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn observe_planned(&mut self, files: usize, manifests: usize, snapshots: usize) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        self.metrics.planned_files.inc_by(count(files));
+        self.metrics.planned_manifests.inc_by(count(manifests));
+        self.set_pending_snapshots(snapshots);
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn install_completion(&mut self, completion: Completion) -> Result<(), ConnectorError> {
+        match completion {
+            Completion::Snapshot(cursor) => self.install_cursor(cursor),
+            Completion::Channel { channel, position } => {
+                self.install_channel_position(channel, position)
+            }
+        }
     }
 
     #[cfg(feature = "iceberg-core")]
@@ -219,8 +285,8 @@ impl IcebergSource {
                 SourceBatch::new(emitted).with_checkpoint(self.checkpoint.clone()),
             ));
         }
-        if let Some(cursor) = pending.completed_cursor {
-            self.install_cursor(cursor)?;
+        if let Some(completion) = pending.completed {
+            self.install_completion(completion)?;
         } else {
             self.replay_unit_in_progress = true;
         }
@@ -259,15 +325,50 @@ impl IcebergSource {
     }
 
     #[cfg(feature = "iceberg-core")]
-    fn start_initial_scan(&mut self) -> Result<(), ConnectorError> {
-        let table = self
-            .table
+    fn loaded_table(&self) -> Result<&iceberg::table::Table, ConnectorError> {
+        self.table
             .as_ref()
             .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "loaded Iceberg table".into(),
                 actual: "table unavailable".into(),
-            })?
-            .clone();
+            })
+    }
+
+    /// Load the table's current metadata and observe its head.
+    #[cfg(feature = "iceberg-core")]
+    async fn reload_table(&mut self) -> Result<iceberg::table::Table, ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "started Iceberg source".into(),
+                actual: "catalog unavailable".into(),
+            })?;
+        let table = super::iceberg_io::load_table_with_timeout(
+            catalog.as_ref(),
+            &self.config.catalog.namespace,
+            &self.config.catalog.table_name,
+            self.config.catalog.request_timeout,
+        )
+        .await?;
+        self.observe_loaded_table(&table);
+        Ok(table)
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn observe_loaded_table(&mut self, table: &iceberg::table::Table) {
+        let head = table
+            .metadata()
+            .snapshot_for_ref(&self.config.table_ref)
+            .map(|snapshot| (snapshot.snapshot_id(), snapshot.sequence_number()));
+        self.observe_table_head(head);
+        self.metrics
+            .observe_table(table.metadata(), &self.config.table_ref);
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn start_initial_scan(&mut self) -> Result<(), ConnectorError> {
+        let table = self.loaded_table()?.clone();
         let selected = Self::selected_snapshot(&table, &self.config)?;
         if self.read_schema.is_none() {
             let root_schema = match selected.as_ref() {
@@ -330,58 +431,17 @@ impl IcebergSource {
             }
         }
         let poll_started = Instant::now();
-        let catalog = self
-            .catalog
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "started Iceberg source".into(),
-                actual: "catalog unavailable".into(),
-            })?;
-        let table = super::iceberg_io::load_table_with_timeout(
-            catalog.as_ref(),
-            &self.config.catalog.namespace,
-            &self.config.catalog.table_name,
-            self.config.catalog.request_timeout,
-        )
-        .await?;
-        let head = table
-            .metadata()
-            .snapshot_for_ref(&self.config.table_ref)
-            .map(|snapshot| (snapshot.snapshot_id(), snapshot.sequence_number()));
-        self.observe_table_head(head);
-        self.metrics
-            .observe_table(table.metadata(), &self.config.table_ref);
-
+        let table = self.reload_table().await?;
         if let Some(cursor) = self.cursor.as_ref() {
             cursor.validate_binding(&self.config, &table)?;
-            let planning_started = Instant::now();
-            let deadline = super::iceberg_io::checked_deadline(
-                self.config.storage.request_timeout,
-                "storage.request_timeout",
-            )?;
-            let plans = tokio::time::timeout_at(
-                deadline,
-                append_lineage::plan_appends(&table, cursor, &self.config, deadline),
-            )
-            .await
-            .map_err(|_| {
-                ConnectorError::ReadError(
-                    "[LDB-ICEBERG-APPEND-PLANNING-TIMEOUT] append manifest planning exceeded storage.request_timeout"
-                        .into(),
-                )
-            })??;
-            self.metrics
-                .planning_duration
-                .observe(planning_started.elapsed().as_secs_f64());
-            let planned_files = plans.iter().fold(0_u64, |total, plan| {
-                total.saturating_add(u64::try_from(plan.added_files.len()).unwrap_or(u64::MAX))
-            });
-            let planned_manifests = plans.iter().fold(0_u64, |total, plan| {
-                total.saturating_add(u64::try_from(plan.manifest_count).unwrap_or(u64::MAX))
-            });
-            self.metrics.planned_files.inc_by(planned_files);
-            self.metrics.planned_manifests.inc_by(planned_manifests);
-            self.set_pending_snapshots(plans.len());
+            let plans = self
+                .plan_within_request_timeout(|deadline| {
+                    append_lineage::plan_appends(&table, cursor, &self.config, deadline)
+                })
+                .await?;
+            let files = plans.iter().map(|plan| plan.added_files.len()).sum();
+            let manifests = plans.iter().map(|plan| plan.manifest_count).sum();
+            self.observe_planned(files, manifests, plans.len());
             self.scan = planner::append_task(
                 table.clone(),
                 &self.config,
@@ -432,6 +492,11 @@ impl IcebergSource {
             .observe(scan.started_at.elapsed().as_secs_f64());
         if self.config.read_mode == IcebergReadMode::Snapshot && !failed {
             self.bounded_snapshot_complete = true;
+        }
+        // A split scan completes its snapshots channel by channel, so they stay pending until the
+        // scan ends.
+        if self.split.is_some() {
+            self.set_pending_snapshots(0);
         }
         Ok(())
     }
@@ -527,17 +592,13 @@ impl SourceConnector for IcebergSource {
 
         #[cfg(feature = "iceberg-core")]
         {
-            let recovered_cursor = match &position {
-                SourcePosition::Initial => None,
-                SourcePosition::Initialized { .. } => {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Iceberg has no sealed topology startup contract".into(),
-                    ));
-                }
-                SourcePosition::Resume { checkpoint, .. } => {
-                    Some(IcebergSourceCursorV1::from_checkpoint(checkpoint)?)
-                }
-            };
+            let source_name = config
+                .get("laminar.source.name")
+                .filter(|name| !name.is_empty())
+                .unwrap_or("iceberg")
+                .to_string();
+            self.reset_read_state();
+            let start = self.decode_start(&position, &source_name)?;
             let catalog = super::iceberg_io::build_catalog_for_access_with_metrics(
                 &self.config.catalog,
                 &self.config.storage,
@@ -553,34 +614,13 @@ impl SourceConnector for IcebergSource {
                 self.config.catalog.request_timeout,
             )
             .await?;
-            let root_schema =
-                self.resolve_root_schema(&config, &table, recovered_cursor.as_ref())?;
+            let schema_cursor = start.schema_cursor(&table)?;
+            let root_schema = self.resolve_root_schema(&config, &table, schema_cursor.as_ref())?;
             self.bind_read_schema(&root_schema, declared_schema)?;
             self.catalog = Some(catalog);
-            let head = table
-                .metadata()
-                .snapshot_for_ref(&self.config.table_ref)
-                .map(|snapshot| (snapshot.snapshot_id(), snapshot.sequence_number()));
-            self.observe_table_head(head);
-            self.metrics
-                .observe_table(table.metadata(), &self.config.table_ref);
+            self.observe_loaded_table(&table);
             self.table = Some(table);
-
-            match position {
-                SourcePosition::Initial => self.start_initial_scan()?,
-                SourcePosition::Initialized { .. } => {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Iceberg has no sealed topology startup contract".into(),
-                    ));
-                }
-                SourcePosition::Resume { .. } => {
-                    self.install_cursor(recovered_cursor.ok_or_else(|| {
-                        ConnectorError::Internal(
-                            "Iceberg resume cursor was not retained during startup".into(),
-                        )
-                    })?)?;
-                }
-            }
+            self.install_start(start, &source_name)?;
             self.state = ConnectorState::Running;
             info!(
                 operation_class = "connector-open",
@@ -628,22 +668,19 @@ impl SourceConnector for IcebergSource {
                 };
             }
             loop {
+                if !self.split_may_read()? {
+                    return Ok(None);
+                }
                 if let Some(batch) = self.emit_pending(max_records)? {
                     return Ok(Some(batch));
                 }
                 if let Some(output) = self.next_scan_output().await? {
                     match output {
-                        ScanOutput::Batch {
-                            batch,
-                            completed_cursor,
-                        } => {
+                        ScanOutput::Batch { batch, completed } => {
                             self.metrics.observe_batch(&batch);
-                            self.pending = Some(PendingBatch {
-                                batch,
-                                completed_cursor,
-                            });
+                            self.pending = Some(PendingBatch { batch, completed });
                         }
-                        ScanOutput::Cursor(cursor) => self.install_cursor(cursor)?,
+                        ScanOutput::Completed(completion) => self.install_completion(completion)?,
                         ScanOutput::ReadMetrics {
                             files,
                             storage_bytes,
@@ -662,7 +699,11 @@ impl SourceConnector for IcebergSource {
                     return Ok(None);
                 }
                 if self.config.read_mode == IcebergReadMode::Append {
-                    self.refresh_append().await?;
+                    if self.split.is_some() {
+                        self.refresh_split().await?;
+                    } else {
+                        self.refresh_append().await?;
+                    }
                     if self.scan.is_some() {
                         continue;
                     }
@@ -690,10 +731,68 @@ impl SourceConnector for IcebergSource {
 
     fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
         #[cfg(feature = "iceberg-core")]
-        if self.replay_unit_in_progress {
+        if self.replay_unit_in_progress || !self.checkpoint_ready()? {
             return Ok(None);
         }
         Ok(Some(self.checkpoint()))
+    }
+
+    fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+        #[cfg(feature = "iceberg-core")]
+        if let Some(split) = &self.split {
+            return split.ready();
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn drive_control_plane(&mut self) {
+        let change = self
+            .split
+            .as_mut()
+            .map_or(OwnershipChange::Unchanged, split::IcebergSplitInput::drive);
+        self.follow_split_ownership(change);
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn begin_drain(
+        &mut self,
+        request: &crate::connector::SourceDrainRequest,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.split_mut()?.begin_drain(request.round)
+    }
+
+    // A drained split source stops at the end of the replay unit it is reading.
+    #[cfg(feature = "iceberg-core")]
+    fn poll_drain_ready(
+        &mut self,
+        round: laminar_core::checkpoint::AssignmentDrainId,
+    ) -> Result<bool, ConnectorError> {
+        self.split_mut()?.ensure_active_drain(round)?;
+        Ok(!self.replay_unit_in_progress)
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    async fn finish_drain(
+        &mut self,
+        settlement: crate::connector::SourceDrainSettlement,
+        _deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        let change = self.split_mut()?.finish_drain(&settlement)?;
+        self.follow_split_ownership(change);
+        Ok(())
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn set_vnode_assignment(
+        &mut self,
+        source_identity: &str,
+        registry: Arc<laminar_core::state::VnodeRegistry>,
+        self_id: laminar_core::state::NodeId,
+    ) -> Result<(), ConnectorError> {
+        self.assignment = Some(SplitAssignment::new(source_identity, registry, self_id)?);
+        Ok(())
     }
 
     fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
@@ -707,6 +806,17 @@ impl SourceConnector for IcebergSource {
             IcebergSourceConfig::from_config(config)?
         };
         super::iceberg::capabilities::validate_source(&parsed)?;
+        if let Some(channels) = parsed.splits {
+            return Ok(SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
+            )
+            .with_placement(SourceChannelPlacement {
+                channels,
+                route: SPLIT_ROUTE,
+            }));
+        }
         Ok(SourceContract::new(
             if parsed.read_mode == IcebergReadMode::Append {
                 SourceConsistency::Replayable

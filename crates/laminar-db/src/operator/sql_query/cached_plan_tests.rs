@@ -161,6 +161,31 @@ async fn cached_plan_compiled_fallback_recovers_on_the_next_batch() {
 }
 
 #[tokio::test]
+async fn compiled_projection_keeps_the_planned_field_metadata() {
+    let ctx = laminar_sql::create_session_context();
+    let field_id = std::collections::HashMap::from([("PARQUET:field_id".into(), "1".into())]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(field_id)
+    ]));
+    let provider = Arc::new(LiveSourceProvider::new(Arc::clone(&schema)));
+    let handle = provider.handle();
+    ctx.register_table("events", provider).unwrap();
+    let sql = "SELECT id FROM events";
+    let planned = crate::pipeline_lifecycle::plan_output_schema(&ctx, sql)
+        .await
+        .unwrap();
+    let mut operator = SqlQueryOperator::new("forward", sql, ctx, None, false);
+    operator.lazy_init().await.unwrap();
+    assert!(matches!(operator.state, QueryState::Compiled(_)));
+
+    let input = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+    handle.swap(vec![input.clone()]);
+    let output = operator.process(&[vec![input]], &[i64::MIN]).await.unwrap();
+    assert_eq!(values(&output, 0), [1, 2]);
+    assert_eq!(output[0].schema(), planned);
+}
+
+#[tokio::test]
 async fn cached_plan_join_rebuilds_both_live_inputs() {
     let ctx = laminar_sql::create_session_context();
     let left = register_source(&ctx, "events");

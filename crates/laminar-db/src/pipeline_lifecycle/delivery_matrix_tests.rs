@@ -122,6 +122,20 @@ const SOURCES: &[Variant] = &[
         exact_properties: &[],
     },
     Variant {
+        label: "Iceberg (append read, splits)",
+        connector: "iceberg",
+        properties: &[
+            ("catalog.type", "rest"),
+            ("catalog.uri", "http://catalog.invalid"),
+            ("catalog.warehouse", "s3://warehouse/root"),
+            ("namespace", "app"),
+            ("table.name", "orders"),
+            ("read.mode", "append"),
+            ("read.splits", "4"),
+        ],
+        exact_properties: &[],
+    },
+    Variant {
         label: "Files",
         connector: "files",
         properties: &[("path", "/data/in/*.json"), ("format", "json")],

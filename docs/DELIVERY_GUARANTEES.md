@@ -33,6 +33,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake change feed | ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
+| Iceberg (append read, splits) | ALO, BE | ALO |
 | Files | ALO, BE | rejected |
 | RabbitMQ | ALO | ALO |
 | IBM MQ | ALO | rejected |
@@ -71,6 +72,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake change feed | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
 | Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
@@ -92,6 +94,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake change feed | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Files | — | — | — | — | — | — | — | — | — | — | — | — |
 | RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | IBM MQ | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -155,6 +158,14 @@ resumes after the committed resume token. `mongodb_source::three_node_mongodb_so
 forwards each insert's id through a stream to a MongoDB sink, through the same kills. Every
 acknowledged id must reach the output collection, ids never written fail the run, duplicates are
 counted, and more than one node must have read the stream.
+
+An Iceberg append read with `read.splits = n` hashes each data file into one of `n` channels, and
+each channel keeps its own position in the table's snapshot lineage, so every node reads part of
+the table. `iceberg_source::three_node_iceberg_source_kill9_soak` (candidate) appends snapshots of
+ids to a REST-catalog table on S3, seeded before the nodes start, and forwards each id through a
+stream to a MongoDB sink, through the same kills. Every appended id must reach the output
+collection, ids never appended fail the run, duplicates are counted, and more than one node must
+have read the table.
 
 ## Materialized view reads
 

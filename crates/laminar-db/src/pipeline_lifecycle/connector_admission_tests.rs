@@ -1026,7 +1026,7 @@ fn rabbitmq_runs_in_cluster_on_one_node_at_least_once() {
     .is_err());
 }
 
-#[cfg(feature = "mongodb-cdc")]
+#[cfg(all(feature = "cluster", feature = "mongodb-cdc"))]
 #[test]
 fn a_mongodb_history_stream_runs_in_cluster_on_one_node_at_least_once() {
     use super::{admit_source_recovery_contract, cluster_assignment_scoped};
@@ -1067,6 +1067,50 @@ fn a_mongodb_history_stream_runs_in_cluster_on_one_node_at_least_once() {
             Err("cluster singleton sources require a connector that one node at a time may run")
         );
     }
+}
+
+#[cfg(all(feature = "cluster", feature = "iceberg"))]
+#[test]
+fn a_split_iceberg_append_read_runs_in_cluster_at_least_once() {
+    use laminar_connectors::lakehouse::iceberg_config::IcebergSourceConfig;
+    use laminar_connectors::lakehouse::IcebergSource;
+
+    use super::{admit_source_recovery_contract, cluster_assignment_scoped};
+
+    let mut config = ConnectorConfig::new("iceberg");
+    for (key, value) in [
+        ("catalog.type", "rest"),
+        ("catalog.uri", "http://catalog.invalid"),
+        ("catalog.warehouse", "s3://warehouse/root"),
+        ("namespace", "app"),
+        ("table.name", "orders"),
+        ("read.mode", "append"),
+    ] {
+        config.set(key, value);
+    }
+    let source = IcebergSource::new(IcebergSourceConfig::from_config(&config).unwrap(), None);
+    let admit = |config: &ConnectorConfig, delivery| {
+        admit_source_recovery_contract(
+            source.contract(config).unwrap(),
+            delivery,
+            true,
+            RuntimeMode::Cluster,
+        )
+    };
+    // Without splits an append read is one stream that no node may share.
+    assert_eq!(
+        admit(&config, DeliveryGuarantee::AtLeastOnce),
+        Err("cluster singleton sources require a connector that one node at a time may run")
+    );
+
+    config.set("read.splits", "4");
+    assert!(cluster_assignment_scoped(source.contract(&config).unwrap()));
+    assert_eq!(admit(&config, DeliveryGuarantee::AtLeastOnce), Ok(()));
+    let error = admit(&config, DeliveryGuarantee::ExactlyOnce).unwrap_err();
+    assert!(
+        error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "postgres-cdc")]

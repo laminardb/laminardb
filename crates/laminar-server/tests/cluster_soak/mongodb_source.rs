@@ -37,7 +37,10 @@ use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::{CollectionOptions, WriteConcern};
 use mongodb::{Client, Collection};
 
-use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSettings};
+use super::kill_rejoin::{
+    boot, cluster_nodes, kill_round, record_consumers, steady_phase, SoakSettings,
+    CHECKPOINTS_COMPLETED, EVENTS_INGESTED,
+};
 use super::multi_writer_sinks::mongo::MongoDb;
 use super::multi_writer_sinks::{block_on, wait_for_delivery, Destination as _};
 use super::{
@@ -48,9 +51,6 @@ use super::{
 /// Passed to the nodes as a reference, because a connection URI can carry credentials.
 const SOURCE_URI: &str = "LAMINAR_SOAK_MONGODB_SOURCE_URI";
 const SOURCE_DATABASE: &str = "laminar_soak_source";
-/// Every node commits checkpoints, while only the node holding the source ingests.
-const COMMITS: &str = "laminardb_checkpoints_completed_total";
-const INGESTED: &str = "laminardb_events_ingested_total";
 /// Warm-up documents take ids from here, above any id the writer reaches.
 const WARM_UP: u64 = 1 << 40;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,7 +99,7 @@ fn three_node_mongodb_source_kill9_soak() {
         &mut nodes,
         &mut || oracle.assert_running(),
         &settings,
-        COMMITS,
+        CHECKPOINTS_COMPLETED,
     );
     latest = warm_up(&mut nodes, &source_uri, &input, &settings, latest);
     let mut writer = Writer::spawn(source_uri.clone(), input.clone(), settings.rps);
@@ -116,12 +116,17 @@ fn three_node_mongodb_source_kill9_soak() {
             round,
             &mut killed_followers,
             &settings,
-            COMMITS,
+            CHECKPOINTS_COMPLETED,
             latest,
         );
         record_consumers(&nodes, &mut consumers);
     }
-    steady_phase(&mut nodes, &mut live, settings.steady, COMMITS);
+    steady_phase(
+        &mut nodes,
+        &mut live,
+        settings.steady,
+        CHECKPOINTS_COMPLETED,
+    );
     wait_for_converged_durable_checkpoint(
         &mut nodes,
         Instant::now() + settings.recovery_ceiling,
@@ -238,22 +243,12 @@ fn warm_up(
             next += 1;
             nodes
                 .iter()
-                .any(|node| node.metric(INGESTED).is_some_and(|rows| rows > 0.0))
+                .any(|node| node.metric(EVENTS_INGESTED).is_some_and(|rows| rows > 0.0))
         },
     );
     let deadline = Instant::now() + settings.recovery_ceiling;
     let first = wait_for_converged_durable_checkpoint(nodes, deadline, "warm-up", Some(latest));
     wait_for_converged_durable_checkpoint(nodes, deadline, "warm-up", Some(first))
-}
-
-/// Add every node that has read the stream since it last started.
-fn record_consumers(nodes: &[Node], consumers: &mut BTreeSet<usize>) {
-    consumers.extend(
-        nodes
-            .iter()
-            .filter(|node| node.metric(INGESTED).is_some_and(|rows| rows > 0.0))
-            .map(|node| node.id),
-    );
 }
 
 /// Insert `{_id: id}`. A duplicate key means an earlier attempt already wrote it.

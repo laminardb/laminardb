@@ -41,7 +41,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSettings};
+use super::kill_rejoin::{
+    boot, cluster_nodes, kill_round, steady_phase, SoakSettings, EVENTS_INGESTED,
+};
 use super::view_reads::{http_post, RETRYABLE_HTTP_ERRORS};
 use super::{
     assert_running_nodes, scoped_soak_storage_url, soak_run_id, wait_for,
@@ -49,7 +51,6 @@ use super::{
 };
 
 const VIEW: &str = "generator_lanes";
-const INGESTED: &str = "laminardb_events_ingested_total";
 const READ_INTERVAL: Duration = Duration::from_millis(250);
 
 #[test]
@@ -84,7 +85,7 @@ fn three_node_generator_splits_kill9_soak() {
         &mut nodes,
         &mut || reader.assert_running(),
         &settings,
-        INGESTED,
+        EVENTS_INGESTED,
     );
     let mut killed_followers = BTreeSet::new();
     let mut rejoined = Vec::new();
@@ -95,7 +96,7 @@ fn three_node_generator_splits_kill9_soak() {
             round,
             &mut killed_followers,
             &settings,
-            INGESTED,
+            EVENTS_INGESTED,
             latest,
         );
         latest = committed;
@@ -107,7 +108,7 @@ fn three_node_generator_splits_kill9_soak() {
         &mut nodes,
         &mut || reader.assert_running(),
         settings.steady,
-        INGESTED,
+        EVENTS_INGESTED,
     );
     wait_for_converged_durable_checkpoint(
         &mut nodes,
@@ -206,7 +207,7 @@ sql = "SELECT seq, ts_ms FROM gen"
         &mut nodes,
         &mut || reader.assert_running(),
         &settings,
-        INGESTED,
+        EVENTS_INGESTED,
     );
     let mut killed_followers = BTreeSet::new();
     for round in 0..settings.kills {
@@ -216,7 +217,7 @@ sql = "SELECT seq, ts_ms FROM gen"
             round,
             &mut killed_followers,
             &settings,
-            INGESTED,
+            EVENTS_INGESTED,
             latest,
         );
         latest = committed;

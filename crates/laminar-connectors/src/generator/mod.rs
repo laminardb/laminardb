@@ -22,6 +22,7 @@ use async_trait::async_trait;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConfigKeySpec, ConnectorConfig, ConnectorInfo};
+use crate::connector::split_ownership::{source_input_channel, SplitAssignment, SPLIT_ROUTE};
 use crate::connector::{
     SourceBatch, SourceChannelPlacement, SourceConnector, SourceConsistency, SourceContract,
     SourceDrainRequest, SourceDrainSettlement, SourceInputMode, SourcePosition,
@@ -35,19 +36,6 @@ const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
 const GENERATOR_CHECKPOINT_VERSION: &str = "2";
 
 mod split;
-
-fn generator_input_channel(source_name: &str, index: u32) -> Result<Vec<u8>, ConnectorError> {
-    let source_len = u32::try_from(source_name.len()).map_err(|_| {
-        ConnectorError::ConfigurationError(
-            "generator source identity exceeds the input-channel encoding limit".into(),
-        )
-    })?;
-    let mut channel = Vec::with_capacity(source_name.len() + 8);
-    channel.extend_from_slice(&source_len.to_be_bytes());
-    channel.extend_from_slice(source_name.as_bytes());
-    channel.extend_from_slice(&index.to_be_bytes());
-    Ok(channel)
-}
 
 fn configured_splits(config: &ConnectorConfig) -> Result<Option<NonZeroU32>, ConnectorError> {
     use laminar_core::state::MAX_KEY_GROUP_COUNT;
@@ -107,7 +95,7 @@ pub struct GeneratorSource {
     /// Set by `splits`; replaces `input_channel` and `next_seq`.
     split: Option<split::SplitInput>,
     /// Cluster ownership, installed before `start`.
-    assignment: Option<split::SplitAssignment>,
+    assignment: Option<SplitAssignment>,
 }
 
 impl GeneratorSource {
@@ -234,7 +222,7 @@ fn row_positions(channel: &[u8], sequences: &[u64]) -> Result<SourceRowPositions
 
 impl Default for GeneratorSource {
     fn default() -> Self {
-        let input_channel = generator_input_channel("generator", 0)
+        let input_channel = source_input_channel("generator", 0)
             .expect("the built-in generator source identity is valid");
         Self {
             schema: Self::generator_schema(),
@@ -272,7 +260,7 @@ impl SourceConnector for GeneratorSource {
         .with_cluster_exact_delivery_certification()
         .with_placement(SourceChannelPlacement {
             channels,
-            route: split::ROUTE,
+            route: SPLIT_ROUTE,
         }))
     }
 
@@ -292,7 +280,7 @@ impl SourceConnector for GeneratorSource {
             .get("laminar.source.name")
             .filter(|name| !name.is_empty())
             .unwrap_or("generator");
-        self.input_channel = generator_input_channel(source_name, 0)?;
+        self.input_channel = source_input_channel(source_name, 0)?;
         if let Some(rps) = config.get_parsed::<u64>("rows.per.second")? {
             if rps == 0 {
                 return Err(ConnectorError::ConfigurationError(
@@ -470,16 +458,7 @@ impl SourceConnector for GeneratorSource {
         registry: Arc<laminar_core::state::VnodeRegistry>,
         self_id: laminar_core::state::NodeId,
     ) -> Result<(), ConnectorError> {
-        if source_identity.is_empty() || self_id.is_unassigned() {
-            return Err(ConnectorError::ConfigurationError(
-                "generator vnode assignment requires a source and node identity".into(),
-            ));
-        }
-        self.assignment = Some(split::SplitAssignment {
-            source_identity: source_identity.to_owned(),
-            registry,
-            node: self_id,
-        });
+        self.assignment = Some(SplitAssignment::new(source_identity, registry, self_id)?);
         Ok(())
     }
 

@@ -1115,8 +1115,13 @@ impl SqlQueryOperator {
         let props = state.execution_props();
         let mut compiled_exprs = Vec::with_capacity(info.proj_exprs.len());
         let mut proj_fields = Vec::with_capacity(info.proj_exprs.len());
+        // The plan's root is the projection, or the scanned input when there is none.
+        let planned_fields = plan.schema().fields();
+        if planned_fields.len() != info.proj_exprs.len() {
+            return None;
+        }
 
-        for expr in &info.proj_exprs {
+        for (expr, planned_field) in info.proj_exprs.iter().zip(planned_fields.iter()) {
             let phys = datafusion::physical_expr::create_physical_expr(
                 expr,
                 &info.input_df_schema,
@@ -1133,7 +1138,11 @@ impl SqlQueryOperator {
                 datafusion_expr::Expr::Alias(alias) => alias.name.clone(),
                 _ => expr.schema_name().to_string(),
             };
-            proj_fields.push(arrow::datatypes::Field::new(name, dt, nullable));
+            // Downstream sinks were handed the planned schema, field metadata included.
+            proj_fields.push(
+                arrow::datatypes::Field::new(name, dt, nullable)
+                    .with_metadata(planned_field.metadata().clone()),
+            );
             compiled_exprs.push(phys);
         }
 

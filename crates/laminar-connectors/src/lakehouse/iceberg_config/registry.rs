@@ -99,6 +99,11 @@ pub(crate) fn source_config_keys() -> Vec<ConfigKeySpec> {
             "initial",
         ),
         ConfigKeySpec::optional(
+            "read.splits",
+            "Append mode: input channels the data files are hashed into by path, each read by one node in a cluster (not Iceberg's scan-task split size)",
+            "",
+        ),
+        ConfigKeySpec::optional(
             "start.snapshot.id",
             "Snapshot selected for bounded reads or append lineage",
             "",
