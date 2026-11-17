@@ -928,8 +928,9 @@ CREATE SOURCE landing (id BIGINT NOT NULL, payload VARCHAR) FROM FILES (
   objects and continues a partly read one at its next row. Nothing is ever removed from that
   record, and each checkpoint writes it whole.
 - The source reads each key once: an object written over a key it has already read is skipped, so
-  producers write every object under a new key. An object that changes while it is part way read
-  stops the source.
+  producers write every object under a new key. A run reads each object whole, in one request, and
+  delivers its rows from that copy. A resume of a partly read object, after a restart or a handoff
+  to another node, checks the object's hash and stops the source if it has changed.
 - The record names keys, not a dataset. Resuming against another bucket or prefix is only valid
   when it holds the same objects; otherwise reset the source.
 - Object-store paths take CSV, JSON or text with declared columns. Parquet, Arrow IPC, FpML and
