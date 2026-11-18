@@ -160,7 +160,7 @@ const SOURCES: &[Variant] = &[
     Variant {
         label: "IBM MQ",
         connector: "ibmmq",
-        properties: &[("queue", "ORDERS")],
+        properties: &[("queue.manager", "QM1"), ("queue", "ORDERS")],
         exact_properties: &[],
     },
     Variant {

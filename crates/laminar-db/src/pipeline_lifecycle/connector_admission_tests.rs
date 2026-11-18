@@ -1034,6 +1034,7 @@ fn ibmmq_runs_in_cluster_on_one_node_at_least_once() {
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
     laminar_connectors::ibmmq::register_ibmmq_source(&registry).unwrap();
     let mut config = laminar_connectors::config::ConnectorConfig::new("ibmmq");
+    config.set("queue.manager", "QM1");
     config.set("queue", "ORDERS");
     config.set("format", "json");
     let contract = registry

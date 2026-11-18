@@ -31,7 +31,8 @@ use crate::config::ConnectorConfig;
 use crate::connector::queue_start::{queue_start_cursor, validate_queue_start_cursor};
 use crate::connector::{
     ConnectorTaskAdmission, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourceStart, SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
@@ -738,7 +739,10 @@ impl SourceConnector for RabbitMqSource {
         // No start position needs placing: a sealed start reads what the queue holds, and every
         // delivery a committed cut did not cover is still unacknowledged, so the broker
         // redelivered it when the previous channel closed.
-        let (config, _, _) = request.into_parts();
+        let (config, position, _) = request.into_parts();
+        if let SourcePosition::Initialized { checkpoint } = &position {
+            validate_queue_start_cursor("rabbitmq", "RabbitMQ", checkpoint)?;
+        }
         let parsed = RabbitMqSourceConfig::from_config(&config)?;
         let name = config.get("laminar.source.name").unwrap_or("rabbitmq");
         let metrics = SourceMetrics::new(name, self.registry.as_ref())?;

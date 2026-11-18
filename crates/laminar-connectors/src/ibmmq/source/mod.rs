@@ -28,8 +28,8 @@ use crate::config::ConnectorConfig;
 use crate::connector::queue_start::{queue_start_cursor, validate_queue_start_cursor};
 use crate::connector::{
     ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceStart,
-    SourceTopology,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
+    SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
@@ -343,8 +343,10 @@ impl SourceConnector for IbmMqSource {
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
         );
-        // FpML is not qualified for cluster sources.
-        if parsed.format == serde::Format::Fpml {
+        // FpML is not qualified for cluster sources. Without `queue.manager` each node would
+        // accept whichever queue manager its own channel definition reaches, so the next owner
+        // could read another queue manager's queue.
+        if parsed.format == serde::Format::Fpml || parsed.connection.queue_manager.is_none() {
             return Ok(contract);
         }
         // Any one node may consume the queue: the queue manager backs out a unit of work the
@@ -385,7 +387,10 @@ impl SourceConnector for IbmMqSource {
         // No start position needs placing: a sealed start reads what the queue holds, and the
         // queue manager backed out every message a committed cut did not cover when the
         // previous connection ended.
-        let (config, _, _) = request.into_parts();
+        let (config, position, _) = request.into_parts();
+        if let SourcePosition::Initialized { checkpoint } = &position {
+            validate_queue_start_cursor("ibmmq", "IBM MQ", checkpoint)?;
+        }
         let parsed = Arc::new(IbmMqSourceConfig::from_config(&config)?);
         let (deserializer, payload, output) = self.codec(&config, &parsed).await?;
         let library = library::load(parsed.connection.client_library.as_deref())?;

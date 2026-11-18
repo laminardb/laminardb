@@ -155,8 +155,9 @@ RabbitMQ sink. The leader and each follower are hard-killed while paused inside 
 independent reader of the output queue must see every confirmed id, ids never published fail the
 run, duplicates are counted, and more than one node must have consumed the queue.
 
-An IBM MQ queue runs the same way, read under syncpoint: the owner commits its unit of work when
-the checkpoint holding it is durable, and the queue manager backs out an owner that fails.
+An IBM MQ queue on a named queue manager runs the same way, read under syncpoint: the owner
+commits its unit of work when the checkpoint holding it is durable, and the queue manager backs
+out an owner that fails.
 `ibmmq_source::three_node_ibmmq_source_kill9_soak` puts ids on a local queue, committing each
 put, and forwards every row through a stream to an IBM MQ sink, through the same kills. Every
 committed id must reach the output queue, ids never put fail the run, duplicates are counted,

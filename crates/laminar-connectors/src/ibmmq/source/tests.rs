@@ -136,22 +136,40 @@ async fn a_sealed_start_records_only_that_the_queue_keeps_its_position() {
         .validate_initial_position(&config, &running)
         .await
         .is_err());
+    let start = SourceStart::new(
+        config,
+        SourcePosition::Initialized {
+            checkpoint: running,
+        },
+        crate::connector::DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap();
+    let error = source.start(start).await.unwrap_err();
+    assert!(
+        matches!(error, ConnectorError::InvalidState { .. }),
+        "a foreign sealed cursor is refused before the queue opens: {error}"
+    );
 }
 
 #[test]
-fn any_one_cluster_node_may_consume_a_queue_unless_it_carries_fpml() {
+fn any_one_cluster_node_may_consume_a_queue_on_a_named_queue_manager() {
     let source = IbmMqSource::new(Arc::new(arrow_schema::Schema::empty()), None);
-    assert!(source
-        .contract(&json_queue_config())
-        .unwrap()
-        .supports_cluster_singleton_placement());
+    let placed = |config: &ConnectorConfig| {
+        source
+            .contract(config)
+            .unwrap()
+            .supports_cluster_singleton_placement()
+    };
+    let mut named = json_queue_config();
+    assert!(
+        !placed(&named),
+        "each node would accept whichever queue manager its channel reaches"
+    );
+    named.set("queue.manager", "QM1");
+    assert!(placed(&named));
     #[cfg(feature = "fpml")]
     {
-        let mut fpml = json_queue_config();
-        fpml.set("format", "fpml");
-        assert!(!source
-            .contract(&fpml)
-            .unwrap()
-            .supports_cluster_singleton_placement());
+        named.set("format", "fpml");
+        assert!(!placed(&named), "FpML is not qualified for cluster sources");
     }
 }

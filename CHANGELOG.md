@@ -24,8 +24,9 @@
   source does. At a planned move the node giving the source up commits the handoff
   checkpoint's unit of work before it closes; when the owner fails, the queue manager backs out
   its unit of work and the next owner gets those messages again. An IBM MQ source may start
-  sealed in every mode (it reads what the queue holds). `FORMAT FPML` stays rejected in cluster
-  mode. A placed singleton source that binds its own cursor to each batch is no longer asked
+  sealed in every mode (it reads what the queue holds). A cluster source must set
+  `queue.manager`, so every node reaches the same queue manager; without it, and with
+  `FORMAT FPML`, the source stays rejected in cluster mode. A placed singleton source that binds its own cursor to each batch is no longer asked
   for a checkpoint per batch, so an IBM MQ source reads on between checkpoints in cluster
   mode.
 
