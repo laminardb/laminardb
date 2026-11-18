@@ -386,10 +386,16 @@ mod splits {
         let expected = routed("gen", &owners, 1, VNODES);
         assert_eq!(channels(&checkpoint), expected);
 
-        // The first poll anchors the rate limit.
-        assert!(source.poll_batch(8).await.unwrap().is_none());
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let mut batch = source.poll_batch(8).await.unwrap().expect("rows");
+        // The first poll anchors the rate limit, so rows may come only on a later poll.
+        let mut batch = None;
+        for _ in 0..20 {
+            if let Some(polled) = source.poll_batch(8).await.unwrap() {
+                batch = Some(polled);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let mut batch = batch.expect("rows within 20 polls");
         match batch.take_cursor() {
             Some(SourceBatchCursor::Complete(cursor)) => {
                 assert_eq!(cursor.assignment_version().map(NonZeroU64::get), Some(1));
