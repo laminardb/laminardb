@@ -523,8 +523,6 @@ jobs:
           docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml up -d --wait redpanda
       - name: Run Iceberg append integration tests
         run: cargo test --profile soak -p laminar-connectors --no-default-features --features iceberg --test iceberg_append -- --ignored --test-threads=1 --nocapture
-      - name: Run files source on S3 end-to-end test
-        run: cargo test --profile soak -p laminar-db --no-default-features --features files,aws --test files_object_store_e2e -- --ignored --nocapture
       - name: Run Iceberg cluster recovery test
         run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka,iceberg" --test iceberg_cluster_soak -- --ignored --exact --test-threads=1 --nocapture
       - name: Capture service logs after failure
@@ -538,6 +536,35 @@ jobs:
         run: |
           docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml down -v
           docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml down -v
+
+  # A separate job: the test builds laminar-db with a feature set no Iceberg step shares, about
+  # 20 minutes of compiling on top of that job's budget.
+  files-object-store-integration:
+    name: Files source on S3
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: files-object-store-integration
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
+      # `--wait` fails on a one-shot service it is asked to start, so the bucket is created by `run`.
+      - name: Start SeaweedFS
+        run: |
+          docker compose -p laminardb-files-ci -f tests/docker/iceberg-compose.yml up -d --wait seaweedfs
+          docker compose -p laminardb-files-ci -f tests/docker/iceberg-compose.yml run --rm seaweedfs-init
+      - name: Run files source on S3 end-to-end test
+        run: cargo test -p laminar-db --no-default-features --features files,aws --test files_object_store_e2e -- --ignored --nocapture
+      - name: Capture service logs after failure
+        if: failure()
+        continue-on-error: true
+        run: docker compose -p laminardb-files-ci -f tests/docker/iceberg-compose.yml logs --no-color seaweedfs seaweedfs-init
+      - name: Stop SeaweedFS
+        if: always()
+        run: docker compose -p laminardb-files-ci -f tests/docker/iceberg-compose.yml down -v
 
   dependency-generations:
     name: Analytical Dependency Generations
@@ -736,7 +763,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, mongodb-cdc-integration, rabbitmq-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, mongodb-cdc-integration, rabbitmq-integration, features, iceberg-integration, files-object-store-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -749,6 +776,7 @@ jobs:
              [[ "${{ needs.mongodb-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.iceberg-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.files-object-store-integration.result }}" != "success" ]] || \
              [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \
