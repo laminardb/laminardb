@@ -48,7 +48,7 @@
 //! resolves from the environment it inherits, so no secret reaches the shared catalog.
 
 #[cfg(feature = "ibmmq")]
-mod ibmmq;
+pub(crate) mod ibmmq;
 #[cfg(feature = "mongodb-cdc")]
 pub(crate) mod mongo;
 #[cfg(feature = "nats")]

@@ -367,7 +367,7 @@ fn reads_channel(source: &FixtureSource, node: u64) -> bool {
             FixtureKind::Generated => {
                 laminar_core::state::SourceChannelRoute::V1.vnode(source.name, partition, vnodes)
             }
-            FixtureKind::Queue => {
+            FixtureKind::Queue(_) => {
                 laminar_core::state::SourceChannelRoute::V1.vnode(source.name, 0, vnodes)
             }
         };

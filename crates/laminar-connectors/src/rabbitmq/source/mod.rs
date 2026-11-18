@@ -28,6 +28,7 @@ use super::connection::{close, connect, prepare_queue};
 use super::metrics::{saturating, SourceMetrics};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
+use crate::connector::queue_start::{queue_start_cursor, validate_queue_start_cursor};
 use crate::connector::{
     ConnectorTaskAdmission, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
     SourceConsistency, SourceContract, SourceInputMode, SourceStart, SourceTopology,
@@ -37,10 +38,6 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 const GENERATION: &str = "generation";
 const DELIVERY_TAG: &str = "delivery_tag";
-/// The sealed start cursor: a queue keeps its own position, so a new source reads whatever the
-/// queue holds when it starts.
-const SEALED_START: (&str, &str) = ("start", "queue");
-const CHECKPOINT_CONNECTOR: &str = "rabbitmq";
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// RabbitMQ AMQP 0-9-1 queue source.
@@ -725,10 +722,7 @@ impl SourceConnector for RabbitMqSource {
         config: &ConnectorConfig,
     ) -> Result<SourceCheckpoint, ConnectorError> {
         RabbitMqSourceConfig::from_config(config)?;
-        let mut cursor = SourceCheckpoint::new();
-        cursor.set_offset(SEALED_START.0, SEALED_START.1);
-        cursor.set_metadata("connector", CHECKPOINT_CONNECTOR);
-        Ok(cursor)
+        Ok(queue_start_cursor("rabbitmq"))
     }
 
     async fn validate_initial_position(
@@ -737,15 +731,7 @@ impl SourceConnector for RabbitMqSource {
         checkpoint: &SourceCheckpoint,
     ) -> Result<(), ConnectorError> {
         RabbitMqSourceConfig::from_config(config)?;
-        if checkpoint.get_metadata("connector") != Some(CHECKPOINT_CONNECTOR)
-            || checkpoint.get_offset(SEALED_START.0) != Some(SEALED_START.1)
-        {
-            return Err(ConnectorError::InvalidState {
-                expected: "a RabbitMQ sealed start cursor".into(),
-                actual: format!("{:?}", checkpoint.offsets()),
-            });
-        }
-        Ok(())
+        validate_queue_start_cursor("rabbitmq", "RabbitMQ", checkpoint)
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {

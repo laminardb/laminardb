@@ -908,3 +908,95 @@ async fn a_poll_cancelled_after_getting_messages_can_never_commit_them() {
     mq.wait_depth(&queue, 5);
     mq.delete(&[&queue]);
 }
+
+/// In a cluster the same source instance reopens the queue when it comes back to its node: the
+/// donor commits the sealed handoff unit before it closes, and the reopened generation reads on.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_source_reopens_its_queue_after_a_handoff() {
+    let Some(mq) = fixture() else { return };
+    let queue = mq.queue("REOPEN", "");
+    mq.put_json(&queue, 0..10).await;
+    mq.wait_depth(&queue, 10);
+
+    let registry = prometheus::Registry::new();
+    let config = mq.config(&[
+        ("queue", queue.as_str()),
+        ("format", "json"),
+        ("wait.interval.ms", "50"),
+    ]);
+    let start = |position| {
+        SourceStart::new(config.clone(), position, DeliveryGuarantee::AtLeastOnce).unwrap()
+    };
+    let mut source = IbmMqSource::new(ids_schema(), Some(&registry));
+    let sealed = source.resolve_initial_position(&config).await.unwrap();
+    source
+        .start(start(SourcePosition::Initialized { checkpoint: sealed }))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&poll_rows(&mut source, 10, Duration::from_secs(10)).await),
+        (0..10).collect::<Vec<_>>()
+    );
+    let handoff = source.checkpoint();
+    source.notify_epoch_committed(1, &handoff).await.unwrap();
+    source.close().await.unwrap();
+    assert!(!mq.uncommitted(&queue));
+    mq.wait_depth(&queue, 0);
+
+    mq.put_json(&queue, 10..15).await;
+    source
+        .start(start(SourcePosition::Resume {
+            attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+            checkpoint: handoff.clone(),
+        }))
+        .await
+        .unwrap();
+    // The donor's cursor names another generation, so it commits nothing here.
+    source.notify_epoch_committed(1, &handoff).await.unwrap();
+    assert_eq!(
+        ids(&poll_rows(&mut source, 5, Duration::from_secs(10)).await),
+        (10..15).collect::<Vec<_>>()
+    );
+    assert!(
+        registry
+            .gather()
+            .iter()
+            .any(|family| family.name() == "ibmmq_source_messages_total"),
+        "the reopened generation exports its metrics"
+    );
+    let cut = source.checkpoint();
+    source.notify_epoch_committed(2, &cut).await.unwrap();
+    source.close().await.unwrap();
+    mq.wait_depth(&queue, 0);
+    mq.delete(&[&queue]);
+}
+
+/// An exclusive queue opens on the acquirer only once the previous reader's connection is gone:
+/// until then the open fails as a transient error, which the engine retries on the next read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exclusive_queue_opens_once_its_previous_reader_closes() {
+    let Some(mq) = fixture() else { return };
+    let queue = mq.queue("EXCLUSIVE", "NOSHARE");
+    mq.put_json(&queue, 0..4).await;
+    mq.wait_depth(&queue, 4);
+
+    let mut donor = mq.source(&queue, ids_schema(), &[]).await.unwrap();
+    assert_eq!(
+        ids(&poll_rows(&mut donor, 4, Duration::from_secs(10)).await).len(),
+        4
+    );
+    let Err(held) = mq.source(&queue, ids_schema(), &[]).await else {
+        panic!("a second reader opened an exclusive queue");
+    };
+    assert!(held.is_transient(), "{held}");
+
+    donor.close().await.unwrap();
+    let mut acquirer = mq.source(&queue, ids_schema(), &[]).await.unwrap();
+    assert_eq!(
+        ids(&poll_rows(&mut acquirer, 4, Duration::from_secs(10)).await),
+        (0..4).collect::<Vec<_>>(),
+        "the donor's uncommitted unit was backed out to the acquirer"
+    );
+    acquirer.close().await.unwrap();
+    mq.delete(&[&queue]);
+}

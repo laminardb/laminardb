@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, ConnectorTaskTracker, SourceBatch,
+    ConnectorCancellationPolicy, ConnectorTaskTracker, SourceBatch, SourceBatchCursor,
     SourceCheckpointUnavailablePolicy, SourceConnector, SourceContract, SourceDrainOutcome,
     SourceDrainRequest, SourceDrainSettlement, SourcePosition, SourceRecency, SourceStart,
     SourceTopology,
@@ -349,12 +349,21 @@ impl SourceConnector for SingletonPlacement {
         if !self.open || self.drain.is_some() || !self.follows_current_assignment() {
             return Ok(None);
         }
-        let Some(batch) = self.inner.poll_batch(max_records).await? else {
+        let Some(mut batch) = self.inner.poll_batch(max_records).await? else {
             return Ok(None);
         };
-        Ok(Some(
-            batch.with_checkpoint(self.bind(self.inner.checkpoint())),
-        ))
+        // As the runtime does, ask for a checkpoint only after a batch without its own cursor: a
+        // connector that binds one may treat `checkpoint` as a capture.
+        let cursor = match batch.take_cursor() {
+            Some(SourceBatchCursor::Complete(cursor)) => cursor,
+            Some(SourceBatchCursor::Incremental(_)) => {
+                return Err(ConnectorError::Internal(
+                    "a singleton source batch carries a checkpoint delta".into(),
+                ))
+            }
+            None => self.inner.checkpoint(),
+        };
+        Ok(Some(batch.with_checkpoint(self.bind(cursor))))
     }
 
     async fn resolve_schema(
@@ -559,6 +568,7 @@ impl SourceConnector for SingletonPlacement {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
@@ -629,10 +639,7 @@ mod tests {
         async fn poll_batch(&mut self, _max: usize) -> Result<Option<SourceBatch>, ConnectorError> {
             assert!(self.open, "a closed singleton was polled");
             self.delivered += 1;
-            let rows = Int64Array::from(vec![i64::try_from(self.delivered).unwrap()]);
-            Ok(Some(SourceBatch::new(
-                RecordBatch::try_new(recorded_schema(), vec![Arc::new(rows)]).unwrap(),
-            )))
+            Ok(Some(SourceBatch::new(row(self.delivered))))
         }
 
         fn schema(&self) -> SchemaRef {
@@ -644,9 +651,7 @@ mod tests {
         }
 
         fn checkpoint(&self) -> SourceCheckpoint {
-            let mut checkpoint = SourceCheckpoint::new();
-            checkpoint.set_offset("delivered", self.delivered.to_string());
-            checkpoint
+            delivered(self.delivered)
         }
 
         async fn notify_epoch_committed(
@@ -675,19 +680,99 @@ mod tests {
             &mut self,
             _config: &ConnectorConfig,
         ) -> Result<SourceCheckpoint, ConnectorError> {
-            let mut checkpoint = SourceCheckpoint::new();
-            checkpoint.set_offset("delivered", "0");
-            Ok(checkpoint)
+            Ok(delivered(0))
         }
 
         fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-            Ok(
-                laminar_connectors::testing::with_cluster_singleton_placement(SourceContract::new(
-                    SourceConsistency::CommitCoupled,
-                    SourceTopology::Singleton,
-                    SourceInputMode::AppendOnly,
-                )),
-            )
+            Ok(placed_singleton())
+        }
+    }
+
+    /// Like an IBM MQ queue under syncpoint: everything read since the last commit is one unit of
+    /// work, and `checkpoint` seals it until a commit names all of it. Each batch binds its own
+    /// cursor, so reading does not seal.
+    struct UnitOfWork {
+        events: Arc<Mutex<Vec<Event>>>,
+        gotten: u64,
+        committed: u64,
+        /// `gotten` at the last capture.
+        sealed: AtomicU64,
+    }
+
+    fn delivered(count: u64) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("delivered", count.to_string());
+        checkpoint
+    }
+
+    /// The `count`th row a test singleton delivers.
+    fn row(count: u64) -> RecordBatch {
+        let rows = Int64Array::from(vec![i64::try_from(count).unwrap()]);
+        RecordBatch::try_new(recorded_schema(), vec![Arc::new(rows)]).unwrap()
+    }
+
+    fn placed_singleton() -> SourceContract {
+        laminar_connectors::testing::with_cluster_singleton_placement(SourceContract::new(
+            SourceConsistency::CommitCoupled,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
+        ))
+    }
+
+    #[async_trait]
+    impl SourceConnector for UnitOfWork {
+        async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+            let (_, start, _) = request.into_parts();
+            self.events.lock().push(Event::Start(position(&start)));
+            Ok(())
+        }
+
+        async fn poll_batch(&mut self, _max: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+            if self.sealed.load(Ordering::Relaxed) > self.committed {
+                return Ok(None);
+            }
+            self.gotten += 1;
+            Ok(Some(
+                SourceBatch::new(row(self.gotten)).with_checkpoint(delivered(self.gotten)),
+            ))
+        }
+
+        fn schema(&self) -> SchemaRef {
+            recorded_schema()
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            self.sealed.store(self.gotten, Ordering::Relaxed);
+            delivered(self.gotten)
+        }
+
+        async fn notify_epoch_committed(
+            &mut self,
+            _epoch: u64,
+            checkpoint: &SourceCheckpoint,
+        ) -> Result<(), ConnectorError> {
+            let count: u64 = checkpoint.get_offset("delivered").unwrap().parse().unwrap();
+            if count <= self.committed {
+                return Ok(());
+            }
+            if count != self.gotten {
+                return Err(ConnectorError::InvalidState {
+                    expected: format!("a cut covering the whole unit of work ({})", self.gotten),
+                    actual: count.to_string(),
+                });
+            }
+            self.events.lock().push(Event::Ack(count.to_string()));
+            self.committed = count;
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.events.lock().push(Event::Close);
+            Ok(())
+        }
+
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            Ok(placed_singleton())
         }
     }
 
@@ -706,18 +791,35 @@ mod tests {
         /// acknowledgements, admitted with `admitted`.
         async fn with(id: u64, refusals: usize, ack_refusals: usize, admitted: SchemaRef) -> Self {
             let events = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Recorder {
+                events: Arc::clone(&events),
+                open: false,
+                delivered: 0,
+                refusals,
+                ack_refusals,
+            };
+            Self::placed(id, Box::new(recorder), events, admitted).await
+        }
+
+        async fn unit_of_work(id: u64) -> Self {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let inner = UnitOfWork {
+                events: Arc::clone(&events),
+                gotten: 0,
+                committed: 0,
+                sealed: AtomicU64::new(0),
+            };
+            Self::placed(id, Box::new(inner), events, recorded_schema()).await
+        }
+
+        async fn placed(
+            id: u64,
+            inner: Box<dyn SourceConnector>,
+            events: Arc<Mutex<Vec<Event>>>,
+            admitted: SchemaRef,
+        ) -> Self {
             let registry = Arc::new(VnodeRegistry::new_unassigned(VNODES));
-            let mut source = SingletonPlacement::new(
-                NAME,
-                Box::new(Recorder {
-                    events: Arc::clone(&events),
-                    open: false,
-                    delivered: 0,
-                    refusals,
-                    ack_refusals,
-                }),
-                Some(admitted),
-            );
+            let mut source = SingletonPlacement::new(NAME, inner, Some(admitted));
             source
                 .set_vnode_assignment(NAME, Arc::clone(&registry), NodeId(id))
                 .unwrap();
@@ -1022,6 +1124,59 @@ mod tests {
                 Event::Close
             ]
         );
+    }
+
+    /// A connector that binds its own cursors may seal what it has read when asked for a
+    /// checkpoint, so only barrier and drain captures ask, and it reads on between them.
+    #[tokio::test]
+    async fn a_unit_of_work_reads_several_batches_per_checkpoint() {
+        let (mut a, mut b) = (Node::unit_of_work(1).await, Node::unit_of_work(2).await);
+        for node in [&a, &b] {
+            node.publish(1, 1);
+        }
+        for count in ["1", "2", "3"] {
+            let cursor = a.poll().await.expect("the unit of work stays open");
+            assert_eq!(cursor.get_offset("delivered"), Some(count));
+        }
+        let cut = a.source.try_checkpoint().unwrap().unwrap();
+        assert!(
+            a.poll().await.is_none(),
+            "a sealed unit waits for its commit"
+        );
+        a.source.notify_epoch_committed(1, &cut).await.unwrap();
+        assert_eq!(a.poll().await.unwrap().get_offset("delivered"), Some("4"));
+
+        begin(&mut [&mut a, &mut b], round(1)).await;
+        let handoff = Arc::new(a.source.checkpoint());
+        for node in [&mut a, &mut b] {
+            node.source
+                .finish_drain(
+                    SourceDrainSettlement::commit(
+                        round(1),
+                        CheckpointAttempt::canonical(2),
+                        Arc::clone(&handoff),
+                    ),
+                    deadline(),
+                )
+                .await
+                .unwrap();
+        }
+        for node in [&a, &b] {
+            node.publish(2, 2);
+        }
+        assert!(a.poll().await.is_none());
+        b.poll().await.expect("the acquirer reads");
+        assert_eq!(
+            a.events(),
+            [
+                Event::Start("initial".into()),
+                Event::Ack("3".into()),
+                Event::Ack("4".into()),
+                Event::Close
+            ],
+            "the donor commits the sealed handoff unit before it closes"
+        );
+        assert_eq!(b.events(), [Event::Start("resume 2 at 4".into())]);
     }
 
     #[test]

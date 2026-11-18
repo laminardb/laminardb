@@ -7,7 +7,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use super::oracle::OutputForm;
-use super::source::{FixtureKind, FixtureSource};
+use super::source::{FixtureKind, FixtureSource, QueueCommit};
 use super::{Case, Verdict};
 
 const PARTITIONS: i64 = 6;
@@ -1388,7 +1388,7 @@ async fn nested_window_aggregate_is_rejected_in_cluster() {
 /// `events_in` delivered through one queue, which only the owner of its home vnode reads.
 /// Every partition's rows in one queue, in event-time order: the queue is one channel with one
 /// watermark, and the partitions repeat the same timestamps, so a row behind it would be late.
-fn queued(name: &'static str) -> FixtureSource {
+fn queued(name: &'static str, commit: QueueCommit) -> FixtureSource {
     let source = events_in(name, 0, PARTITIONS, BATCHES_PER_PARTITION);
     let rows = arrow::compute::concat_batches(&source.schema(), &source.all_batches()).unwrap();
     let order =
@@ -1403,19 +1403,17 @@ fn queued(name: &'static str) -> FixtureSource {
         name,
         columns: EVENT_COLUMNS,
         partitions: vec![batches].into(),
-        kind: FixtureKind::Queue,
+        kind: FixtureKind::Queue(commit),
     }
 }
 
-// A placed singleton: one node reads the queue, acknowledging each checkpoint, and the merged
-// cursor claims its one channel once while the rows reach their aggregate owners on every node.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn singleton_queue_keyed_aggregate_checkpoints_are_equal() {
-    let case = Case {
-        sources: vec![queued("events")],
+/// A keyed aggregate over a placed singleton queue, checkpointed under load.
+fn singleton_keyed_aggregate(name: &'static str, commit: QueueCommit) -> Case {
+    Case {
+        sources: vec![queued("events", commit)],
         checkpoint_under_load: true,
         ..case(
-            "singleton_queue_keyed_aggregate",
+            name,
             &[
                 "CREATE STREAM out AS SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events \
                GROUP BY k EMIT CHANGES",
@@ -1423,7 +1421,26 @@ async fn singleton_queue_keyed_aggregate_checkpoints_are_equal() {
             OutputForm::Changelog,
             Some("SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k"),
         )
-    };
+    }
+}
+
+// A placed singleton: one node reads the queue, acknowledging each checkpoint, and the merged
+// cursor claims its one channel once while the rows reach their aggregate owners on every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn singleton_queue_keyed_aggregate_checkpoints_are_equal() {
+    let case =
+        singleton_keyed_aggregate("singleton_queue_keyed_aggregate", QueueCommit::Cumulative);
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+// A placed unit of work, as IBM MQ reads under syncpoint: only barrier and drain captures seal
+// it, and every commit names all of it, or the reader fails the case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn singleton_unit_of_work_keyed_aggregate_checkpoints_are_equal() {
+    let case = singleton_keyed_aggregate(
+        "singleton_unit_of_work_keyed_aggregate",
+        QueueCommit::UnitOfWork,
+    );
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
@@ -1431,7 +1448,7 @@ async fn singleton_queue_keyed_aggregate_checkpoints_are_equal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn windows_close_past_the_nodes_without_a_singleton() {
     let case = Case {
-        sources: vec![queued("events")],
+        sources: vec![queued("events", QueueCommit::Cumulative)],
         ..case(
             "windows_past_nodes_without_a_singleton",
             &[

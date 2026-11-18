@@ -362,6 +362,10 @@ pub trait SourceConnector: Send {
 
     /// Returned checkpoint must contain enough info to resume from the
     /// current position after a restart.
+    ///
+    /// The runtime asks at barrier and drain captures, and after a batch that carries no cursor
+    /// of its own ([`SourceBatch::with_checkpoint`]). A connector that binds a cursor to every
+    /// batch may therefore treat this call as a capture, as IBM MQ does to seal its unit of work.
     fn checkpoint(&self) -> SourceCheckpoint;
 
     /// Atomically attempt to capture a source cursor. `Ok(None)` means a

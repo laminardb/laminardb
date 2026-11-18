@@ -25,10 +25,11 @@ use super::session::Session;
 use super::worker::Worker;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
+use crate::connector::queue_start::{queue_start_cursor, validate_queue_start_cursor};
 use crate::connector::{
     ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
-    SourceStart, SourceTopology,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
@@ -334,14 +335,22 @@ impl SourceConnector for IbmMqSource {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        IbmMqSourceConfig::from_config(config)?;
+        let parsed = IbmMqSourceConfig::from_config(config)?;
         // MQCMIT runs only for a durable checkpoint. Exactly-once is not certified: the queue
         // commit and the sink commit are separate.
-        Ok(SourceContract::new(
+        let contract = SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
-        ))
+        );
+        // FpML is not qualified for cluster sources.
+        if parsed.format == serde::Format::Fpml {
+            return Ok(contract);
+        }
+        // Any one node may consume the queue: the queue manager backs out a unit of work the
+        // committed cut did not cover when its connection ends, so whichever node opens the
+        // queue next gets those messages again.
+        Ok(contract.with_cluster_singleton_placement())
     }
 
     fn recovery_identity_options(
@@ -351,15 +360,32 @@ impl SourceConnector for IbmMqSource {
         Ok(Some(IbmMqSourceConfig::from_config(config)?.identity()))
     }
 
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
+    async fn resolve_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        IbmMqSourceConfig::from_config(config)?;
+        Ok(queue_start_cursor("ibmmq"))
+    }
+
+    async fn validate_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        IbmMqSourceConfig::from_config(config)?;
+        validate_queue_start_cursor("ibmmq", "IBM MQ", checkpoint)
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let (config, position, _) = request.into_parts();
-        if matches!(position, SourcePosition::Initialized { .. }) {
-            return Err(ConnectorError::ConfigurationError(
-                "IBM MQ has no sealed topology startup contract".into(),
-            ));
-        }
-        // A resume needs no positioning: the queue manager backed out every message the
-        // committed cut did not cover when the previous connection ended.
+        // No start position needs placing: a sealed start reads what the queue holds, and the
+        // queue manager backed out every message a committed cut did not cover when the
+        // previous connection ended.
+        let (config, _, _) = request.into_parts();
         let parsed = Arc::new(IbmMqSourceConfig::from_config(&config)?);
         let (deserializer, payload, output) = self.codec(&config, &parsed).await?;
         let library = library::load(parsed.connection.client_library.as_deref())?;

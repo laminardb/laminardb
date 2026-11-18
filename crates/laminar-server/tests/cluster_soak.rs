@@ -102,6 +102,9 @@ use std::time::{Duration, Instant};
 #[cfg(all(feature = "kafka", feature = "files", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/files_source.rs"]
 mod files_source;
+#[cfg(all(feature = "kafka", feature = "ibmmq"))]
+#[path = "cluster_soak/ibmmq_source.rs"]
+mod ibmmq_source;
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
 #[path = "cluster_soak/iceberg_leg.rs"]
 mod iceberg_leg;

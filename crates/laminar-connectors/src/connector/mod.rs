@@ -2,6 +2,8 @@
 
 mod contracts;
 mod coordinated_commit;
+#[cfg(any(feature = "rabbitmq", feature = "ibmmq"))]
+pub(crate) mod queue_start;
 mod recency;
 mod sink;
 mod source;

@@ -677,7 +677,8 @@ impl SourceBatch {
         Ok(self)
     }
 
-    /// Bind the exact source cursor captured with this batch.
+    /// Bind the exact source cursor captured with this batch. The runtime then takes this cursor
+    /// instead of asking the source for a checkpoint after the batch.
     #[must_use]
     pub fn with_checkpoint(mut self, checkpoint: SourceCheckpoint) -> Self {
         self.cursor = Some(SourceBatchCursor::Complete(checkpoint));

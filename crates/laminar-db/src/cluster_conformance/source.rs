@@ -32,7 +32,18 @@ pub(super) enum FixtureKind {
     Generated,
     /// One queue of batches, read by the owner of the source's home vnode. A delivery leaves the
     /// queue when a checkpoint covering it commits and returns to it when its reader closes.
-    Queue,
+    Queue(QueueCommit),
+}
+
+/// How a queue reader releases deliveries at a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueueCommit {
+    /// Every delivery up to the committed cut's tag, like a RabbitMQ channel.
+    Cumulative,
+    /// Every delivery since the last commit is one unit of work, like IBM MQ under syncpoint:
+    /// capturing a checkpoint seals the unit, and the reader gets nothing more until a commit
+    /// naming all of it.
+    UnitOfWork,
 }
 
 /// One fixture source.
@@ -101,7 +112,7 @@ impl Queues {
         Arc::new(Self(
             sources
                 .iter()
-                .filter(|source| source.kind == FixtureKind::Queue)
+                .filter(|source| matches!(source.kind, FixtureKind::Queue(_)))
                 .map(|source| {
                     let batches = source.all_batches();
                     let queue = Queue {
@@ -154,12 +165,15 @@ pub(super) fn register(
                 },
                 Arc::new(move |_| {
                     let (polled, allowance) = (Arc::clone(&polled), Arc::clone(&allowance));
-                    if let Some(queue) = &queue {
+                    if let (Some(queue), FixtureKind::Queue(commit)) = (&queue, source.kind) {
                         return Ok(Box::new(QueueSource {
                             queue: Arc::clone(queue),
                             schema: source.schema(),
+                            commit,
                             consumer: None,
                             delivered: 0,
+                            sealed: AtomicU64::new(0),
+                            committed: 0,
                             unacked: VecDeque::new(),
                             polled,
                             allowance,
@@ -182,14 +196,18 @@ pub(super) fn register(
     }
 }
 
-/// A queue reader that acknowledges cumulatively, like a broker channel: its cursor names the
-/// reader and the last delivery it handed over.
+/// A queue reader: its cursor names the reader and the last delivery it handed over.
 struct QueueSource {
     queue: Arc<Mutex<Queue>>,
     schema: SchemaRef,
+    commit: QueueCommit,
     consumer: Option<u64>,
     /// The last tag this reader handed over.
     delivered: u64,
+    /// `delivered` at the last capture; a unit of work above `committed` is sealed.
+    sealed: AtomicU64,
+    /// The last tag a commit released.
+    committed: u64,
     /// Deliveries not yet acknowledged, as `(tag, batch)`, oldest first.
     unacked: VecDeque<(u64, usize)>,
     polled: Arc<AtomicU64>,
@@ -218,11 +236,18 @@ impl SourceConnector for QueueSource {
         queue.consumers += 1;
         self.consumer = Some(queue.consumers);
         self.delivered = 0;
+        self.sealed.store(0, Ordering::Relaxed);
+        self.committed = 0;
         Ok(())
     }
 
     async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
         if self.polled.load(Ordering::Acquire) >= self.allowance.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if self.commit == QueueCommit::UnitOfWork
+            && self.sealed.load(Ordering::Relaxed) > self.committed
+        {
             return Ok(None);
         }
         let mut queue = self.queue.lock();
@@ -232,7 +257,12 @@ impl SourceConnector for QueueSource {
         self.delivered += 1;
         self.unacked.push_back((self.delivered, batch));
         self.polled.fetch_add(1, Ordering::AcqRel);
-        Ok(Some(SourceBatch::new(queue.batches[batch].clone())))
+        let batch = SourceBatch::new(queue.batches[batch].clone());
+        // A unit of work binds its own cursor, so that only a barrier capture seals it.
+        Ok(Some(match self.commit {
+            QueueCommit::Cumulative => batch,
+            QueueCommit::UnitOfWork => batch.with_checkpoint(self.cursor()),
+        }))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -240,12 +270,8 @@ impl SourceConnector for QueueSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut checkpoint = SourceCheckpoint::new();
-        if let Some(consumer) = self.consumer {
-            checkpoint.set_offset("consumer", consumer.to_string());
-            checkpoint.set_offset("tag", self.delivered.to_string());
-        }
-        checkpoint
+        self.sealed.store(self.delivered, Ordering::Relaxed);
+        self.cursor()
     }
 
     async fn notify_epoch_committed(
@@ -261,9 +287,19 @@ impl SourceConnector for QueueSource {
             .get_offset("tag")
             .and_then(|tag| tag.parse().ok())
             .unwrap_or(0);
+        if self.commit == QueueCommit::UnitOfWork && tag > self.committed && tag != self.delivered {
+            return Err(ConnectorError::InvalidState {
+                expected: format!(
+                    "a committed cut covering the whole unit of work (tag {})",
+                    self.delivered
+                ),
+                actual: format!("tag {tag}"),
+            });
+        }
         while self.unacked.front().is_some_and(|(acked, _)| *acked <= tag) {
             self.unacked.pop_front();
         }
+        self.committed = self.committed.max(tag);
         Ok(())
     }
 
@@ -274,6 +310,17 @@ impl SourceConnector for QueueSource {
         }
         self.consumer = None;
         Ok(())
+    }
+}
+
+impl QueueSource {
+    fn cursor(&self) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        if let Some(consumer) = self.consumer {
+            checkpoint.set_offset("consumer", consumer.to_string());
+            checkpoint.set_offset("tag", self.delivered.to_string());
+        }
+        checkpoint
     }
 }
 

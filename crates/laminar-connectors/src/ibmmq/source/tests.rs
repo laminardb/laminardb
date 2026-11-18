@@ -104,3 +104,54 @@ fn intake_pauses_when_the_unit_of_work_is_full() {
     ledger.uow_full = true;
     assert!(limits(&ledger, 1_000).is_none(), "MAXUMSGS reached");
 }
+
+fn json_queue_config() -> ConnectorConfig {
+    let mut config = ConnectorConfig::new("ibmmq");
+    config.set("queue", "Q");
+    config.set("format", "json");
+    config
+}
+
+#[tokio::test]
+async fn a_sealed_start_records_only_that_the_queue_keeps_its_position() {
+    let config = json_queue_config();
+    let mut source = IbmMqSource::new(Arc::new(arrow_schema::Schema::empty()), None);
+    assert!(source.supports_initialized_start());
+    let cursor = source.resolve_initial_position(&config).await.unwrap();
+    assert_eq!(cursor.get_metadata("connector"), Some("ibmmq"));
+    source
+        .validate_initial_position(&config, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan_for(1, 0, 0, &cursor).unwrap(),
+        CommitPlan::Nothing,
+        "a sealed start commits nothing"
+    );
+
+    let mut running = SourceCheckpoint::new();
+    running.set_offset(GENERATION, "00000000000000ff");
+    running.set_offset(GOTTEN, "4");
+    assert!(source
+        .validate_initial_position(&config, &running)
+        .await
+        .is_err());
+}
+
+#[test]
+fn any_one_cluster_node_may_consume_a_queue_unless_it_carries_fpml() {
+    let source = IbmMqSource::new(Arc::new(arrow_schema::Schema::empty()), None);
+    assert!(source
+        .contract(&json_queue_config())
+        .unwrap()
+        .supports_cluster_singleton_placement());
+    #[cfg(feature = "fpml")]
+    {
+        let mut fpml = json_queue_config();
+        fpml.set("format", "fpml");
+        assert!(!source
+            .contract(&fpml)
+            .unwrap()
+            .supports_cluster_singleton_placement());
+    }
+}
