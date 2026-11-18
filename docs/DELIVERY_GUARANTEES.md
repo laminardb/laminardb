@@ -37,7 +37,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Files | ALO, BE | rejected |
 | Files (object store, splits) | ALO, BE | ALO |
 | RabbitMQ | ALO | ALO |
-| IBM MQ | ALO | rejected |
+| IBM MQ | ALO | ALO |
 | NATS JetStream | BE | rejected |
 | WebSocket | BE | rejected |
 | OpenTelemetry | BE | rejected |
@@ -100,7 +100,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Files | — | — | — | — | — | — | — | — | — | — | — | — |
 | Files (object store, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| IBM MQ | — | — | — | — | — | — | — | — | — | — | — | — |
+| IBM MQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — |
 | WebSocket | — | — | — | — | — | — | — | — | — | — | — | — |
 | OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -154,6 +154,15 @@ a durable classic queue from a confirmed publisher and forwards every row throug
 RabbitMQ sink. The leader and each follower are hard-killed while paused inside a checkpoint. An
 independent reader of the output queue must see every confirmed id, ids never published fail the
 run, duplicates are counted, and more than one node must have consumed the queue.
+
+An IBM MQ queue on a named queue manager runs the same way, read under syncpoint: the owner
+commits its unit of work when the checkpoint holding it is durable, and the queue manager backs
+out an owner that fails.
+`ibmmq_source::three_node_ibmmq_source_kill9_soak` puts ids on a local queue, committing each
+put, and forwards every row through a stream to an IBM MQ sink, through the same kills. Every
+committed id must reach the output queue, ids never put fail the run, duplicates are counted,
+and more than one node must have consumed the queue. It needs the licensed IBM MQ client and
+queue manager, so it is development-host evidence and no workflow runs it.
 
 A MongoDB change stream (`output.mode=history`, `snapshot.mode=never`) runs the same way and
 resumes after the committed resume token. `mongodb_source::three_node_mongodb_source_kill9_soak`

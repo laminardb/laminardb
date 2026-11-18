@@ -1,6 +1,7 @@
 //! IBM MQ, against the `tests/docker/compose.yml` queue manager `QM1`: every node puts persistent
 //! messages on one local queue under syncpoint; the oracle reads the queue through the IBM MQ
-//! source and commits each batch after counting it.
+//! source and commits each batch after counting it. The IBM MQ source soak reads its input queue
+//! with the same settings.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -16,24 +17,66 @@ use laminar_connectors::connector::{
 };
 use laminar_connectors::ibmmq::IbmMqSource;
 
-use super::{block_on, setting, Destination, Observed, Oracle};
+use super::{block_on, setting, wait_until, Destination, Observed, Oracle};
 
 const PASSWORD: &str = "LAMINAR_SOAK_IBMMQ_PASSWORD";
+/// runmqsc's message for an object another connection holds open.
+const OBJECT_IN_USE: &str = "AMQ8148E";
+const IN_USE_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub(super) struct IbmMq {
+pub(crate) struct IbmMq {
     library: String,
     container: String,
     connection: String,
 }
 
 impl IbmMq {
-    pub(super) fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         setting(PASSWORD, None);
         Self {
             library: setting("LAMINAR_SOAK_IBMMQ_LIBRARY", None),
             container: setting("LAMINAR_SOAK_IBMMQ_CONTAINER", None),
             connection: setting("LAMINAR_SOAK_IBMMQ_CONNECTION", Some("127.0.0.1(1414)")),
         }
+    }
+
+    /// The run's input queue for the IBM MQ source soak.
+    pub(crate) fn source_queue(run_id: &str) -> String {
+        format!("DEV.SOAK.SOURCE.{}", run_id.replace('-', "."))
+    }
+
+    /// Server properties that connect to `queue` as the developer image's `app` user.
+    pub(crate) fn queue_properties(&self, queue: &str) -> String {
+        format!(
+            r#""client.library" = "{library}"
+"queue.manager" = "QM1"
+channel = "DEV.APP.SVRCONN"
+"connection.name" = "{connection}"
+username = "app"
+password = "$${{{PASSWORD}}}"
+queue = "{queue}"
+"#,
+            library = self.library,
+            connection = self.connection,
+        )
+    }
+
+    /// A test client's connector config for `queue`.
+    pub(crate) fn client_config(&self, queue: &str, format: &str) -> ConnectorConfig {
+        let mut config = ConnectorConfig::new("ibmmq");
+        for (key, value) in [
+            ("client.library", self.library.as_str()),
+            ("queue.manager", "QM1"),
+            ("channel", "DEV.APP.SVRCONN"),
+            ("connection.name", self.connection.as_str()),
+            ("username", "app"),
+            ("queue", queue),
+            ("format", format),
+        ] {
+            config.set(key, value);
+        }
+        config.set("password", setting(PASSWORD, None));
+        config
     }
 }
 
@@ -56,41 +99,39 @@ impl Destination for IbmMq {
     }
 
     fn sink_properties(&self, queue: &str) -> String {
-        format!(
-            r#""client.library" = "{library}"
-"queue.manager" = "QM1"
-channel = "DEV.APP.SVRCONN"
-"connection.name" = "{connection}"
-username = "app"
-password = "$${{{PASSWORD}}}"
-queue = "{queue}"
-"#,
-            library = self.library,
-            connection = self.connection,
-        )
+        self.queue_properties(queue)
     }
 
     fn create(&self, queue: &str) {
         mqsc(
             &self.container,
             &format!("DEFINE QLOCAL('{queue}') MAXDEPTH(999999999) REPLACE\n"),
-        );
+        )
+        .unwrap_or_else(|output| panic!("runmqsc failed: {output}"));
     }
 
+    /// A stopped node's connection may keep the queue open until the queue manager reaps it.
     fn delete(&self, queue: &str) {
-        mqsc(
-            &self.container,
-            &format!("DELETE QLOCAL('{queue}') PURGE\n"),
+        let command = format!("DELETE QLOCAL('{queue}') PURGE\n");
+        let deleted = wait_until(IN_USE_TIMEOUT, || match mqsc(&self.container, &command) {
+            Ok(()) => true,
+            Err(output) if output.contains(OBJECT_IN_USE) => false,
+            Err(output) => panic!("runmqsc failed: {output}"),
+        });
+        assert!(
+            deleted,
+            "queue {queue} stayed in use for {IN_USE_TIMEOUT:?}"
         );
     }
 
     fn spawn_oracle(&self, queue: &str) -> Oracle {
-        let config = oracle_config(&self.library, &self.connection, queue);
+        let config = self.client_config(queue, "raw");
         Oracle::spawn(move |observed, stop| block_on(consume(config, observed, stop)))
     }
 }
 
-fn mqsc(container: &str, commands: &str) {
+/// Run MQSC commands on `QM1`; a failure returns runmqsc's output.
+fn mqsc(container: &str, commands: &str) -> Result<(), String> {
     let mut child = Command::new("docker")
         .args(["exec", "-i", container, "runmqsc", "QM1"])
         .stdin(Stdio::piped())
@@ -104,28 +145,10 @@ fn mqsc(container: &str, commands: &str) {
         .write_all(commands.as_bytes())
         .expect("write MQSC commands");
     let output = child.wait_with_output().expect("runmqsc output");
-    assert!(
-        output.status.success(),
-        "runmqsc failed: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-}
-
-fn oracle_config(library: &str, connection: &str, queue: &str) -> ConnectorConfig {
-    let mut config = ConnectorConfig::new("ibmmq");
-    for (key, value) in [
-        ("client.library", library),
-        ("queue.manager", "QM1"),
-        ("channel", "DEV.APP.SVRCONN"),
-        ("connection.name", connection),
-        ("username", "app"),
-        ("queue", queue),
-        ("format", "raw"),
-    ] {
-        config.set(key, value);
+    if output.status.success() {
+        return Ok(());
     }
-    config.set("password", setting(PASSWORD, None));
-    config
+    Err(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Commit each polled batch after recording it; a failed generation restarts the source, and the

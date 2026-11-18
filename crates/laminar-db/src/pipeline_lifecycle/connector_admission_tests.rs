@@ -1026,6 +1026,30 @@ fn rabbitmq_runs_in_cluster_on_one_node_at_least_once() {
     .is_err());
 }
 
+#[cfg(feature = "ibmmq")]
+#[test]
+fn ibmmq_runs_in_cluster_on_one_node_at_least_once() {
+    use super::{admit_source_recovery_contract, cluster_assignment_scoped};
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::ibmmq::register_ibmmq_source(&registry).unwrap();
+    let mut config = laminar_connectors::config::ConnectorConfig::new("ibmmq");
+    config.set("queue.manager", "QM1");
+    config.set("queue", "ORDERS");
+    config.set("format", "json");
+    let contract = registry
+        .create_source(&config, None)
+        .unwrap()
+        .contract(&config)
+        .unwrap();
+    assert!(cluster_assignment_scoped(contract));
+    let admit =
+        |delivery| admit_source_recovery_contract(contract, delivery, true, RuntimeMode::Cluster);
+    assert_eq!(admit(DeliveryGuarantee::AtLeastOnce), Ok(()));
+    let error = admit(DeliveryGuarantee::ExactlyOnce).unwrap_err();
+    assert!(error.contains("not production-certified"), "{error}");
+}
+
 #[cfg(all(feature = "cluster", feature = "mongodb-cdc"))]
 #[test]
 fn a_mongodb_history_stream_runs_in_cluster_on_one_node_at_least_once() {

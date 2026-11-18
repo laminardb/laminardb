@@ -42,7 +42,7 @@ The source needs checkpointing and at-least-once delivery; a best-effort pipelin
 | Formats | `JSON`, `CSV` (several lines per message), and `RAW` (`value BYTEA` keeps bytes exactly; `value VARCHAR` requires UTF-8). Sources also read `FPML` (the `fpml` build feature): one document per message | `AVRO` and `DEBEZIUM`; `FPML` sinks |
 | Messages | Complete messages up to `max.message.bytes`, including group members | Segmented messages (`MQMF_SEGMENT`), which would be partial records |
 | Delivery | At-least-once with checkpointing; a persistent sink is durable at-least-once | Exactly-once, XA, and best-effort sources |
-| Deployment | Embedded and single-node server. In cluster mode the sink runs on every node as an independent at-least-once writer, under the same rule as Kafka and NATS output | Cluster mode rejects the source: it is a singleton |
+| Deployment | Embedded and single-node server. In cluster mode one node at a time reads the source: the node that owns the source's home vnode. When that node fails or the vnode moves, another node opens the queue and gets every message no committed checkpoint covered, because the queue manager backed out the previous owner's unit of work. A cluster source needs `queue.manager`, and every node must reach that queue manager. The sink runs on every node as an independent at-least-once writer, under the same rule as Kafka and NATS output | `FPML` sources, and sources without `queue.manager`, in cluster mode |
 | Reconnect | Source: disabled. Sink: `disabled`, `qmgr`, or `any` | Source reconnect (a reconnect backs out the unit of work holding uncheckpointed messages) |
 | TLS | `tls.cipher.spec`, key repository, certificate label, and `SSLPEER` filter on an explicit channel; a CCDT's channel definition owns its own TLS settings | TLS options combined with `ccdt.url` |
 
@@ -87,7 +87,8 @@ in `MQCNO`. That overrides `ccdt.url`, which in turn overrides the client's envi
 (`MQSERVER`, `MQCCDTURL`, `MQCHLLIB`/`MQCHLTAB`, `mqclient.ini`). Set one of the two options, or
 neither to defer to the environment; setting both is rejected. A `connection.name` list is tried in
 order by the client. `queue.manager` is the `MQCONNX` name: leave it out to accept whichever queue
-manager the channel definition reaches.
+manager the channel definition reaches. A cluster source must set it (see
+[Delivery, recovery, and failures](#delivery-recovery-and-failures)).
 
 **Reconnect.** The `reconnect` option sets the `MQCNO` reconnect option explicitly, so
 `mqclient.ini`'s `DefRecon` does not apply implicitly. IBM's rule still holds:
@@ -215,10 +216,27 @@ received whole for the move, matched by `MsgId` and never truncated. Startup fai
 The connector never falls back to the dead-letter queue.
 
 **`BackoutCount` counts against neighbours.** A backout increments the count of every message in
-the unit of work: an engine restart caused by something else, such as a sink outage, raises the
-counts of all uncheckpointed messages. After `BOTHRESH` such restarts, healthy messages are moved
+the unit of work: an engine restart caused by something else, such as a sink outage or, in a
+cluster, another node's failure, raises the counts of all uncheckpointed messages. After `BOTHRESH` such restarts, healthy messages are moved
 too. Set `BOTHRESH` well above the restarts you expect, or 0 to disable automatic moves and rely on
 `on.decode.error`.
+
+**In a cluster.** Every node that may own the source must reach the same queue: messages backed
+out on one queue manager are redelivered only there. Cluster mode therefore rejects a source
+without `queue.manager`, which would let each node accept whichever queue manager its own
+channel definition reaches. With the name set, a node whose channel reaches another queue manager
+fails to connect rather than reading another queue; two queue managers that share one name are
+still the operator's to avoid.
+
+When the source moves at a rescale or a rejoin, the node giving it up commits the handoff
+checkpoint's unit of work before it closes, so the next owner gets only later messages and no
+`BackoutCount` rises. When the owner fails, or a recovery restarts every node, its open unit of
+work is backed out and the next owner gets those messages again. The queue may be exclusive
+(`NOSHARE` or `DEFSOPT(EXCL)`): until the previous owner's connection is gone, the next owner's
+open fails with `MQRC_OBJECT_IN_USE` and is retried at its next read. A killed process's
+connection closes with it. A node whose host becomes unreachable holds the queue until the
+queue manager detects the broken connection, which depends on the channel's heartbeat (`HBINT`)
+and TCP keepalive settings.
 
 | What goes wrong | What happens |
 |---|---|
@@ -288,7 +306,10 @@ Connector tests (`crates/laminar-connectors/tests/ibmmq_integration.rs`) cover:
 - bad credentials;
 - CCDT;
 - a cancelled poll that taints its unit of work;
-- FpML documents becoming rows, with a rejected document moved to the backout queue.
+- FpML documents becoming rows, with a rejected document moved to the backout queue;
+- a sealed start, and one source reopening its queue after a handoff (run on 2026-11-18 against
+  the stock image, which now starts under OrbStack's emulation);
+- an exclusive queue opening on the next owner only once the previous one closes.
 
 SQL tests (`crates/laminar-db/tests/ibmmq_e2e.rs`) cover JSON and byte-exact binary round trips,
 backout-and-replay without loss across a restart, metadata columns across a restart, and FpML
@@ -301,8 +322,15 @@ one local queue, and checkpoints go to a shared S3 store (SeaweedFS). The leader
 twice and each follower once, every time while paused inside a checkpoint after the sinks
 flushed. Every node put messages before the first kill and after it rejoined, and each put
 29–40% of the rows in the 30 s steady phase that followed. Of 71,726 messages none was missing
-from the queue; 4,306 arrived more than once. TLS, sink reconnect, and
-queue-manager failover were not tested against a live queue manager.
+from the queue; 4,306 arrived more than once.
+`crates/laminar-server/tests/cluster_soak/ibmmq_source.rs` runs the source in a three-node
+cluster: a publisher commits ids to one local queue, the node that owns the source's home vnode
+reads it under syncpoint, and a stream forwards the rows to an IBM MQ sink whose output queue an
+independent reader drains. The leader was hard-killed twice and each follower once, every time
+while paused inside a checkpoint. In three local runs on 2026-11-18, none of 48,425, 46,845 and
+46,277 published messages was missing from the output, 3,350, 2,548 and 2,466 arrived more than
+once, and two of the three nodes consumed the queue as the source moved. No workflow runs this leg. TLS, sink
+reconnect, and queue-manager failover were not tested against a live queue manager.
 
 ## Performance
 

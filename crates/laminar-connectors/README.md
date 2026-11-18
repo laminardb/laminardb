@@ -18,7 +18,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node, and `history` without a snapshot in a cluster on one node at a time | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node, and in a cluster on one node at a time ([guide](../../docs/RABBITMQ.md)) | Implemented |
-| IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node ([guide](../../docs/IBMMQ.md)) | Implemented |
+| IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node, and in a cluster on one node at a time with `queue.manager` set ([guide](../../docs/IBMMQ.md)) | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
