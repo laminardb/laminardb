@@ -3,7 +3,7 @@
 
 use crate::checkpoint::SourceCheckpoint;
 
-use super::super::config::{SnapshotMode, SourceOutputMode};
+use super::super::config::SnapshotMode;
 use super::admission::source_database;
 use super::checkpoint::encode_checkpoint;
 use super::lifecycle::restored_start;
@@ -16,14 +16,11 @@ use super::{
 
 /// Only the change stream starts sealed: an initial copy has no boundary to seal.
 pub(super) fn require(config: &MongoDbSourceConfig) -> Result<(), ConnectorError> {
-    if config.output_mode == SourceOutputMode::History
-        && config.snapshot_mode == SnapshotMode::Never
-    {
+    if config.snapshot_mode == SnapshotMode::Never {
         return Ok(());
     }
     Err(ConnectorError::ConfigurationError(
-        "a MongoDB CDC source starts sealed only with output.mode=history and snapshot.mode=never"
-            .into(),
+        "a MongoDB CDC source starts sealed only with snapshot.mode=never".into(),
     ))
 }
 

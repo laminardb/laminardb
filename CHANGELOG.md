@@ -31,6 +31,16 @@
   for a checkpoint per batch, so an IBM MQ source reads on between checkpoints in cluster
   mode.
 
+- A MongoDB document source takes `change.time.column`: a declared, non-key
+  `TIMESTAMP NOT NULL` column filled with each change's server wall time (MongoDB 6.0 or later),
+  deletes included. With a watermark on it, the source can be the right side of a temporal join
+  in every mode; before, a document source could not have a non-null event-time column, and a
+  watermarked one faulted at its first batch because its checkpoints named no input channel. In
+  cluster mode a document source without the initial copy runs at-least-once on one node at a
+  time, as history mode does, and may only feed a temporal join's right side. A placed
+  singleton's positioned rows now carry its one channel, so any such source can feed a temporal
+  or interval join in a cluster.
+
 - The Iceberg source takes `read.splits = n` in append mode. Each data file belongs to one of `n`
   input channels by a hash of its path, and each channel keeps its own position in the snapshot
   lineage, so a cluster reads one table on several nodes, each channel on the node that owns the

@@ -1052,7 +1052,7 @@ fn ibmmq_runs_in_cluster_on_one_node_at_least_once() {
 
 #[cfg(all(feature = "cluster", feature = "mongodb-cdc"))]
 #[test]
-fn a_mongodb_history_stream_runs_in_cluster_on_one_node_at_least_once() {
+fn a_mongodb_change_stream_runs_in_cluster_on_one_node_at_least_once() {
     use super::{admit_source_recovery_contract, cluster_assignment_scoped};
 
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
@@ -1074,20 +1074,22 @@ fn a_mongodb_history_stream_runs_in_cluster_on_one_node_at_least_once() {
             RuntimeMode::Cluster,
         )
     };
-    assert!(cluster_assignment_scoped(source.contract(&config).unwrap()));
-    assert_eq!(admit(&config, DeliveryGuarantee::AtLeastOnce), Ok(()));
-    let error = admit(&config, DeliveryGuarantee::ExactlyOnce).unwrap_err();
-    assert!(error.contains("not production-certified"), "{error}");
-
-    // The initial copy and the keyed document mirror stay rejected in cluster.
-    let mut copied = config.clone();
-    copied.set("snapshot.mode", "initial");
     let mut document = config.clone();
     document.set("output.mode", "document");
     document.set("full.document.mode", "required");
-    for config in [&copied, &document] {
+    for config in [&config, &document] {
+        assert!(cluster_assignment_scoped(source.contract(config).unwrap()));
+        assert_eq!(admit(config, DeliveryGuarantee::AtLeastOnce), Ok(()));
+        let error = admit(config, DeliveryGuarantee::ExactlyOnce).unwrap_err();
+        assert!(error.contains("not production-certified"), "{error}");
+    }
+
+    // The initial copy stays rejected in cluster, in either output mode.
+    for base in [&config, &document] {
+        let mut copied = base.clone();
+        copied.set("snapshot.mode", "initial");
         assert_eq!(
-            admit(config, DeliveryGuarantee::AtLeastOnce),
+            admit(&copied, DeliveryGuarantee::AtLeastOnce),
             Err("cluster singleton sources require a connector that one node at a time may run")
         );
     }

@@ -235,7 +235,9 @@ impl MongoDbCdcSource {
             byte_budget,
             config,
             state: ConnectorState::Created,
-            schema: mongodb_history_schema(),
+            // Declared document columns are known only at admission; until then the schema is
+            // empty, which callers read as not yet known.
+            schema: Arc::new(arrow_schema::Schema::empty()),
             metrics: Arc::new(MongoDbCdcMetrics::new(registry)),
             event_buffer: VecDeque::new(),
             emitted: None,
@@ -493,6 +495,8 @@ impl MongoDbCdcSource {
                         ConnectorError::Internal("snapshot key bookkeeping".into())
                     })?,
                     document: &record.raw,
+                    // A copied document holds the version current at the snapshot's time.
+                    changed_at_ms: pending.snapshot_at.map(|at| i64::from(at.time) * 1_000),
                 }),
                 BufferedMongoPayload::HighWatermark { .. }
                 | BufferedMongoPayload::SnapshotComplete => {}
@@ -522,8 +526,9 @@ impl MongoDbCdcSource {
                 change.operation
             ))
         })?;
+        let changed_at_ms = change.wall_time_us.map(|micros| micros / 1_000);
         if record.operation == ChangeOperation::Delete {
-            return Ok(Some(DocumentRow::Tombstone { key }));
+            return Ok(Some(DocumentRow::Tombstone { key, changed_at_ms }));
         }
         let document = change.full_document.ok_or_else(|| {
             ConnectorError::SchemaMismatch(format!(
@@ -532,7 +537,11 @@ impl MongoDbCdcSource {
                 change.operation, self.config.database, self.config.collection
             ))
         })?;
-        Ok(Some(DocumentRow::Put { key, document }))
+        Ok(Some(DocumentRow::Put {
+            key,
+            document,
+            changed_at_ms,
+        }))
     }
 }
 
