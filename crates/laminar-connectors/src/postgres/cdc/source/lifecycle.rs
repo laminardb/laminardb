@@ -148,26 +148,34 @@ impl PostgresCdcSource {
         // A source that failed while installing its slot still reports where it stands: a
         // barrier captured between a retried poll error and the fault may commit.
         let phase = match (&self.phase, self.consistent_point) {
-            (Phase::Claiming(_), _) | (Phase::Idle, None) => CursorPhase::Claimed,
-            (Phase::Snapshot(snapshot), Some(consistent_point)) => {
-                CursorPhase::Snapshot(snapshot.position(consistent_point, self.polled_lsn))
-            }
+            (Phase::Claiming(_), _) | (Phase::Idle, None) => Some(CursorPhase::Claimed),
+            (Phase::Snapshot(snapshot), Some(consistent_point)) => Some(CursorPhase::Snapshot(
+                snapshot.position(consistent_point, self.polled_lsn),
+            )),
             (
                 Phase::AwaitingStream { .. } | Phase::Streaming | Phase::Idle,
                 Some(consistent_point),
-            ) => CursorPhase::Streaming {
+            ) => Some(CursorPhase::Streaming {
                 consistent_point,
                 lsn: self.polled_lsn,
-            },
-            (Phase::AwaitingStream { .. } | Phase::Snapshot(_) | Phase::Streaming, None) => {
-                return write_cursor(&self.config, None);
-            }
+            }),
+            (Phase::AwaitingStream { .. } | Phase::Snapshot(_) | Phase::Streaming, None) => None,
         };
-        let position = match (&self.claim, &self.checkpoint_binding) {
-            (Some(claim), Some(binding)) => Some((claim, binding, phase)),
+        let position = match (&self.claim, &self.checkpoint_binding, phase) {
+            (Some(claim), Some(binding), Some(phase)) => Some((claim, binding, phase)),
             _ => None,
         };
-        write_cursor(&self.config, position)
+        let mut checkpoint = write_cursor(&self.config, position);
+        // Rows are positioned under the claimed slot, the one input channel a watermark follows.
+        checkpoint
+            .set_input_channels(
+                self.claim
+                    .iter()
+                    .map(|claim| claim.slot().as_bytes().to_vec())
+                    .collect::<Arc<[_]>>(),
+            )
+            .expect("a claim slot name is a non-empty channel");
+        checkpoint
     }
 
     /// Re-read the live contract and report orphaned slots at most every

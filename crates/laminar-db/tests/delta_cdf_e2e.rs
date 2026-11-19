@@ -46,10 +46,10 @@ fn location(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// A Delta table with change data feed enabled from its second version on.
-async fn source_table(path: &Path, rows: &[(i64, &str, i64)]) {
+/// A Delta table of `rows` with change data feed enabled from its second version on.
+async fn source_table(path: &Path, rows: RecordBatch) {
     std::fs::create_dir_all(path).unwrap();
-    let table = open_or_create_table(&location(path), HashMap::new(), Some(&schema()))
+    let table = open_or_create_table(&location(path), HashMap::new(), Some(&rows.schema()))
         .await
         .unwrap();
     let table = table
@@ -60,7 +60,7 @@ async fn source_table(path: &Path, rows: &[(i64, &str, i64)]) {
         )]))
         .await
         .unwrap();
-    table.write(vec![orders(rows)]).await.unwrap();
+    table.write(vec![rows]).await.unwrap();
 }
 
 async fn open(storage: &Path) -> Arc<LaminarDB> {
@@ -146,7 +146,7 @@ struct Views {
 }
 
 impl Views {
-    async fn converge(&self) {
+    async fn converge(&self, db: &LaminarDB) {
         for (target, expected, observed) in [
             (
                 &self.totals,
@@ -169,21 +169,34 @@ impl Views {
                 "SELECT id, qty FROM t",
             ),
         ] {
-            let want = query(&self.source, expected).await;
-            let deadline = tokio::time::Instant::now() + CONVERGE;
-            loop {
-                let got = query(target, observed).await;
-                if got == want {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "{} did not converge:\n  want {want:?}\n  got  {got:?}",
-                    target.display()
-                );
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            converge_table(db, &self.source, target, expected, observed).await;
         }
+    }
+}
+
+/// Wait until `observed` over `target` returns what `expected` returns over `source`, failing
+/// on a pipeline fault.
+async fn converge_table(
+    db: &LaminarDB,
+    source: &Path,
+    target: &Path,
+    expected: &str,
+    observed: &str,
+) {
+    let want = query(source, expected).await;
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    loop {
+        let got = query(target, observed).await;
+        if got == want {
+            return;
+        }
+        assert_eq!(db.last_fault(), None);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} did not converge:\n  want {want:?}\n  got  {got:?}",
+            target.display()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -217,7 +230,7 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
     let seed: Vec<(i64, &str, i64)> = (1..=200)
         .map(|id| (id, if id % 3 == 0 { "OPEN" } else { "CLOSED" }, id))
         .collect();
-    source_table(&views.source, &seed).await;
+    source_table(&views.source, orders(&seed)).await;
 
     let statements = vec![
         source_ddl(&views.source),
@@ -241,7 +254,7 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
             panic!("{error}");
         }
         db.start().await.expect("start");
-        views.converge().await;
+        views.converge(&db).await;
 
         let table = open_or_create_table(&location(&views.source), HashMap::new(), None)
             .await
@@ -272,7 +285,7 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
             .with_predicate("id BETWEEN 10 AND 30")
             .await
             .unwrap();
-        views.converge().await;
+        views.converge(&db).await;
         assert!(db.checkpoint().await.unwrap().success);
         db.shutdown().await.expect("shutdown");
     }
@@ -295,7 +308,7 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
     {
         let db = reopen(storage.path(), &statements).await;
         db.start().await.expect("restart");
-        views.converge().await;
+        views.converge(&db).await;
         db.shutdown().await.expect("shutdown");
     }
 }
@@ -305,7 +318,7 @@ async fn delta_change_feed_maintains_aggregates_filters_and_mirrors_across_resta
 async fn delta_change_feed_consumers_that_cannot_retract_are_rejected() {
     let lake = tempfile::tempdir().unwrap();
     let path = lake.path().join("orders");
-    source_table(&path, &[(1, "OPEN", 1)]).await;
+    source_table(&path, orders(&[(1, "OPEN", 1)])).await;
     let append = lake.path().join("append");
     let cases = [(
         format!(
@@ -335,6 +348,76 @@ async fn delta_change_feed_consumers_that_cannot_retract_are_rejected() {
     }
 }
 
+/// `rows` as orders, every one changed at `changed_at_micros`.
+fn orders_changed_at(rows: &[(i64, &str, i64)], changed_at_micros: i64) -> RecordBatch {
+    let orders = orders(rows);
+    let mut fields = orders.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "changed_at",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        false,
+    )));
+    let mut columns = orders.columns().to_vec();
+    columns.push(Arc::new(arrow::array::TimestampMicrosecondArray::from(
+        vec![changed_at_micros; rows.len()],
+    )));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
+/// A watermark on a Delta change feed follows its one input channel through checkpoints and a
+/// restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delta_change_feed_with_a_watermark_checkpoints_and_restarts() {
+    // 2026-01-01T00:00:00Z
+    const CHANGED_AT_MICROS: i64 = 1_767_225_600_000_000;
+    let lake = tempfile::tempdir().unwrap();
+    let source = lake.path().join("orders");
+    let totals = lake.path().join("totals");
+    let seed: Vec<(i64, &str, i64)> = (1..=50)
+        .map(|id| (id, if id % 2 == 0 { "OPEN" } else { "CLOSED" }, id))
+        .collect();
+    source_table(&source, orders_changed_at(&seed, CHANGED_AT_MICROS)).await;
+    let statements = vec![
+        format!(
+            "CREATE SOURCE orders (id BIGINT NOT NULL, label VARCHAR NOT NULL, qty BIGINT NOT NULL, \
+             changed_at TIMESTAMP NOT NULL, __weight BIGINT NOT NULL, \
+             WATERMARK FOR changed_at AS changed_at - INTERVAL '1' SECOND) \
+             FROM \"delta-lake\" ('table.path' = '{}', 'poll.interval.ms' = '50')",
+            location(&source)
+        ),
+        "CREATE STREAM totals AS SELECT label, SUM(qty) AS total, COUNT(*) AS n \
+         FROM orders GROUP BY label EMIT CHANGES"
+            .to_string(),
+        upsert_sink("totals_sink", "totals", &totals, "label"),
+    ];
+    let storage = tempfile::tempdir().unwrap();
+    for round in 0..2 {
+        if round == 1 {
+            // A change while the pipeline is down replays from the committed cursor.
+            open_or_create_table(&location(&source), HashMap::new(), None)
+                .await
+                .unwrap()
+                .update()
+                .with_predicate("id = 2")
+                .with_update("label", "'CLOSED'")
+                .await
+                .unwrap();
+        }
+        let db = reopen(storage.path(), &statements).await;
+        db.start().await.expect("start");
+        converge_table(
+            &db,
+            &source,
+            &totals,
+            "SELECT label, SUM(qty), COUNT(*) FROM t GROUP BY label",
+            "SELECT label, total, n FROM t",
+        )
+        .await;
+        assert!(db.checkpoint().await.unwrap().success);
+        db.shutdown().await.expect("shutdown");
+    }
+}
+
 /// End-to-end latency from a source commit to the row being readable in the Delta mirror, and
 /// the duration of a manual checkpoint (flush initiation to durable sink visibility). Run with
 /// `cargo test -p laminar-db --features delta-lake --release --test delta_cdf_e2e -- --ignored --nocapture`.
@@ -349,7 +432,7 @@ async fn delta_change_feed_latency() {
     let lake = tempfile::tempdir().unwrap();
     let source_path = lake.path().join("orders");
     let mirror = lake.path().join("mirror");
-    source_table(&source_path, &[(0, "SEED", 0)]).await;
+    source_table(&source_path, orders(&[(0, "SEED", 0)])).await;
     let storage = tempfile::tempdir().unwrap();
     let db = LaminarDB::builder()
         .storage_dir(storage.path())

@@ -31,7 +31,8 @@ pub(super) enum DeltaPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DeltaCursor {
-    /// Delta `metaData.id`; a table recreated at the same location has a different one.
+    /// Delta `metaData.id`, never empty; a table recreated at the same location has a
+    /// different one.
     pub(super) table_id: String,
     pub(super) phase: DeltaPhase,
 }
@@ -41,6 +42,11 @@ impl DeltaCursor {
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset(FORMAT_KEY, FORMAT_VERSION);
         checkpoint.set_offset(TABLE_ID_KEY, self.table_id.clone());
+        // Rows are positioned under the table incarnation, the one input channel a watermark on
+        // them follows.
+        checkpoint
+            .set_input_channels(vec![self.table_id.as_bytes().to_vec()])
+            .expect("a cursor's table id is a non-empty channel");
         match &self.phase {
             DeltaPhase::Snapshot {
                 version,
@@ -140,10 +146,12 @@ mod tests {
                 table_id: "4c1a".into(),
                 phase,
             };
+            let checkpoint = cursor.to_checkpoint();
             assert_eq!(
-                DeltaCursor::from_checkpoint(&cursor.to_checkpoint()).unwrap(),
-                cursor
+                checkpoint.input_channels(),
+                Some([b"4c1a".to_vec()].as_slice())
             );
+            assert_eq!(DeltaCursor::from_checkpoint(&checkpoint).unwrap(), cursor);
         }
     }
 

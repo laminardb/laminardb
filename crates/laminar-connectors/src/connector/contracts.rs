@@ -139,7 +139,9 @@ pub enum SourceRowPositionCapability {
     /// Every emitted row carries a replay position. Within one source run, `(order_key,
     /// sub_offset)` is nondecreasing per partition across batches; recovery may restart from an
     /// earlier position. Replaying an equal position must produce the same logical row and
-    /// mutation. This does not define the merge order of independent partitions.
+    /// mutation. This does not define the merge order of independent partitions. A watermark on
+    /// such a source follows each partition as an input channel, so every checkpoint must name
+    /// the partitions its rows use as its input channels.
     OrderedDeterministic,
 }
 

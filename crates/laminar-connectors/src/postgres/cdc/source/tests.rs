@@ -506,6 +506,11 @@ async fn positions_are_deterministic_wal_order_with_bound_cursors() {
             panic!("complete cursor expected");
         };
         assert_eq!(cursor.get_offset("lsn"), Some("0/210"));
+        assert_eq!(
+            cursor.input_channels(),
+            Some([b"laminar_slot_0123456789abcdef".to_vec()].as_slice()),
+            "the cursor names the slot its rows are positioned under"
+        );
         encoded_runs.push(encoded(&source, batch));
     }
     assert_eq!(
