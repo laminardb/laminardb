@@ -27,14 +27,33 @@ pub(crate) const SESSION_OPTIONS: &str =
 const BUILDER_GROWTH_FACTOR: usize = 2;
 const OFFSET_BYTES: usize = 4;
 
-/// One declared output column and the relation tuple position it reads.
+/// Where a declared output column's values come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnSource {
+    /// The relation tuple column at this position.
+    Tuple(usize),
+    /// The commit time of the row's transaction (`change.time.column`), on every row.
+    ChangeTime,
+}
+
+/// One declared output column and where its values come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundColumn {
     pub(crate) name: String,
-    pub(crate) tuple_index: usize,
+    pub(crate) source: ColumnSource,
     pub(crate) kind: ValueKind,
     pub(crate) nullable: bool,
     pub(crate) is_key: bool,
+}
+
+impl BoundColumn {
+    /// The relation tuple position this column reads, if it reads one.
+    pub(crate) const fn tuple_index(&self) -> Option<usize> {
+        match self.source {
+            ColumnSource::Tuple(index) => Some(index),
+            ColumnSource::ChangeTime => None,
+        }
+    }
 }
 
 /// Immutable mapping from the `PostgreSQL` relation to the declared Arrow schema.
@@ -166,6 +185,16 @@ impl ColumnBuilder {
         Ok(())
     }
 
+    fn append_timestamp_micros(&mut self, micros: i64) -> Result<(), String> {
+        match self {
+            Self::Timestamp(builder, ..) => {
+                builder.append_value(micros);
+                Ok(())
+            }
+            _ => Err("the change time needs a timestamp column".into()),
+        }
+    }
+
     fn finish(&mut self) -> Result<ArrayRef, ConnectorError> {
         Ok(match self {
             Self::Bool(builder) => Arc::new(builder.finish()),
@@ -225,21 +254,38 @@ impl RowBuilder {
 
     /// Append one row. `value(declared_index, column)` yields the text value, or `None` for
     /// SQL `NULL`, or the error that makes the value unavailable.
-    /// Non-key columns of a key-only row are `NULL`; `planned_bytes` is the row's
+    /// Non-key columns of a key-only row are `NULL`, except the change-time column, which takes
+    /// `commit_time_ms` on every row; `planned_bytes` is the row's
     /// [`RowLayout::planned_row_bytes`] charge.
     ///
     /// # Errors
-    /// Returns an error for an unparseable value or a `NULL` in a non-nullable column. The
-    /// builder is then partially appended and must be discarded.
+    /// Returns an error for an unparseable value, a `NULL` in a non-nullable column, or a
+    /// change-time column without a commit time. The builder is then partially appended and
+    /// must be discarded.
     pub(crate) fn append<'a>(
         &mut self,
         layout: &RowLayout,
         mut value: impl FnMut(usize, &BoundColumn) -> Result<Option<&'a [u8]>, ConnectorError>,
         key_only: bool,
         weight: Option<i64>,
+        commit_time_ms: Option<i64>,
         planned_bytes: usize,
     ) -> Result<(), ConnectorError> {
         for (index, (column, builder)) in layout.columns.iter().zip(&mut self.columns).enumerate() {
+            if column.source == ColumnSource::ChangeTime {
+                let micros = commit_time_ms
+                    .and_then(|millis| millis.checked_mul(1_000))
+                    .ok_or_else(|| {
+                        ConnectorError::Internal(format!(
+                            "PostgreSQL CDC change-time column '{}' has no commit time",
+                            column.name
+                        ))
+                    })?;
+                builder
+                    .append_timestamp_micros(micros)
+                    .map_err(ConnectorError::Internal)?;
+                continue;
+            }
             let omitted = key_only && !column.is_key;
             let text = if omitted { None } else { value(index, column)? };
             match text {

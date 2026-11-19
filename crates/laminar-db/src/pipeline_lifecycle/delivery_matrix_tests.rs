@@ -81,6 +81,20 @@ const SOURCES: &[Variant] = &[
         exact_properties: &[],
     },
     Variant {
+        label: "PostgreSQL CDC (no initial copy)",
+        connector: "postgres-cdc",
+        properties: &[
+            ("host", "localhost"),
+            ("database", "app"),
+            ("slot.name", "matrix"),
+            ("publication", "matrix"),
+            ("table", "public.orders"),
+            ("ssl.mode", "disable"),
+            ("snapshot.mode", "never"),
+        ],
+        exact_properties: &[],
+    },
+    Variant {
         label: "MongoDB change stream",
         connector: "mongodb-cdc",
         properties: &[

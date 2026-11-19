@@ -338,7 +338,7 @@ consumed it, so a value near the cap means this node consumes slower than its pe
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
 | `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC source (embedded/single-node); also builds the `postgres` lookup connector |
+| `postgres-cdc` | PostgreSQL CDC source (every mode; in a cluster, `upsert` without the initial copy); also builds the `postgres` lookup connector |
 | `postgres-sink` | PostgreSQL sink |
 | `mongodb-cdc` | MongoDB CDC source (embedded/single-node), sink, and lookup |
 | `delta-lake` | Delta Lake sink and source |

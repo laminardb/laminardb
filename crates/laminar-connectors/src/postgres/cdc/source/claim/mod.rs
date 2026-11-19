@@ -8,7 +8,7 @@
 
 mod creation;
 
-use crate::connector::SourceBatch;
+use crate::connector::{ProcessLeaseCheck, SourceBatch};
 
 use super::super::config::{OutputMode, PostgresCdcConfig};
 use super::super::postgres_io::slots::{self, PrefixSlot, SlotFacts, SlotHolder};
@@ -231,11 +231,25 @@ pub(super) fn busy(slot: &str, holder: &SlotHolder) -> ConnectorError {
     ))
 }
 
+/// Refuse to act on the slot once this process lost its cluster process lease: it is fenced,
+/// and another node may own the source and its session.
+pub(super) fn require_live(lease: Option<&ProcessLeaseCheck>) -> Result<(), ConnectorError> {
+    if lease.is_none_or(ProcessLeaseCheck::is_live) {
+        return Ok(());
+    }
+    Err(ConnectorError::InvalidState {
+        expected: "a live cluster process lease before using the PostgreSQL replication slot"
+            .into(),
+        actual: "the process lease expired".into(),
+    })
+}
+
 /// Inspect the claimed slot under the committed `binding` and apply [`resume_action`], ending
-/// at most one stale session of the claim.
+/// at most one stale session of the claim, and only while `lease` is live.
 ///
 /// # Errors
-/// Returns an error when the live identity drifted from `binding` or the catalog is unreachable.
+/// Returns an error when the live identity drifted from `binding`, the catalog is unreachable,
+/// or the process lease expired.
 pub(super) async fn settle(
     control: &ControlConnection,
     config: &PostgresCdcConfig,
@@ -243,6 +257,7 @@ pub(super) async fn settle(
     incarnation: &str,
     phase: &CursorPhase,
     binding: &PostgresCheckpointBinding,
+    lease: Option<&ProcessLeaseCheck>,
 ) -> Result<ResumeAction, ConnectorError> {
     let decide = || async {
         let inspected = inspect_source(control.client(), config, Some(claim.slot())).await?;
@@ -259,6 +274,7 @@ pub(super) async fn settle(
     let ResumeAction::TerminateStale(holder) = action else {
         return Ok(action);
     };
+    require_live(lease)?;
     tracing::warn!(
         slot = claim.slot(),
         %holder,
@@ -348,6 +364,7 @@ impl PostgresCdcSource {
             config: self.config.clone(),
             application_name: claim.application_name(&self.incarnation),
             incarnation: self.incarnation.clone(),
+            process_lease: self.process_lease.clone(),
             claim: claim.clone(),
             binding: binding.clone(),
             admission: self.task_owner.admission(),

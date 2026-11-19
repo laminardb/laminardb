@@ -17,6 +17,8 @@ use super::{
 use super::{
     source_process_authority_is_live, ClusterController, CycleError, SourceProcessAuthority,
 };
+#[cfg(feature = "cluster")]
+use laminar_connectors::connector::ProcessLeaseCheck;
 
 struct PreparedSourceSet {
     prepared_sources: Vec<PreparedSourceGeneration>,
@@ -422,6 +424,7 @@ impl StreamingCoordinator {
     fn prepare_source_starts(
         sources: Vec<TrackedSourceRegistration>,
         delivery_guarantee: DeliveryGuarantee,
+        #[cfg(feature = "cluster")] process_lease: Option<&ProcessLeaseCheck>,
     ) -> Result<Vec<(TrackedSourceRegistration, SourceStart)>, DbError> {
         let mut source_starts = Vec::with_capacity(sources.len());
         for src in sources {
@@ -444,6 +447,11 @@ impl StreamingCoordinator {
                     src.name, attempt.epoch, attempt.checkpoint_id
                 )),
             })?;
+            #[cfg(feature = "cluster")]
+            let start = match process_lease {
+                Some(lease) => start.with_process_lease(lease.clone()),
+                None => start,
+            };
             if matches!(&src.position, SourcePosition::Initialized { .. })
                 && !src.connector.supports_initialized_start()
             {
@@ -691,8 +699,18 @@ impl StreamingCoordinator {
         )?;
 
         #[cfg(feature = "cluster")]
+        let process_lease = source_process_authority.as_ref().map(|controller| {
+            let controller = Arc::clone(controller);
+            ProcessLeaseCheck::new(move || controller.process_lease_is_live())
+        });
+        #[cfg(feature = "cluster")]
         let source_process_authority = source_process_authority.map(SourceProcessAuthority::new);
-        let source_starts = Self::prepare_source_starts(sources, config.delivery_guarantee)?;
+        let source_starts = Self::prepare_source_starts(
+            sources,
+            config.delivery_guarantee,
+            #[cfg(feature = "cluster")]
+            process_lease.as_ref(),
+        )?;
         let PreparedSourceSet {
             prepared_sources,
             committed_offsets,

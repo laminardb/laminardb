@@ -15,7 +15,9 @@ use tokio::sync::Notify;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ConnectorState;
-use crate::connector::{ConnectorTaskOwner, ConnectorTaskTracker, SourceMutation};
+use crate::connector::{
+    ConnectorTaskOwner, ConnectorTaskTracker, ProcessLeaseCheck, SourceMutation,
+};
 use crate::error::ConnectorError;
 
 use super::config::PostgresCdcConfig;
@@ -31,6 +33,7 @@ mod decoding;
 mod drain;
 mod lifecycle;
 mod reader;
+mod sealed_start;
 mod snapshot;
 mod startup;
 
@@ -98,6 +101,7 @@ struct StagedRows {
 struct OpenTransaction {
     final_lsn: Lsn,
     xid: u32,
+    commit_time_ms: i64,
     /// Rows of a transaction decoded during the copy.
     staged: Option<StagedRows>,
 }
@@ -165,6 +169,8 @@ pub struct PostgresCdcSource {
     claim: Option<SlotClaim>,
     /// Random per `start()`, in this incarnation's `application_name`.
     incarnation: String,
+    /// The cluster process lease this source runs under; `None` outside a cluster.
+    process_lease: Option<ProcessLeaseCheck>,
     /// The owned slot's consistent point, once the slot exists.
     consistent_point: Option<Lsn>,
     /// SQL of the initial copy, read at startup when the source copies.
@@ -248,6 +254,7 @@ impl PostgresCdcSource {
             checkpoint_binding: None,
             claim: None,
             incarnation: String::new(),
+            process_lease: None,
             consistent_point: None,
             copy_plan: None,
             #[cfg(test)]

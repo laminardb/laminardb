@@ -2497,29 +2497,10 @@ async fn history_appends_every_event_to_iceberg() {
 #[allow(dead_code)]
 #[path = "common/kafka.rs"]
 mod kafka;
-
-/// Trades as JSON objects `{"id", "key", "at"}`, `at` in epoch milliseconds.
+// Shared with the PostgreSQL CDC tests.
 #[cfg(feature = "kafka")]
-async fn produce_trades(brokers: &str, topic: &str, trades: &[(i64, i64, i64)]) {
-    use rdkafka::producer::{FutureProducer, FutureRecord};
-    let producer: FutureProducer = rdkafka::config::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("message.timeout.ms", "5000")
-        .create()
-        .expect("producer");
-    for (id, key, at) in trades {
-        let payload = format!(r#"{{"id": {id}, "key": {key}, "at": {at}}}"#);
-        producer
-            .send(
-                FutureRecord::to(topic)
-                    .payload(&payload)
-                    .key(&id.to_string()),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("produce");
-    }
-}
+#[path = "common/temporal_trades.rs"]
+mod temporal_trades;
 
 /// Each trade id's joined rate in the output collection; an id seen twice must agree.
 #[cfg(feature = "kafka")]
@@ -2542,27 +2523,6 @@ async fn priced(collection: &mongodb::Collection<Document>) -> BTreeMap<i64, Opt
         );
     }
     priced
-}
-
-/// Wall-clock milliseconds; the fixture's server shares this host's clock.
-#[cfg(feature = "kafka")]
-fn now_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-    )
-    .unwrap()
-}
-
-/// A wall-clock instant at least 1.5 s after the last change and before the next one.
-#[cfg(feature = "kafka")]
-async fn instant_between_changes() -> i64 {
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let at = now_ms();
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    at
 }
 
 /// A document source whose change-time column carries a watermark is an ordered event-time
@@ -2597,12 +2557,7 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
              'collection' = 'rates', 'output.mode' = 'document', \
              'full.document.mode' = 'required', 'change.time.column' = 'changed_at')"
         ),
-        format!(
-            "CREATE SOURCE trades (id BIGINT NOT NULL, key BIGINT NOT NULL, at TIMESTAMP NOT NULL, \
-             WATERMARK FOR at AS at - INTERVAL '1' SECOND) FROM KAFKA (\
-             'bootstrap.servers' = '{brokers}', 'topic' = '{topic}', 'group.id' = '{topic}', \
-             'startup.mode' = 'earliest', 'json.column.at.epoch_unit' = 'millis') FORMAT JSON"
-        ),
+        temporal_trades::trades_source(brokers, &topic),
         "CREATE STREAM priced AS SELECT t.id AS id, r.rate AS rate FROM trades t \
          LEFT JOIN rates FOR SYSTEM_TIME AS OF t.at AS r ON t.key = r._id"
             .to_string(),
@@ -2624,12 +2579,12 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
                 .await
                 .unwrap();
         }
-        let before_update = instant_between_changes().await;
+        let before_update = temporal_trades::instant_between_changes().await;
         rates
             .replace_one(doc! {"_id": 1_i64}, doc! {"rate": 500_i64})
             .await
             .unwrap();
-        let after_update = instant_between_changes().await;
+        let after_update = temporal_trades::instant_between_changes().await;
         // A later change moves the rates' watermark past every trade.
         rates.insert_one(doc! {"_id": 99_i64}).await.unwrap();
         let trades: Vec<_> = (0..8)
@@ -2638,7 +2593,7 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
                 (id, id % 4, at)
             })
             .collect();
-        produce_trades(brokers, &topic, &trades).await;
+        temporal_trades::produce_trades(brokers, &topic, &trades).await;
         for (id, key, _) in &trades {
             let joined = if *key == 1 && *id >= 4 {
                 500
@@ -2661,10 +2616,10 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
     {
         let db = reopen(storage.path(), &statements).await;
         db.start().await.expect("restart");
-        let after_changes = instant_between_changes().await;
+        let after_changes = temporal_trades::instant_between_changes().await;
         rates.insert_one(doc! {"_id": 98_i64}).await.unwrap();
         let trades: Vec<_> = (8..12).map(|id| (id, id % 4, after_changes)).collect();
-        produce_trades(brokers, &topic, &trades).await;
+        temporal_trades::produce_trades(brokers, &topic, &trades).await;
         for (id, key, _) in &trades {
             let joined = match key {
                 1 => Some(500),

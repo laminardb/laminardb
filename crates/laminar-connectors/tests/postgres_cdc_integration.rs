@@ -21,9 +21,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{encode_arrow_schema_ipc, ConnectorConfig};
 use laminar_connectors::connector::{
-    DeliveryGuarantee, SourceBatch, SourceBatchCursor, SourceConnector, SourceMutation,
-    SourcePosition, SourceStart,
+    DeliveryGuarantee, ProcessLeaseCheck, SourceBatch, SourceBatchCursor, SourceConnector,
+    SourceMutation, SourcePosition, SourceStart,
 };
+use laminar_connectors::error::ConnectorError;
 use laminar_connectors::postgres::{
     Lsn, PostgresCdcConfig, PostgresCdcSource, PostgresLookupSource, PostgresLookupSourceConfig,
 };
@@ -1329,6 +1330,121 @@ async fn a_stale_session_of_the_claim_is_ended_and_its_slot_adopted() {
     assert_eq!(delivered_until(&mut resumed, 1).await, [1]);
     drop(stale);
     resumed.close().await.unwrap();
+}
+
+/// A process whose cluster lease expired is fenced: it neither ends the session another node
+/// opened on its claim's slot nor streams from it, even once the slot is free.
+#[tokio::test]
+async fn a_fenced_process_leaves_another_session_of_its_claim_alone() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    commit_until_ready(&mut first).await;
+    let streaming = first.try_checkpoint().unwrap().expect("a cursor");
+    assert_eq!(phase(&streaming), "streaming");
+    first.close().await.unwrap();
+    let slot = slot_of(&claimed);
+    let claim = claimed.get_metadata("claim").unwrap();
+    let owner = hold_slot(&fixture, &slot, &format!("laminar:{claim}:0wner000")).await;
+    let refused = |error: ConnectorError| {
+        assert!(
+            error.to_string().contains("process lease expired"),
+            "{error}"
+        );
+    };
+    let fenced_start = |lease: ProcessLeaseCheck| {
+        let request = resume(&config, streaming.clone()).with_process_lease(lease);
+        async move {
+            PostgresCdcSource::new(PostgresCdcConfig::default(), None)
+                .start(request)
+                .await
+                .unwrap_err()
+        }
+    };
+    // Live only for its first check, at the start: it expires while the start works.
+    let expiring = || {
+        let checks = AtomicU64::new(0);
+        ProcessLeaseCheck::new(move || checks.fetch_add(1, Ordering::SeqCst) == 0)
+    };
+
+    refused(fenced_start(ProcessLeaseCheck::new(|| false)).await);
+    refused(fenced_start(expiring()).await);
+    assert_eq!(
+        fixture.slot(&slot).await.map(|slot| slot.1),
+        Some(true),
+        "the owner's session survives"
+    );
+
+    drop(owner);
+    timeout(WAIT, async {
+        while fixture.slot(&slot).await.is_some_and(|slot| slot.1) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the owner's session ends");
+    refused(fenced_start(expiring()).await);
+    // A claimed cursor adopts the slot at start and streams from it once a checkpoint commits.
+    let mut adopted = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    adopted
+        .start(resume(&config, claimed).with_process_lease(expiring()))
+        .await
+        .unwrap();
+    let cursor = adopted.try_checkpoint().unwrap().expect("a cursor");
+    adopted.notify_epoch_committed(1, &cursor).await.unwrap();
+    refused(adopted.poll_batch(64).await.unwrap_err());
+    assert_eq!(
+        fixture.slot(&slot).await.map(|slot| slot.1),
+        Some(false),
+        "a fenced process does not stream from a free slot"
+    );
+}
+
+/// A sealed start is a claim resolved before the source runs: it names a slot nobody created,
+/// and the owner creates it and streams from it when it opens.
+#[tokio::test]
+async fn a_sealed_claim_starts_the_stream_on_the_node_that_opens_it() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut sealer = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let sealed = sealer.resolve_initial_position(&config).await.unwrap();
+    assert_eq!(phase(&sealed), "claimed");
+    let slot = slot_of(&sealed);
+    assert_eq!(fixture.slot(&slot).await, None, "sealing creates nothing");
+    sealer
+        .validate_initial_position(&config, &sealed)
+        .await
+        .unwrap();
+
+    let request = SourceStart::new(
+        config.clone(),
+        SourcePosition::Initialized { checkpoint: sealed },
+        DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap();
+    let mut source = started(request).await;
+    assert_eq!(slot_of(&source.try_checkpoint().unwrap().unwrap()), slot);
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
+        .await;
+    assert_eq!(delivered_until(&mut source, 1).await, [1]);
+    let streaming = source.try_checkpoint().unwrap().unwrap();
+    let error = sealer
+        .validate_initial_position(&config, &streaming)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not yet created"), "{error}");
+    source.close().await.unwrap();
+
+    let initial = fixture.config(&orders_schema(), &["id"], &[]);
+    let error = sealer.resolve_initial_position(&initial).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot.mode=never"), "{error}");
 }
 
 #[tokio::test]

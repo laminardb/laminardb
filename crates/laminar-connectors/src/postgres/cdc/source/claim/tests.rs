@@ -330,3 +330,18 @@ fn slot_creation_failures_are_classified_by_sqlstate() {
         );
     }
 }
+
+#[test]
+fn an_expired_process_lease_refuses_to_touch_the_slot() {
+    use crate::connector::ProcessLeaseCheck;
+    assert!(
+        require_live(None).is_ok(),
+        "outside a cluster there is no lease"
+    );
+    assert!(require_live(Some(&ProcessLeaseCheck::new(|| true))).is_ok());
+    let error = require_live(Some(&ProcessLeaseCheck::new(|| false))).unwrap_err();
+    assert!(
+        error.to_string().contains("process lease expired"),
+        "{error}"
+    );
+}

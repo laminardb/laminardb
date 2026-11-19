@@ -322,14 +322,15 @@ history consumers tolerate that. Resume tokens are never decoded.
 
 `postgres-cdc` reads one table through PostgreSQL logical replication (`pgoutput`) and delivers
 typed rows straight to sinks or to retractable SQL: PostgreSQL → LaminarDB → destinations, with
-no broker or Debezium in between. It runs in embedded and single-node server mode; cluster mode
-rejects it.
+no broker or Debezium in between. It runs in embedded and single-node server mode; in cluster
+mode, `upsert` without the initial copy runs on one node at a time (see
+[Cluster](#postgresql-cdc-in-a-cluster)).
 
 New to it? [Try it locally](#try-postgresql-cdc-locally) first.
 
 | `output.mode` | Rows | Contract | Consumers |
 |---|---|---|---|
-| `upsert` (default) | Current row per primary key; delete → key-only tombstone; a primary-key change → tombstone for the old key, then the new row | Keyed upsert | A keyed sink reading the source directly; tested with the PostgreSQL upsert sink (`changelog.mode = 'true'`). Streams over it are rejected |
+| `upsert` (default) | Current row per primary key; delete → key-only tombstone; a primary-key change → tombstone for the old key, then the new row | Keyed upsert | A keyed sink reading the source directly, tested with the PostgreSQL upsert sink (`changelog.mode = 'true'`); the right side of a temporal join, with a watermark on [`change.time.column`](#change-time-and-temporal-joins). Streams over it are rejected |
 | `changelog` | Z-set with a trailing `__weight BIGINT NOT NULL`: insert `+1`, delete `−1`, update `−1` old row then `+1` new row | Full changelog | A PostgreSQL upsert sink with `changelog.mode`, directly or through projections, filters, and non-windowed `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` aggregates with `EMIT CHANGES`; windows, joins with other streams, and append sinks are rejected. Needs `snapshot.mode=initial` |
 
 `snapshot.mode=initial` (default) copies the table, then streams every later change.
@@ -505,6 +506,7 @@ in a server TOML `sql` block write `$${VAR}`.
 | `publication`, `slot.name`, `table` | required | `slot.name` is a prefix of at most 46 bytes of lower-case letters, digits and `_` (see [Slots](#slots)); `table` is `schema.table` |
 | `snapshot.mode` | `initial` | `initial` or `never` |
 | `output.mode` | `upsert` | `upsert` or `changelog` |
+| `change.time.column` | none | A declared non-key `TIMESTAMP NOT NULL` column, not a table column, that receives each change's commit time (see [Change time](#change-time-and-temporal-joins)); needs `snapshot.mode=never` |
 | `max.buffered.bytes` | `268435456` (256 MiB) | All source memory for raw WAL, decoded transactions and Arrow building; 1 MiB to 4 GiB |
 
 Removed keys (`table.include`, `table.exclude`, `start.lsn`, `max.buffered.events`,
@@ -567,13 +569,35 @@ timestamp fails the source. Snapshot and replication sessions pin `DateStyle`, `
 
 - Rows arrive in commit order, one whole transaction at a time; a rolled-back transaction emits
   nothing. Repeated changes to one key in a transaction are all delivered, in order.
-- `upsert` deletes carry only the key, so non-key columns must be nullable.
+- `upsert` deletes carry only the key, so non-key columns must be nullable, except the
+  change-time column.
 - An unchanged TOAST value in an update is restored from the full old row.
 - `TRUNCATE` stops the source: it has no row images to apply. Reset as described below.
 - A change to the table's columns, types or replica identity stops the source at the first row
   change after it. The publication and slot are rechecked, and orphaned slots reported, as
   checkpoints commit, at most every 30 seconds; that check is best-effort, so restrict who can
   alter them.
+
+#### Change time and temporal joins
+
+`change.time.column` names a declared non-key `TIMESTAMP NOT NULL` column that the table does not
+have. Every row receives its transaction's commit time, truncated to the millisecond, deletes
+included; a replay rebuilds the same value. With a watermark on it, an `upsert` source can be the
+right side of a temporal join (`FOR SYSTEM_TIME AS OF`), which needs a non-null event time on
+every version:
+
+```sql
+CREATE SOURCE rates (id BIGINT NOT NULL, rate BIGINT, changed_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (id), WATERMARK FOR changed_at AS changed_at - INTERVAL '1' SECOND)
+FROM "postgres-cdc" ('host' = '...', 'database' = 'app', 'publication' = 'rates_pub',
+    'slot.name' = 'laminar_rates', 'table' = 'public.rates', 'snapshot.mode' = 'never',
+    'change.time.column' = 'changed_at');
+```
+
+It needs `snapshot.mode=never`, so only rows changed after the source started have a version. A
+table's own timestamp column does not work as the time: a delete carries only the key, and
+PostgreSQL keeps microseconds, which a temporal join refuses. The commit time is the server's
+clock, so a probe's time must come from comparable clocks.
 
 #### Initial snapshot
 
@@ -675,6 +699,23 @@ committed after it was copied: no gap and no overlap.
   `postgres_cdc_updates_total`, `postgres_cdc_deletes_total`, `postgres_cdc_transactions_total`,
   `postgres_cdc_snapshot_rows_total`, `postgres_cdc_confirmed_flush_lsn`,
   `postgres_cdc_replication_lag_bytes`.
+
+#### PostgreSQL CDC in a cluster
+
+- `output.mode=upsert` with `snapshot.mode=never` runs at-least-once on one node at a time: the
+  node that owns the source's home vnode. When it fails, a survivor resumes from the committed
+  slot position; when the source moves at a rescale or a rejoin, the node giving it up stops at
+  the handoff checkpoint and the node taking it resumes there.
+- The slot allows one session at a time. A node ends a session of its own claim left by another
+  node only once that node is fenced: it gave the source up at a committed handoff, or recovery
+  proved its process lease expired. A node whose process lease expired never opens a session or
+  ends one, so a paused node cannot take the slot back when it resumes.
+- In a cluster an upsert source may only be a temporal join's right side, with the watermark on
+  `change.time.column`, or an interval join's input when its `PRIMARY KEY` holds every join column
+  and the watermarked event-time column.
+- A source that a topology change adds to a running cluster starts from a claim recorded when the
+  change was sealed; its first owner creates the slot.
+- `output.mode=changelog`, `snapshot.mode=initial` and exactly-once are rejected in a cluster.
 
 #### Unique constraints on the target
 

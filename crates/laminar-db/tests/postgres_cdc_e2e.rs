@@ -73,6 +73,7 @@ async fn open_with(storage: &Path, interval_ms: Option<u64>) -> std::sync::Arc<L
             ..Default::default()
         })
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .temporal_join_idle_history_retention(Duration::from_secs(300))
         .config_var("E2E_PG_PASSWORD", PASSWORD)
         .build()
         .await
@@ -163,15 +164,25 @@ struct Capture {
 
 impl Capture {
     async fn new(client: &tokio_postgres::Client) -> Self {
+        Self::of(
+            client,
+            "orders",
+            "id bigint PRIMARY KEY, label text NOT NULL, qty integer",
+        )
+        .await
+    }
+
+    /// A captured table named after `prefix` with the given column definitions.
+    async fn of(client: &tokio_postgres::Client, prefix: &str, columns: &str) -> Self {
         let capture = Self {
-            table: unique("orders"),
+            table: unique(prefix),
             slot: unique("slot"),
             publication: unique("pub"),
             mirror: unique("mirror"),
         };
         client
             .batch_execute(&format!(
-                "CREATE TABLE {t} (id bigint PRIMARY KEY, label text NOT NULL, qty integer); \
+                "CREATE TABLE {t} ({columns}); \
                  ALTER TABLE {t} REPLICA IDENTITY FULL; \
                  CREATE PUBLICATION {p} FOR TABLE {t};",
                 t = capture.table,
@@ -405,6 +416,171 @@ async fn a_watermarked_source_mirrors_into_postgres_across_restart() {
         assert!(db.checkpoint().await.unwrap().success);
         db.shutdown().await.expect("shutdown");
     }
+}
+
+// Shared with the Kafka scenarios, which use every helper this file does not.
+#[cfg(feature = "kafka")]
+#[allow(dead_code)]
+#[path = "common/kafka.rs"]
+mod kafka;
+// Shared with the MongoDB CDC tests.
+#[cfg(feature = "kafka")]
+#[path = "common/temporal_trades.rs"]
+mod temporal_trades;
+
+/// A change-time column carries the watermark of an upsert source keyed by `id`: it feeds a
+/// temporal join's right side, and each trade joins the rate its key had at the trade's time,
+/// deletes included, across a restart.
+#[cfg(feature = "kafka")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_time_source_is_the_right_side_of_a_temporal_join_across_restart() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let Some(brokers) = std::env::var("LAMINAR_KAFKA_BROKERS")
+        .ok()
+        .or_else(|| kafka::kafka_brokers().map(str::to_owned))
+    else {
+        eprintln!("skipping: Redpanda not reachable");
+        return;
+    };
+    let brokers = brokers.as_str();
+    let capture = Capture::of(&client, "rates", "id bigint PRIMARY KEY, rate bigint").await;
+    let topic = unique("trades");
+    kafka::create_topic(brokers, &topic, 1).await;
+    let statements = vec![
+        capture.source(
+            "rates",
+            "id BIGINT NOT NULL, rate BIGINT, changed_at TIMESTAMP NOT NULL, PRIMARY KEY (id), \
+             WATERMARK FOR changed_at AS changed_at - INTERVAL '1' SECOND",
+            ", 'snapshot.mode' = 'never', 'change.time.column' = 'changed_at'",
+        ),
+        temporal_trades::trades_source(brokers, &topic),
+        "CREATE STREAM priced AS SELECT t.id AS id, r.rate AS rate FROM trades t \
+         LEFT JOIN rates FOR SYSTEM_TIME AS OF t.at AS r ON t.key = r.id"
+            .to_string(),
+        format!(
+            "CREATE SINK priced_out FROM priced INTO \"postgres-sink\" ({PG_SINK}, \
+             'port' = '{port}', 'table.name' = '{mirror}', 'write.mode' = 'append', \
+             'auto.create.table' = 'true')",
+            port = port(),
+            mirror = capture.mirror,
+        ),
+    ];
+    let table = &capture.table;
+    let priced = format!("SELECT id, rate FROM {}", capture.mirror);
+    let storage = tempfile::tempdir().unwrap();
+    let mut expected = BTreeMap::new();
+    {
+        let db = reopen(storage.path(), &statements).await;
+        db.start().await.expect("start");
+        // Without a copy, only changes after the slot's consistent point are captured.
+        eventually(
+            CONVERGE,
+            || slots_under(&client, &capture.slot),
+            |slots| !slots.is_empty(),
+        )
+        .await;
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {table} SELECT g, 100 + g FROM generate_series(0, 3) g"
+            ))
+            .await
+            .unwrap();
+        let before_changes = temporal_trades::instant_between_changes().await;
+        client
+            .batch_execute(&format!(
+                "UPDATE {table} SET rate = 500 WHERE id = 1; DELETE FROM {table} WHERE id = 3"
+            ))
+            .await
+            .unwrap();
+        let after_changes = temporal_trades::instant_between_changes().await;
+        // A later change moves the rates' watermark past every trade.
+        client
+            .batch_execute(&format!("INSERT INTO {table} VALUES (99, 0)"))
+            .await
+            .unwrap();
+        let trades: Vec<_> = (0..8)
+            .map(|id| {
+                let at = if id < 4 {
+                    before_changes
+                } else {
+                    after_changes
+                };
+                (id, id % 4, at)
+            })
+            .collect();
+        temporal_trades::produce_trades(brokers, &topic, &trades).await;
+        for (id, key, _) in &trades {
+            let joined = match (key, *id >= 4) {
+                (1, true) => Some(500),
+                (3, true) => None,
+                (key, _) => Some(100 + key),
+            };
+            expected.insert(*id, joined);
+        }
+        let observed = eventually(
+            CONVERGE,
+            || joined_rates(&client, &priced),
+            |rows| rows == &expected || db.last_fault().is_some(),
+        )
+        .await;
+        assert_eq!(db.last_fault(), None);
+        assert_eq!(observed, expected, "trades before the restart");
+        assert!(db.checkpoint().await.unwrap().success);
+        db.shutdown().await.expect("shutdown");
+    }
+    // Changes while the pipeline is down replay from the committed slot position.
+    client
+        .batch_execute(&format!(
+            "UPDATE {table} SET rate = 700 WHERE id = 2; DELETE FROM {table} WHERE id = 0"
+        ))
+        .await
+        .unwrap();
+    {
+        let db = reopen(storage.path(), &statements).await;
+        db.start().await.expect("restart");
+        let after_restart = temporal_trades::instant_between_changes().await;
+        client
+            .batch_execute(&format!("INSERT INTO {table} VALUES (98, 0)"))
+            .await
+            .unwrap();
+        let trades: Vec<_> = (8..12).map(|id| (id, id % 4, after_restart)).collect();
+        temporal_trades::produce_trades(brokers, &topic, &trades).await;
+        for (id, key, _) in &trades {
+            let joined = match key {
+                0 | 3 => None,
+                1 => Some(500),
+                2 => Some(700),
+                key => Some(100 + key),
+            };
+            expected.insert(*id, joined);
+        }
+        let observed = eventually(
+            CONVERGE,
+            || joined_rates(&client, &priced),
+            |rows| rows == &expected || db.last_fault().is_some(),
+        )
+        .await;
+        assert_eq!(db.last_fault(), None);
+        assert_eq!(observed, expected, "trades after the restart");
+        db.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Each trade id's joined rate in the output table; an id seen twice must agree.
+#[cfg(feature = "kafka")]
+async fn joined_rates(client: &tokio_postgres::Client, query: &str) -> BTreeMap<i64, Option<i64>> {
+    let mut joined = BTreeMap::new();
+    for row in client.query(query, &[]).await.unwrap_or_default() {
+        let (id, rate) = (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1));
+        let previous = joined.insert(id, rate);
+        assert!(
+            previous.is_none() || previous == Some(rate),
+            "trade {id} joined two rates"
+        );
+    }
+    joined
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

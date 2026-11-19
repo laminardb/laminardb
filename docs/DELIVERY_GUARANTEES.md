@@ -29,6 +29,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Kafka | EO, ALO, BE | EO, ALO |
 | Kafka (Debezium) | EO, ALO, BE | EO, ALO |
 | PostgreSQL CDC | ALO | rejected |
+| PostgreSQL CDC (no initial copy) | ALO | ALO |
 | MongoDB change stream | ALO, BE | ALO |
 | Delta Lake change feed | ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
@@ -69,6 +70,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Kafka | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Kafka (Debezium) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Delta Lake change feed | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
@@ -92,6 +94,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Kafka | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | PostgreSQL CDC | — | — | — | — | — | — | — | — | — | — | — | — |
+| PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Delta Lake change feed | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -182,6 +185,17 @@ and keeps only the trades priced with their key's rate in a MongoDB sink, throug
 Every produced id must reach the output collection, so a trade joined to no rate or another one
 fails the run; ids never produced fail it, duplicates are counted, and more than one node must
 have opened the source.
+
+A PostgreSQL CDC source (`output.mode=upsert`, `snapshot.mode=never`) runs the same way, with the
+watermark on its `change.time.column` (each transaction's commit time). Its replication slot
+allows one session: a node opens the source only after a committed handoff closed the previous
+owner or recovery fenced its process, and a process whose lease expired neither connects nor ends
+another node's session.
+`postgres_source::three_node_postgres_temporal_kill9_soak` (candidate) runs the MongoDB document
+soak's trade workload on a PostgreSQL rates table, into a PostgreSQL sink, through the same kills.
+One more round freezes the node streaming the slot until a survivor takes the slot over, then
+resumes it: the frozen node must exit fenced while the survivor's session keeps the slot, and the
+run must create one slot.
 
 An Iceberg append read with `read.splits = n` hashes each data file into one of `n` channels, and
 each channel keeps its own position in the table's snapshot lineage, so every node reads part of

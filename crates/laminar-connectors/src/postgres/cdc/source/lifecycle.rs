@@ -13,13 +13,13 @@ use crate::connector::{
 };
 use crate::error::ConnectorError;
 
-use super::super::config::{OutputMode, PostgresCdcConfig};
+use super::super::config::{OutputMode, PostgresCdcConfig, SnapshotMode};
 use super::super::schema_resolution::{committed_relation, declared_primary_key, declared_schema};
 use super::super::typed_rows::RowBuilder;
 use super::checkpoint::{parse_cursor, validate_live_binding, write_cursor, CursorPhase};
 use super::claim::incarnation;
 use super::decoding::Decoded;
-use super::startup::{prepare, ReaderRuntime, StartInputs, StartPhase};
+use super::startup::{guard, prepare, ReaderRuntime, StartInputs, StartPhase};
 use super::{reap_postgres_reader, Arc, ChunkedSnapshot, Lsn, Notify, Phase, PostgresCdcSource};
 
 /// Minimum spacing of live publication/table revalidation at checkpoint commits.
@@ -108,6 +108,9 @@ impl PostgresCdcSource {
                 "PostgreSQL CDC streams without a binding or a slot claim".into(),
             )));
         };
+        if let Err(error) = super::claim::require_live(self.process_lease.as_ref()) {
+            return Err(self.fail(error));
+        }
         let launched = super::startup::launch_reader(
             &self.task_owner,
             Arc::clone(&self.data_ready),
@@ -191,6 +194,7 @@ impl PostgresCdcSource {
             return Ok(());
         };
         self.next_contract_check = Some(now + CONTRACT_CHECK_INTERVAL);
+        super::claim::require_live(self.process_lease.as_ref())?;
         let checked = super::startup::revalidate(
             &self.task_owner,
             &self.config,
@@ -228,14 +232,39 @@ impl SourceConnector for PostgresCdcSource {
         config: &ConnectorConfig,
     ) -> Result<Option<BTreeMap<String, String>>, ConnectorError> {
         let parsed = parsed_config(&self.config, config)?;
-        Ok(Some(BTreeMap::from([
+        let mut options = BTreeMap::from([
             ("database".into(), parsed.database),
             ("publication".into(), parsed.publication),
             ("slot.name".into(), parsed.slot_name),
             ("table".into(), parsed.table.to_string()),
             ("output.mode".into(), parsed.output_mode.to_string()),
             ("wire.protocol".into(), "pgoutput-v1-typed".into()),
-        ])))
+        ]);
+        if let Some(column) = parsed.change_time_column {
+            options.insert("change.time.column".into(), column);
+        }
+        Ok(Some(options))
+    }
+
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
+    async fn resolve_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        let parsed = parsed_config(&self.config, config)?;
+        super::sealed_start::resolve(&parsed, config, guard(&self.task_owner)?).await
+    }
+
+    async fn validate_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        let parsed = parsed_config(&self.config, config)?;
+        super::sealed_start::validate(&parsed, config, checkpoint, guard(&self.task_owner)?).await
     }
 
     async fn resolve_schema(
@@ -256,6 +285,7 @@ impl SourceConnector for PostgresCdcSource {
                 actual: self.state.to_string(),
             });
         }
+        let process_lease = request.process_lease().cloned();
         let (config, position, _) = request.into_parts();
         let parsed = parsed_config(&self.config, &config)?;
         let declared = declared_schema(&config, None)?;
@@ -263,10 +293,9 @@ impl SourceConnector for PostgresCdcSource {
         let committed = committed_relation(config.schema_binding(), &parsed)?;
         let cursor = match position {
             SourcePosition::Initial => None,
-            SourcePosition::Initialized { .. } => {
-                return Err(ConnectorError::ConfigurationError(
-                    "PostgreSQL CDC has no sealed topology startup contract".into(),
-                ));
+            SourcePosition::Initialized { checkpoint } => {
+                super::sealed_start::require(&parsed)?;
+                Some(super::sealed_start::claimed_cursor(&checkpoint, &parsed)?)
             }
             SourcePosition::Resume {
                 attempt,
@@ -288,6 +317,7 @@ impl SourceConnector for PostgresCdcSource {
                 primary_key: &primary_key,
                 committed_relation: committed.as_ref(),
                 incarnation: &incarnation,
+                process_lease: process_lease.as_ref(),
             },
             cursor,
         )
@@ -299,6 +329,7 @@ impl SourceConnector for PostgresCdcSource {
         self.checkpoint_binding = Some(prepared.binding);
         self.copy_plan = prepared.copy_plan.map(Arc::new);
         self.incarnation = incarnation;
+        self.process_lease = process_lease;
         self.config = parsed;
         self.schema = declared;
         if let Some(orphans) = prepared.orphans {
@@ -488,12 +519,21 @@ impl SourceConnector for PostgresCdcSource {
             OutputMode::Upsert => SourceInputMode::KeyedUpsert,
             OutputMode::Changelog => SourceInputMode::FullChangelog,
         };
-        Ok(SourceContract::new(
+        let contract = SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::Singleton,
             input_mode,
         )
-        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic);
+        // Any one node may stream the slot: the cursor holds the claim and position, and a node
+        // ends another session of the claim only while its process lease is live. The copy and
+        // changelog mode are not qualified for cluster sources.
+        Ok(match (parsed.output_mode, parsed.snapshot_mode) {
+            (OutputMode::Upsert, SnapshotMode::Never) => {
+                contract.with_cluster_singleton_placement()
+            }
+            _ => contract,
+        })
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {

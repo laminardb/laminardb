@@ -397,6 +397,7 @@ fn chunk_records(
             |index, _| Ok(values[index].as_deref()),
             false,
             layout.weighted.then_some(1),
+            None,
             bytes,
         )?;
         next_slot = next;

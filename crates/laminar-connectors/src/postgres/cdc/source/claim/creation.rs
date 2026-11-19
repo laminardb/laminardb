@@ -9,7 +9,9 @@ use pgwire_replication::{CreatedSlot, PgWireError, SlotSnapshot};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::connector::{ConnectorTaskAdmission, ConnectorTaskGuard, ConnectorTaskOwner};
+use crate::connector::{
+    ConnectorTaskAdmission, ConnectorTaskGuard, ConnectorTaskOwner, ProcessLeaseCheck,
+};
 
 use super::super::super::config::{PostgresCdcConfig, SnapshotMode};
 use super::super::super::postgres_io::slots;
@@ -17,7 +19,7 @@ use super::super::super::postgres_io::{self, ControlConnection, PostgresCheckpoi
 use super::super::checkpoint::CursorPhase;
 use super::super::snapshot::PgSnapshot;
 use super::super::{Arc, ConnectorError, Lsn, Notify};
-use super::{busy, other_claims, settle, warn_orphaning, ResumeAction, SlotClaim};
+use super::{busy, other_claims, require_live, settle, warn_orphaning, ResumeAction, SlotClaim};
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -40,6 +42,7 @@ pub(super) struct ClaimJob {
     pub(super) config: PostgresCdcConfig,
     pub(super) claim: SlotClaim,
     pub(super) incarnation: String,
+    pub(super) process_lease: Option<ProcessLeaseCheck>,
     pub(super) application_name: String,
     pub(super) binding: PostgresCheckpointBinding,
     pub(super) admission: ConnectorTaskAdmission,
@@ -179,6 +182,7 @@ impl ClaimJob {
     }
 
     async fn connect(&self) -> Result<ControlConnection, ConnectorError> {
+        require_live(self.process_lease.as_ref())?;
         let guard = self.admission.track().ok_or_else(|| {
             ConnectorError::Internal(
                 "PostgreSQL CDC connector generation is already retired".into(),
@@ -206,6 +210,7 @@ impl ClaimJob {
             &self.incarnation,
             &CursorPhase::Claimed,
             &self.binding,
+            self.process_lease.as_ref(),
         )
         .await?;
         let copies = self.config.snapshot_mode == SnapshotMode::Initial;

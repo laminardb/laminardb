@@ -13,7 +13,7 @@ use super::super::decoder::{
 };
 use super::super::schema::RelationInfo;
 use super::super::schema_resolution::validate_relation;
-use super::super::typed_rows::{RowBuilder, RowLayout};
+use super::super::typed_rows::{BoundColumn, RowBuilder, RowLayout};
 use super::reader::logical_wal_payload_bytes;
 use super::{
     CommittedTransaction, Lsn, OpenTransaction, OwnedWalPayload, Phase, PostgresCdcSource,
@@ -106,8 +106,8 @@ impl PostgresCdcSource {
                 },
                 None,
             ) => {
-                Self::validate_timestamp(commit_ts_us, "BEGIN")?;
-                self.begin_transaction(Lsn::new(final_lsn), xid)?;
+                let commit_time_ms = Self::validate_timestamp(commit_ts_us, "BEGIN")?;
+                self.begin_transaction(Lsn::new(final_lsn), xid, commit_time_ms)?;
             }
             (
                 WalPayload::Commit {
@@ -143,12 +143,11 @@ impl PostgresCdcSource {
         Ok(Decoded::Applied)
     }
 
-    fn validate_timestamp(commit_ts_us: i64, boundary: &str) -> Result<(), ConnectorError> {
-        pg_timestamp_to_unix_ms(commit_ts_us)
-            .map(|_| ())
-            .map_err(|error| {
-                ConnectorError::ReadError(format!("pgoutput {boundary} timestamp decode: {error}"))
-            })
+    /// The commit time in Unix milliseconds.
+    fn validate_timestamp(commit_ts_us: i64, boundary: &str) -> Result<i64, ConnectorError> {
+        pg_timestamp_to_unix_ms(commit_ts_us).map_err(|error| {
+            ConnectorError::ReadError(format!("pgoutput {boundary} timestamp decode: {error}"))
+        })
     }
 
     fn oversized_transaction(&mut self, planned: usize) -> ConnectorError {
@@ -204,7 +203,9 @@ impl PostgresCdcSource {
     /// Apply one decoded message without admission checks.
     pub(super) fn apply_message(&mut self, message: WalMessage) -> Result<(), ConnectorError> {
         match message {
-            WalMessage::Begin(begin) => self.begin_transaction(begin.final_lsn, begin.xid),
+            WalMessage::Begin(begin) => {
+                self.begin_transaction(begin.final_lsn, begin.xid, begin.commit_ts_ms)
+            }
             WalMessage::Commit(commit) => {
                 self.commit_transaction(commit.commit_lsn, commit.end_lsn)
             }
@@ -288,9 +289,7 @@ impl PostgresCdcSource {
     fn key_changed(&self, old: &TupleData, new: &TupleData) -> Result<bool, ConnectorError> {
         let layout = self.bound_layout()?;
         for column in layout.columns.iter().filter(|column| column.is_key) {
-            if resolve_value(new, Some(old), column.tuple_index)?
-                != resolve_value(old, None, column.tuple_index)?
-            {
+            if column_value(column, new, Some(old))? != column_value(column, old, None)? {
                 return Ok(true);
             }
         }
@@ -322,6 +321,10 @@ impl PostgresCdcSource {
         }
         let planned = layout.planned_row_bytes(declared_text_bytes(layout, tuple, old))?;
         let (key_only, weight, mutation) = image.parts();
+        let commit_time_ms = self
+            .open_transaction
+            .as_ref()
+            .map(|transaction| transaction.commit_time_ms);
         if let Some(staged) = self
             .open_transaction
             .as_mut()
@@ -349,9 +352,10 @@ impl PostgresCdcSource {
         }
         let appended = rows.append(
             layout,
-            |_, column| resolve_value(tuple, old, column.tuple_index),
+            |_, column| column_value(column, tuple, old),
             key_only,
             weight,
+            commit_time_ms,
             planned,
         );
         if let Err(error) = appended {
@@ -395,7 +399,12 @@ impl PostgresCdcSource {
         Ok(())
     }
 
-    fn begin_transaction(&mut self, final_lsn: Lsn, xid: u32) -> Result<(), ConnectorError> {
+    fn begin_transaction(
+        &mut self,
+        final_lsn: Lsn,
+        xid: u32,
+        commit_time_ms: i64,
+    ) -> Result<(), ConnectorError> {
         if self.open_transaction.is_some() {
             return Err(self.fail(ConnectorError::ReadError(
                 "PostgreSQL CDC received BEGIN before the current transaction committed".into(),
@@ -405,6 +414,7 @@ impl PostgresCdcSource {
         self.open_transaction = Some(OpenTransaction {
             final_lsn,
             xid,
+            commit_time_ms,
             staged,
         });
         Ok(())
@@ -499,6 +509,17 @@ fn full_old_tuple(old: &OldTuple) -> Option<&TupleData> {
     }
 }
 
+/// The text value of a declared column read from the tuple; the change time has none.
+fn column_value<'a>(
+    column: &BoundColumn,
+    tuple: &'a TupleData,
+    old: Option<&'a TupleData>,
+) -> Result<Option<&'a [u8]>, ConnectorError> {
+    column
+        .tuple_index()
+        .map_or(Ok(None), |index| resolve_value(tuple, old, index))
+}
+
 /// The text value of one column. An unchanged TOAST value reads the complete old row; it is
 /// never mistaken for SQL `NULL`.
 fn resolve_value<'a>(
@@ -537,7 +558,7 @@ fn staged_values(
             if key_only && !column.is_key {
                 return Ok(None);
             }
-            resolve_value(tuple, old, column.tuple_index).map(|value| value.map(Box::from))
+            column_value(column, tuple, old).map(|value| value.map(Box::from))
         })
         .collect()
 }
@@ -547,7 +568,7 @@ fn declared_text_bytes(layout: &RowLayout, tuple: &TupleData, old: Option<&Tuple
         .columns
         .iter()
         .map(|column| {
-            resolve_value(tuple, old, column.tuple_index)
+            column_value(column, tuple, old)
                 .ok()
                 .flatten()
                 .map_or(0, <[u8]>::len)
