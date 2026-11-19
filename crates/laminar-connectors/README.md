@@ -314,8 +314,8 @@ history consumers tolerate that. Resume tokens are never decoded.
 - `output.mode=document` runs the same way. In a cluster an upsert source may only be a
   temporal join's right side, with the watermark on `change.time.column`, or an interval join's
   input when its `PRIMARY KEY` holds every join column and the watermarked event-time column
-  (such as a `TIMESTAMP` `_id`). Documents that predate the source's start are never joined,
-  because the initial copy is rejected in a cluster.
+  (such as a `TIMESTAMP` `_id`). The initial copy is rejected in a cluster, so a document joins
+  only once a change after the source's start emits it.
 - `snapshot.mode=initial` is rejected in a cluster.
 
 ### PostgreSQL CDC
