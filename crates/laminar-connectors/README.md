@@ -228,8 +228,9 @@ rows behind.
   an existing PostgreSQL column must hold at least that scale and integer width.
 - Sinks apply `_op = 'U'` and `_op = 'D'` rows by that key: PostgreSQL upserts and deletes by
   primary key, and Delta merges. A sink must declare exactly the source key. Filters, streams,
-  aggregates, and joins other than a temporal join's right side over a document source are
-  rejected: they would need retractions of rows the engine does not retain.
+  aggregates, and joins over a document source are rejected, except a temporal join's right side
+  and an interval join whose key includes the event time (a `TIMESTAMP` `_id`): the others would
+  need retractions of rows the engine does not retain.
 - `change.time.column` names a non-key `TIMESTAMP NOT NULL` column that receives each change's
   server wall time (`wallTime`, MongoDB 6.0 or later), deletes included; copied documents carry
   the snapshot's time. With a watermark on it, the source can be the right side of a temporal
