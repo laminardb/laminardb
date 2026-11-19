@@ -1447,9 +1447,9 @@ async fn singleton_unit_of_work_keyed_aggregate_checkpoints_are_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-/// A keyed-upsert queue of one version per key before the events start, updates and
-/// tombstones while they run, and a last version after them, so its watermark passes every event.
-fn versions(name: &'static str) -> FixtureSource {
+/// One version per key before the events start, updates and tombstones (`v = -1`) while they
+/// run, and a last version after them, so a watermark on them passes every event.
+fn version_rows() -> Vec<(i64, i64, i64)> {
     let mut rows = Vec::new();
     for key in 0..KEYS {
         rows.push((key, 1_000 + key, 900_000));
@@ -1464,6 +1464,16 @@ fn versions(name: &'static str) -> FixtureSource {
         }
         rows.push((key, 4_000 + key, 1_600_000));
     }
+    rows
+}
+
+/// A keyed-upsert queue of [`version_rows`].
+fn versions(name: &'static str) -> FixtureSource {
+    versions_of(name, version_rows())
+}
+
+/// A keyed-upsert queue of `rows` in event-time order; rows at one time keep their order.
+fn versions_of(name: &'static str, mut rows: Vec<(i64, i64, i64)>) -> FixtureSource {
     rows.sort_by_key(|&(key, _, micros)| (micros, key));
     let size = usize::try_from(ROWS_PER_BATCH).unwrap();
     let batches = rows
@@ -1525,7 +1535,16 @@ async fn a_plain_stream_over_an_upsert_singleton_is_unsupported_everywhere() {
 // The bounded interval route over a placed upsert singleton whose key includes its event time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interval_join_over_a_placed_upsert_singleton_is_equal() {
-    let mut timed = versions("versions");
+    // Keyed by `(k, ts)`, a tombstone deletes only the version at its own time: put one there
+    // first, so the join retracts a matched version.
+    let rows = version_rows()
+        .into_iter()
+        .flat_map(|row| match row {
+            (key, -1, micros) => vec![(key, 5_000 + key, micros), row],
+            row => vec![row],
+        })
+        .collect();
+    let mut timed = versions_of("versions", rows);
     timed.columns = "(k BIGINT NOT NULL, v BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
                      PRIMARY KEY (k, ts), WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND)";
     let case = Case {
