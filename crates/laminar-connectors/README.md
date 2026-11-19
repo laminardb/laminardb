@@ -15,7 +15,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | Replayable ALO with typed record metadata; exact-certified input for coordinated EO pipelines | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
-| MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node, and `history` without a snapshot in a cluster on one node at a time | Implemented |
+| MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node, and without a snapshot in a cluster on one node at a time (`document` as a temporal join's right side) | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node, and in a cluster on one node at a time ([guide](../../docs/RABBITMQ.md)) | Implemented |
 | IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node, and in a cluster on one node at a time with `queue.manager` set ([guide](../../docs/IBMMQ.md)) | Implemented |
@@ -33,8 +33,8 @@ composition before any connector I/O.
 
 `mongodb-cdc` reads one collection's change stream with the official Rust driver and delivers it
 straight to sinks: MongoDB → LaminarDB → destinations, with no broker in between. It runs in
-embedded and single-node server mode. A cluster runs `output.mode=history` with
-`snapshot.mode=never` on one node at a time ([Cluster](#cluster)) and rejects the rest.
+embedded and single-node server mode. A cluster runs either output mode with
+`snapshot.mode=never` on one node at a time ([Cluster](#cluster)) and rejects the initial copy.
 
 New to it? [Try it locally](#try-mongodb-cdc-locally) first.
 
@@ -228,8 +228,22 @@ rows behind.
   an existing PostgreSQL column must hold at least that scale and integer width.
 - Sinks apply `_op = 'U'` and `_op = 'D'` rows by that key: PostgreSQL upserts and deletes by
   primary key, and Delta merges. A sink must declare exactly the source key. Filters, streams,
-  joins, and aggregates over a document source are rejected: they would need retractions of
-  rows the engine does not retain.
+  aggregates, and joins other than a temporal join's right side over a document source are
+  rejected: they would need retractions of rows the engine does not retain.
+- `change.time.column` names a non-key `TIMESTAMP NOT NULL` column that receives each change's
+  server wall time (`wallTime`, MongoDB 6.0 or later), deletes included; copied documents carry
+  the snapshot's time. With a watermark on it, the source can be the right side of a temporal
+  join (`FOR SYSTEM_TIME AS OF`), which needs a non-null event time on every version:
+
+  ```sql
+  CREATE SOURCE rates (_id BIGINT NOT NULL, rate BIGINT, changed_at TIMESTAMP NOT NULL,
+      PRIMARY KEY (_id), WATERMARK FOR changed_at AS changed_at - INTERVAL '1' SECOND)
+  FROM "mongodb-cdc" ('connection.uri' = '...', 'database' = 'app', 'collection' = 'rates',
+      'output.mode' = 'document', 'full.document.mode' = 'required',
+      'change.time.column' = 'changed_at');
+  ```
+
+  The change time is the server's clock, so a probe's time must come from comparable clocks.
 
 #### Initial snapshot
 
@@ -295,7 +309,11 @@ history consumers tolerate that. Resume tokens are never decoded.
 - A position MongoDB refuses, such as one the oplog no longer holds or one of a recreated
   collection, faults the source. Cluster recovery restores the same checkpoint, so the cluster
   keeps retrying recovery until the source is reset.
-- `output.mode=document` and `snapshot.mode=initial` are rejected in a cluster.
+- `output.mode=document` runs the same way. In a cluster an upsert source may only be a
+  temporal join's right side (or an interval join's when its key includes the event time), so a
+  document source there needs `change.time.column` and a watermark. Documents that predate the
+  source's start are never joined, because the initial copy is rejected in a cluster.
+- `snapshot.mode=initial` is rejected in a cluster.
 
 ### PostgreSQL CDC
 
