@@ -205,6 +205,12 @@ fn mongodb_cdc_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         ConfigKeySpec::optional(
+            "change.time.column",
+            "Document-mode TIMESTAMP NOT NULL column receiving each change's server wall time \
+             (MongoDB 6.0 or later), deletes included",
+            "",
+        ),
+        ConfigKeySpec::optional(
             "pipeline",
             "JSON array of up to 64 $match stages (maximum 256 KiB)",
             "[]",

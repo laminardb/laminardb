@@ -703,6 +703,17 @@ impl SourceBatch {
         self.row_positions.as_ref()
     }
 
+    /// Name every positioned row's partition `partition`, keeping its order key and sub-offset.
+    /// A batch without row positions is unchanged.
+    #[must_use]
+    pub fn with_row_partition(mut self, partition: &[u8]) -> Self {
+        if let Some(positions) = &mut self.row_positions {
+            positions.partition =
+                BinaryArray::from_iter_values(std::iter::repeat_n(partition, positions.len()));
+        }
+        self
+    }
+
     /// Mixed row mutations, or `None` when every row is a [`SourceMutation::Put`].
     #[must_use]
     pub fn mutations(&self) -> Option<&[SourceMutation]> {

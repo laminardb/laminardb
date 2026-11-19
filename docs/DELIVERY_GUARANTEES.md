@@ -171,6 +171,17 @@ forwards each insert's id through a stream to a MongoDB sink, through the same k
 acknowledged id must reach the output collection, ids never written fail the run, duplicates are
 counted, and more than one node must have read the stream.
 
+A MongoDB document source (`output.mode=document`, `snapshot.mode=never`) runs the same way, as
+an upsert source whose only cluster route is a temporal join's right side; its
+`change.time.column` carries the watermark.
+`mongodb_document_source::three_node_mongodb_document_temporal_kill9_soak` (candidate) writes
+one rate per key, acknowledged by the majority, and a heartbeat document every 250 ms. It
+produces Kafka trades stamped with the wall time, prices each through a temporal `LEFT JOIN`,
+and keeps only the trades priced with their key's rate in a MongoDB sink, through the same kills.
+Every produced id must reach the output collection, so a trade joined to no rate or another one
+fails the run; ids never produced fail it, duplicates are counted, and more than one node must
+have opened the source.
+
 An Iceberg append read with `read.splits = n` hashes each data file into one of `n` channels, and
 each channel keeps its own position in the table's snapshot lineage, so every node reads part of
 the table. `iceberg_source::three_node_iceberg_source_kill9_soak` (candidate) appends snapshots of

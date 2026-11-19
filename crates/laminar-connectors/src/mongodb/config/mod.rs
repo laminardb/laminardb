@@ -33,6 +33,7 @@ const SOURCE_CONFIG_KEYS: &[&str] = &[
     "full.document.mode",
     "objectid.columns",
     "document.json.column",
+    "change.time.column",
     "pipeline",
     "max.buffered.bytes",
     "laminar.source.name",
@@ -159,6 +160,11 @@ pub struct MongoDbSourceConfig {
     #[serde(default)]
     pub document_json_column: Option<String>,
 
+    /// Document-mode `TIMESTAMP NOT NULL` column that receives each change's server wall time,
+    /// deletes included, so a watermark can follow the changes.
+    #[serde(default)]
+    pub change_time_column: Option<String>,
+
     /// Additional `$match` stages applied when the change stream opens.
     #[serde(default)]
     pub pipeline: Vec<serde_json::Value>,
@@ -183,6 +189,7 @@ impl Default for MongoDbSourceConfig {
             full_document_mode: FullDocumentMode::default(),
             objectid_columns: Vec::new(),
             document_json_column: None,
+            change_time_column: None,
             pipeline: Vec::new(),
             max_buffered_bytes: default_max_buffered_bytes(),
         }
@@ -251,10 +258,13 @@ impl MongoDbSourceConfig {
         }
         match self.output_mode {
             SourceOutputMode::History => {
-                if !self.objectid_columns.is_empty() || self.document_json_column.is_some() {
+                if !self.objectid_columns.is_empty()
+                    || self.document_json_column.is_some()
+                    || self.change_time_column.is_some()
+                {
                     return Err(ConnectorError::ConfigurationError(
-                        "MongoDB CDC objectid.columns and document.json.column require \
-                         output.mode=document"
+                        "MongoDB CDC objectid.columns, document.json.column and \
+                         change.time.column require output.mode=document"
                             .into(),
                     ));
                 }
@@ -279,6 +289,7 @@ impl MongoDbSourceConfig {
                     .objectid_columns
                     .iter()
                     .chain(self.document_json_column.iter())
+                    .chain(self.change_time_column.iter())
                 {
                     if column.trim().is_empty() || !seen.insert(column.as_str()) {
                         return Err(ConnectorError::ConfigurationError(format!(
@@ -334,6 +345,9 @@ impl MongoDbSourceConfig {
         }
         cfg.document_json_column = config
             .get("document.json.column")
+            .map(|column| column.trim().to_string());
+        cfg.change_time_column = config
+            .get("change.time.column")
             .map(|column| column.trim().to_string());
         if let Some(pipeline) = config.get("pipeline") {
             cfg.pipeline = parse_pipeline_property(pipeline)?;
