@@ -172,8 +172,9 @@ acknowledged id must reach the output collection, ids never written fail the run
 counted, and more than one node must have read the stream.
 
 A MongoDB document source (`output.mode=document`, `snapshot.mode=never`) runs the same way, as
-an upsert source whose only cluster route is a temporal join's right side; its
-`change.time.column` carries the watermark.
+an upsert source: in a cluster it may be a temporal join's right side, with the watermark on its
+`change.time.column`, or an interval join's input when its key holds every join column and the
+watermarked event time (a `TIMESTAMP` `_id`).
 `mongodb_document_source::three_node_mongodb_document_temporal_kill9_soak` (candidate) writes
 one rate per key, acknowledged by the majority, and a heartbeat document every 250 ms. It
 produces Kafka trades stamped with the wall time, prices each through a temporal `LEFT JOIN`,

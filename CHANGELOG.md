@@ -37,7 +37,8 @@
   in every mode; before, a document source could not have a non-null event-time column, and a
   watermarked one faulted at its first batch because its checkpoints named no input channel. In
   cluster mode a document source without the initial copy runs at-least-once on one node at a
-  time, as history mode does, and may only feed a temporal join's right side. A placed
+  time, as history mode does, and may feed a temporal join's right side, or an interval join
+  when its key holds every join column and the event time (a `TIMESTAMP` `_id`). A placed
   singleton's positioned rows now carry its one channel, so any such source can feed a temporal
   or interval join in a cluster.
 
@@ -81,6 +82,13 @@
   `is_cluster_exact_delivery_certified()`.
 
 ### Fixed
+
+- A pipeline over a PostgreSQL CDC or Delta Lake change data feed source with a `WATERMARK`
+  faulted at the source's first batch ("ordered event-time source checkpoint omitted its
+  input-channel inventory"). Their checkpoints now name the one input channel their rows use: the
+  replication slot for PostgreSQL, and the table's `metaData.id` for Delta, whose rows were
+  positioned under an empty channel. Sources without a watermark behave as before and resume from
+  existing checkpoints. Embedded and single-node; both sources stay rejected in cluster mode.
 
 - A stream that selects source columns carrying field metadata, such as an Iceberg column's field
   ID, emitted batches without that metadata while its planned schema kept it, so a MongoDB or files

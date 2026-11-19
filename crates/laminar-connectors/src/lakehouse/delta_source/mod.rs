@@ -181,6 +181,11 @@ impl DeltaSource {
             delta_io::classify_delta_metadata_error("read Delta table metadata", &error)
         })?;
         let table_id = snapshot.metadata().id().to_string();
+        if table_id.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta table metadata has no table id".into(),
+            ));
+        }
         self.check_read_features(snapshot.metadata().configuration())?;
         let latest = snapshot.version();
         let cursor = match recovered {
@@ -397,6 +402,7 @@ impl DeltaSource {
     /// cursor and unit bookkeeping, so a failed emission leaves the checkpointable state intact.
     fn emit_pending(&mut self, max_records: usize) -> Result<Option<SourceBatch>, ConnectorError> {
         let open_unit = self.open_unit;
+        let table_id = self.cursor()?.table_id.clone();
         let Some(pending) = self.reader_mut()?.pending.as_ref() else {
             return Ok(None);
         };
@@ -411,7 +417,12 @@ impl DeltaSource {
         };
         let rows = pending.batch.num_rows();
         let take = rows.min(max_records);
-        let emitted = positioned(pending.batch.slice(0, take), pending.unit, first_row)?;
+        let emitted = positioned(
+            pending.batch.slice(0, take),
+            table_id.as_bytes(),
+            pending.unit,
+            first_row,
+        )?;
         let rows_emitted = u32::try_from(take)
             .ok()
             .and_then(|take| first_row.checked_add(take))
@@ -632,11 +643,12 @@ fn row_position_overflow() -> ConnectorError {
     )
 }
 
-/// Attach replay positions: an empty partition (one channel), the unit's order key, and the
-/// row's ordinal within its unit.
+/// Attach replay positions: the table incarnation as the one partition, the unit's order key,
+/// and the row's ordinal within its unit.
 #[cfg(feature = "delta-lake")]
 fn positioned(
     batch: RecordBatch,
+    table_id: &[u8],
     unit: reader::UnitKey,
     first_row: u32,
 ) -> Result<SourceBatch, ConnectorError> {
@@ -647,7 +659,7 @@ fn positioned(
         .ok_or_else(row_position_overflow)?;
     let key = unit.order_key();
     let positions = crate::connector::SourceRowPositions::try_new(
-        BinaryArray::from_iter_values(std::iter::repeat_n(&[][..], rows)),
+        BinaryArray::from_iter_values(std::iter::repeat_n(table_id, rows)),
         BinaryArray::from_iter_values(std::iter::repeat_n(&key[..], rows)),
         UInt32Array::from_iter_values(first_row..end),
     )?;

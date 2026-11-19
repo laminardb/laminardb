@@ -228,8 +228,10 @@ rows behind.
   an existing PostgreSQL column must hold at least that scale and integer width.
 - Sinks apply `_op = 'U'` and `_op = 'D'` rows by that key: PostgreSQL upserts and deletes by
   primary key, and Delta merges. A sink must declare exactly the source key. Filters, streams,
-  aggregates, and joins other than a temporal join's right side over a document source are
-  rejected: they would need retractions of rows the engine does not retain.
+  aggregates, and joins over a document source are rejected, except a temporal join's right side
+  and an interval join whose `PRIMARY KEY` holds every join column and the watermarked event-time
+  column; a document key holds only `_id` and shard-key fields, so that column is, for example, a
+  `TIMESTAMP` `_id`. The others would need retractions of rows the engine does not retain.
 - `change.time.column` names a non-key `TIMESTAMP NOT NULL` column that receives each change's
   server wall time (`wallTime`, MongoDB 6.0 or later), deletes included; copied documents carry
   the snapshot's time. With a watermark on it, the source can be the right side of a temporal
@@ -310,9 +312,10 @@ history consumers tolerate that. Resume tokens are never decoded.
   collection, faults the source. Cluster recovery restores the same checkpoint, so the cluster
   keeps retrying recovery until the source is reset.
 - `output.mode=document` runs the same way. In a cluster an upsert source may only be a
-  temporal join's right side (or an interval join's when its key includes the event time), so a
-  document source there needs `change.time.column` and a watermark. Documents that predate the
-  source's start are never joined, because the initial copy is rejected in a cluster.
+  temporal join's right side, with the watermark on `change.time.column`, or an interval join's
+  input when its `PRIMARY KEY` holds every join column and the watermarked event-time column
+  (such as a `TIMESTAMP` `_id`). The initial copy is rejected in a cluster, so a document joins
+  only once a change after the source's start emits it.
 - `snapshot.mode=initial` is rejected in a cluster.
 
 ### PostgreSQL CDC

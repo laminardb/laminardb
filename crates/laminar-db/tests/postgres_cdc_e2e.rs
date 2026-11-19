@@ -358,6 +358,55 @@ async fn snapshot_and_changes_mirror_into_postgres_across_restart() {
     }
 }
 
+/// A watermark on a CDC source follows the slot's one input channel through the snapshot, live
+/// changes, checkpoints, and a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watermarked_source_mirrors_into_postgres_across_restart() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {t} ADD COLUMN changed_at timestamp NOT NULL DEFAULT localtimestamp; \
+             INSERT INTO {t} SELECT g, 'seed', g FROM generate_series(1, 500) g",
+            t = capture.table
+        ))
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let statements = vec![
+        capture.source(
+            "orders",
+            "id BIGINT NOT NULL, label VARCHAR, qty INT, changed_at TIMESTAMP, \
+             PRIMARY KEY (id), WATERMARK FOR changed_at AS changed_at - INTERVAL '1' SECOND",
+            "",
+        ),
+        capture.upsert_sink("orders_mirror", "orders", "id"),
+    ];
+    let mirror_query = capture.mirror_rows();
+    for round in 0..2 {
+        if round == 1 {
+            // Changes while the pipeline is down replay from the committed cursor.
+            churn(&client, &capture.table, 2).await;
+        }
+        let db = reopen(storage.path(), &statements).await;
+        db.start().await.expect("start");
+        churn(&client, &capture.table, round).await;
+        let expected = rows(&client, &capture.source_rows()).await;
+        let observed = eventually(
+            CONVERGE,
+            || rows(&client, &mirror_query),
+            |rows| rows == &expected || db.last_fault().is_some(),
+        )
+        .await;
+        assert_eq!(db.last_fault(), None);
+        assert_eq!(observed, expected, "mirror after round {round}");
+        assert!(db.checkpoint().await.unwrap().success);
+        db.shutdown().await.expect("shutdown");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsupported_upsert_compositions_fail_before_data_moves() {
     let Some(client) = postgres().await else {
