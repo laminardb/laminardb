@@ -363,7 +363,13 @@ impl SourceConnector for SingletonPlacement {
             }
             None => self.inner.checkpoint(),
         };
-        Ok(Some(batch.with_checkpoint(self.bind(cursor))))
+        // The one channel every owner reports is the catalog name, so positioned rows carry it
+        // as their partition rather than the connector's own identity, such as a collection's.
+        Ok(Some(
+            batch
+                .with_row_partition(&self.channel)
+                .with_checkpoint(self.bind(cursor)),
+        ))
     }
 
     async fn resolve_schema(
@@ -571,11 +577,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    use arrow::array::Int64Array;
+    use arrow::array::{BinaryArray, Int64Array, UInt32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use laminar_connectors::connector::{
-        DeliveryGuarantee, SourceConsistency, SourceInputMode, SourceTopology,
+        DeliveryGuarantee, SourceConsistency, SourceInputMode, SourceMutation, SourceRowPositions,
+        SourceTopology,
     };
     use parking_lot::Mutex;
 
@@ -768,6 +775,45 @@ mod tests {
 
         async fn close(&mut self) -> Result<(), ConnectorError> {
             self.events.lock().push(Event::Close);
+            Ok(())
+        }
+
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            Ok(placed_singleton())
+        }
+    }
+
+    /// Emits positioned upserts under its own channel identity, the second row a tombstone.
+    struct Positioned;
+
+    #[async_trait]
+    impl SourceConnector for Positioned {
+        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn poll_batch(&mut self, _max: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+            let rows = Int64Array::from(vec![1, 2]);
+            let records = RecordBatch::try_new(recorded_schema(), vec![Arc::new(rows)]).unwrap();
+            let positions = SourceRowPositions::try_new(
+                BinaryArray::from_iter_values([b"collection-uuid"; 2]),
+                BinaryArray::from_iter_values([[0_u8, 1], [0, 2]]),
+                UInt32Array::from(vec![0, 0]),
+            )?;
+            SourceBatch::positioned(records, positions)?
+                .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+                .map(Some)
+        }
+
+        fn schema(&self) -> SchemaRef {
+            recorded_schema()
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            SourceCheckpoint::new()
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
             Ok(())
         }
 
@@ -1177,6 +1223,31 @@ mod tests {
             "the donor commits the sealed handoff unit before it closes"
         );
         assert_eq!(b.events(), [Event::Start("resume 2 at 4".into())]);
+    }
+
+    /// Every owner reports the catalog name as the one channel, so positioned rows carry it as
+    /// their partition; order keys and mutations pass through.
+    #[tokio::test]
+    async fn positioned_rows_take_the_channel_as_their_partition() {
+        let mut node =
+            Node::placed(1, Box::new(Positioned), Arc::default(), recorded_schema()).await;
+        node.publish(1, 1);
+        let batch = node
+            .source
+            .poll_batch(8)
+            .await
+            .unwrap()
+            .expect("the owner reads");
+        let positions = batch.row_positions().expect("positions pass through");
+        assert!(positions
+            .partition()
+            .iter()
+            .all(|partition| partition == Some(NAME.as_bytes())));
+        assert_eq!(positions.order_key().value(1), [0, 2]);
+        assert_eq!(
+            batch.mutations(),
+            Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::source::{self, FixtureSource};
-use super::DEADLINE;
+use super::{DEADLINE, TEMPORAL_RETENTION};
 use crate::cluster_test_support::{prepare_controls, ClusterControl};
 use crate::{DbError, LaminarDB};
 
@@ -90,6 +90,7 @@ impl Cluster {
                 .shuffle_sender(Arc::clone(&control.sender))
                 .shuffle_receiver(Arc::clone(&control.receiver))
                 .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+                .temporal_join_idle_history_retention(TEMPORAL_RETENTION)
                 .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
                     interval_ms: None,
                     ..Default::default()

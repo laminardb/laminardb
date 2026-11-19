@@ -7,7 +7,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use super::oracle::OutputForm;
-use super::source::{FixtureKind, FixtureSource, QueueCommit};
+use super::source::{FixtureKind, FixtureSource, QueueCommit, QueueRows};
 use super::{Case, Verdict};
 
 const PARTITIONS: i64 = 6;
@@ -1403,7 +1403,10 @@ fn queued(name: &'static str, commit: QueueCommit) -> FixtureSource {
         name,
         columns: EVENT_COLUMNS,
         partitions: vec![batches].into(),
-        kind: FixtureKind::Queue(commit),
+        kind: FixtureKind::Queue {
+            commit,
+            rows: QueueRows::Append,
+        },
     }
 }
 
@@ -1441,6 +1444,104 @@ async fn singleton_unit_of_work_keyed_aggregate_checkpoints_are_equal() {
         "singleton_unit_of_work_keyed_aggregate",
         QueueCommit::UnitOfWork,
     );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A keyed-upsert queue of one version per key before the events start, updates and
+/// tombstones while they run, and a last version after them, so its watermark passes every event.
+fn versions(name: &'static str) -> FixtureSource {
+    let mut rows = Vec::new();
+    for key in 0..KEYS {
+        rows.push((key, 1_000 + key, 900_000));
+        if key % 3 == 0 {
+            rows.push((key, 2_000 + key, 1_100_000));
+        }
+        if key % 4 == 1 {
+            rows.push((key, -1, 1_200_000));
+        }
+        if key % 8 == 1 {
+            rows.push((key, 3_000 + key, 1_300_000));
+        }
+        rows.push((key, 4_000 + key, 1_600_000));
+    }
+    rows.sort_by_key(|&(key, _, micros)| (micros, key));
+    let size = usize::try_from(ROWS_PER_BATCH).unwrap();
+    let batches = rows
+        .chunks(size)
+        .map(|chunk| event_batch(chunk.iter().copied()))
+        .collect();
+    FixtureSource {
+        name,
+        columns: "(k BIGINT PRIMARY KEY, v BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+                  WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND)",
+        partitions: vec![batches].into(),
+        kind: FixtureKind::Queue {
+            commit: QueueCommit::Cumulative,
+            rows: QueueRows::KeyedUpsert,
+        },
+    }
+}
+
+// A placed keyed-upsert singleton as a temporal join's right side: one node reads the versions,
+// and each event joins the version its key's owner held at the event's time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn temporal_join_over_a_placed_upsert_singleton_is_equal() {
+    let case = Case {
+        sources: vec![events("events", 0), versions("versions")],
+        checkpoint_under_load: true,
+        ..case(
+            "temporal_join_over_a_placed_upsert_singleton",
+            &[
+                "CREATE STREAM out AS SELECT l.k AS k, l.v AS v, l.ts AS ts, r.v AS version \
+               FROM events l LEFT JOIN versions FOR SYSTEM_TIME AS OF l.ts AS r ON l.k = r.k",
+            ],
+            OutputForm::Rows,
+            None,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+// A keyed-upsert source needs one exclusive route; a plain stream is none, in any mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_stream_over_an_upsert_singleton_is_unsupported_everywhere() {
+    let case = Case {
+        sources: vec![versions("versions")],
+        ..case(
+            "plain_stream_over_an_upsert_singleton",
+            &["CREATE STREAM out AS SELECT k, v, ts FROM versions"],
+            OutputForm::Rows,
+            None,
+        )
+    };
+    match verdict(case).await {
+        Verdict::UnsupportedEverywhere(reason) => {
+            assert!(reason.contains("is not exclusive"), "{reason}");
+        }
+        other => panic!("a plain stream over an upsert source has no route: {other:?}"),
+    }
+}
+
+// The bounded interval route over a placed upsert singleton whose key includes its event time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interval_join_over_a_placed_upsert_singleton_is_equal() {
+    let mut timed = versions("versions");
+    timed.columns = "(k BIGINT NOT NULL, v BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+                     PRIMARY KEY (k, ts), WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND)";
+    let case = Case {
+        sources: vec![events("events", 0), timed],
+        checkpoint_under_load: true,
+        ..case(
+            "interval_join_over_a_placed_upsert_singleton",
+            &[
+                "CREATE STREAM out AS SELECT l.k AS k, l.v AS v, r.v AS version \
+               FROM events l JOIN versions r ON l.k = r.k \
+               AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '100' MILLISECOND",
+            ],
+            OutputForm::Changelog,
+            None,
+        )
+    };
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 

@@ -23,6 +23,10 @@ use source::{FixtureKind, FixtureSource};
 pub(super) const DEADLINE: Duration = Duration::from_secs(40);
 const NODES: u64 = 3;
 const VNODES: u32 = 12;
+/// How long a failed checkpoint waits for the nodes to record the fault behind it.
+const FAULT_RECORD_WAIT: Duration = Duration::from_secs(2);
+/// Long enough that no temporal join history is evicted while a case runs.
+const TEMPORAL_RETENTION: Duration = Duration::from_secs(60);
 
 struct Case {
     name: &'static str,
@@ -342,12 +346,22 @@ impl Case {
         Ok(batches)
     }
 
-    /// Commit a checkpoint from the first (leader) node.
+    /// Commit a checkpoint from the first (leader) node. A failed checkpoint reports each node's
+    /// pipeline fault, which a faulted pipeline records just after it fails the checkpoint.
     async fn checkpoint(&self, dbs: &[Arc<LaminarDB>]) -> Result<(), String> {
-        let checkpoint = dbs[0]
-            .checkpoint_with_timeout(DEADLINE)
-            .await
-            .map_err(|e| format!("{}: checkpoint on {} node(s): {e}", self.name, dbs.len()))?;
+        let checkpoint = match dbs[0].checkpoint_with_timeout(DEADLINE).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let faulted = || dbs.iter().any(|db| db.last_fault.lock().is_some());
+                let _ = wait_until(FAULT_RECORD_WAIT, faulted).await;
+                let faults: Vec<_> = dbs.iter().map(|db| db.last_fault.lock().clone()).collect();
+                return Err(format!(
+                    "{}: checkpoint on {} node(s): {error}; node faults {faults:?}",
+                    self.name,
+                    dbs.len()
+                ));
+            }
+        };
         if !checkpoint.success {
             return Err(format!("{}: checkpoint failed: {checkpoint:?}", self.name));
         }
@@ -367,7 +381,7 @@ fn reads_channel(source: &FixtureSource, node: u64) -> bool {
             FixtureKind::Generated => {
                 laminar_core::state::SourceChannelRoute::V1.vnode(source.name, partition, vnodes)
             }
-            FixtureKind::Queue(_) => {
+            FixtureKind::Queue { .. } => {
                 laminar_core::state::SourceChannelRoute::V1.vnode(source.name, 0, vnodes)
             }
         };
@@ -383,6 +397,7 @@ async fn embedded_db(
 ) -> Result<Arc<LaminarDB>, String> {
     LaminarDB::builder()
         .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+        .temporal_join_idle_history_retention(TEMPORAL_RETENTION)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
             data_dir: Some(directory.into()),
             interval_ms: None,

@@ -5,14 +5,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arrow::array::{BinaryArray, RecordBatch, UInt32Array};
+use arrow::array::{BinaryArray, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
 use laminar_connectors::connector::{
     SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
-    SourcePosition, SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
+    SourceMutation, SourcePosition, SourceRowPositionCapability, SourceRowPositions, SourceStart,
+    SourceTopology,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_connectors::registry::ConnectorRegistry;
@@ -32,7 +33,21 @@ pub(super) enum FixtureKind {
     Generated,
     /// One queue of batches, read by the owner of the source's home vnode. A delivery leaves the
     /// queue when a checkpoint covering it commits and returns to it when its reader closes.
-    Queue(QueueCommit),
+    Queue {
+        commit: QueueCommit,
+        rows: QueueRows,
+    },
+}
+
+/// What a queue's rows mean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueueRows {
+    /// Appended rows, without row positions.
+    Append,
+    /// Keyed upserts by the declared primary key, positioned by the batch's place in the queue;
+    /// a row whose `v` is negative is a tombstone. Like a MongoDB collection incarnation, the
+    /// queue's own channel identity differs from its catalog name.
+    KeyedUpsert,
 }
 
 /// How a queue reader releases deliveries at a commit.
@@ -112,7 +127,7 @@ impl Queues {
         Arc::new(Self(
             sources
                 .iter()
-                .filter(|source| matches!(source.kind, FixtureKind::Queue(_)))
+                .filter(|source| matches!(source.kind, FixtureKind::Queue { .. }))
                 .map(|source| {
                     let batches = source.all_batches();
                     let queue = Queue {
@@ -165,11 +180,15 @@ pub(super) fn register(
                 },
                 Arc::new(move |_| {
                     let (polled, allowance) = (Arc::clone(&polled), Arc::clone(&allowance));
-                    if let (Some(queue), FixtureKind::Queue(commit)) = (&queue, source.kind) {
+                    if let (Some(queue), FixtureKind::Queue { commit, rows }) =
+                        (&queue, source.kind)
+                    {
                         return Ok(Box::new(QueueSource {
                             queue: Arc::clone(queue),
+                            name: source.name,
                             schema: source.schema(),
                             commit,
+                            rows,
                             consumer: None,
                             delivered: 0,
                             sealed: AtomicU64::new(0),
@@ -199,8 +218,10 @@ pub(super) fn register(
 /// A queue reader: its cursor names the reader and the last delivery it handed over.
 struct QueueSource {
     queue: Arc<Mutex<Queue>>,
+    name: &'static str,
     schema: SchemaRef,
     commit: QueueCommit,
+    rows: QueueRows,
     consumer: Option<u64>,
     /// The last tag this reader handed over.
     delivered: u64,
@@ -217,13 +238,20 @@ struct QueueSource {
 #[async_trait]
 impl SourceConnector for QueueSource {
     fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(
-            laminar_connectors::testing::with_cluster_singleton_placement(SourceContract::new(
+        let contract = match self.rows {
+            QueueRows::Append => SourceContract::new(
                 SourceConsistency::CommitCoupled,
                 SourceTopology::Singleton,
                 SourceInputMode::AppendOnly,
-            )),
-        )
+            ),
+            QueueRows::KeyedUpsert => SourceContract::new(
+                SourceConsistency::CommitCoupled,
+                SourceTopology::Singleton,
+                SourceInputMode::KeyedUpsert,
+            )
+            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
+        };
+        Ok(laminar_connectors::testing::with_cluster_singleton_placement(contract))
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -257,7 +285,11 @@ impl SourceConnector for QueueSource {
         self.delivered += 1;
         self.unacked.push_back((self.delivered, batch));
         self.polled.fetch_add(1, Ordering::AcqRel);
-        let batch = SourceBatch::new(queue.batches[batch].clone());
+        let records = queue.batches[batch].clone();
+        let batch = match self.rows {
+            QueueRows::Append => SourceBatch::new(records),
+            QueueRows::KeyedUpsert => keyed_upserts(&self.incarnation(), batch, records)?,
+        };
         // A unit of work binds its own cursor, so that only a barrier capture seals it.
         Ok(Some(match self.commit {
             QueueCommit::Cumulative => batch,
@@ -314,14 +346,52 @@ impl SourceConnector for QueueSource {
 }
 
 impl QueueSource {
+    fn incarnation(&self) -> Vec<u8> {
+        format!("{}@incarnation-1", self.name).into_bytes()
+    }
+
     fn cursor(&self) -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
         if let Some(consumer) = self.consumer {
             checkpoint.set_offset("consumer", consumer.to_string());
             checkpoint.set_offset("tag", self.delivered.to_string());
         }
+        if self.rows == QueueRows::KeyedUpsert {
+            checkpoint
+                .set_input_channels(vec![self.incarnation()])
+                .expect("one channel is a valid inventory");
+        }
         checkpoint
     }
+}
+
+/// Positions by the batch's place in the queue, which every reader agrees on, and a tombstone
+/// for each row whose `v` is negative.
+fn keyed_upserts(
+    channel: &[u8],
+    index: usize,
+    records: RecordBatch,
+) -> Result<SourceBatch, ConnectorError> {
+    let rows = u32::try_from(records.num_rows())
+        .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
+    let order = (index as u64).to_be_bytes();
+    let positions = SourceRowPositions::try_new(
+        BinaryArray::from_vec(vec![channel; rows as usize]),
+        BinaryArray::from_vec(vec![order.as_slice(); rows as usize]),
+        UInt32Array::from((0..rows).collect::<Vec<_>>()),
+    )?;
+    let values = records
+        .column_by_name("v")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| ConnectorError::SchemaMismatch("keyed queue rows need `v`".into()))?;
+    let mutations: Vec<SourceMutation> = values
+        .iter()
+        .map(|value| match value {
+            Some(value) if value < 0 => SourceMutation::Tombstone,
+            _ => SourceMutation::Put,
+        })
+        .collect();
+    SourceBatch::positioned(records, positions)?.with_mutations(mutations)
 }
 
 struct PartitionedSource {
