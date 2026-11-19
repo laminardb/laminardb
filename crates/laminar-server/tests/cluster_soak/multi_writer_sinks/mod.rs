@@ -54,7 +54,7 @@ pub(crate) mod mongo;
 #[cfg(feature = "nats")]
 mod nats;
 #[cfg(feature = "postgres-sink")]
-mod postgres;
+pub(crate) mod postgres;
 #[cfg(feature = "rabbitmq")]
 pub(crate) mod rabbitmq;
 

@@ -129,9 +129,21 @@ mod mongodb_source;
 ))]
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
+#[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]
+#[path = "cluster_soak/postgres_source.rs"]
+mod postgres_source;
 #[cfg(all(feature = "kafka", feature = "rabbitmq"))]
 #[path = "cluster_soak/rabbitmq_source.rs"]
 mod rabbitmq_source;
+#[cfg(all(
+    feature = "kafka",
+    any(
+        feature = "mongodb-cdc",
+        all(feature = "postgres-cdc", feature = "postgres-sink")
+    )
+))]
+#[path = "cluster_soak/temporal_pricing.rs"]
+mod temporal_pricing;
 // Shared with iceberg_cluster_soak, which uses every helper this soak does not.
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/generator_splits.rs"]

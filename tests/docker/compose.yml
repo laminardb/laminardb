@@ -95,6 +95,8 @@ services:
       POSTGRES_USER: laminar
       POSTGRES_PASSWORD: laminar-test-secret
       POSTGRES_DB: laminar
+    # The PostgreSQL source soak streams a table of this server through logical replication.
+    command: ["postgres", "-c", "wal_level=logical"]
     ports:
       - "127.0.0.1:15434:5432"
     healthcheck:

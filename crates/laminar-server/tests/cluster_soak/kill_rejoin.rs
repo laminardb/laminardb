@@ -22,7 +22,12 @@ use super::{
 };
 
 /// Grows on every node that commits checkpoints.
-#[cfg(any(feature = "rabbitmq", feature = "ibmmq", feature = "mongodb-cdc"))]
+#[cfg(any(
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "mongodb-cdc",
+    feature = "postgres-cdc"
+))]
 pub(super) const CHECKPOINTS_COMPLETED: &str = "laminardb_checkpoints_completed_total";
 /// Grows only on the nodes that read the source.
 pub(super) const EVENTS_INGESTED: &str = "laminardb_events_ingested_total";
@@ -239,7 +244,24 @@ pub(super) fn kill_round(
         "survivor progress after kill",
         Some(latest),
     );
+    let rejoined = rejoin(nodes, live, victim, settings, metric, survived);
+    eprintln!(
+        "soak round {round}: node {victim} rejoined; checkpoint {} committed",
+        rejoined.checkpoint_id
+    );
+    (victim, rejoined)
+}
 
+/// Restart the stopped node `victim`, require it to rejoin and advance `metric`, and return the
+/// checkpoint the cluster commits after `survived`.
+pub(super) fn rejoin(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    victim: usize,
+    settings: &SoakSettings,
+    metric: &str,
+    survived: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
     let permit = nodes[victim].verify_executable_for_spawn();
     let rejoin_deadline = Instant::now() + settings.recovery_ceiling;
     nodes[victim].spawn(permit);
@@ -255,17 +277,12 @@ pub(super) fn kill_round(
                     .is_some_and(|value| value > 0.0)
         },
     );
-    let rejoined = wait_for_converged_durable_checkpoint(
+    wait_for_converged_durable_checkpoint(
         nodes,
         rejoin_deadline,
         "progress after rejoin",
         Some(survived),
-    );
-    eprintln!(
-        "soak round {round}: node {victim} rejoined; checkpoint {} committed",
-        rejoined.checkpoint_id
-    );
-    (victim, rejoined)
+    )
 }
 
 fn counter(node: &Node, metric: &str) -> f64 {
