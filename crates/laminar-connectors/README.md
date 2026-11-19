@@ -310,9 +310,10 @@ history consumers tolerate that. Resume tokens are never decoded.
   collection, faults the source. Cluster recovery restores the same checkpoint, so the cluster
   keeps retrying recovery until the source is reset.
 - `output.mode=document` runs the same way. In a cluster an upsert source may only be a
-  temporal join's right side (or an interval join's when its key includes the event time), so a
-  document source there needs `change.time.column` and a watermark. Documents that predate the
-  source's start are never joined, because the initial copy is rejected in a cluster.
+  temporal join's right side (or an interval join's when its key includes the event time, such
+  as a `TIMESTAMP` `_id`), so a document source there needs a watermark, normally on
+  `change.time.column`. Documents that predate the source's start are never joined, because the
+  initial copy is rejected in a cluster.
 - `snapshot.mode=initial` is rejected in a cluster.
 
 ### PostgreSQL CDC
