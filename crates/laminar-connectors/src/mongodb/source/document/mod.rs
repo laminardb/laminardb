@@ -58,9 +58,12 @@ pub(super) enum DocumentRow<'a> {
     Put {
         key: &'a RawDocument,
         document: &'a RawDocument,
+        /// Server wall time of the change in milliseconds, when the change carried one.
+        changed_at_ms: Option<i64>,
     },
     Tombstone {
         key: &'a RawDocument,
+        changed_at_ms: Option<i64>,
     },
 }
 
@@ -71,6 +74,8 @@ pub(super) struct DocumentProjection {
     columns: Vec<ColumnPlan>,
     key_columns: Vec<usize>,
     key_names: BTreeSet<String>,
+    /// The column filled with each change's wall time rather than a document field.
+    change_time_column: Option<usize>,
 }
 
 fn projection_error(message: impl Into<String>) -> ConnectorError {
@@ -113,12 +118,14 @@ impl DocumentProjection {
     ///
     /// # Errors
     /// Rejects reserved or path-like names, unsupported types, a primary key without `_id`,
-    /// nullable keys, and non-key columns that cannot hold a key-only tombstone.
+    /// nullable keys, non-key columns that cannot hold a key-only tombstone, and a change-time
+    /// column that is not a non-key `TIMESTAMP NOT NULL`.
     pub(super) fn try_new(
         schema: &SchemaRef,
         primary_key: &[String],
         objectid_columns: &[String],
         document_json_column: Option<&str>,
+        change_time_column: Option<&str>,
     ) -> Result<Self, ConnectorError> {
         if primary_key.is_empty() {
             return Err(projection_error(
@@ -132,6 +139,7 @@ impl DocumentProjection {
             .iter()
             .map(String::as_str)
             .chain(document_json_column)
+            .chain(change_time_column)
         {
             if schema.field_with_name(column).is_err() {
                 return Err(projection_error(format!(
@@ -141,6 +149,7 @@ impl DocumentProjection {
         }
         let mut columns = Vec::with_capacity(schema.fields().len());
         let mut key_columns = Vec::with_capacity(primary_key.len());
+        let mut change_time = None;
         for (index, field) in schema.fields().iter().enumerate() {
             let name = field.name();
             if RESERVED_COLUMNS
@@ -161,7 +170,14 @@ impl DocumentProjection {
             let objectid = objectid_columns.iter().any(|column| column == name);
             let kind = column_kind(field.data_type(), objectid, document)
                 .map_err(|reason| projection_error(format!("column '{name}': {reason}")))?;
-            if is_key {
+            if change_time_column == Some(name.as_str()) {
+                if is_key || !matches!(kind, ColumnKind::Timestamp(_)) || field.is_nullable() {
+                    return Err(projection_error(format!(
+                        "change.time.column '{name}' must be a non-key TIMESTAMP NOT NULL column"
+                    )));
+                }
+                change_time = Some(index);
+            } else if is_key {
                 if field.is_nullable() {
                     return Err(projection_error(format!(
                         "PRIMARY KEY column '{name}' must be NOT NULL"
@@ -194,6 +210,7 @@ impl DocumentProjection {
             columns,
             key_columns,
             key_names: primary_key.iter().cloned().collect(),
+            change_time_column: change_time,
         })
     }
 
@@ -213,12 +230,20 @@ impl DocumentProjection {
             .collect();
         let mut mutations = Vec::with_capacity(rows.len());
         for row in rows {
-            let (key, document) = match row {
-                DocumentRow::Put { key, document } => (*key, Some(*document)),
-                DocumentRow::Tombstone { key } => (*key, None),
+            let (key, document, changed_at_ms) = match row {
+                DocumentRow::Put {
+                    key,
+                    document,
+                    changed_at_ms,
+                } => (*key, Some(*document), *changed_at_ms),
+                DocumentRow::Tombstone { key, changed_at_ms } => (*key, None, *changed_at_ms),
             };
             self.check_key_shape(key)?;
             for (index, (column, builder)) in self.columns.iter().zip(&mut builders).enumerate() {
+                if self.change_time_column == Some(index) {
+                    builder.push_change_time(column, changed_at_ms)?;
+                    continue;
+                }
                 let value = if self.key_columns.contains(&index) {
                     let value = key_value(key, &column.name)?;
                     if let Some(document) = document {
@@ -349,6 +374,34 @@ impl ColumnValues {
             ));
         };
         builder.append_value(canonical_document_extjson(document)?);
+        Ok(())
+    }
+
+    fn push_change_time(
+        &mut self,
+        column: &ColumnPlan,
+        changed_at_ms: Option<i64>,
+    ) -> Result<(), ConnectorError> {
+        let (Self::Int64(values), ColumnKind::Timestamp(unit)) = (self, column.kind) else {
+            return Err(ConnectorError::Internal(format!(
+                "change.time.column '{}' is not a timestamp builder",
+                column.name
+            )));
+        };
+        let changed_at_ms = changed_at_ms.ok_or_else(|| {
+            ConnectorError::SchemaMismatch(format!(
+                "change.time.column '{}' needs each change's wallTime, which MongoDB sends \
+                 from version 6.0",
+                column.name
+            ))
+        })?;
+        let value = timestamp_value(changed_at_ms, unit).ok_or_else(|| {
+            ConnectorError::SchemaMismatch(format!(
+                "change time {changed_at_ms} ms does not fit change.time.column '{}' exactly",
+                column.name
+            ))
+        })?;
+        values.push(Some(value));
         Ok(())
     }
 

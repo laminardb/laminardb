@@ -5,7 +5,7 @@ use mongodb::bson::{doc, oid::ObjectId, Document};
 use super::admission::{await_mongo_reader_ready, source_client_options};
 use super::buffering::{buffered_retained_bytes, ChangeRecord, SnapshotRecord};
 use super::checkpoint::{
-    canonical_resume_token, mongodb_stream_identity, parse_deployment_identity,
+    canonical_resume_token, encode_checkpoint, mongodb_stream_identity, parse_deployment_identity,
     set_emitted_offsets, RESUME_TOKEN_OFFSET, SEQUENCE_OFFSET, SNAPSHOT_AFTER_KEY_OFFSET,
     SNAPSHOT_AT_OFFSET, START_AFTER_TOKEN_OFFSET, START_AT_OFFSET,
 };
@@ -58,6 +58,7 @@ fn anchor() -> EmittedPosition {
 
 fn admitted_source(config: MongoDbSourceConfig) -> MongoDbCdcSource {
     let mut source = MongoDbCdcSource::new(config, None);
+    source.schema = mongodb_history_schema();
     source.collection_uuid = Some(test_collection_uuid());
     source.deployment_identity = Some(test_deployment_identity());
     source.emitted = Some(anchor());
@@ -90,7 +91,7 @@ fn document_config() -> MongoDbSourceConfig {
 fn document_source() -> MongoDbCdcSource {
     let mut source = admitted_source(document_config());
     let projection =
-        DocumentProjection::try_new(&document_schema(), &["_id".into()], &[], None).unwrap();
+        DocumentProjection::try_new(&document_schema(), &["_id".into()], &[], None, None).unwrap();
     source.schema = Arc::clone(projection.schema());
     source.projection = Some(projection);
     source
@@ -1019,50 +1020,78 @@ fn contracts_follow_the_output_and_snapshot_modes() {
 }
 
 #[tokio::test]
-async fn only_a_history_stream_without_a_copy_runs_in_a_cluster_or_starts_sealed() {
+async fn a_change_stream_without_a_copy_runs_in_a_cluster_or_starts_sealed() {
     let mut source = MongoDbCdcSource::new(MongoDbSourceConfig::default(), None);
     let history = valid_connector_config();
-    assert!(
-        source
-            .contract(&history)
-            .unwrap()
-            .supports_cluster_singleton_placement(),
-        "any one node may follow the change stream"
-    );
-    assert!(source.supports_initialized_start());
-
-    let mut copied = valid_connector_config();
-    copied.set("snapshot.mode", "initial");
     let mut document = valid_connector_config();
     document.set("output.mode", "document");
     document.set("full.document.mode", "required");
-    for config in [&copied, &document] {
-        assert!(!source
-            .contract(config)
-            .unwrap()
-            .supports_cluster_singleton_placement());
-        let error = source.resolve_initial_position(config).await.unwrap_err();
-        assert!(error.to_string().contains("starts sealed only"), "{error}");
-        let sealed = recovery_checkpoint(
-            &MongoDbSourceConfig::from_config(config).unwrap(),
-            &[
-                (RESUME_TOKEN_OFFSET, r#"{"_data":"01"}"#),
-                (SEQUENCE_OFFSET, "0"),
-            ],
+    for config in [&history, &document] {
+        assert!(
+            source
+                .contract(config)
+                .unwrap()
+                .supports_cluster_singleton_placement(),
+            "any one node may follow the change stream"
         );
-        let error = source
-            .start(
-                SourceStart::new(
-                    config.clone(),
-                    SourcePosition::Initialized { checkpoint: sealed },
-                    crate::connector::DeliveryGuarantee::AtLeastOnce,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("starts sealed only"), "{error}");
     }
+    assert!(source.supports_initialized_start());
+
+    let mut copied = document.clone();
+    copied.set("snapshot.mode", "initial");
+    assert!(!source
+        .contract(&copied)
+        .unwrap()
+        .supports_cluster_singleton_placement());
+    let error = source.resolve_initial_position(&copied).await.unwrap_err();
+    assert!(error.to_string().contains("starts sealed only"), "{error}");
+    let sealed = recovery_checkpoint(
+        &MongoDbSourceConfig::from_config(&copied).unwrap(),
+        &[
+            (RESUME_TOKEN_OFFSET, r#"{"_data":"01"}"#),
+            (SEQUENCE_OFFSET, "0"),
+        ],
+    );
+    let error = source
+        .start(
+            SourceStart::new(
+                copied,
+                SourcePosition::Initialized { checkpoint: sealed },
+                crate::connector::DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("starts sealed only"), "{error}");
+}
+
+#[test]
+fn document_checkpoints_name_the_collection_incarnation_as_their_channel() {
+    let mut document = valid_connector_config();
+    document.set("output.mode", "document");
+    document.set("full.document.mode", "required");
+    let uuid = test_collection_uuid();
+    let deployment = test_deployment_identity();
+    let emitted = anchor();
+    let checkpoint = encode_checkpoint(
+        &MongoDbSourceConfig::from_config(&document).unwrap(),
+        uuid,
+        &deployment,
+        &emitted,
+    );
+    assert_eq!(
+        checkpoint.input_channels(),
+        Some(&[uuid.as_bytes().to_vec()][..]),
+        "a watermark on document rows follows the partition they are positioned under"
+    );
+    let history = encode_checkpoint(
+        &MongoDbSourceConfig::from_config(&valid_connector_config()).unwrap(),
+        uuid,
+        &deployment,
+        &emitted,
+    );
+    assert_eq!(history.input_channels(), None);
 }
 
 #[test]
@@ -1577,5 +1606,32 @@ fn canonical_extended_json_preserves_document_field_order() {
         crate::mongodb::change_event::canonical_document_extjson(&raw).unwrap(),
         r#"{"z":{"$numberInt":"1"},"a":{"$numberInt":"2"},"m":{"$numberInt":"3"}}"#,
         "document keys compare by field order; canonical text must not sort them"
+    );
+}
+
+#[test]
+fn the_change_time_column_is_document_only_and_enters_the_identity_only_when_set() {
+    let mut history = valid_connector_config();
+    history.set("change.time.column", "changed_at");
+    let error = MongoDbSourceConfig::from_config(&history).unwrap_err();
+    assert!(error.to_string().contains("change.time.column"), "{error}");
+
+    let mut document = valid_connector_config();
+    document.set("output.mode", "document");
+    document.set("full.document.mode", "required");
+    let source = MongoDbCdcSource::new(MongoDbSourceConfig::from_config(&document).unwrap(), None);
+    let unset = source
+        .recovery_identity_options(&document)
+        .unwrap()
+        .unwrap();
+    assert!(!unset.contains_key("change.time.column"));
+    document.set("change.time.column", "changed_at");
+    let set = source
+        .recovery_identity_options(&document)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        set.get("change.time.column").map(String::as_str),
+        Some("changed_at")
     );
 }

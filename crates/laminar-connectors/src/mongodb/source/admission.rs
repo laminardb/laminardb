@@ -219,9 +219,11 @@ impl MongoDbCdcSource {
             }
             _ => None,
         };
-        if let Some(projection) = projection.as_ref() {
-            self.schema = std::sync::Arc::clone(projection.schema());
-        }
+        self.schema = projection
+            .as_ref()
+            .map_or_else(super::mongodb_history_schema, |projection| {
+                std::sync::Arc::clone(projection.schema())
+            });
         self.projection = projection;
         self.config = config;
         self.metrics

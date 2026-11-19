@@ -77,6 +77,7 @@ async fn open(storage: &Path) -> std::sync::Arc<LaminarDB> {
             ..Default::default()
         })
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .temporal_join_idle_history_retention(Duration::from_secs(300))
         .config_var("E2E_PG_PASSWORD", "laminar-test-secret")
         .config_var("E2E_BAD_MONGO_PASSWORD", "wrong")
         .config_var("E2E_MINIO_SECRET", "minioadmin")
@@ -2489,4 +2490,196 @@ async fn history_appends_every_event_to_iceberg() {
     let identities: std::collections::BTreeSet<&str> =
         rows.iter().map(|(_, _, id)| id.as_str()).collect();
     assert_eq!(identities.len(), 5);
+}
+
+// Shared with the Kafka scenarios, which use every helper this file does not.
+#[cfg(feature = "kafka")]
+#[allow(dead_code)]
+#[path = "common/kafka.rs"]
+mod kafka;
+
+/// Trades as JSON objects `{"id", "key", "at"}`, `at` in epoch milliseconds.
+#[cfg(feature = "kafka")]
+async fn produce_trades(brokers: &str, topic: &str, trades: &[(i64, i64, i64)]) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    let producer: FutureProducer = rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("producer");
+    for (id, key, at) in trades {
+        let payload = format!(r#"{{"id": {id}, "key": {key}, "at": {at}}}"#);
+        producer
+            .send(
+                FutureRecord::to(topic)
+                    .payload(&payload)
+                    .key(&id.to_string()),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce");
+    }
+}
+
+/// Each trade id's joined rate in the output collection; an id seen twice must agree.
+#[cfg(feature = "kafka")]
+async fn priced(collection: &mongodb::Collection<Document>) -> BTreeMap<i64, Option<i64>> {
+    let mut priced = BTreeMap::new();
+    let rows: Vec<Document> = collection
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    for row in rows {
+        let id = row.get_i64("id").unwrap();
+        let rate = row.get_i64("rate").ok();
+        let previous = priced.insert(id, rate);
+        assert!(
+            previous.is_none() || previous == Some(rate),
+            "trade {id} joined two rates"
+        );
+    }
+    priced
+}
+
+/// Wall-clock milliseconds; the fixture's server shares this host's clock.
+#[cfg(feature = "kafka")]
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// Let the server's wall clock move past the last change and the next one.
+#[cfg(feature = "kafka")]
+async fn pause() -> i64 {
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let at = now_ms();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    at
+}
+
+/// A document source whose change-time column carries a watermark is an ordered event-time
+/// source keyed by `_id`: it feeds a temporal join's right side, and each trade joins the rate
+/// its key had at the trade's time, deletes included, across a restart.
+#[cfg(feature = "kafka")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart() {
+    let Some(client) = mongo(MONGO_URI).await else {
+        return;
+    };
+    let brokers = match std::env::var("LAMINAR_KAFKA_BROKERS") {
+        Ok(brokers) => brokers,
+        Err(_) => match kafka::kafka_brokers() {
+            Some(brokers) => brokers.to_owned(),
+            None => {
+                eprintln!("skipping: Redpanda not reachable");
+                return;
+            }
+        },
+    };
+    let brokers = brokers.as_str();
+    let database = unique("pricing");
+    let source_db = client.database(&database);
+    collection_with_images(&source_db, "rates").await;
+    let rates = source_db.collection::<Document>("rates");
+    let output = client.database(&database).collection::<Document>("priced");
+    let topic = unique("trades");
+    kafka::create_topic(brokers, &topic, 1).await;
+    let statements = vec![
+        format!(
+            "CREATE SOURCE rates (_id BIGINT NOT NULL, rate BIGINT, changed_at TIMESTAMP NOT NULL, \
+             PRIMARY KEY (_id), WATERMARK FOR changed_at AS changed_at - INTERVAL '1' SECOND) \
+             FROM \"mongodb-cdc\" ('connection.uri' = '{MONGO_URI}', 'database' = '{database}', \
+             'collection' = 'rates', 'output.mode' = 'document', \
+             'full.document.mode' = 'required', 'change.time.column' = 'changed_at')"
+        ),
+        format!(
+            "CREATE SOURCE trades (id BIGINT NOT NULL, key BIGINT NOT NULL, at TIMESTAMP NOT NULL, \
+             WATERMARK FOR at AS at - INTERVAL '1' SECOND) FROM KAFKA (\
+             'bootstrap.servers' = '{brokers}', 'topic' = '{topic}', 'group.id' = '{topic}', \
+             'startup.mode' = 'earliest', 'json.column.at.epoch_unit' = 'millis') FORMAT JSON"
+        ),
+        "CREATE STREAM priced AS SELECT t.id AS id, r.rate AS rate FROM trades t \
+         LEFT JOIN rates FOR SYSTEM_TIME AS OF t.at AS r ON t.key = r._id"
+            .to_string(),
+        format!(
+            "CREATE SINK priced_out FROM priced INTO \"mongodb-sink\" (\
+             'connection.uri' = '{MONGO_URI}', 'database' = '{database}', \
+             'collection' = 'priced', 'write.mode' = 'insert', 'auto.create' = 'true')"
+        ),
+    ];
+    let storage = tempfile::tempdir().unwrap();
+    let mut expected = BTreeMap::new();
+    {
+        let db = open(storage.path()).await;
+        execute_all(&db, &statements).await;
+        db.start().await.expect("start");
+        for key in 0..4_i64 {
+            rates
+                .insert_one(doc! {"_id": key, "rate": 100 + key})
+                .await
+                .unwrap();
+        }
+        let before_update = pause().await;
+        rates
+            .replace_one(doc! {"_id": 1_i64}, doc! {"rate": 500_i64})
+            .await
+            .unwrap();
+        let after_update = pause().await;
+        // A later change moves the rates' watermark past every trade.
+        rates.insert_one(doc! {"_id": 99_i64}).await.unwrap();
+        let trades: Vec<_> = (0..8)
+            .map(|id| {
+                let at = if id < 4 { before_update } else { after_update };
+                (id, id % 4, at)
+            })
+            .collect();
+        produce_trades(brokers, &topic, &trades).await;
+        for (id, key, _) in &trades {
+            let joined = if *key == 1 && *id >= 4 {
+                500
+            } else {
+                100 + key
+            };
+            expected.insert(*id, Some(joined));
+        }
+        let observed = eventually(CONVERGE, || priced(&output), |rows| rows == &expected).await;
+        assert_eq!(observed, expected, "trades before the restart");
+        assert!(db.checkpoint().await.unwrap().success);
+        db.shutdown().await.expect("shutdown");
+    }
+    // Changes while the pipeline is down are replayed from the committed resume token.
+    rates
+        .replace_one(doc! {"_id": 2_i64}, doc! {"rate": 700_i64})
+        .await
+        .unwrap();
+    rates.delete_one(doc! {"_id": 3_i64}).await.unwrap();
+    {
+        let db = reopen(storage.path(), &statements).await;
+        db.start().await.expect("restart");
+        let after_changes = pause().await;
+        rates.insert_one(doc! {"_id": 98_i64}).await.unwrap();
+        let trades: Vec<_> = (8..12).map(|id| (id, id % 4, after_changes)).collect();
+        produce_trades(brokers, &topic, &trades).await;
+        for (id, key, _) in &trades {
+            let joined = match key {
+                1 => Some(500),
+                2 => Some(700),
+                3 => None,
+                key => Some(100 + key),
+            };
+            expected.insert(*id, joined);
+        }
+        let observed = eventually(CONVERGE, || priced(&output), |rows| rows == &expected).await;
+        assert_eq!(observed, expected, "trades after the restart");
+        db.shutdown().await.expect("shutdown");
+    }
+    kafka::delete_topic(brokers, &topic).await;
 }

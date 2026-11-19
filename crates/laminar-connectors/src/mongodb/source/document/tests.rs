@@ -17,6 +17,7 @@ fn projection(fields: Vec<Field>, objectid: &[&str], json: Option<&str>) -> Docu
             .map(|c| (*c).to_string())
             .collect::<Vec<_>>(),
         json,
+        None,
     )
     .unwrap()
 }
@@ -35,6 +36,7 @@ fn build_put(
         .build(&[DocumentRow::Put {
             key: &key,
             document: &document,
+            changed_at_ms: None,
         }])
         .map(|(batch, _)| batch)
 }
@@ -200,7 +202,10 @@ fn json_column_preserves_the_whole_document_including_null_versus_missing() {
 
     let key = raw(&doc! { "_id": "a" });
     let (tombstone, mutations) = typed
-        .build(&[DocumentRow::Tombstone { key: &key }])
+        .build(&[DocumentRow::Tombstone {
+            key: &key,
+            changed_at_ms: None,
+        }])
         .unwrap();
     assert_eq!(mutations, [SourceMutation::Tombstone]);
     assert!(tombstone.column(1).is_null(0));
@@ -242,8 +247,8 @@ fn projection_validation_rejects_unsafe_declarations() {
         ),
     ];
     for (fields, primary_key, needle) in cases {
-        let error =
-            DocumentProjection::try_new(&schema(fields), &primary_key, &[], None).unwrap_err();
+        let error = DocumentProjection::try_new(&schema(fields), &primary_key, &[], None, None)
+            .unwrap_err();
         assert!(error.to_string().contains(needle), "{needle}: {error}");
     }
     let error = DocumentProjection::try_new(
@@ -251,7 +256,97 @@ fn projection_validation_rejects_unsafe_declarations() {
         &["_id".to_string()],
         &["missing".to_string()],
         None,
+        None,
     )
     .unwrap_err();
     assert!(error.to_string().contains("undeclared"), "{error}");
+}
+
+fn string_id() -> Field {
+    Field::new("_id", DataType::Utf8, false)
+}
+
+fn changed_at() -> Field {
+    Field::new(
+        "changed_at",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        false,
+    )
+}
+
+#[test]
+fn the_change_time_column_holds_each_change_time_puts_and_deletes_alike() {
+    let projection = DocumentProjection::try_new(
+        &schema(vec![
+            string_id(),
+            Field::new("rate", DataType::Int64, true),
+            changed_at(),
+        ]),
+        &["_id".to_string()],
+        &[],
+        None,
+        Some("changed_at"),
+    )
+    .unwrap();
+    let key = raw(&doc! { "_id": "a" });
+    let document = raw(&doc! { "_id": "a", "rate": 7_i64, "changed_at": "ignored" });
+    let (batch, mutations) = projection
+        .build(&[
+            DocumentRow::Put {
+                key: &key,
+                document: &document,
+                changed_at_ms: Some(1_700_000_000_123),
+            },
+            DocumentRow::Tombstone {
+                key: &key,
+                changed_at_ms: Some(1_700_000_000_456),
+            },
+        ])
+        .unwrap();
+    assert_eq!(mutations, [SourceMutation::Put, SourceMutation::Tombstone]);
+    let times = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+        .unwrap();
+    assert_eq!(times.values(), &[1_700_000_000_123, 1_700_000_000_456]);
+
+    let error = projection
+        .build(&[DocumentRow::Tombstone {
+            key: &key,
+            changed_at_ms: None,
+        }])
+        .unwrap_err();
+    assert!(error.to_string().contains("version 6.0"), "{error}");
+}
+
+#[test]
+fn the_change_time_column_must_be_a_non_key_timestamp_not_null() {
+    let nullable = Field::new(
+        "changed_at",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        true,
+    );
+    let text = Field::new("changed_at", DataType::Utf8, false);
+    for (column, primary_key) in [
+        (nullable, vec!["_id".to_string()]),
+        (text, vec!["_id".to_string()]),
+        (
+            changed_at(),
+            vec!["_id".to_string(), "changed_at".to_string()],
+        ),
+    ] {
+        let error = DocumentProjection::try_new(
+            &schema(vec![string_id(), column]),
+            &primary_key,
+            &[],
+            None,
+            Some("changed_at"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("non-key TIMESTAMP NOT NULL"),
+            "{error}"
+        );
+    }
 }

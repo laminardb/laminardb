@@ -70,6 +70,7 @@ pub(super) fn document_projection(
         &declared_primary_key(config),
         &parsed.objectid_columns,
         parsed.document_json_column.as_deref(),
+        parsed.change_time_column.as_deref(),
     )
     .map(Some)
 }
@@ -135,7 +136,8 @@ impl SourceConnector for MongoDbCdcSource {
             SourceOutputMode::History => "change-stream-history-v1",
             SourceOutputMode::Document => "change-stream-document-v1",
         };
-        Ok(Some(BTreeMap::from([
+        let change_time_column = parsed.change_time_column.take();
+        let mut identity = BTreeMap::from([
             ("collection".into(), parsed.collection),
             ("database".into(), parsed.database),
             (
@@ -151,7 +153,12 @@ impl SourceConnector for MongoDbCdcSource {
             ),
             ("pipeline".into(), pipeline),
             ("wire.protocol".into(), wire_protocol.into()),
-        ])))
+        ]);
+        // Present only when set, so sources without it keep their stored identity.
+        if let Some(column) = change_time_column {
+            identity.insert("change.time.column".into(), column);
+        }
+        Ok(Some(identity))
     }
 
     async fn resolve_schema(
@@ -375,12 +382,20 @@ impl SourceConnector for MongoDbCdcSource {
                 SourceTopology::Singleton,
                 SourceInputMode::AppendOnly,
             ),
-            SourceOutputMode::Document => SourceContract::new(
-                consistency,
-                SourceTopology::Singleton,
-                SourceInputMode::KeyedUpsert,
-            )
-            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
+            SourceOutputMode::Document => {
+                let contract = SourceContract::new(
+                    consistency,
+                    SourceTopology::Singleton,
+                    SourceInputMode::KeyedUpsert,
+                )
+                .with_row_positions(SourceRowPositionCapability::OrderedDeterministic);
+                // Every update carries its post-image, so the resume token is the whole cursor
+                // and any one node may follow the stream; the initial copy is not qualified.
+                match parsed.snapshot_mode {
+                    SnapshotMode::Never => contract.with_cluster_singleton_placement(),
+                    SnapshotMode::Initial => contract,
+                }
+            }
         })
     }
 }

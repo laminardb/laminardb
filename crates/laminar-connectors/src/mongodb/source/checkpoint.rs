@@ -238,6 +238,13 @@ pub(super) fn encode_checkpoint(
     );
     checkpoint.set_metadata(DEPLOYMENT_IDENTITY_METADATA, deployment_identity.encode());
     checkpoint.set_metadata(STREAM_IDENTITY_METADATA, mongodb_stream_identity(config));
+    // Document rows are positioned under the collection incarnation, the one input channel a
+    // watermark on them follows.
+    if config.output_mode == SourceOutputMode::Document {
+        checkpoint
+            .set_input_channels(vec![collection_uuid.as_bytes().to_vec()])
+            .expect("one channel is a valid inventory");
+    }
     checkpoint
 }
 
