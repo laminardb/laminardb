@@ -357,7 +357,8 @@ pub trait SourceConnector: Send {
         ))
     }
 
-    /// Arrow schema of records this source produces.
+    /// Arrow schema of records this source produces. An empty schema before `start` means the
+    /// connector learns it only from its configuration when it starts.
     fn schema(&self) -> SchemaRef;
 
     /// Returned checkpoint must contain enough info to resume from the

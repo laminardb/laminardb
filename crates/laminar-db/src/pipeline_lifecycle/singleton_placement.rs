@@ -206,6 +206,11 @@ impl SingletonPlacement {
                     )?)
                     .await?;
                 self.open = true;
+                tracing::info!(
+                    source = %String::from_utf8_lossy(&self.channel),
+                    assignment = self.reconciled,
+                    "placed singleton source opened on this node"
+                );
                 if let Some(admitted) = &self.admitted {
                     if self.inner.schema() != *admitted {
                         let error = ConnectorError::SchemaMismatch(
@@ -222,6 +227,11 @@ impl SingletonPlacement {
                     .await?;
                 self.inner.close().await?;
                 self.open = false;
+                tracing::info!(
+                    source = %String::from_utf8_lossy(&self.channel),
+                    assignment = self.reconciled,
+                    "placed singleton source handed off from this node"
+                );
             }
         }
         Ok(())
