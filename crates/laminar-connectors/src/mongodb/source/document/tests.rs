@@ -322,11 +322,7 @@ fn the_change_time_column_holds_each_change_time_puts_and_deletes_alike() {
 
 #[test]
 fn the_change_time_column_must_be_a_non_key_timestamp_not_null() {
-    let nullable = Field::new(
-        "changed_at",
-        DataType::Timestamp(TimeUnit::Millisecond, None),
-        true,
-    );
+    let nullable = changed_at().with_nullable(true);
     let text = Field::new("changed_at", DataType::Utf8, false);
     for (column, primary_key) in [
         (nullable, vec!["_id".to_string()]),

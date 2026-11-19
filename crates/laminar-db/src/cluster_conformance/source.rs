@@ -185,7 +185,7 @@ pub(super) fn register(
                     {
                         return Ok(Box::new(QueueSource {
                             queue: Arc::clone(queue),
-                            name: source.name,
+                            channel: format!("{}@incarnation-1", source.name).into_bytes(),
                             schema: source.schema(),
                             commit,
                             rows,
@@ -218,7 +218,8 @@ pub(super) fn register(
 /// A queue reader: its cursor names the reader and the last delivery it handed over.
 struct QueueSource {
     queue: Arc<Mutex<Queue>>,
-    name: &'static str,
+    /// The queue's own channel identity, which differs from its catalog name.
+    channel: Vec<u8>,
     schema: SchemaRef,
     commit: QueueCommit,
     rows: QueueRows,
@@ -288,7 +289,7 @@ impl SourceConnector for QueueSource {
         let records = queue.batches[batch].clone();
         let batch = match self.rows {
             QueueRows::Append => SourceBatch::new(records),
-            QueueRows::KeyedUpsert => keyed_upserts(&self.incarnation(), batch, records)?,
+            QueueRows::KeyedUpsert => keyed_upserts(&self.channel, batch, records)?,
         };
         // A unit of work binds its own cursor, so that only a barrier capture seals it.
         Ok(Some(match self.commit {
@@ -346,10 +347,6 @@ impl SourceConnector for QueueSource {
 }
 
 impl QueueSource {
-    fn incarnation(&self) -> Vec<u8> {
-        format!("{}@incarnation-1", self.name).into_bytes()
-    }
-
     fn cursor(&self) -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
         if let Some(consumer) = self.consumer {
@@ -358,7 +355,7 @@ impl QueueSource {
         }
         if self.rows == QueueRows::KeyedUpsert {
             checkpoint
-                .set_input_channels(vec![self.incarnation()])
+                .set_input_channels(vec![self.channel.clone()])
                 .expect("one channel is a valid inventory");
         }
         checkpoint
@@ -372,14 +369,7 @@ fn keyed_upserts(
     index: usize,
     records: RecordBatch,
 ) -> Result<SourceBatch, ConnectorError> {
-    let rows = u32::try_from(records.num_rows())
-        .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
-    let order = (index as u64).to_be_bytes();
-    let positions = SourceRowPositions::try_new(
-        BinaryArray::from_vec(vec![channel; rows as usize]),
-        BinaryArray::from_vec(vec![order.as_slice(); rows as usize]),
-        UInt32Array::from((0..rows).collect::<Vec<_>>()),
-    )?;
+    let positions = batch_positions(channel, index, records.num_rows())?;
     let values = records
         .column_by_name("v")
         .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
@@ -392,6 +382,22 @@ fn keyed_upserts(
         })
         .collect();
     SourceBatch::positioned(records, positions)?.with_mutations(mutations)
+}
+
+/// Every row of batch `index` on `channel`, ordered by the batch index and then the row.
+fn batch_positions(
+    channel: &[u8],
+    index: usize,
+    rows: usize,
+) -> Result<SourceRowPositions, ConnectorError> {
+    let row_count = u32::try_from(rows)
+        .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
+    let order = (index as u64).to_be_bytes();
+    SourceRowPositions::try_new(
+        BinaryArray::from_vec(vec![channel; rows]),
+        BinaryArray::from_vec(vec![order.as_slice(); rows]),
+        UInt32Array::from((0..row_count).collect::<Vec<_>>()),
+    )
 }
 
 struct PartitionedSource {
@@ -457,15 +463,7 @@ impl SourceConnector for PartitionedSource {
             let Some(records) = self.partitions[partition].get(cursor).cloned() else {
                 continue;
             };
-            let rows = u32::try_from(records.num_rows())
-                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
-            let channel = channel(partition);
-            let key = (cursor as u64).to_be_bytes();
-            let positions = SourceRowPositions::try_new(
-                BinaryArray::from_vec(vec![channel.as_slice(); rows as usize]),
-                BinaryArray::from_vec(vec![key.as_slice(); rows as usize]),
-                UInt32Array::from((0..rows).collect::<Vec<_>>()),
-            )?;
+            let positions = batch_positions(&channel(partition), cursor, records.num_rows())?;
             self.cursors[partition] = cursor + 1;
             self.next = (slot + 1) % self.owned.len();
             self.polled.fetch_add(1, Ordering::AcqRel);

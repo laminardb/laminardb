@@ -352,9 +352,9 @@ impl Case {
         let checkpoint = match dbs[0].checkpoint_with_timeout(DEADLINE).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
-                let faulted = || dbs.iter().any(|db| db.last_fault.lock().is_some());
+                let faulted = || dbs.iter().any(|db| db.last_fault().is_some());
                 let _ = wait_until(FAULT_RECORD_WAIT, faulted).await;
-                let faults: Vec<_> = dbs.iter().map(|db| db.last_fault.lock().clone()).collect();
+                let faults: Vec<_> = dbs.iter().map(|db| db.last_fault()).collect();
                 return Err(format!(
                     "{}: checkpoint on {} node(s): {error}; node faults {faults:?}",
                     self.name,

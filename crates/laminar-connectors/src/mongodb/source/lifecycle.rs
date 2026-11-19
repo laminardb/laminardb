@@ -136,7 +136,6 @@ impl SourceConnector for MongoDbCdcSource {
             SourceOutputMode::History => "change-stream-history-v1",
             SourceOutputMode::Document => "change-stream-document-v1",
         };
-        let change_time_column = parsed.change_time_column.take();
         let mut identity = BTreeMap::from([
             ("collection".into(), parsed.collection),
             ("database".into(), parsed.database),
@@ -155,7 +154,7 @@ impl SourceConnector for MongoDbCdcSource {
             ("wire.protocol".into(), wire_protocol.into()),
         ]);
         // Present only when set, so sources without it keep their stored identity.
-        if let Some(column) = change_time_column {
+        if let Some(column) = parsed.change_time_column {
             identity.insert("change.time.column".into(), column);
         }
         Ok(Some(identity))
@@ -366,36 +365,25 @@ impl SourceConnector for MongoDbCdcSource {
             SnapshotMode::Never => SourceConsistency::Replayable,
             SnapshotMode::Initial => SourceConsistency::CommitCoupled,
         };
-        Ok(match parsed.output_mode {
-            // Any one node may follow the change stream: it resumes after the committed token.
-            // The initial copy is not qualified for cluster sources.
-            SourceOutputMode::History if parsed.snapshot_mode == SnapshotMode::Never => {
-                SourceContract::new(
-                    consistency,
-                    SourceTopology::Singleton,
-                    SourceInputMode::AppendOnly,
-                )
-                .with_cluster_singleton_placement()
-            }
+        let contract = match parsed.output_mode {
             SourceOutputMode::History => SourceContract::new(
                 consistency,
                 SourceTopology::Singleton,
                 SourceInputMode::AppendOnly,
             ),
-            SourceOutputMode::Document => {
-                let contract = SourceContract::new(
-                    consistency,
-                    SourceTopology::Singleton,
-                    SourceInputMode::KeyedUpsert,
-                )
-                .with_row_positions(SourceRowPositionCapability::OrderedDeterministic);
-                // Every update carries its post-image, so the resume token is the whole cursor
-                // and any one node may follow the stream; the initial copy is not qualified.
-                match parsed.snapshot_mode {
-                    SnapshotMode::Never => contract.with_cluster_singleton_placement(),
-                    SnapshotMode::Initial => contract,
-                }
-            }
+            SourceOutputMode::Document => SourceContract::new(
+                consistency,
+                SourceTopology::Singleton,
+                SourceInputMode::KeyedUpsert,
+            )
+            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
+        };
+        // Any one node may follow the change stream: it resumes after the committed token, the
+        // whole cursor in either mode (document updates carry their post-images). The initial
+        // copy is not qualified for cluster sources.
+        Ok(match parsed.snapshot_mode {
+            SnapshotMode::Never => contract.with_cluster_singleton_placement(),
+            SnapshotMode::Initial => contract,
         })
     }
 }

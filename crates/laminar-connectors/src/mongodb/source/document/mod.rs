@@ -149,7 +149,7 @@ impl DocumentProjection {
         }
         let mut columns = Vec::with_capacity(schema.fields().len());
         let mut key_columns = Vec::with_capacity(primary_key.len());
-        let mut change_time = None;
+        let mut change_time_column_index = None;
         for (index, field) in schema.fields().iter().enumerate() {
             let name = field.name();
             if RESERVED_COLUMNS
@@ -176,7 +176,7 @@ impl DocumentProjection {
                         "change.time.column '{name}' must be a non-key TIMESTAMP NOT NULL column"
                     )));
                 }
-                change_time = Some(index);
+                change_time_column_index = Some(index);
             } else if is_key {
                 if field.is_nullable() {
                     return Err(projection_error(format!(
@@ -210,7 +210,7 @@ impl DocumentProjection {
             columns,
             key_columns,
             key_names: primary_key.iter().cloned().collect(),
-            change_time_column: change_time,
+            change_time_column: change_time_column_index,
         })
     }
 

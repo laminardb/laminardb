@@ -1068,29 +1068,16 @@ async fn a_change_stream_without_a_copy_runs_in_a_cluster_or_starts_sealed() {
 
 #[test]
 fn document_checkpoints_name_the_collection_incarnation_as_their_channel() {
-    let mut document = valid_connector_config();
-    document.set("output.mode", "document");
-    document.set("full.document.mode", "required");
     let uuid = test_collection_uuid();
     let deployment = test_deployment_identity();
     let emitted = anchor();
-    let checkpoint = encode_checkpoint(
-        &MongoDbSourceConfig::from_config(&document).unwrap(),
-        uuid,
-        &deployment,
-        &emitted,
-    );
+    let checkpoint = encode_checkpoint(&document_config(), uuid, &deployment, &emitted);
     assert_eq!(
         checkpoint.input_channels(),
         Some(&[uuid.as_bytes().to_vec()][..]),
         "a watermark on document rows follows the partition they are positioned under"
     );
-    let history = encode_checkpoint(
-        &MongoDbSourceConfig::from_config(&valid_connector_config()).unwrap(),
-        uuid,
-        &deployment,
-        &emitted,
-    );
+    let history = encode_checkpoint(&history_source().config, uuid, &deployment, &emitted);
     assert_eq!(history.input_channels(), None);
 }
 

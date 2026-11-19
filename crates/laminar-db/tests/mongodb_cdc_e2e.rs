@@ -2556,9 +2556,9 @@ fn now_ms() -> i64 {
     .unwrap()
 }
 
-/// Let the server's wall clock move past the last change and the next one.
+/// A wall-clock instant at least 1.5 s after the last change and before the next one.
 #[cfg(feature = "kafka")]
-async fn pause() -> i64 {
+async fn instant_between_changes() -> i64 {
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let at = now_ms();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -2574,22 +2574,19 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
     let Some(client) = mongo(MONGO_URI).await else {
         return;
     };
-    let brokers = match std::env::var("LAMINAR_KAFKA_BROKERS") {
-        Ok(brokers) => brokers,
-        Err(_) => match kafka::kafka_brokers() {
-            Some(brokers) => brokers.to_owned(),
-            None => {
-                eprintln!("skipping: Redpanda not reachable");
-                return;
-            }
-        },
+    let Some(brokers) = std::env::var("LAMINAR_KAFKA_BROKERS")
+        .ok()
+        .or_else(|| kafka::kafka_brokers().map(str::to_owned))
+    else {
+        eprintln!("skipping: Redpanda not reachable");
+        return;
     };
     let brokers = brokers.as_str();
     let database = unique("pricing");
     let source_db = client.database(&database);
     collection_with_images(&source_db, "rates").await;
     let rates = source_db.collection::<Document>("rates");
-    let output = client.database(&database).collection::<Document>("priced");
+    let output = source_db.collection::<Document>("priced");
     let topic = unique("trades");
     kafka::create_topic(brokers, &topic, 1).await;
     let statements = vec![
@@ -2627,12 +2624,12 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
                 .await
                 .unwrap();
         }
-        let before_update = pause().await;
+        let before_update = instant_between_changes().await;
         rates
             .replace_one(doc! {"_id": 1_i64}, doc! {"rate": 500_i64})
             .await
             .unwrap();
-        let after_update = pause().await;
+        let after_update = instant_between_changes().await;
         // A later change moves the rates' watermark past every trade.
         rates.insert_one(doc! {"_id": 99_i64}).await.unwrap();
         let trades: Vec<_> = (0..8)
@@ -2664,7 +2661,7 @@ async fn a_document_source_is_the_right_side_of_a_temporal_join_across_restart()
     {
         let db = reopen(storage.path(), &statements).await;
         db.start().await.expect("restart");
-        let after_changes = pause().await;
+        let after_changes = instant_between_changes().await;
         rates.insert_one(doc! {"_id": 98_i64}).await.unwrap();
         let trades: Vec<_> = (8..12).map(|id| (id, id % 4, after_changes)).collect();
         produce_trades(brokers, &topic, &trades).await;
