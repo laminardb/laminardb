@@ -49,12 +49,12 @@ use super::{
 };
 
 /// Passed to the nodes as a reference, because a connection URI can carry credentials.
-const SOURCE_URI: &str = "LAMINAR_SOAK_MONGODB_SOURCE_URI";
-const SOURCE_DATABASE: &str = "laminar_soak_source";
+pub(super) const SOURCE_URI: &str = "LAMINAR_SOAK_MONGODB_SOURCE_URI";
+pub(super) const SOURCE_DATABASE: &str = "laminar_soak_source";
 /// Warm-up documents take ids from here, above any id the writer reaches.
 const WARM_UP: u64 = 1 << 40;
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const WRITE_ATTEMPTS: u32 = 40;
+pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const WRITE_ATTEMPTS: u32 = 40;
 const DUPLICATE_KEY: i32 = 11_000;
 
 #[test]
@@ -207,7 +207,7 @@ async fn create_input(uri: &str, name: &str) {
 
 /// The input database, through a client owned by the calling runtime: the driver monitors the
 /// server from tasks on that runtime.
-async fn connect_database(uri: &str) -> mongodb::Database {
+pub(super) async fn connect_database(uri: &str) -> mongodb::Database {
     Client::with_uri_str(uri)
         .await
         .expect("connect to the MongoDB replica set")
@@ -215,7 +215,7 @@ async fn connect_database(uri: &str) -> mongodb::Database {
 }
 
 /// The input collection, written with the majority's acknowledgement.
-async fn connect(uri: &str, name: &str) -> Collection<Document> {
+pub(super) async fn connect(uri: &str, name: &str) -> Collection<Document> {
     connect_database(uri).await.collection_with_options(
         name,
         CollectionOptions::builder()

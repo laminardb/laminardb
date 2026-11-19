@@ -314,6 +314,22 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs mongodb mongodb-rs
             candidate: "true"
+          - label: Cluster ALO MongoDB document temporal source (gossip)
+            test: mongodb_document_source::three_node_mongodb_document_temporal_kill9_soak
+            features: cluster,aws,kafka,mongodb-cdc
+            delivery: alo
+            topology: cluster-mongodb-document-source
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # One node at a time follows the rates' change stream into a temporal join's right
+            # side; the oracle requires every Kafka trade priced with its key's rate.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs redpanda mongodb mongodb-rs
+            candidate: "true"
           - label: Cluster ALO Iceberg split source (gossip)
             test: iceberg_source::three_node_iceberg_source_kill9_soak
             features: cluster,aws,kafka,iceberg,mongodb-cdc

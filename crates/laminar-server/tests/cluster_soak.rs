@@ -112,6 +112,9 @@ mod iceberg_leg;
 #[path = "cluster_soak/iceberg_source.rs"]
 mod iceberg_source;
 #[cfg(all(feature = "kafka", feature = "mongodb-cdc"))]
+#[path = "cluster_soak/mongodb_document_source.rs"]
+mod mongodb_document_source;
+#[cfg(all(feature = "kafka", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/mongodb_source.rs"]
 mod mongodb_source;
 #[cfg(all(
