@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::{
-    BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-    UInt64Array,
+    BinaryViewArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    StringViewArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use testcontainers::runners::AsyncRunner;
@@ -525,6 +525,116 @@ async fn test_changelog_upsert_and_delete() {
     assert_eq!(rows[1].get::<_, i64>(0), 3);
 
     sink.close().await.expect("close");
+}
+
+// ── Arrow view types, which SQL string casts produce ────────────────
+
+fn view_batch(
+    schema: &SchemaRef,
+    tags: &[&str],
+    payloads: &[Option<&[u8]>],
+    weights: Option<&[i64]>,
+) -> RecordBatch {
+    let mut columns: Vec<arrow_array::ArrayRef> = vec![
+        Arc::new(StringViewArray::from(tags.to_vec())),
+        Arc::new(BinaryViewArray::from(payloads.to_vec())),
+    ];
+    if let Some(weights) = weights {
+        columns.push(Arc::new(Int64Array::from(weights.to_vec())));
+    }
+    RecordBatch::try_new(Arc::clone(schema), columns).expect("view batch")
+}
+
+async fn tagged_payloads(
+    pg: &tokio_postgres::Client,
+    table: &str,
+) -> Vec<(String, Option<Vec<u8>>)> {
+    pg.query(
+        &format!("SELECT tag, payload FROM public.{table} ORDER BY tag"),
+        &[],
+    )
+    .await
+    .expect("select view rows")
+    .iter()
+    .map(|row| (row.get(0), row.get(1)))
+    .collect()
+}
+
+/// `Utf8View` and `BinaryView` columns are written by COPY in append mode and by UNNEST, keyed on
+/// the view column, in upsert mode, deletes included.
+#[tokio::test]
+async fn test_view_typed_columns_are_written_by_copy_and_unnest() {
+    let (_container, host, port) = start_pg().await;
+    let pg = connect(&host, port).await;
+    let append_schema = Arc::new(Schema::new(vec![
+        Field::new("tag", DataType::Utf8View, false),
+        Field::new("payload", DataType::BinaryView, true),
+    ]));
+    let mut config = sink_config(&host, port, WriteMode::Append);
+    config.table_name = "view_append".into();
+    let mut sink = PostgresSink::new(Arc::clone(&append_schema), config, None);
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open append");
+    let long = "a tag longer than the twelve bytes a view keeps inline";
+    sink.write_batch(&view_batch(
+        &append_schema,
+        &["short", long],
+        &[Some(b"\x00\x01".as_slice()), None],
+        None,
+    ))
+    .await
+    .expect("write append");
+    sink.flush().await.expect("flush append");
+    sink.close().await.expect("close append");
+    assert_eq!(
+        tagged_payloads(&pg, "view_append").await,
+        [
+            (long.to_owned(), None),
+            ("short".to_owned(), Some(vec![0, 1])),
+        ]
+    );
+
+    let upsert_schema = Arc::new(Schema::new(vec![
+        Field::new("tag", DataType::Utf8View, false),
+        Field::new("payload", DataType::BinaryView, true),
+        Field::new("__weight", DataType::Int64, false),
+    ]));
+    let mut config = sink_config(&host, port, WriteMode::Upsert);
+    config.table_name = "view_upsert".into();
+    config.primary_key_columns = vec!["tag".into()];
+    config.changelog_mode = true;
+    let mut sink = PostgresSink::new(Arc::clone(&upsert_schema), config, None);
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open upsert");
+    sink.write_batch(&view_batch(
+        &upsert_schema,
+        &["kept", long],
+        &[Some(b"old".as_slice()), Some(b"gone".as_slice())],
+        Some(&[1, 1]),
+    ))
+    .await
+    .expect("write inserts");
+    sink.flush().await.expect("flush inserts");
+    sink.write_batch(&view_batch(
+        &upsert_schema,
+        &["kept", "kept", long],
+        &[
+            Some(b"old".as_slice()),
+            Some(b"new".as_slice()),
+            Some(b"gone".as_slice()),
+        ],
+        Some(&[-1, 1, -1]),
+    ))
+    .await
+    .expect("write update and delete");
+    sink.flush().await.expect("flush update and delete");
+    sink.close().await.expect("close upsert");
+    assert_eq!(
+        tagged_payloads(&pg, "view_upsert").await,
+        [("kept".to_owned(), Some(b"new".to_vec()))]
+    );
 }
 
 // ── Z-set changelog collapse (incremental MV → upsert) ──────────────

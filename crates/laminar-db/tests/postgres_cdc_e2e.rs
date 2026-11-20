@@ -768,6 +768,38 @@ async fn changelog_source_maintains_aggregates_and_filters_exactly() {
     }
 }
 
+/// A string cast types its column `Utf8View`, which a PostgreSQL sink writes as TEXT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cast_string_column_reaches_the_postgres_sink() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, g::text, g FROM generate_series(1, 50) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path()).await;
+    // Each row's label is its quantity as text, so the mirror of the cast quantities is the table.
+    execute_all(
+        &db,
+        &[
+            capture.source("orders", CHANGELOG_COLUMNS, ", 'output.mode' = 'changelog'"),
+            "CREATE STREAM qty_texts AS SELECT id, CAST(qty AS VARCHAR) AS label, qty FROM orders"
+                .to_string(),
+            capture.upsert_sink("qty_texts_sink", "qty_texts", "id"),
+        ],
+    )
+    .await;
+    db.start().await.expect("start");
+    converge_mirror(&client, &capture, "the cast column").await;
+    db.shutdown().await.expect("shutdown");
+}
+
 /// Terminate the backends `query` selects, returning how many were terminated.
 async fn terminate(client: &tokio_postgres::Client, query: &str) -> i64 {
     client
