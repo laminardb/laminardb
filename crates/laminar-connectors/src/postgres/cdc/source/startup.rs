@@ -3,6 +3,8 @@
 
 use arrow_schema::SchemaRef;
 
+use crate::connector::ProcessLeaseCheck;
+
 use super::super::config::{PostgresCdcConfig, SnapshotMode};
 use super::super::postgres_io::{
     self, in_recovery, inspect_capture_table, inspect_source, layout_fingerprint,
@@ -13,7 +15,9 @@ use super::super::schema::RelationInfo;
 use super::super::schema_resolution::{bind_layout, validate_relation};
 use super::super::typed_rows::RowLayout;
 use super::checkpoint::{validate_live_binding, Cursor, CursorPhase, SnapshotPosition};
-use super::claim::{busy, report_orphans, settle, warn_orphaning, ResumeAction, SlotClaim};
+use super::claim::{
+    busy, report_orphans, require_live, settle, warn_orphaning, ResumeAction, SlotClaim,
+};
 use super::reader::{run_wal_reader, OwnedWalPayload, WalPayloadRx, WalTerminalError};
 use super::snapshot::{copy_problem, CopyPlan};
 use super::{
@@ -67,6 +71,7 @@ pub(super) struct StartInputs<'a> {
     pub(super) primary_key: &'a [String],
     pub(super) committed_relation: Option<&'a RelationInfo>,
     pub(super) incarnation: &'a str,
+    pub(super) process_lease: Option<&'a ProcessLeaseCheck>,
 }
 
 pub(super) struct ReaderRuntime {
@@ -78,7 +83,7 @@ pub(super) struct ReaderRuntime {
     pub(super) applied_lsn: pgwire_replication::AppliedLsnHandle,
 }
 
-fn guard(
+pub(super) fn guard(
     owner: &ConnectorTaskOwner,
 ) -> Result<crate::connector::ConnectorTaskGuard, ConnectorError> {
     owner.track().ok_or_else(|| {
@@ -97,6 +102,7 @@ pub(super) async fn prepare(
     inputs: StartInputs<'_>,
     cursor: Option<Cursor>,
 ) -> Result<PreparedStart, ConnectorError> {
+    require_live(inputs.process_lease)?;
     let config = inputs.config;
     let claim = cursor.as_ref().map_or_else(
         || SlotClaim::generate(&config.slot_name),
@@ -163,6 +169,7 @@ async fn prepare_on(
                 inputs.incarnation,
                 &cursor.phase,
                 &cursor.binding,
+                inputs.process_lease,
             )
             .await?;
             let phase = resumed_phase(owner, inputs, claim, &cursor, action).await?;
@@ -264,6 +271,7 @@ async fn resumed_phase(
                     consistent_point, ..
                 } => *consistent_point,
             };
+            require_live(inputs.process_lease)?;
             let runtime = launch_reader(
                 owner,
                 Arc::clone(inputs.data_ready),

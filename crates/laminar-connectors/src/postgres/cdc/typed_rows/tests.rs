@@ -11,11 +11,15 @@ use super::*;
 fn column(name: &str, tuple_index: usize, kind: ValueKind, nullable: bool) -> BoundColumn {
     BoundColumn {
         name: name.into(),
-        tuple_index,
+        source: ColumnSource::Tuple(tuple_index),
         kind,
         nullable,
         is_key: tuple_index == 0,
     }
+}
+
+fn at(column: &BoundColumn) -> usize {
+    column.tuple_index().unwrap()
 }
 
 fn layout(columns: Vec<(BoundColumn, DataType)>, weighted: bool) -> RowLayout {
@@ -37,7 +41,14 @@ fn layout(columns: Vec<(BoundColumn, DataType)>, weighted: bool) -> RowLayout {
 fn single(kind: ValueKind, data_type: DataType, text: &str) -> Result<ArrayRef, ConnectorError> {
     let layout = layout(vec![(column("v", 0, kind, true), data_type)], false);
     let mut rows = RowBuilder::new(&layout);
-    rows.append(&layout, |_, _| Ok(Some(text.as_bytes())), false, None, 1)?;
+    rows.append(
+        &layout,
+        |_, _| Ok(Some(text.as_bytes())),
+        false,
+        None,
+        None,
+        1,
+    )?;
     Ok(Arc::clone(rows.finish(&layout)?.column(0)))
 }
 
@@ -145,28 +156,17 @@ fn nulls_key_only_rows_and_weights_are_explicit() {
     );
     let mut rows = RowBuilder::new(&layout);
     let values = [Some("7".as_bytes()), Some("seven".as_bytes())];
-    rows.append(
-        &layout,
-        |_, c| Ok(values[c.tuple_index]),
-        false,
-        Some(1),
-        10,
-    )
-    .unwrap();
-    rows.append(
-        &layout,
-        |_, c| Ok(values[c.tuple_index]),
-        true,
-        Some(-1),
-        10,
-    )
-    .unwrap();
+    rows.append(&layout, |_, c| Ok(values[at(c)]), false, Some(1), None, 10)
+        .unwrap();
+    rows.append(&layout, |_, c| Ok(values[at(c)]), true, Some(-1), None, 10)
+        .unwrap();
     let null_label = [Some("8".as_bytes()), None];
     rows.append(
         &layout,
-        |_, c| Ok(null_label[c.tuple_index]),
+        |_, c| Ok(null_label[at(c)]),
         false,
         Some(1),
+        None,
         10,
     )
     .unwrap();
@@ -187,11 +187,44 @@ fn nulls_key_only_rows_and_weights_are_explicit() {
     let error = rows
         .append(
             &layout,
-            |_, c| Ok(missing_key[c.tuple_index]),
+            |_, c| Ok(missing_key[at(c)]),
             false,
             Some(1),
+            None,
             10,
         )
         .unwrap_err();
     assert!(error.to_string().contains("declared NOT NULL"), "{error}");
+}
+
+#[test]
+fn change_time_column_is_filled_on_every_row_including_key_only_rows() {
+    let changed_at = BoundColumn {
+        name: "changed_at".into(),
+        source: ColumnSource::ChangeTime,
+        kind: ValueKind::TimestampMicros,
+        nullable: false,
+        is_key: false,
+    };
+    let layout = layout(
+        vec![
+            (column("id", 0, ValueKind::Int64, false), DataType::Int64),
+            (changed_at, DataType::Timestamp(TimeUnit::Microsecond, None)),
+        ],
+        false,
+    );
+    let mut rows = RowBuilder::new(&layout);
+    let id = [Some("7".as_bytes())];
+    rows.append(&layout, |_, c| Ok(id[at(c)]), false, None, Some(1_500), 10)
+        .unwrap();
+    rows.append(&layout, |_, c| Ok(id[at(c)]), true, None, Some(2_500), 10)
+        .unwrap();
+    let batch = rows.finish(&layout).unwrap();
+    let changed = batch.column(1).as_primitive::<TimestampMicrosecondType>();
+    assert_eq!(changed.values().as_ref(), [1_500_000, 2_500_000]);
+
+    let error = rows
+        .append(&layout, |_, c| Ok(id[at(c)]), false, None, None, 10)
+        .unwrap_err();
+    assert!(error.to_string().contains("no commit time"), "{error}");
 }

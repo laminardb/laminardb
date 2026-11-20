@@ -4,6 +4,21 @@
 
 ### Added
 
+- A PostgreSQL CDC source takes `change.time.column`: a declared, non-key `TIMESTAMP NOT NULL`
+  column that is not a table column, filled with each change's transaction commit time to the
+  millisecond, deletes included, with `snapshot.mode=never`. With a watermark on it, an `upsert`
+  source can be the right side of a temporal join in every mode; before, its deletes carried only
+  the key, so no non-null time column could hold, and the table's own timestamps kept
+  microseconds a temporal join refuses. In cluster mode an `upsert` source without the initial
+  copy runs at-least-once on one node at a time, may start sealed, and feeds a temporal join's
+  right side, or an interval join when its key holds every join column and the event time. A node
+  ends another session of its slot only once that node is fenced, and checks its own process lease
+  just before it opens a session, creates the slot or ends a session, so a node that resumes after
+  its lease expired does not take the slot back (the check is not atomic with the call, so a stall
+  between the two can still let that one call through). `SourceStart` carries the cluster
+  `ProcessLeaseCheck` (`with_process_lease`, `process_lease`, `with_position`). Changelog mode,
+  the initial copy and exactly-once stay rejected in cluster mode.
+
 - The generator source takes `splits = n`, which spreads its sequence over `n` input channels:
   row `i` is on channel `i mod n`. In cluster mode each channel is read by the node that owns the
   vnode a versioned, engine-owned route gives it, so a split generator runs on several nodes. A

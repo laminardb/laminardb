@@ -90,8 +90,10 @@ const CLAIM_ID: &str = "0123456789abcdef";
 pub(super) const CONSISTENT_POINT: Lsn = Lsn::new(0x10);
 
 pub(super) fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
-    let config = source_config(output_mode);
-    let schema = declared(output_mode);
+    streaming_source_of(source_config(output_mode), declared(output_mode))
+}
+
+fn streaming_source_of(config: PostgresCdcConfig, schema: SchemaRef) -> PostgresCdcSource {
     let layout = bind_layout(&config, &schema, &["id".into()], &capture_table()).unwrap();
     let mut source = PostgresCdcSource::new(config, None);
     source.checkpoint_binding = Some(test_binding(&source.config));
@@ -147,9 +149,14 @@ fn tuple(buf: &mut Vec<u8>, tag: u8, values: &[V<'_>]) {
 
 /// A BEGIN whose xid is the low word of `final_lsn`, so each test transaction has its own.
 pub(super) fn begin(final_lsn: u64) -> Vec<u8> {
+    begin_at(final_lsn, 0)
+}
+
+/// A BEGIN committing `commit_pg_micros` after the PostgreSQL epoch (2000-01-01).
+fn begin_at(final_lsn: u64, commit_pg_micros: i64) -> Vec<u8> {
     let mut buf = vec![b'B'];
     buf.extend_from_slice(&final_lsn.to_be_bytes());
-    buf.extend_from_slice(&0_i64.to_be_bytes());
+    buf.extend_from_slice(&commit_pg_micros.to_be_bytes());
     buf.extend_from_slice(&u32::try_from(final_lsn).unwrap().to_be_bytes());
     buf
 }
@@ -640,6 +647,73 @@ fn cursors_round_trip_every_phase_bound_to_the_exact_slot() {
     assert!(
         identity.values().all(|value| !value.contains(CLAIM_ID)),
         "a new claim never changes the recovery identity: {identity:?}"
+    );
+}
+
+/// A source whose change-time column follows each transaction's commit time.
+fn change_time_source() -> PostgresCdcSource {
+    let mut config = source_config(OutputMode::Upsert);
+    config.snapshot_mode = crate::postgres::cdc::config::SnapshotMode::Never;
+    config.change_time_column = Some("changed_at".into());
+    let mut fields = declared(OutputMode::Upsert).fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "changed_at",
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        false,
+    )));
+    streaming_source_of(config, Arc::new(Schema::new(fields)))
+}
+
+#[tokio::test]
+async fn change_time_column_carries_the_commit_time_on_puts_and_tombstones() {
+    // Unix milliseconds of the PostgreSQL epoch, 2000-01-01.
+    const PG_EPOCH_MS: i64 = 946_684_800_000;
+    let mut source = change_time_source();
+    source.enqueue_wal_data(relation_message());
+    source.enqueue_wal_data(begin_at(0x100, 1_234_567));
+    source.enqueue_wal_data(insert(&row("1", "A", "1")));
+    source.enqueue_wal_data(commit(0x100, 0x110));
+    source.enqueue_wal_data(begin_at(0x200, 9_000_999));
+    source.enqueue_wal_data(delete(b'O', &row("1", "A", "1")));
+    source.enqueue_wal_data(commit(0x200, 0x210));
+    let batch = next(&mut source, 100).await;
+    assert_eq!(ids(&batch), [1, 1]);
+    let changed_at = batch
+        .records
+        .column_by_name("changed_at")
+        .unwrap()
+        .as_primitive::<arrow_array::types::TimestampMicrosecondType>();
+    assert_eq!(
+        changed_at.null_count(),
+        0,
+        "a tombstone carries its change time"
+    );
+    assert_eq!(
+        changed_at.values().as_ref(),
+        [(PG_EPOCH_MS + 1_234) * 1_000, (PG_EPOCH_MS + 9_000) * 1_000],
+        "each row carries its transaction's commit time, truncated to the millisecond"
+    );
+    assert_eq!(
+        batch.mutations().unwrap(),
+        [SourceMutation::Put, SourceMutation::Tombstone]
+    );
+}
+
+#[test]
+fn change_time_column_enters_the_recovery_identity_only_when_set() {
+    let config = ConnectorConfig::new("postgres-cdc");
+    let plain = streaming_source(OutputMode::Upsert)
+        .recovery_identity_options(&config)
+        .unwrap()
+        .unwrap();
+    assert!(!plain.contains_key("change.time.column"));
+    let timed = change_time_source()
+        .recovery_identity_options(&config)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        timed.get("change.time.column").map(String::as_str),
+        Some("changed_at")
     );
 }
 
@@ -1241,6 +1315,28 @@ async fn close_interrupts_reader_blocked_on_full_wal_queue() {
     assert!(stopped.load(Ordering::Acquire));
     assert_eq!(source.state, ConnectorState::Closed);
     assert!(source.applied_lsn.is_none());
+}
+
+#[tokio::test]
+async fn a_closed_source_returns_to_created_keeping_what_the_engine_holds() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.relation_announced = true;
+    let metrics = Arc::clone(&source.metrics);
+    let data_ready = Arc::clone(&source.data_ready);
+    let admission = source.task_owner.admission();
+    source.close().await.unwrap();
+
+    source.reset_to_created();
+    assert_eq!(source.state, ConnectorState::Created);
+    assert!(!source.relation_announced);
+    assert!(source.claim.is_none() && source.consistent_point.is_none());
+    assert!(Arc::ptr_eq(&source.metrics, &metrics));
+    assert!(Arc::ptr_eq(&source.data_ready, &data_ready));
+    assert!(
+        admission.track().is_some(),
+        "the task generation the engine tracks stays open"
+    );
+    assert!(!source.task_tracker.is_terminated());
 }
 
 #[tokio::test]

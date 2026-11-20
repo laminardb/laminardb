@@ -1141,7 +1141,7 @@ fn a_split_iceberg_append_read_runs_in_cluster_at_least_once() {
 
 #[cfg(feature = "postgres-cdc")]
 #[test]
-fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
+fn postgres_cdc_is_admitted_at_least_once_with_checkpoints_and_in_cluster_only_streaming_upserts() {
     use super::admit_source_recovery_contract;
 
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
@@ -1157,8 +1157,13 @@ fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
         config.set(key, value);
     }
     let source = registry.create_source(&config, None).unwrap();
-    for mode in ["upsert", "changelog"] {
+    for (mode, snapshot, placed) in [
+        ("upsert", "never", true),
+        ("upsert", "initial", false),
+        ("changelog", "initial", false),
+    ] {
         config.set("output.mode", mode);
+        config.set("snapshot.mode", snapshot);
         let contract = source.contract(&config).unwrap();
         let admit = |delivery, checkpointing, runtime| {
             admit_source_recovery_contract(contract, delivery, checkpointing, runtime)
@@ -1166,20 +1171,29 @@ fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
         assert_eq!(
             admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Local),
             Ok(()),
-            "{mode}"
+            "{mode} {snapshot}"
         );
-        assert_eq!(
-            admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster),
-            Err("cluster singleton sources require a connector that one node at a time may run"),
-            "{mode}"
-        );
-        assert!(
-            admit(DeliveryGuarantee::ExactlyOnce, true, RuntimeMode::Local).is_err(),
-            "{mode}"
-        );
+        let cluster = admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster);
+        if placed {
+            assert_eq!(cluster, Ok(()), "{mode} {snapshot}");
+        } else {
+            assert_eq!(
+                cluster,
+                Err(
+                    "cluster singleton sources require a connector that one node at a time may run"
+                ),
+                "{mode} {snapshot}"
+            );
+        }
+        for runtime in [RuntimeMode::Local, RuntimeMode::Cluster] {
+            assert!(
+                admit(DeliveryGuarantee::ExactlyOnce, true, runtime).is_err(),
+                "{mode} {snapshot}"
+            );
+        }
         assert!(
             admit(DeliveryGuarantee::AtLeastOnce, false, RuntimeMode::Local).is_err(),
-            "{mode}"
+            "{mode} {snapshot}"
         );
     }
 }

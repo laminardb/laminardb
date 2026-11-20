@@ -53,6 +53,36 @@ pub enum SourcePosition {
     },
 }
 
+/// Whether this process still holds its cluster process lease.
+///
+/// A connector whose upstream allows one holder at a time (a replication slot) checks it before
+/// it opens a session or ends another holder's: a process whose lease expired has been fenced, and
+/// another node may already own the source. The check is synchronous, so it holds right after a
+/// pause.
+#[derive(Clone)]
+pub struct ProcessLeaseCheck(Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl ProcessLeaseCheck {
+    /// A lease that is live while `is_live` returns true.
+    pub fn new(is_live: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(is_live))
+    }
+
+    /// Whether the lease is still live.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for ProcessLeaseCheck {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessLeaseCheck")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Complete source startup request.
 ///
 /// Startup is intentionally a single operation so a connector cannot become
@@ -65,6 +95,8 @@ pub struct SourceStart {
     position: SourcePosition,
     /// Pipeline-wide delivery guarantee used for fail-closed cursor policy.
     delivery: DeliveryGuarantee,
+    /// The cluster process lease; `None` outside a cluster.
+    process_lease: Option<ProcessLeaseCheck>,
 }
 
 impl SourceStart {
@@ -104,7 +136,32 @@ impl SourceStart {
             config,
             position,
             delivery,
+            process_lease: None,
         })
+    }
+
+    /// Run the source under a cluster process lease.
+    #[must_use]
+    pub fn with_process_lease(mut self, lease: ProcessLeaseCheck) -> Self {
+        self.process_lease = Some(lease);
+        self
+    }
+
+    /// The same request, starting at `position` instead.
+    ///
+    /// # Errors
+    /// Returns the error [`Self::new`] returns for `position`.
+    pub fn with_position(self, position: SourcePosition) -> Result<Self, ConnectorError> {
+        let process_lease = self.process_lease;
+        let mut start = Self::new(self.config, position, self.delivery)?;
+        start.process_lease = process_lease;
+        Ok(start)
+    }
+
+    /// The cluster process lease the source runs under, if any.
+    #[must_use]
+    pub fn process_lease(&self) -> Option<&ProcessLeaseCheck> {
+        self.process_lease.as_ref()
     }
 
     /// Consume the request into connector-owned startup inputs.

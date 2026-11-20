@@ -193,18 +193,12 @@ impl SingletonPlacement {
     async fn perform(&mut self, pending: &Pending) -> Result<(), ConnectorError> {
         match pending {
             Pending::Open(position) => {
-                let (config, _, delivery) = self
+                let start = self
                     .request
                     .clone()
                     .ok_or_else(|| invalid("singleton source assigned before it started"))?
-                    .into_parts();
-                self.inner
-                    .start(SourceStart::new(
-                        config,
-                        start_position(position),
-                        delivery,
-                    )?)
-                    .await?;
+                    .with_position(start_position(position))?;
+                self.inner.start(start).await?;
                 self.open = true;
                 tracing::info!(
                     source = %String::from_utf8_lossy(&self.channel),
@@ -591,8 +585,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use laminar_connectors::connector::{
-        DeliveryGuarantee, SourceConsistency, SourceInputMode, SourceMutation, SourceRowPositions,
-        SourceTopology,
+        DeliveryGuarantee, ProcessLeaseCheck, SourceConsistency, SourceInputMode, SourceMutation,
+        SourceRowPositions, SourceTopology,
     };
     use parking_lot::Mutex;
 
@@ -641,6 +635,10 @@ mod tests {
     #[async_trait]
     impl SourceConnector for Recorder {
         async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+            assert!(
+                request.process_lease().is_some(),
+                "the wrapper hands the connector its process lease"
+            );
             let (_, start, _) = request.into_parts();
             if self.refusals > 0 {
                 self.refusals -= 1;
@@ -884,7 +882,8 @@ mod tests {
                 SourcePosition::Initial,
                 DeliveryGuarantee::AtLeastOnce,
             )
-            .unwrap();
+            .unwrap()
+            .with_process_lease(ProcessLeaseCheck::new(|| true));
             source.start(request).await.unwrap();
             Self {
                 source,
@@ -979,7 +978,8 @@ mod tests {
             resume,
             DeliveryGuarantee::AtLeastOnce,
         )
-        .unwrap();
+        .unwrap()
+        .with_process_lease(ProcessLeaseCheck::new(|| true));
         recovered.source.start(request).await.unwrap();
         recovered.publish(1, 1);
         recovered.poll().await.expect("the owner reads");

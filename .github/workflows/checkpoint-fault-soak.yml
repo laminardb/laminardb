@@ -363,6 +363,23 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs mongodb
             candidate: "true"
+          - label: Cluster ALO PostgreSQL temporal source (gossip)
+            test: postgres_source::three_node_postgres_temporal_kill9_soak
+            features: cluster,aws,kafka,postgres-cdc,postgres-sink
+            delivery: alo
+            topology: cluster-postgres-source
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # One node at a time streams the rates' slot into a temporal join's right side; a
+            # paused owner must not touch the slot once resumed, and the oracle requires every
+            # Kafka trade priced with its key's rate.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs redpanda postgres
+            candidate: "true"
           - label: Cluster ALO PostgreSQL sink (gossip)
             test: multi_writer_sinks::three_node_postgres_sink_kill9_soak
             features: cluster,aws,kafka,postgres-sink

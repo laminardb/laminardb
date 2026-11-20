@@ -25,6 +25,7 @@ pub(crate) fn append_staged(
         |index, _| Ok(row.values[index].as_deref()),
         key_only,
         weight,
+        None,
         row.bytes,
     )?;
     Ok(mutation)

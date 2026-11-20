@@ -13,7 +13,8 @@ use super::{block_on, setting, Destination, Observed, Oracle};
 
 const PASSWORD: &str = "LAMINAR_SOAK_POSTGRES_PASSWORD";
 
-pub(super) struct Postgres {
+#[derive(Clone)]
+pub(crate) struct Postgres {
     host: String,
     port: String,
     database: String,
@@ -21,7 +22,7 @@ pub(super) struct Postgres {
 }
 
 impl Postgres {
-    pub(super) fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         setting(PASSWORD, None);
         Self {
             host: setting("LAMINAR_SOAK_POSTGRES_HOST", Some("127.0.0.1")),
@@ -29,6 +30,45 @@ impl Postgres {
             database: setting("LAMINAR_SOAK_POSTGRES_DATABASE", Some("laminar")),
             username: setting("LAMINAR_SOAK_POSTGRES_USERNAME", Some("laminar")),
         }
+    }
+
+    /// The connection properties of a PostgreSQL CDC source on the soak's server.
+    #[cfg(feature = "postgres-cdc")]
+    pub(crate) fn source_properties(&self) -> String {
+        format!(
+            r#"host = "{host}"
+port = "{port}"
+database = "{database}"
+username = "{username}"
+password = "$${{{PASSWORD}}}"
+"ssl.mode" = "disable"
+"#,
+            host = self.host,
+            port = self.port,
+            database = self.database,
+            username = self.username,
+        )
+    }
+
+    /// A client of the soak's PostgreSQL server.
+    #[cfg(feature = "postgres-cdc")]
+    pub(crate) async fn client(&self) -> Client {
+        connect(&self.connection_string())
+            .await
+            .expect("connect to PostgreSQL")
+    }
+
+    /// Runs each statement on its own and ignores failures: cleanup that must not panic, even
+    /// while a failed soak unwinds.
+    pub(crate) fn execute_ignoring_errors(&self, statements: &[String]) {
+        let connection = self.connection_string();
+        block_on(async move {
+            if let Ok(client) = connect(&connection).await {
+                for statement in statements {
+                    let _ = client.batch_execute(statement).await;
+                }
+            }
+        });
     }
 
     fn connection_string(&self) -> String {
@@ -95,14 +135,7 @@ password = "$${{{PASSWORD}}}"
     }
 
     fn delete(&self, table: &str) {
-        let connection = self.connection_string();
-        block_on(async move {
-            if let Ok(client) = connect(&connection).await {
-                let _ = client
-                    .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
-                    .await;
-            }
-        });
+        self.execute_ignoring_errors(&[format!("DROP TABLE IF EXISTS {table}")]);
     }
 
     fn spawn_oracle(&self, table: &str) -> Oracle {

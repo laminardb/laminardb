@@ -26,8 +26,8 @@ pub use coordinated_commit::{
 pub use recency::{RecencyTarget, SourceRecency};
 pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
-    SourceCheckpointUnavailablePolicy, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourceDrainSettlement, SourcePosition, SourceStart,
+    ProcessLeaseCheck, SourceCheckpointUnavailablePolicy, SourceConnector, SourceDrainOutcome,
+    SourceDrainRequest, SourceDrainResolution, SourceDrainSettlement, SourcePosition, SourceStart,
 };
 pub use source_batch::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
@@ -425,6 +425,35 @@ mod tests {
         assert_eq!(config.get("endpoint"), Some("local"));
         assert!(matches!(position, SourcePosition::Initial));
         assert_eq!(delivery, DeliveryGuarantee::BestEffort);
+    }
+
+    #[test]
+    fn a_restarted_request_keeps_its_process_lease() {
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let observed = std::sync::Arc::clone(&live);
+        let request = SourceStart::new(
+            ConnectorConfig::new("test"),
+            SourcePosition::Initial,
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap()
+        .with_process_lease(ProcessLeaseCheck::new(move || {
+            observed.load(std::sync::atomic::Ordering::Acquire)
+        }));
+        let resumed = request
+            .with_position(SourcePosition::Resume {
+                attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                checkpoint: SourceCheckpoint::new(),
+            })
+            .unwrap();
+        let lease = resumed.process_lease().expect("the lease is kept");
+        assert!(lease.is_live());
+        live.store(false, std::sync::atomic::Ordering::Release);
+        assert!(!lease.is_live(), "the check reads the lease each time");
+        assert!(matches!(
+            resumed.into_parts().1,
+            SourcePosition::Resume { .. }
+        ));
     }
 
     #[test]

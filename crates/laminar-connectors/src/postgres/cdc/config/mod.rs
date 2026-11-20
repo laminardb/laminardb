@@ -34,6 +34,7 @@ const RELATION_METADATA_DIVISOR: usize = 8;
 const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "_arrow_schema",
     "_primary_key_columns",
+    "change.time.column",
     "database",
     "host",
     "laminar.source.name",
@@ -162,6 +163,10 @@ pub struct PostgresCdcConfig {
 
     /// Total connector-owned payload budget across raw WAL, decoded state, and Arrow construction.
     pub max_buffered_bytes: usize,
+
+    /// A declared non-key `TIMESTAMP NOT NULL` column that is not a table column, filled with
+    /// each row's transaction commit time to the millisecond, deletes included.
+    pub change_time_column: Option<String>,
 }
 
 impl Default for PostgresCdcConfig {
@@ -180,6 +185,7 @@ impl Default for PostgresCdcConfig {
             snapshot_mode: SnapshotMode::default(),
             output_mode: OutputMode::default(),
             max_buffered_bytes: DEFAULT_BUFFERED_BYTES,
+            change_time_column: None,
         }
     }
 }
@@ -292,6 +298,7 @@ impl PostgresCdcConfig {
         if let Some(max) = config.get_parsed::<usize>("max.buffered.bytes")? {
             cfg.max_buffered_bytes = max;
         }
+        cfg.change_time_column = config.get("change.time.column").map(String::from);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -331,6 +338,16 @@ impl PostgresCdcConfig {
             return Err(ConnectorError::ConfigurationError(
                 "table must name the one captured table as schema.table".into(),
             ));
+        }
+        if let Some(column) = &self.change_time_column {
+            crate::config::require_non_empty(column, "change.time.column")?;
+            // The copy merges streamed changes into copied rows by their values, which a
+            // per-transaction time would split.
+            if self.snapshot_mode != SnapshotMode::Never {
+                return Err(ConnectorError::ConfigurationError(
+                    "change.time.column requires snapshot.mode=never".into(),
+                ));
+            }
         }
         if self.output_mode == OutputMode::Changelog && self.snapshot_mode == SnapshotMode::Never {
             return Err(ConnectorError::ConfigurationError(

@@ -159,6 +159,21 @@ fn modes_parse_and_changelog_requires_a_snapshot() {
 }
 
 #[test]
+fn change_time_column_streams_without_a_copy() {
+    let mut config = connector_config();
+    config.set("change.time.column", "changed_at");
+    let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+    assert!(error.to_string().contains("snapshot.mode=never"), "{error}");
+
+    config.set("snapshot.mode", "never");
+    let cfg = PostgresCdcConfig::from_config(&config).unwrap();
+    assert_eq!(cfg.change_time_column.as_deref(), Some("changed_at"));
+
+    config.set("change.time.column", "");
+    assert!(PostgresCdcConfig::from_config(&config).is_err());
+}
+
+#[test]
 fn table_must_be_one_schema_qualified_name() {
     for table in ["users", ".users", "public.", "a.b.c", ""] {
         let mut config = connector_config();

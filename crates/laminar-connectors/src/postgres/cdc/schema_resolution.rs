@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
 
 use super::config::{OutputMode, PostgresCdcConfig};
-use super::postgres_io::{self, CaptureTable};
+use super::postgres_io::{self, CaptureTable, InspectedSource};
 use super::schema::RelationInfo;
-use super::typed_rows::{BoundColumn, RowLayout};
-use super::types::bind_value_kind;
+use super::typed_rows::{BoundColumn, ColumnSource, RowLayout};
+use super::types::{bind_value_kind, ValueKind};
 use crate::config::ConnectorConfig;
 use crate::connector::ConnectorTaskGuard;
 use crate::error::ConnectorError;
@@ -48,16 +48,14 @@ pub(super) async fn resolve(
 ) -> Result<SchemaBinding, ConnectorError> {
     let parsed = PostgresCdcConfig::from_config(config)?;
     let declared = declared_schema(config, explicit)?;
-    let connection = postgres_io::connect(&parsed, "laminar", guard).await?;
-    let inspected = async {
-        let source = postgres_io::inspect_source(connection.client(), &parsed, None).await?;
-        let table = postgres_io::inspect_capture_table(connection.client(), &parsed).await?;
-        Ok::<_, ConnectorError>((source, table))
-    }
-    .await;
-    connection.close().await;
-    let (source, table) = inspected?;
-    bind_layout(&parsed, &declared, &declared_primary_key(config), &table)?;
+    let (source, table) = inspect_declared_table(
+        &parsed,
+        &declared,
+        &declared_primary_key(config),
+        None,
+        guard,
+    )
+    .await?;
 
     let mut binding = logical_binding(
         config,
@@ -84,6 +82,28 @@ pub(super) async fn resolve(
         references: Vec::new(),
     });
     Ok(binding)
+}
+
+/// Connect, read the live source (with `slot`, if any) and the captured table, and bind the
+/// declared columns to the table.
+pub(super) async fn inspect_declared_table(
+    config: &PostgresCdcConfig,
+    declared: &SchemaRef,
+    primary_key: &[String],
+    slot: Option<&str>,
+    guard: ConnectorTaskGuard,
+) -> Result<(InspectedSource, CaptureTable), ConnectorError> {
+    let connection = postgres_io::connect(config, "laminar", guard).await?;
+    let inspected = async {
+        let source = postgres_io::inspect_source(connection.client(), config, slot).await?;
+        let table = postgres_io::inspect_capture_table(connection.client(), config).await?;
+        Ok::<_, ConnectorError>((source, table))
+    }
+    .await;
+    connection.close().await;
+    let (source, table) = inspected?;
+    bind_layout(config, declared, primary_key, &table)?;
+    Ok((source, table))
 }
 
 /// The relation layout persisted when the source was created, if a binding was committed.
@@ -156,6 +176,10 @@ pub(super) fn bind_layout(
     let relation = &table.relation;
     let mut columns = Vec::with_capacity(visible.len());
     for field in visible {
+        if config.change_time_column.as_deref() == Some(field.name().as_str()) {
+            columns.push(change_time_column(field, primary_key, relation)?);
+            continue;
+        }
         let tuple_index = relation
             .columns
             .iter()
@@ -179,11 +203,20 @@ pub(super) fn bind_layout(
         }
         columns.push(BoundColumn {
             name: field.name().clone(),
-            tuple_index,
+            source: ColumnSource::Tuple(tuple_index),
             kind,
             nullable: field.is_nullable(),
             is_key: primary_key.contains(field.name()),
         });
+    }
+    if let Some(column) = config
+        .change_time_column
+        .as_ref()
+        .filter(|name| !columns.iter().any(|column| &column.name == *name))
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "change.time.column names undeclared column '{column}'"
+        )));
     }
     if let Some(missing) = primary_key
         .iter()
@@ -198,6 +231,37 @@ pub(super) fn bind_layout(
         tuple_width: relation.columns.len(),
         schema: SchemaRef::clone(declared),
         weighted,
+    })
+}
+
+/// The declared change-time column: a non-key `TIMESTAMP NOT NULL` that no table column feeds.
+fn change_time_column(
+    field: &Field,
+    primary_key: &[String],
+    relation: &RelationInfo,
+) -> Result<BoundColumn, ConnectorError> {
+    let name = field.name();
+    if primary_key.contains(name)
+        || field.is_nullable()
+        || field.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None)
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "change.time.column '{name}' must be a non-key TIMESTAMP NOT NULL column"
+        )));
+    }
+    if relation.columns.iter().any(|column| column.name == *name) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "change.time.column '{name}' is a published column of PostgreSQL table {}.{}; the \
+             source fills it, so it must not name a table column",
+            relation.namespace, relation.name
+        )));
+    }
+    Ok(BoundColumn {
+        name: name.clone(),
+        source: ColumnSource::ChangeTime,
+        kind: ValueKind::TimestampMicros,
+        nullable: false,
+        is_key: false,
     })
 }
 
@@ -313,7 +377,7 @@ mod tests {
         let bound: Vec<_> = layout
             .columns
             .iter()
-            .map(|column| (column.tuple_index, column.kind, column.is_key))
+            .map(|column| (column.tuple_index().unwrap(), column.kind, column.is_key))
             .collect();
         assert_eq!(
             bound,
@@ -394,6 +458,54 @@ mod tests {
         for (fields, key, expected) in cases {
             let error = bind_layout(&config(OutputMode::Upsert), &schema(fields), &key, &table())
                 .unwrap_err();
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn change_time_column_is_filled_by_the_source_not_read_from_the_table() {
+        let mut timed = config(OutputMode::Upsert);
+        timed.change_time_column = Some("changed_at".into());
+        let id = Field::new("id", DataType::Int64, false);
+        let changed_at = |name: &str, nullable: bool| {
+            Field::new(
+                name,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                nullable,
+            )
+        };
+        let layout = bind_layout(
+            &timed,
+            &schema(vec![id.clone(), changed_at("changed_at", false)]),
+            &["id".into()],
+            &table(),
+        )
+        .unwrap();
+        assert_eq!(layout.columns[1].source, ColumnSource::ChangeTime);
+        assert!(!layout.columns[1].is_key);
+
+        let mut table_column = timed.clone();
+        table_column.change_time_column = Some("updated_at".into());
+        let cases = [
+            (
+                &timed,
+                vec![id.clone(), changed_at("changed_at", true)],
+                "TIMESTAMP NOT NULL",
+            ),
+            (
+                &timed,
+                vec![id.clone(), Field::new("changed_at", DataType::Int64, false)],
+                "TIMESTAMP NOT NULL",
+            ),
+            (&timed, vec![id.clone()], "undeclared column 'changed_at'"),
+            (
+                &table_column,
+                vec![id.clone(), changed_at("updated_at", false)],
+                "must not name a table column",
+            ),
+        ];
+        for (config, fields, expected) in cases {
+            let error = bind_layout(config, &schema(fields), &["id".into()], &table()).unwrap_err();
             assert!(error.to_string().contains(expected), "{expected}: {error}");
         }
     }
