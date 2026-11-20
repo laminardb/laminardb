@@ -58,6 +58,19 @@ password = "$${{{PASSWORD}}}"
             .expect("connect to PostgreSQL")
     }
 
+    /// Runs each statement on its own and ignores failures: cleanup that must not panic, even
+    /// while a failed soak unwinds.
+    pub(crate) fn execute_ignoring_errors(&self, statements: &[String]) {
+        let connection = self.connection_string();
+        block_on(async move {
+            if let Ok(client) = connect(&connection).await {
+                for statement in statements {
+                    let _ = client.batch_execute(statement).await;
+                }
+            }
+        });
+    }
+
     fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password={}",
@@ -122,14 +135,7 @@ password = "$${{{PASSWORD}}}"
     }
 
     fn delete(&self, table: &str) {
-        let connection = self.connection_string();
-        block_on(async move {
-            if let Ok(client) = connect(&connection).await {
-                let _ = client
-                    .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
-                    .await;
-            }
-        });
+        self.execute_ignoring_errors(&[format!("DROP TABLE IF EXISTS {table}")]);
     }
 
     fn spawn_oracle(&self, table: &str) -> Oracle {

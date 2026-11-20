@@ -244,6 +244,7 @@ impl ClaimJob {
         } else {
             SlotSnapshot::Nothing
         };
+        require_live(self.process_lease.as_ref())?;
         let created = match self.create(slot, snapshot, false).await {
             Ok(created) => created,
             Err(failure) => return Err(self.creation_error(control, slot, failure).await),

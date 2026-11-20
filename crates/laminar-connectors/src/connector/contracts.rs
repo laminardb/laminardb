@@ -298,8 +298,9 @@ impl SourceContract {
 
     /// Mark a built-in singleton connector that one cluster node at a time may run: it can be
     /// closed on one node and started with `Resume` on another, and it acknowledges upstream only
-    /// in `notify_epoch_committed`. Its positioned rows, if any, share one partition: the engine
-    /// renames it to the source's one input channel.
+    /// in `notify_epoch_committed`. A node keeps one instance, so a closed instance must start
+    /// again when the source comes back, keeping its terminal task tracker. Its positioned rows,
+    /// if any, share one partition: the engine renames it to the source's one input channel.
     #[cfg_attr(
         not(any(feature = "rabbitmq", feature = "testing", test)),
         allow(dead_code)

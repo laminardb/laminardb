@@ -84,6 +84,12 @@ fn three_node_postgres_temporal_kill9_soak() {
     };
     let (trades, output) = (format!("soak-trades-{run_id}"), postgres.name(&run_id));
     create_tables(&postgres, &capture, &output);
+    // Bound before the nodes, so it runs after they stop.
+    let _cleanup = CaptureCleanup {
+        postgres: &postgres,
+        capture: &capture,
+        output: &output,
+    };
     kafka_create_topic(&brokers, &trades, TRADE_PARTITIONS);
     let mut oracle = postgres.spawn_oracle(&output);
 
@@ -174,9 +180,6 @@ fn three_node_postgres_temporal_kill9_soak() {
          {killed_followers:?}) slots={slots:?}",
         settings.kills
     );
-    drop(nodes);
-    drop_capture(&postgres, &capture);
-    postgres.delete(&output);
 }
 
 fn workload(brokers: &str, trades: &str, capture: &Capture, source: &str, sink: &str) -> String {
@@ -244,30 +247,33 @@ fn create_tables(postgres: &Postgres, capture: &Capture, output: &str) {
     });
 }
 
-/// End every session on the run's slots, then drop them, the publication, and the table.
-fn drop_capture(postgres: &Postgres, capture: &Capture) {
-    let Capture {
-        rates,
-        publication,
-        slot,
-    } = capture;
-    block_on(async {
-        let client = postgres.client().await;
-        for name in slots_under(postgres, slot).await {
-            let _ = client
-                .batch_execute(&format!(
-                    "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
-                     WHERE slot_name = '{name}' AND active_pid IS NOT NULL; \
-                     SELECT pg_drop_replication_slot('{name}');"
-                ))
-                .await;
-        }
-        let _ = client
-            .batch_execute(&format!(
-                "DROP PUBLICATION IF EXISTS {publication}; DROP TABLE IF EXISTS {rates}"
-            ))
-            .await;
-    });
+/// Ends every session on the run's slots, then drops them, the publication and the tables, when
+/// the soak ends or fails: a slot left behind keeps its WAL.
+struct CaptureCleanup<'a> {
+    postgres: &'a Postgres,
+    capture: &'a Capture,
+    output: &'a str,
+}
+
+impl Drop for CaptureCleanup<'_> {
+    fn drop(&mut self) {
+        let Capture {
+            rates,
+            publication,
+            slot,
+        } = self.capture;
+        let slots =
+            format!("FROM pg_replication_slots WHERE starts_with(slot_name::text, '{slot}_')");
+        self.postgres.execute_ignoring_errors(&[
+            // A timeout makes the call wait until the session ended and released its slot.
+            format!(
+                "SELECT pg_terminate_backend(active_pid, 10000) {slots} AND active_pid IS NOT NULL"
+            ),
+            format!("SELECT pg_drop_replication_slot(slot_name) {slots}"),
+            format!("DROP PUBLICATION IF EXISTS {publication}"),
+            format!("DROP TABLE IF EXISTS {rates}, {}", self.output),
+        ]);
+    }
 }
 
 /// Freeze the node streaming the slot past its process lease while its session stays attached,
@@ -282,10 +288,13 @@ fn paused_owner_round(
     capture: &Capture,
     latest: DurableCheckpointStatus,
 ) -> DurableCheckpointStatus {
-    let owner = rates_streamer(nodes, live, settings);
-    let frozen = block_on(slot_session(postgres, &capture.slot))
-        .expect("the node streaming the rates holds the slot");
+    let (owner, frozen) = slot_holder(nodes, live, settings, postgres, &capture.slot);
     let paused = nodes[owner].pause();
+    assert_eq!(
+        block_on(slot_session(postgres, &capture.slot)).as_ref(),
+        Some(&frozen),
+        "the rates slot changed sessions before node {owner} was paused"
+    );
     eprintln!("soak: SIGSTOP delivered to node {owner}, which streams the rates slot");
     let survived = wait_for_converged_durable_checkpoint(
         nodes,
@@ -323,21 +332,28 @@ fn paused_owner_round(
     )
 }
 
-/// The node streaming the slot: the one node whose received-event count grows while the
-/// heartbeat changes the table.
-fn rates_streamer(nodes: &mut [Node], live: &mut dyn FnMut(), settings: &SoakSettings) -> usize {
+/// The node streaming the slot and its session: the one node whose received-event count grows
+/// while the heartbeat changes the table, over a window in which the slot keeps one session.
+fn slot_holder(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    settings: &SoakSettings,
+    postgres: &Postgres,
+    slot: &str,
+) -> (usize, SlotSession) {
     let received = |nodes: &[Node]| -> Vec<f64> {
         nodes
             .iter()
             .map(|node| node.metric(RATES_RECEIVED).unwrap_or(0.0))
             .collect()
     };
-    let mut streamer = None;
+    let mut holder = None;
     wait_for(
-        "one node to stream the rates slot",
+        "one node to stream the rates slot through one session",
         settings.recovery_ceiling,
         || {
             live();
+            let session = block_on(slot_session(postgres, slot));
             let before = received(nodes);
             std::thread::sleep(HEARTBEAT_EVERY * 4);
             let growing: Vec<usize> = received(nodes)
@@ -347,11 +363,18 @@ fn rates_streamer(nodes: &mut [Node], live: &mut dyn FnMut(), settings: &SoakSet
                 .filter(|(_, (after, before))| after > before)
                 .map(|(index, _)| index)
                 .collect();
-            streamer = (growing.len() == 1).then(|| growing[0]);
-            streamer.is_some()
+            holder = match (growing.as_slice(), session) {
+                ([streamer], Some(session))
+                    if block_on(slot_session(postgres, slot)).as_ref() == Some(&session) =>
+                {
+                    Some((*streamer, session))
+                }
+                _ => None,
+            };
+            holder.is_some()
         },
     );
-    streamer.expect("the streamer wait returned a node")
+    holder.expect("the holder wait returned a node")
 }
 
 /// The replication session holding the run's slot.

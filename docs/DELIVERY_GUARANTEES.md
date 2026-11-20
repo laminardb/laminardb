@@ -189,8 +189,10 @@ have opened the source.
 A PostgreSQL CDC source (`output.mode=upsert`, `snapshot.mode=never`) runs the same way, with the
 watermark on its `change.time.column` (each transaction's commit time). Its replication slot
 allows one session: a node opens the source only after a committed handoff closed the previous
-owner or recovery fenced its process, and a process whose lease expired neither connects nor ends
-another node's session.
+owner or recovery fenced its process, and a process checks its own lease just before it connects
+to the slot or ends another node's session. The check is not atomic with the call: a process that
+stalls between the two can still make that one call after its lease expired, before it exits
+fenced.
 `postgres_source::three_node_postgres_temporal_kill9_soak` (candidate) runs the MongoDB document
 soak's trade workload on a PostgreSQL rates table, into a PostgreSQL sink, through the same kills.
 One more round freezes the node streaming the slot until a survivor takes the slot over, then

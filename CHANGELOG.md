@@ -12,10 +12,12 @@
   microseconds a temporal join refuses. In cluster mode an `upsert` source without the initial
   copy runs at-least-once on one node at a time, may start sealed, and feeds a temporal join's
   right side, or an interval join when its key holds every join column and the event time. A node
-  ends another session of its slot only once that node is fenced, and a node whose process lease
-  expired never opens or ends a session. `SourceStart` carries the cluster `ProcessLeaseCheck`
-  (`with_process_lease`, `process_lease`, `with_position`). Changelog mode, the initial copy and
-  exactly-once stay rejected in cluster mode.
+  ends another session of its slot only once that node is fenced, and checks its own process lease
+  just before it opens a session, creates the slot or ends a session, so a node that resumes after
+  its lease expired does not take the slot back (the check is not atomic with the call, so a stall
+  between the two can still let that one call through). `SourceStart` carries the cluster
+  `ProcessLeaseCheck` (`with_process_lease`, `process_lease`, `with_position`). Changelog mode,
+  the initial copy and exactly-once stay rejected in cluster mode.
 
 - The generator source takes `splits = n`, which spreads its sequence over `n` input channels:
   row `i` is on channel `i mod n`. In cluster mode each channel is read by the node that owns the

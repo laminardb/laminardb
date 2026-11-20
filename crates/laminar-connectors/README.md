@@ -708,8 +708,10 @@ committed after it was copied: no gap and no overlap.
   the handoff checkpoint and the node taking it resumes there.
 - The slot allows one session at a time. A node ends a session of its own claim left by another
   node only once that node is fenced: it gave the source up at a committed handoff, or recovery
-  proved its process lease expired. A node whose process lease expired never opens a session or
-  ends one, so a paused node cannot take the slot back when it resumes.
+  proved its process lease expired. A node checks its own process lease just before it opens a
+  session, creates the slot or ends a session, so a paused node does not take the slot back when
+  it resumes. The check is not atomic with the call: a process that stalls between the two can
+  still make that one call after its lease expired, before it exits fenced.
 - In a cluster an upsert source may only be a temporal join's right side, with the watermark on
   `change.time.column`, or an interval join's input when its `PRIMARY KEY` holds every join column
   and the watermarked event-time column.

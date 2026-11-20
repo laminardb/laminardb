@@ -275,6 +275,21 @@ fn resume(config: &ConnectorConfig, checkpoint: SourceCheckpoint) -> SourceStart
     .unwrap()
 }
 
+fn initialized(config: &ConnectorConfig, checkpoint: SourceCheckpoint) -> SourceStart {
+    SourceStart::new(
+        config.clone(),
+        SourcePosition::Initialized { checkpoint },
+        DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap()
+}
+
+/// A process lease that is live for its first `checks` checks, then expired.
+fn lease_live_for(checks: u64) -> ProcessLeaseCheck {
+    let checked = AtomicU64::new(0);
+    ProcessLeaseCheck::new(move || checked.fetch_add(1, Ordering::SeqCst) < checks)
+}
+
 fn phase(cursor: &SourceCheckpoint) -> &str {
     cursor.get_metadata("phase").unwrap_or_default()
 }
@@ -411,6 +426,20 @@ async fn next_batch(source: &mut PostgresCdcSource) -> SourceBatch {
     .expect("no batch arrived")
 }
 
+/// The error that stops the source.
+async fn first_poll_error(source: &mut PostgresCdcSource) -> ConnectorError {
+    timeout(WAIT, async {
+        loop {
+            match source.poll_batch(64).await {
+                Ok(_) => sleep(Duration::from_millis(10)).await,
+                Err(error) => return error,
+            }
+        }
+    })
+    .await
+    .expect("the source must fail")
+}
+
 /// Poll until the source has left the snapshot and emitted every row up to the server's WAL end.
 async fn drain_to(source: &mut PostgresCdcSource, mirror: &mut Mirror, fixture: &Fixture) {
     let expected = table_state(fixture).await;
@@ -534,6 +563,51 @@ async fn committed_cursor_resumes_and_feedback_advances_the_slot() {
         "committed rows are not replayed"
     );
     resumed.close().await.unwrap();
+}
+
+/// A cluster placement closes the source when another node takes it over, and starts the same
+/// instance again when the source comes back: it resumes the slot at the cut it is handed.
+#[tokio::test]
+async fn a_closed_source_starts_again_at_the_cut_it_is_handed() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = started(start(&config)).await;
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
+        .await;
+    assert_eq!(delivered_until(&mut first, 1).await, [1]);
+    let handoff = first.try_checkpoint().unwrap().expect("a cursor");
+    first.notify_epoch_committed(1, &handoff).await.unwrap();
+    first.close().await.unwrap();
+
+    let mut second = started(resume(&config, handoff.clone())).await;
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (2, 'b', 2)", fixture.table))
+        .await;
+    assert_eq!(delivered_until(&mut second, 2).await, [2]);
+    let handback = second.try_checkpoint().unwrap().expect("a cursor");
+    second.notify_epoch_committed(2, &handback).await.unwrap();
+    second.close().await.unwrap();
+
+    first
+        .start(resume(&config, handback))
+        .await
+        .expect("a closed source starts again");
+    commit_until_ready(&mut first).await;
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (3, 'c', 3)", fixture.table))
+        .await;
+    assert_eq!(delivered_until(&mut first, 3).await, [3]);
+    let cursor = first.try_checkpoint().unwrap().expect("a cursor");
+    assert_eq!(slot_of(&cursor), slot_of(&handoff));
+    assert_eq!(
+        fixture.slots().await.len(),
+        1,
+        "the sessions share one slot"
+    );
+    first.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -900,16 +974,7 @@ async fn truncate_stops_intake_before_feedback() {
             t = fixture.table
         ))
         .await;
-    let error = timeout(WAIT, async {
-        loop {
-            match source.poll_batch(64).await {
-                Ok(_) => sleep(Duration::from_millis(10)).await,
-                Err(error) => return error,
-            }
-        }
-    })
-    .await
-    .expect("TRUNCATE must stop the source");
+    let error = first_poll_error(&mut source).await;
     assert!(error.to_string().contains("TRUNCATE"), "{error}");
     source.close().await.unwrap();
 }
@@ -1365,14 +1430,10 @@ async fn a_fenced_process_leaves_another_session_of_its_claim_alone() {
                 .unwrap_err()
         }
     };
-    // Live only for its first check, at the start: it expires while the start works.
-    let expiring = || {
-        let checks = AtomicU64::new(0);
-        ProcessLeaseCheck::new(move || checks.fetch_add(1, Ordering::SeqCst) == 0)
-    };
 
     refused(fenced_start(ProcessLeaseCheck::new(|| false)).await);
-    refused(fenced_start(expiring()).await);
+    // Live only for the start's first check: it expires while the start works.
+    refused(fenced_start(lease_live_for(1)).await);
     assert_eq!(
         fixture.slot(&slot).await.map(|slot| slot.1),
         Some(true),
@@ -1387,11 +1448,11 @@ async fn a_fenced_process_leaves_another_session_of_its_claim_alone() {
     })
     .await
     .expect("the owner's session ends");
-    refused(fenced_start(expiring()).await);
+    refused(fenced_start(lease_live_for(1)).await);
     // A claimed cursor adopts the slot at start and streams from it once a checkpoint commits.
     let mut adopted = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
     adopted
-        .start(resume(&config, claimed).with_process_lease(expiring()))
+        .start(resume(&config, claimed).with_process_lease(lease_live_for(1)))
         .await
         .unwrap();
     let cursor = adopted.try_checkpoint().unwrap().expect("a cursor");
@@ -1422,13 +1483,7 @@ async fn a_sealed_claim_starts_the_stream_on_the_node_that_opens_it() {
         .await
         .unwrap();
 
-    let request = SourceStart::new(
-        config.clone(),
-        SourcePosition::Initialized { checkpoint: sealed },
-        DeliveryGuarantee::AtLeastOnce,
-    )
-    .unwrap();
-    let mut source = started(request).await;
+    let mut source = started(initialized(&config, sealed)).await;
     assert_eq!(slot_of(&source.try_checkpoint().unwrap().unwrap()), slot);
     fixture
         .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
@@ -1445,6 +1500,36 @@ async fn a_sealed_claim_starts_the_stream_on_the_node_that_opens_it() {
     let initial = fixture.config(&orders_schema(), &["id"], &[]);
     let error = sealer.resolve_initial_position(&initial).await.unwrap_err();
     assert!(error.to_string().contains("snapshot.mode=never"), "{error}");
+}
+
+/// A node whose lease expires after it opened a sealed claim leaves the claim's slot uncreated.
+#[tokio::test]
+async fn a_fenced_process_does_not_create_its_sealed_slot() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let sealed = PostgresCdcSource::new(PostgresCdcConfig::default(), None)
+        .resolve_initial_position(&config)
+        .await
+        .unwrap();
+    let slot = slot_of(&sealed);
+    let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    // Live for the start and for the claim's connection, then expired.
+    source
+        .start(initialized(&config, sealed).with_process_lease(lease_live_for(2)))
+        .await
+        .unwrap();
+    let error = first_poll_error(&mut source).await;
+    assert!(
+        error.to_string().contains("process lease expired"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.slot(&slot).await,
+        None,
+        "a fenced process creates no slot"
+    );
 }
 
 #[tokio::test]

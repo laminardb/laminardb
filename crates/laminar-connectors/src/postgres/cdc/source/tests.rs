@@ -1318,6 +1318,28 @@ async fn close_interrupts_reader_blocked_on_full_wal_queue() {
 }
 
 #[tokio::test]
+async fn a_closed_source_returns_to_created_keeping_what_the_engine_holds() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.relation_announced = true;
+    let metrics = Arc::clone(&source.metrics);
+    let data_ready = Arc::clone(&source.data_ready);
+    let admission = source.task_owner.admission();
+    source.close().await.unwrap();
+
+    source.reset_to_created();
+    assert_eq!(source.state, ConnectorState::Created);
+    assert!(!source.relation_announced);
+    assert!(source.claim.is_none() && source.consistent_point.is_none());
+    assert!(Arc::ptr_eq(&source.metrics, &metrics));
+    assert!(Arc::ptr_eq(&source.data_ready, &data_ready));
+    assert!(
+        admission.track().is_some(),
+        "the task generation the engine tracks stays open"
+    );
+    assert!(!source.task_tracker.is_terminated());
+}
+
+#[tokio::test]
 async fn reader_terminal_error_fails_the_source() {
     let terminal: WalTerminalError = Arc::new(std::sync::Mutex::new(None));
     let data_ready = Notify::new();

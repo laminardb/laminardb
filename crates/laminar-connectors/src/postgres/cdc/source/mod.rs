@@ -273,6 +273,18 @@ impl PostgresCdcSource {
         }
     }
 
+    /// Return a closed source to a created one, so its next session starts from nothing the
+    /// last one decoded. The engine holds the metrics, the readiness signal and the task
+    /// generation across sessions, so those stay.
+    fn reset_to_created(&mut self) {
+        let mut created = Self::new(self.config.clone(), None);
+        std::mem::swap(&mut created.metrics, &mut self.metrics);
+        std::mem::swap(&mut created.data_ready, &mut self.data_ready);
+        std::mem::swap(&mut created.task_owner, &mut self.task_owner);
+        std::mem::swap(&mut created.task_tracker, &mut self.task_tracker);
+        *self = created;
+    }
+
     /// Returns a reference to the CDC configuration.
     #[must_use]
     pub fn config(&self) -> &PostgresCdcConfig {

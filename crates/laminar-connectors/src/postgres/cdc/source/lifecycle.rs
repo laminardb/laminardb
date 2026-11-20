@@ -279,11 +279,17 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        if self.state != ConnectorState::Created {
-            return Err(ConnectorError::InvalidState {
-                expected: ConnectorState::Created.to_string(),
-                actual: self.state.to_string(),
-            });
+        // A cluster placement closes the source when another node takes it over, and starts it
+        // again if it comes back.
+        match self.state {
+            ConnectorState::Created => {}
+            ConnectorState::Closed => self.reset_to_created(),
+            actual => {
+                return Err(ConnectorError::InvalidState {
+                    expected: "a created or closed source".into(),
+                    actual: actual.to_string(),
+                });
+            }
         }
         let process_lease = request.process_lease().cloned();
         let (config, position, _) = request.into_parts();
