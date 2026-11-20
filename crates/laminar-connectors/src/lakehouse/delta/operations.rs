@@ -521,7 +521,7 @@ impl DeltaLakeSink {
             writer = writer.with_writer_properties(props);
         }
         for batch in batches {
-            let batch = super::super::delta_io::widen_batch_millisecond_timestamps(batch)?;
+            let batch = super::super::delta_io::delta_storage_batch(batch)?;
             writer
                 .write(batch)
                 .await

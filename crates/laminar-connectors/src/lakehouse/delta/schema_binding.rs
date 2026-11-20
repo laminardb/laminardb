@@ -139,8 +139,8 @@ impl DeltaLakeSink {
             )));
         }
 
-        // INVARIANT: identity is checked in Delta storage form (ms -> us).
-        let pipeline = super::super::delta_io::widen_millisecond_timestamps(pipeline);
+        // INVARIANT: identity is checked in Delta storage form.
+        let pipeline = super::super::delta_io::delta_storage_schema(pipeline);
 
         if exact_schema_required {
             if pipeline.as_ref() != table.as_ref() {
@@ -163,7 +163,7 @@ impl DeltaLakeSink {
                     input_field.name()
                 )));
             };
-            // Only the lossless top-level ms -> us widening above is applied; any other
+            // Only the lossless top-level storage conversions above are applied; any other
             // difference (precision, timezone, nested timestamp unit) would be a lossy cast.
             if !input_field
                 .data_type()

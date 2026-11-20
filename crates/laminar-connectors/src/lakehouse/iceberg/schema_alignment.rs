@@ -724,4 +724,41 @@ mod tests {
             .to_string()
             .contains("schema changed"));
     }
+
+    #[test]
+    fn view_columns_are_copied_into_their_offset_form() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::{BinaryViewArray, StringViewArray};
+
+        let source_schema = Arc::new(Schema::new(vec![
+            field("label", DataType::Utf8View, false, 1),
+            field("payload", DataType::BinaryView, true, 2),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            field("label", DataType::Utf8, false, 1),
+            field("payload", DataType::LargeBinary, true, 2),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    "a label past the inline prefix",
+                ])) as ArrayRef,
+                Arc::new(BinaryViewArray::from(vec![Some(b"payload".as_slice())])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let aligned = SchemaAlignmentPlan::new(1, source_schema, Arc::clone(&target_schema))
+            .unwrap()
+            .align(&batch)
+            .unwrap();
+
+        assert_eq!(aligned.schema(), target_schema);
+        assert_eq!(
+            aligned.column(0).as_string::<i32>().value(0),
+            "a label past the inline prefix"
+        );
+        assert_eq!(aligned.column(1).as_binary::<i64>().value(0), b"payload");
+    }
 }

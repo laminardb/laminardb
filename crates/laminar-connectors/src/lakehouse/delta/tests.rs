@@ -809,6 +809,22 @@ fn zset_changelog(rows: &[(&str, i64, i64)]) -> RecordBatch {
     .unwrap()
 }
 
+/// The changelog with its `region` key as a view column, as a SQL string cast produces it.
+#[cfg(feature = "delta-lake")]
+fn view_regions(changelog: &RecordBatch) -> RecordBatch {
+    let region = changelog.schema().index_of("region").unwrap();
+    let mut fields = changelog.schema().fields().to_vec();
+    fields[region] = Arc::new(
+        fields[region]
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Utf8View),
+    );
+    let mut columns = changelog.columns().to_vec();
+    columns[region] = arrow_cast::cast(&columns[region], &DataType::Utf8View).unwrap();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
 /// Land one at-least-once write cut through the durable flush path.
 #[cfg(feature = "delta-lake")]
 async fn flush_batch(sink: &mut DeltaLakeSink, batch: &RecordBatch) {
@@ -941,6 +957,37 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
     sink.close().await.unwrap();
 }
 
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn upsert_keyed_on_a_view_column_merges_into_its_offset_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "view_keys");
+    let mut cfg = DeltaLakeSinkConfig::new(&path);
+    cfg.write_mode = DeltaWriteMode::Upsert;
+    cfg.merge_key_columns = vec!["region".to_string()];
+    cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
+    cfg.auto_create = true;
+    let mut sink = opened_sink(cfg, view_regions(&zset_changelog(&[])).schema()).await;
+
+    flush_batch(
+        &mut sink,
+        &view_regions(&zset_changelog(&[("east", 10, 1), ("west", 5, 1)])),
+    )
+    .await;
+    flush_batch(
+        &mut sink,
+        &view_regions(&zset_changelog(&[
+            ("east", 10, -1),
+            ("east", 30, 1),
+            ("west", 5, -1),
+        ])),
+    )
+    .await;
+
+    assert_eq!(read_regions(&path).await, vec![("east".into(), 30)]);
+    sink.close().await.unwrap();
+}
+
 // ── Coordinated-commit (designated-committer) regressions ──
 
 #[cfg(feature = "delta-lake")]
@@ -1045,6 +1092,49 @@ async fn coordinated_millisecond_timestamp_is_widened_before_materialization() {
     sink.open(&ConnectorConfig::new("delta-lake"))
         .await
         .unwrap();
+    sink.begin_epoch(1).await.unwrap();
+    sink.write_batch(&batch).await.unwrap();
+    let descriptor = sink.pre_commit(1).await.unwrap();
+
+    assert!(descriptor.is_some());
+    sink.rollback_epoch(1).await.unwrap();
+    sink.close().await.unwrap();
+}
+
+/// Exactly-once append checks the query against an existing table in Delta storage form and
+/// stages view columns (SQL string casts) in the table's offset form.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_view_columns_bind_an_existing_offset_table() {
+    use arrow_array::{BinaryViewArray, StringViewArray};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "coord_view_columns");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("label", DataType::Utf8View, false),
+        Field::new("payload", DataType::BinaryView, true),
+    ]));
+    super::super::delta_io::open_or_create_table(
+        &path,
+        std::collections::HashMap::new(),
+        Some(&schema),
+    )
+    .await
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringViewArray::from(vec![
+                "a label past the inline prefix",
+            ])),
+            Arc::new(BinaryViewArray::from(vec![Some(b"payload".as_slice())])),
+        ],
+    )
+    .unwrap();
+    let mut config = coordinated_config(&path);
+    config.auto_create = false;
+    let mut sink = opened_sink(config, schema).await;
+
     sink.begin_epoch(1).await.unwrap();
     sink.write_batch(&batch).await.unwrap();
     let descriptor = sink.pre_commit(1).await.unwrap();

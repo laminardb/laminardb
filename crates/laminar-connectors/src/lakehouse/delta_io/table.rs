@@ -45,47 +45,50 @@ pub(crate) fn validate_delta_timestamp_precision(schema: &SchemaRef) -> Result<(
     })
 }
 
-/// WHY: Delta timestamps are microsecond; values scale by `1_000` and timezone metadata is
-/// preserved. Nested timestamps are refused by [`validate_delta_timestamp_precision`].
+/// The schema Delta stores for `schema`, which is also what the kernel reads back. Top-level
+/// millisecond timestamps widen to microseconds (values scale by `1_000`, timezone kept), and
+/// view strings and binaries become their offset forms. Nested timestamps are refused by
+/// [`validate_delta_timestamp_precision`]; nested types are not rewritten.
 #[cfg(feature = "delta-lake")]
-pub(crate) fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
-    let needs_widening = schema.fields().iter().any(|field| {
-        matches!(
-            field.data_type(),
-            DataType::Timestamp(TimeUnit::Millisecond, _)
-        )
-    });
-    if !needs_widening {
+pub(crate) fn delta_storage_schema(schema: &SchemaRef) -> SchemaRef {
+    fn storage_type(data_type: &DataType) -> Option<DataType> {
+        match data_type {
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+            }
+            DataType::Utf8View => Some(DataType::Utf8),
+            DataType::BinaryView => Some(DataType::Binary),
+            _ => None,
+        }
+    }
+    if schema
+        .fields()
+        .iter()
+        .all(|field| storage_type(field.data_type()).is_none())
+    {
         return Arc::clone(schema);
     }
     let fields: Vec<_> = schema
         .fields()
         .iter()
-        .map(|field| match field.data_type() {
-            DataType::Timestamp(TimeUnit::Millisecond, tz) => Arc::new(
-                field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
-            ),
-            _ => Arc::clone(field),
+        .map(|field| match storage_type(field.data_type()) {
+            Some(data_type) => Arc::new(field.as_ref().clone().with_data_type(data_type)),
+            None => Arc::clone(field),
         })
         .collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// Casts via the kernel's own `cast_record_batch` (strict, no column
-/// addition) so schema validation is not weakened.
+/// Casts into [`delta_storage_schema`] with the kernel's own `cast_record_batch` (strict, no
+/// column addition) so schema validation is not weakened.
 #[cfg(feature = "delta-lake")]
-pub(crate) fn widen_batch_millisecond_timestamps(
-    batch: RecordBatch,
-) -> Result<RecordBatch, ConnectorError> {
-    let target = widen_millisecond_timestamps(&batch.schema());
+pub(crate) fn delta_storage_batch(batch: RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let target = delta_storage_schema(&batch.schema());
     if Arc::ptr_eq(&target, &batch.schema()) {
         return Ok(batch);
     }
     cast_record_batch(&batch, target, false, false).map_err(|error| {
-        ConnectorError::SchemaMismatch(format!("millisecond timestamp widening failed: {error}"))
+        ConnectorError::SchemaMismatch(format!("Delta storage type conversion failed: {error}"))
     })
 }
 
@@ -331,7 +334,7 @@ pub async fn open_or_create_partitioned_table(
 
     validate_delta_timestamp_precision(schema).map_err(ConnectorError::SchemaMismatch)?;
     // Convert Arrow schema to Delta Lake schema using TryIntoKernel.
-    let delta_schema: deltalake::kernel::StructType = widen_millisecond_timestamps(schema)
+    let delta_schema: deltalake::kernel::StructType = delta_storage_schema(schema)
         .as_ref()
         .try_into_kernel()
         .map_err(|e| ConnectorError::SchemaMismatch(format!("schema conversion failed: {e}")))?;
@@ -401,7 +404,7 @@ pub(crate) async fn write_batches(
 
     let batches = batches
         .into_iter()
-        .map(widen_batch_millisecond_timestamps)
+        .map(delta_storage_batch)
         .collect::<Result<Vec<_>, _>>()
         .map_err(DeltaWriteAttemptError::Local)?;
 

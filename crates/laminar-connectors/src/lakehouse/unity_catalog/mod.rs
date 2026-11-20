@@ -104,7 +104,7 @@ pub(crate) fn arrow_to_uc_columns(
             "Unity Catalog registration cannot represent the Delta schema: {reason}"
         ))
     })?;
-    let normalized = super::delta_io::widen_millisecond_timestamps(schema);
+    let normalized = super::delta_io::delta_storage_schema(schema);
     let kernel: StructType = normalized.as_ref().try_into_kernel().map_err(|error| {
         ConnectorError::SchemaMismatch(format!(
             "Unity Catalog registration cannot represent the Delta schema: {error}"
