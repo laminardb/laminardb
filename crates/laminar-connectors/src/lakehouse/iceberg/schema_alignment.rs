@@ -743,8 +743,12 @@ mod tests {
             vec![
                 Arc::new(StringViewArray::from(vec![
                     "a label past the inline prefix",
+                    "short",
                 ])) as ArrayRef,
-                Arc::new(BinaryViewArray::from(vec![Some(b"payload".as_slice())])) as ArrayRef,
+                Arc::new(BinaryViewArray::from(vec![
+                    Some(b"payload".as_slice()),
+                    None,
+                ])) as ArrayRef,
             ],
         )
         .unwrap();
@@ -755,10 +759,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(aligned.schema(), target_schema);
-        assert_eq!(
-            aligned.column(0).as_string::<i32>().value(0),
-            "a label past the inline prefix"
-        );
-        assert_eq!(aligned.column(1).as_binary::<i64>().value(0), b"payload");
+        assert_eq!(aligned.num_rows(), 2);
+        let label = aligned.column(0).as_string::<i32>();
+        assert_eq!(label.value(0), "a label past the inline prefix");
+        assert_eq!(label.value(1), "short");
+        let payload = aligned.column(1).as_binary::<i64>();
+        assert_eq!(payload.value(0), b"payload");
+        assert!(payload.is_null(1));
     }
 }
