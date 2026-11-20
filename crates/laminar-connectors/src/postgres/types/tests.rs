@@ -130,3 +130,48 @@ fn numeric_wire_keeps_zero_digit_groups_around_the_decimal_point() {
     assert_eq!(widest[..4], [10, 9, 0, 0]);
     assert_eq!(widest[4], 99);
 }
+
+#[test]
+fn view_types_map_like_their_offset_forms() {
+    for (view, offset) in [
+        (DataType::Utf8View, DataType::Utf8),
+        (DataType::BinaryView, DataType::Binary),
+    ] {
+        assert_eq!(
+            postgres_type(&view).unwrap(),
+            postgres_type(&offset).unwrap()
+        );
+    }
+}
+
+#[cfg(feature = "postgres-sink")]
+#[test]
+fn copy_encodes_view_columns() {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("tag", DataType::Utf8View, false),
+        arrow_schema::Field::new("payload", DataType::BinaryView, true),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::StringViewArray::from(vec!["a", "b"])),
+            Arc::new(arrow_array::BinaryViewArray::from(vec![
+                Some(b"\x00".as_slice()),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let normalized = postgres_copy_batch(&batch).unwrap();
+    assert_eq!(
+        normalized.schema().field(0).data_type(),
+        &DataType::Utf8View
+    );
+    assert_eq!(normalized.schema().field(1).data_type(), &DataType::Binary);
+
+    let mut encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new(normalized.schema().as_ref())
+        .expect("pgpq encodes the COPY batch's types");
+    let mut buffer = bytes::BytesMut::new();
+    encoder.write_header(&mut buffer).unwrap();
+    encoder.write_batch(&normalized, &mut buffer).unwrap();
+}

@@ -43,8 +43,12 @@ pub(super) fn postgres_type(data_type: &DataType) -> Result<PostgresType, Connec
         }
         DataType::Float32 => PostgresType::new("float4", "REAL"),
         DataType::Float64 => PostgresType::new("float8", "DOUBLE PRECISION"),
-        DataType::Utf8 | DataType::LargeUtf8 => PostgresType::new("text", "TEXT"),
-        DataType::Binary | DataType::LargeBinary => PostgresType::new("bytea", "BYTEA"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            PostgresType::new("text", "TEXT")
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+            PostgresType::new("bytea", "BYTEA")
+        }
         DataType::Date32 => PostgresType::new("date", "DATE"),
         DataType::Decimal128(_, scale) if *scale >= 0 => PostgresType {
             parameter: Some("text"),
@@ -62,8 +66,8 @@ pub(super) fn postgres_type(data_type: &DataType) -> Result<PostgresType, Connec
             return Err(ConnectorError::ConfigurationError(format!(
                 "PostgreSQL sink does not support Arrow type {unsupported:?}; supported types are \
                  Boolean, signed integers, UInt8/16/32, range-checked UInt64, Float32/64, \
-                 Utf8/LargeUtf8, Binary/LargeBinary, Date32, Decimal128 with a non-negative \
-                 scale, and second/millisecond/microsecond Timestamp"
+                 Utf8/LargeUtf8/Utf8View, Binary/LargeBinary/BinaryView, Date32, Decimal128 \
+                 with a non-negative scale, and second/millisecond/microsecond Timestamp"
             )));
         }
     };
@@ -226,6 +230,9 @@ pub(super) fn validate_postgres_array_values(
 /// `pgpq` 0.11 drops leading zero fractional groups from decimals (`1.00005` becomes `1.5`), so
 /// decimals are pre-encoded as NUMERIC wire values in a Binary column. COPY BINARY fields carry
 /// no type, so the target NUMERIC column decodes the bytes.
+///
+/// `pgpq` 0.12 encodes `Utf8View` but has no `BinaryView` encoder, so those columns are copied
+/// into `Binary`.
 #[cfg(feature = "postgres-sink")]
 pub(super) fn postgres_copy_batch(
     batch: &arrow_array::RecordBatch,
@@ -285,6 +292,15 @@ pub(super) fn postgres_copy_batch(
                 field.as_ref().clone().with_data_type(DataType::Int64),
             ));
             columns.push(Arc::new(Int64Array::from(converted)));
+            changed = true;
+        } else if field.data_type() == &DataType::BinaryView {
+            let values = arrow_cast::cast(column, &DataType::Binary).map_err(|error| {
+                ConnectorError::Internal(format!("copy BinaryView into Binary: {error}"))
+            })?;
+            fields.push(Arc::new(
+                field.as_ref().clone().with_data_type(DataType::Binary),
+            ));
+            columns.push(values);
             changed = true;
         } else {
             fields.push(field.clone());
@@ -346,10 +362,11 @@ pub(super) fn arrow_column_to_pg_array(
     array: &dyn arrow_array::Array,
 ) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, ConnectorError> {
     use arrow_array::{
-        Array as _, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        Array as _, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
+        Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
     };
 
     postgres_type(array.data_type())?;
@@ -426,7 +443,13 @@ pub(super) fn arrow_column_to_pg_array(
         DataType::LargeUtf8 => nullable!(LargeStringArray, |v: &LargeStringArray, row| v
             .value(row)
             .to_owned()),
+        DataType::Utf8View => nullable!(StringViewArray, |v: &StringViewArray, row| v
+            .value(row)
+            .to_owned()),
         DataType::Binary => nullable!(BinaryArray, |v: &BinaryArray, row| v.value(row).to_vec()),
+        DataType::BinaryView => nullable!(BinaryViewArray, |v: &BinaryViewArray, row| v
+            .value(row)
+            .to_vec()),
         DataType::LargeBinary => nullable!(LargeBinaryArray, |v: &LargeBinaryArray, row| v
             .value(row)
             .to_vec()),
