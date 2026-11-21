@@ -98,6 +98,12 @@
 
 ### Fixed
 
+- The NATS sink checks `subject.column`, `header.columns` and `dedup.id.column` at `CREATE SINK`:
+  each must name a `Utf8` or `Utf8View` query column. Before, a missing or wrongly typed column
+  passed `CREATE SINK` and faulted the pipeline at its first batch. With `FORMAT RAW`, the error notes
+  that these columns count toward its single payload column. This applies in every deployment mode
+  (#745).
+
 - The PostgreSQL sink writes `Utf8View` columns as `TEXT` and `BinaryView` columns as `BYTEA`, in
   append (COPY) and upsert (UNNEST) mode. A SQL string cast such as `CAST(x AS VARCHAR)` produces
   `Utf8View`, so a pipeline that wrote a cast string column into a PostgreSQL sink failed at
