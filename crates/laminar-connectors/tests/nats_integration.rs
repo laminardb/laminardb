@@ -278,7 +278,7 @@ async fn dedup_rejects_short_duplicate_window() {
                 ("servers", NATS_URL),
                 ("subject", "short.events"),
                 ("stream", "SHORT"),
-                ("dedup.id.column", "id"),
+                ("dedup.id.column", "name"),
                 ("format", "json"),
                 ("min.duplicate.window.ms", "60000"),
             ]),

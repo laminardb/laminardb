@@ -17,10 +17,13 @@ use lapin::BasicProperties;
 
 use super::super::config::{RabbitMqSinkConfig, Valued};
 use crate::error::ConnectorError;
+use crate::schema::require_column;
 use crate::serde::Format;
 
 /// AMQP short strings (routing keys, ids) hold at most 255 bytes.
 const SHORT_STRING_MAX: usize = 255;
+
+const PROPERTY_COLUMN: &str = "RabbitMQ property column";
 
 /// Validate that every property column exists with a representable type, and return the payload
 /// schema: the input without property columns.
@@ -29,8 +32,9 @@ pub(super) fn payload_schema(
     input: &SchemaRef,
 ) -> Result<SchemaRef, ConnectorError> {
     let text = |name: &str| {
-        require(
+        require_column(
             input,
+            PROPERTY_COLUMN,
             name,
             &[DataType::Utf8, DataType::Utf8View],
             "Utf8 or Utf8View",
@@ -46,11 +50,12 @@ pub(super) fn payload_schema(
         text(name)?;
     }
     if let Some(Valued::Column(name)) = &config.priority {
-        require(input, name, INTEGERS, "an integer")?;
+        require_column(input, PROPERTY_COLUMN, name, INTEGERS, "an integer")?;
     }
     for name in &config.header_columns {
-        require(
+        require_column(
             input,
+            PROPERTY_COLUMN,
             name,
             HEADER_TYPES,
             "Utf8, Utf8View, Binary, BinaryView, Boolean, integer, or floating point",
@@ -95,26 +100,6 @@ const HEADER_TYPES: &[DataType] = &[
     DataType::Float32,
     DataType::Float64,
 ];
-
-fn require(
-    schema: &SchemaRef,
-    name: &str,
-    allowed: &[DataType],
-    expected: &str,
-) -> Result<(), ConnectorError> {
-    let field = schema.field_with_name(name).map_err(|_| {
-        ConnectorError::SchemaMismatch(format!(
-            "RabbitMQ property column '{name}' is not in the query"
-        ))
-    })?;
-    if !allowed.contains(field.data_type()) {
-        return Err(ConnectorError::SchemaMismatch(format!(
-            "RabbitMQ property column '{name}' must be {expected}, got {}",
-            field.data_type()
-        )));
-    }
-    Ok(())
-}
 
 /// The content type a codec's output carries unless `content.type` overrides it.
 pub(super) fn default_content_type(format: Format, payload: &Schema) -> Option<&'static str> {

@@ -10,6 +10,8 @@ pub mod traits;
 pub mod types;
 
 pub(crate) mod lookup_binding;
+#[cfg(any(feature = "nats", feature = "rabbitmq", feature = "ibmmq"))]
+mod query_column;
 /// Control-plane schema capabilities and resolution policy.
 pub mod resolution;
 pub(crate) mod resolution_metrics;
@@ -34,6 +36,8 @@ pub use json::{
 pub use parquet::{
     ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig, RowGroupPredicate,
 };
+#[cfg(any(feature = "nats", feature = "rabbitmq", feature = "ibmmq"))]
+pub(crate) use query_column::require_column;
 pub(crate) use text_column::utf8_column;
 pub use traits::{
     ArrayInference, ColumnProjection, CompatibilityMode, EvolutionVerdict, FieldInferenceDetail,

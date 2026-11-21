@@ -223,6 +223,48 @@ fn dynamic_headers_are_validated_before_publish() {
 }
 
 #[test]
+fn routing_columns_are_checked_at_create_sink() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("subject", DataType::Utf8View, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let resolve = |format: &str, options: &[(&str, &str)]| {
+        let mut config = ConnectorConfig::new("nats");
+        config.set("servers", "nats://localhost:4222");
+        config.set("mode", "core");
+        config.set("subject.column", "subject");
+        config.set("format", format);
+        for (key, value) in options {
+            config.set(*key, *value);
+        }
+        schema_binding::resolve(&config, &schema).map_err(|error| error.to_string())
+    };
+
+    resolve("json", &[]).unwrap();
+    let error = resolve("json", &[("header.columns", "count")]).unwrap_err();
+    assert!(
+        error.contains("NATS header.columns 'count' must be Utf8 or Utf8View, got Int64"),
+        "{error}"
+    );
+    let jetstream_dedup = [
+        ("mode", "jetstream"),
+        ("stream", "EVENTS"),
+        ("dedup.id.column", "missing"),
+    ];
+    let error = resolve("json", &jetstream_dedup).unwrap_err();
+    assert!(
+        error.contains("NATS dedup.id.column 'missing' is not in the query"),
+        "{error}"
+    );
+    let error = resolve("raw", &[]).unwrap_err();
+    assert!(
+        error.contains("every query column into the payload"),
+        "{error}"
+    );
+    assert_eq!(error.matches("schema mismatch").count(), 1, "{error}");
+}
+
+#[test]
 fn view_text_columns_resolve_as_utf8() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("subject", DataType::Utf8View, false),

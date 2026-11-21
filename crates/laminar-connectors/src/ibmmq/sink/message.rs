@@ -13,6 +13,7 @@ use mqi::string::StrCcsidOwned;
 
 use super::super::config::{IbmMqSinkConfig, Persistence, Valued};
 use crate::error::ConnectorError;
+use crate::schema::require_column;
 use crate::serde::Format;
 
 /// One message ready for `MQPUT`.
@@ -50,33 +51,38 @@ const PROPERTY_TYPES: &[DataType] = &[
     DataType::Float64,
 ];
 
+const COLUMN: &str = "IBM MQ column";
+
 /// Validate descriptor and property columns; return the payload schema without them.
 pub(super) fn payload_schema(
     config: &IbmMqSinkConfig,
     input: &SchemaRef,
 ) -> Result<SchemaRef, ConnectorError> {
     if let Some(name) = &config.message_id_column {
-        require(
+        require_column(
             input,
+            COLUMN,
             name,
             IDENTIFIER,
             "Binary, BinaryView, Utf8, or Utf8View",
         )?;
     }
     if let Some(name) = &config.correlation_id_column {
-        require(
+        require_column(
             input,
+            COLUMN,
             name,
             IDENTIFIER,
             "Binary, BinaryView, Utf8, or Utf8View",
         )?;
     }
     if let Some(Valued::Column(name)) = &config.priority {
-        require(input, name, INTEGERS, "an integer")?;
+        require_column(input, COLUMN, name, INTEGERS, "an integer")?;
     }
     for name in &config.property_columns {
-        require(
+        require_column(
             input,
+            COLUMN,
             name,
             PROPERTY_TYPES,
             "Utf8, Utf8View, Binary, BinaryView, Boolean, integer, or floating point",
@@ -93,24 +99,6 @@ pub(super) fn payload_schema(
         payload,
         input.metadata().clone(),
     )))
-}
-
-fn require(
-    schema: &SchemaRef,
-    name: &str,
-    allowed: &[DataType],
-    expected: &str,
-) -> Result<(), ConnectorError> {
-    let field = schema.field_with_name(name).map_err(|_| {
-        ConnectorError::SchemaMismatch(format!("IBM MQ column '{name}' is not in the query"))
-    })?;
-    if !allowed.contains(field.data_type()) {
-        return Err(ConnectorError::SchemaMismatch(format!(
-            "IBM MQ column '{name}' must be {expected}, got {}",
-            field.data_type()
-        )));
-    }
-    Ok(())
 }
 
 /// The `MQMD` shared by every message of the sink.
