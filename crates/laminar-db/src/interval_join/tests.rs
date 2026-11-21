@@ -1147,6 +1147,53 @@ fn retracting_cdc_fails_before_either_side_mutates() {
 }
 
 #[test]
+fn view_operations_are_checked_like_utf8() {
+    let right = |operation: &str| {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("_op", DataType::Utf8View, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(TimestampMillisecondArray::from(vec![100])),
+                Arc::new(Float64Array::from(vec![1.0])),
+                Arc::new(StringViewArray::from(vec![operation])),
+            ],
+        )
+        .unwrap()
+    };
+    let left = || [left_batch(&["A"], &[100], &[1.0])];
+
+    let error = execute_interval_join_cycle(
+        &mut IntervalJoinState::new(),
+        &left(),
+        &[right("D")],
+        &make_config(),
+        0,
+        0,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("row 0 has _op D"), "{error}");
+    execute_interval_join_cycle(
+        &mut IntervalJoinState::new(),
+        &left(),
+        &[right("I")],
+        &make_config(),
+        0,
+        0,
+    )
+    .unwrap();
+}
+
+#[test]
 fn append_normalization_borrows_plain_batches_and_owns_only_weight_strips() {
     let config = make_config();
     let plain_input = [left_batch(&["A"], &[100], &[1.0])];

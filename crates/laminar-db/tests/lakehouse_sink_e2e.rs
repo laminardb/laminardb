@@ -1,5 +1,6 @@
 //! A string column produced by a SQL cast (`CAST(x AS VARCHAR)` types as `Utf8View`) reaches
-//! the exactly-once lakehouse sinks, which store it in their own string type.
+//! the lakehouse sinks, which store it in their own string type, and can carry a changelog's
+//! `_op`.
 #![cfg(any(feature = "delta-lake", feature = "iceberg"))]
 #![allow(clippy::disallowed_types)]
 
@@ -15,14 +16,14 @@ use laminar_db::LaminarDB;
 const ROWS: i64 = 200;
 const CONVERGE: Duration = Duration::from_secs(60);
 
-async fn open(storage: &Path) -> Arc<LaminarDB> {
+async fn open(storage: &Path, delivery: DeliveryGuarantee) -> Arc<LaminarDB> {
     LaminarDB::builder()
         .storage_dir(storage)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
             interval_ms: Some(300),
             ..Default::default()
         })
-        .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
+        .delivery_guarantee(delivery)
         .config_var("E2E_MINIO_SECRET", "minioadmin")
         .build()
         .await
@@ -30,13 +31,13 @@ async fn open(storage: &Path) -> Arc<LaminarDB> {
 }
 
 /// Runs `seq` and its text cast into `sink`, checkpointing until `read` sees every row.
-async fn write_labelled_rows<F, Fut>(sink: &str, mut read: F) -> Vec<(i64, String)>
+async fn write_labelled_rows<F, Fut>(sink: &str, read: F) -> Vec<(i64, String)>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Vec<(i64, String)>>,
 {
     let storage = tempfile::tempdir().unwrap();
-    let db = open(storage.path()).await;
+    let db = open(storage.path(), DeliveryGuarantee::ExactlyOnce).await;
     for statement in [
         format!(
             "CREATE SOURCE gen FROM GENERATOR ('splits' = '2', 'max.rows' = '{ROWS}', \
@@ -50,17 +51,29 @@ where
             .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
     db.start().await.expect("start");
-    let deadline = tokio::time::Instant::now() + CONVERGE;
-    let rows = loop {
-        let _ = db.checkpoint().await;
-        let rows = read().await;
-        if rows.len() >= usize::try_from(ROWS).unwrap() || tokio::time::Instant::now() >= deadline {
-            break rows;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    let rows = checkpoint_until(&db, read, |rows: &Vec<(i64, String)>| {
+        rows.len() >= usize::try_from(ROWS).unwrap()
+    })
+    .await;
     db.shutdown().await.expect("shutdown");
     rows
+}
+
+/// Checkpoints and reads until `done` holds, or returns the last read at the deadline.
+async fn checkpoint_until<T, F, Fut>(db: &LaminarDB, mut read: F, done: impl Fn(&T) -> bool) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    loop {
+        let _ = db.checkpoint().await;
+        let value = read().await;
+        if done(&value) || tokio::time::Instant::now() >= deadline {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 fn labelled(batches: &[RecordBatch]) -> Vec<(i64, String)> {
@@ -83,8 +96,9 @@ fn every_row() -> Vec<(i64, String)> {
     (0..ROWS).map(|seq| (seq, seq.to_string())).collect()
 }
 
+/// The result of `sql` over the Delta table at `table` as `t`; empty before the table exists.
 #[cfg(feature = "delta-lake")]
-async fn delta_rows(table: &str) -> Vec<(i64, String)> {
+async fn delta_batches(table: &str, sql: &str) -> Vec<RecordBatch> {
     if !Path::new(table).join("_delta_log").exists() {
         return Vec::new();
     }
@@ -97,14 +111,12 @@ async fn delta_rows(table: &str) -> Vec<(i64, String)> {
     )
     .await
     .unwrap();
-    let batches = ctx
-        .sql("SELECT seq, label FROM t")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    labelled(&batches)
+    ctx.sql(sql).await.unwrap().collect().await.unwrap()
+}
+
+#[cfg(feature = "delta-lake")]
+async fn delta_rows(table: &str) -> Vec<(i64, String)> {
+    labelled(&delta_batches(table, "SELECT seq, label FROM t").await)
 }
 
 #[cfg(feature = "delta-lake")]
@@ -121,6 +133,67 @@ async fn a_cast_string_column_reaches_the_delta_sink() {
     );
     let rows = write_labelled_rows(&sink, || delta_rows(&table)).await;
     assert_eq!(rows, every_row());
+}
+
+#[cfg(feature = "delta-lake")]
+async fn delta_ids(table: &str) -> Vec<i64> {
+    delta_batches(table, "SELECT id FROM t ORDER BY id")
+        .await
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Runs ten generated changes, with `_op` cast from `operation`, into the Delta upsert table at
+/// `table`, checkpointing until it holds `expected` ids.
+#[cfg(feature = "delta-lake")]
+async fn upsert_cast_changes(table: &str, operation: &str, expected: &[i64]) -> Vec<i64> {
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path(), DeliveryGuarantee::AtLeastOnce).await;
+    for statement in [
+        "CREATE SOURCE gen FROM GENERATOR ('max.rows' = '10', 'rows.per.second' = '1000')".into(),
+        format!(
+            "CREATE STREAM changes AS SELECT seq AS id, CAST({operation} AS VARCHAR) AS _op FROM gen"
+        ),
+        format!(
+            "CREATE SINK lake FROM changes INTO \"delta-lake\" ('table.path' = '{table}', \
+             'write.mode' = 'upsert', 'merge.key.columns' = 'id', 'auto.create' = 'true')"
+        ),
+    ] {
+        db.execute(&statement)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    db.start().await.expect("start");
+    let ids = checkpoint_until(&db, || delta_ids(table), |ids: &Vec<i64>| ids == expected).await;
+    db.shutdown().await.expect("shutdown");
+    ids
+}
+
+/// One pipeline writes ids 0 to 9; a second deletes the odd ones from the table.
+#[cfg(feature = "delta-lake")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cast_operation_column_upserts_and_deletes_in_delta() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = directory
+        .path()
+        .join("table")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let inserted: Vec<i64> = (0..10).collect();
+    assert_eq!(
+        upsert_cast_changes(&table, "'U'", &inserted).await,
+        inserted
+    );
+    let kept = [0, 2, 4, 6, 8];
+    let deletes = "CASE WHEN seq % 2 = 1 THEN 'D' ELSE 'U' END";
+    assert_eq!(upsert_cast_changes(&table, deletes, &kept).await, kept);
 }
 
 #[cfg(feature = "iceberg")]

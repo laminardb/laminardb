@@ -13,6 +13,7 @@ pub(crate) mod lookup_binding;
 /// Control-plane schema capabilities and resolution policy.
 pub mod resolution;
 pub(crate) mod resolution_metrics;
+mod text_column;
 
 #[cfg(any(feature = "parquet-lookup", feature = "files"))]
 pub mod parquet;
@@ -33,6 +34,7 @@ pub use json::{
 pub use parquet::{
     ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig, RowGroupPredicate,
 };
+pub(crate) use text_column::utf8_column;
 pub use traits::{
     ArrayInference, ColumnProjection, CompatibilityMode, EvolutionVerdict, FieldInferenceDetail,
     FormatDecoder, FormatEncoder, InferenceConfig, InferenceWarning, InferredSchema,

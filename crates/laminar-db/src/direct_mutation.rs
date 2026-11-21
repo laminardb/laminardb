@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use laminar_connectors::connector::{source_mutations, strip_source_row_positions, SourceMutation};
@@ -18,6 +19,26 @@ use crate::connector_manager::{SinkRegistration, StreamRegistration};
 
 /// Operation column appended to a direct mutation sink's input.
 pub(crate) const OP_COLUMN: &str = "_op";
+
+/// The first row of an `_op` column that is not an insert (`I`), or the column's type when it is
+/// not text. A stream that builds `_op` with a SQL string cast types it `Utf8View`.
+pub(crate) fn first_non_insert(
+    operations: &ArrayRef,
+) -> Result<Option<(usize, Option<&str>)>, &DataType> {
+    match operations.data_type() {
+        DataType::Utf8 => Ok(operations
+            .as_string::<i32>()
+            .iter()
+            .enumerate()
+            .find(|(_, operation)| *operation != Some("I"))),
+        DataType::Utf8View => Ok(operations
+            .as_string_view()
+            .iter()
+            .enumerate()
+            .find(|(_, operation)| *operation != Some("I"))),
+        other => Err(other),
+    }
+}
 
 /// Changelog column names a direct mutation source schema must not declare, because the sink
 /// side would interpret them as engine operations.
@@ -255,7 +276,7 @@ pub(crate) fn validate_sink_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, BinaryArray, Int64Array, UInt32Array};
+    use arrow_array::{Array, BinaryArray, Int64Array, StringViewArray, UInt32Array};
     use laminar_connectors::connector::{
         schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
         SourceBatch, SourceRowPositionCapability, SourceRowPositions,
@@ -438,5 +459,19 @@ mod tests {
         assert!(direct_sink_consumers("src", std::iter::empty(), [&sink, &query_sink]).is_none());
         let stream = stream("SELECT * FROM src");
         assert!(direct_sink_consumers("src", [&stream], [&sink]).is_none());
+    }
+
+    #[test]
+    fn first_non_insert_reads_either_string_layout() {
+        for operations in [
+            Arc::new(StringArray::from(vec!["I", "D"])) as ArrayRef,
+            Arc::new(StringViewArray::from(vec!["I", "D"])) as ArrayRef,
+        ] {
+            assert_eq!(first_non_insert(&operations), Ok(Some((1, Some("D")))));
+        }
+        let inserts: ArrayRef = Arc::new(StringViewArray::from(vec!["I", "I"]));
+        assert_eq!(first_non_insert(&inserts), Ok(None));
+        let numbers: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        assert_eq!(first_non_insert(&numbers), Err(&DataType::Int64));
     }
 }

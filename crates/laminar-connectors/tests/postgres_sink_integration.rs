@@ -481,13 +481,22 @@ async fn test_statement_timeout_is_applied_to_pool_connections() {
 
 #[tokio::test]
 async fn test_changelog_upsert_and_delete() {
+    changelog_upsert_and_delete(DataType::Utf8).await;
+}
+
+#[tokio::test]
+async fn test_changelog_view_operations_upsert_and_delete() {
+    changelog_upsert_and_delete(DataType::Utf8View).await;
+}
+
+async fn changelog_upsert_and_delete(operation_type: DataType) {
     let (_container, host, port) = start_pg().await;
 
     let changelog_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, true),
         Field::new("value", DataType::Float64, true),
-        Field::new("_op", DataType::Utf8, false),
+        Field::new("_op", operation_type.clone(), false),
     ]));
 
     let mut config = sink_config(&host, port, WriteMode::Upsert);
@@ -504,7 +513,11 @@ async fn test_changelog_upsert_and_delete() {
             Arc::new(Int64Array::from(vec![1, 2, 3, 2])),
             Arc::new(StringArray::from(vec!["alice", "bob", "carol", "bob"])),
             Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 2.0])),
-            Arc::new(StringArray::from(vec!["I", "I", "I", "D"])),
+            arrow_cast::cast(
+                &StringArray::from(vec!["I", "I", "I", "D"]),
+                &operation_type,
+            )
+            .unwrap(),
         ],
     )
     .expect("changelog batch");

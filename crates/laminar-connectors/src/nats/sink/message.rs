@@ -3,24 +3,17 @@
 //! Validation completes before a row is published so malformed batches cannot produce a partial
 //! prefix. Header-size accounting uses the exact bytes emitted by async-nats.
 
-use arrow_schema::DataType;
-
 use super::{
-    err, Array, AsArray, ConnectorError, FromStr, HeaderMap, HeaderName, HeaderValue, RecordBatch,
+    err, Array, ConnectorError, FromStr, HeaderMap, HeaderName, HeaderValue, RecordBatch,
     StringArray, SubjectSpec,
 };
 
-/// The named column as `Utf8`; a view column is copied into that form.
 pub(super) fn resolve_utf8(batch: &RecordBatch, name: &str) -> Result<StringArray, ConnectorError> {
     let col = batch
         .column_by_name(name)
         .ok_or_else(|| err(&format!("column '{name}' not in batch schema")))?;
-    if !matches!(col.data_type(), DataType::Utf8 | DataType::Utf8View) {
-        return Err(err(&format!("column '{name}' must be Utf8 or Utf8View")));
-    }
-    let strings = arrow_cast::cast(col, &DataType::Utf8)
-        .map_err(|error| err(&format!("column '{name}': {error}")))?;
-    Ok(strings.as_string::<i32>().clone())
+    crate::schema::utf8_column(col)?
+        .ok_or_else(|| err(&format!("column '{name}' must be Utf8 or Utf8View")))
 }
 
 pub(super) fn validate_non_null(

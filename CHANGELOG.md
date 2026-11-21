@@ -118,6 +118,13 @@
   Utf8View", "property column must be Utf8"), or for NATS the first batch faulted. This applies in
   every deployment mode (#741).
 
+- A changelog `_op` column that a stream builds with a SQL string cast such as `CAST(x AS VARCHAR)`,
+  which produces `Utf8View`, drives upserts and deletes in the Delta Lake, PostgreSQL and Kafka
+  upsert sinks and passes the append-only interval join's check; the AI inference operator reads a
+  `Utf8View` input column. Before, PostgreSQL refused `_op` at `CREATE SINK`, the others faulted at
+  the first batch ("_op column is not Utf8", "input column must be Utf8"). This applies in every
+  deployment mode (#746).
+
 - A pipeline over a PostgreSQL CDC or Delta Lake change data feed source with a `WATERMARK`
   faulted at the source's first batch ("ordered event-time source checkpoint omitted its
   input-channel inventory"). Their checkpoints now name the one input channel their rows use: the

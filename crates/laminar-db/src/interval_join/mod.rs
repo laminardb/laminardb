@@ -3207,20 +3207,13 @@ fn validate_normalized_join_batch(
 ) -> Result<(), DbError> {
     if execution_mode == JoinExecutionMode::AppendOnly {
         if let Ok(index) = batch.schema().index_of("_op") {
-            let operations = batch
-                .column(index)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
+            let first_change = crate::direct_mutation::first_non_insert(batch.column(index))
+                .map_err(|data_type| {
                     DbError::Pipeline(format!(
-                        "interval join ({side}): _op must be Utf8 for append-only validation"
+                        "interval join ({side}): _op must be Utf8 or Utf8View for append-only validation, got {data_type}"
                     ))
                 })?;
-            if let Some((row, operation)) = operations
-                .iter()
-                .enumerate()
-                .find(|(_, operation)| *operation != Some("I"))
-            {
+            if let Some((row, operation)) = first_change {
                 return Err(DbError::InvalidOperation(format!(
                     "interval join ({side}) accepts append-only input; row {row} has _op {}",
                     operation.unwrap_or("NULL")

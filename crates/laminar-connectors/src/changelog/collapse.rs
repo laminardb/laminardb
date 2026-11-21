@@ -196,11 +196,9 @@ fn collapse_cdc(batch: &RecordBatch, merge_key: &[String]) -> Result<RecordBatch
     let schema = batch.schema();
     let op_values = match schema.index_of("_op") {
         Ok(idx) => Some(
-            batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ConnectorError::Internal("_op column is not Utf8".into()))?,
+            crate::schema::utf8_column(batch.column(idx))?.ok_or_else(|| {
+                ConnectorError::Internal("'_op' column must be Utf8 or Utf8View".into())
+            })?,
         ),
         Err(_) => None,
     };
@@ -230,7 +228,7 @@ fn collapse_cdc(batch: &RecordBatch, merge_key: &[String]) -> Result<RecordBatch
     // image); otherwise the row is the current image for its key.
     let ops: Vec<&str> = selected
         .iter()
-        .map(|&idx| match op_values {
+        .map(|&idx| match &op_values {
             Some(values) if !values.is_null(idx) => {
                 if matches!(values.value(idx), "D" | "U-") {
                     "D"
@@ -510,6 +508,16 @@ mod tests {
         .unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(col_str(&out, "_op"), vec!["D"]);
+    }
+
+    #[test]
+    fn cdc_view_operations_collapse_like_utf8() {
+        let batch = crate::testing::with_view_column(
+            &cdc_batch(&[(1, 10.0, "I"), (1, 10.0, "D"), (2, 5.0, "I")]),
+            "_op",
+        );
+        let out = collapse_changelog(&batch, &keys(&["id"])).unwrap();
+        assert_eq!(col_str(&out, "_op"), vec!["D", "U"]);
     }
 
     #[test]

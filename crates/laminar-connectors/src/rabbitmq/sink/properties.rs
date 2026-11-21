@@ -188,20 +188,11 @@ impl<'a> BoundProperties<'a> {
             })
         };
         let text = |name: &str| -> Result<StringArray, ConnectorError> {
-            let array = column(name)?;
-            if !matches!(array.data_type(), DataType::Utf8 | DataType::Utf8View) {
-                return Err(ConnectorError::SchemaMismatch(format!(
+            let strings = crate::schema::utf8_column(column(name)?)?.ok_or_else(|| {
+                ConnectorError::SchemaMismatch(format!(
                     "RabbitMQ property column '{name}' must be Utf8 or Utf8View"
-                )));
-            }
-            let strings = arrow_cast::cast(array, &DataType::Utf8)
-                .map_err(|error| {
-                    ConnectorError::SchemaMismatch(format!(
-                        "RabbitMQ property column '{name}': {error}"
-                    ))
-                })?
-                .as_string::<i32>()
-                .clone();
+                ))
+            })?;
             short_strings(&strings, name)?;
             Ok(strings)
         };

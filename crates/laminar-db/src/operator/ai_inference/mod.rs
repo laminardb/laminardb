@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float32Builder, Float64Builder, ListBuilder, RecordBatch, StringArray,
+    Array, ArrayRef, AsArray, Float32Builder, Float64Builder, ListBuilder, RecordBatch,
     StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
@@ -260,18 +260,14 @@ impl AiInferenceOperator {
                 self.input_column
             ))
         })?;
-        let array = column
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                DbError::InvalidOperation(format!(
-                    "ai operator: input column '{}' must be Utf8",
-                    self.input_column
-                ))
-            })?;
-        Ok((0..array.len())
-            .map(|i| (!array.is_null(i)).then(|| array.value(i)))
-            .collect())
+        match column.data_type() {
+            DataType::Utf8 => Ok(column.as_string::<i32>().iter().collect()),
+            DataType::Utf8View => Ok(column.as_string_view().iter().collect()),
+            _ => Err(DbError::InvalidOperation(format!(
+                "ai operator: input column '{}' must be Utf8 or Utf8View",
+                self.input_column
+            ))),
+        }
     }
 
     fn build_output(

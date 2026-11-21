@@ -841,13 +841,9 @@ impl DeltaLakeSink {
             )
         })?;
 
-        let op_array = batch
-            .column(op_idx)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
-            })?;
+        let op_array = crate::schema::utf8_column(batch.column(op_idx))?.ok_or_else(|| {
+            ConnectorError::ConfigurationError("'_op' column must be Utf8 or Utf8View".into())
+        })?;
 
         // Build boolean masks for insert vs delete rows.
         let len = op_array.len();
