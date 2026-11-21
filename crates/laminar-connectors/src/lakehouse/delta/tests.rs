@@ -1,5 +1,4 @@
 use super::*;
-use crate::testing::with_view_column;
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
@@ -954,13 +953,13 @@ async fn upsert_keyed_on_a_view_column_merges_into_its_offset_form() {
     cfg.auto_create = true;
     let mut sink = opened_sink(
         cfg,
-        with_view_column(&zset_changelog(&[]), "region").schema(),
+        crate::testing::with_view_column(&zset_changelog(&[]), "region").schema(),
     )
     .await;
 
     flush_batch(
         &mut sink,
-        &with_view_column(
+        &crate::testing::with_view_column(
             &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
             "region",
         ),
@@ -968,7 +967,7 @@ async fn upsert_keyed_on_a_view_column_merges_into_its_offset_form() {
     .await;
     flush_batch(
         &mut sink,
-        &with_view_column(
+        &crate::testing::with_view_column(
             &zset_changelog(&[("east", 10, -1), ("east", 30, 1), ("west", 5, -1)]),
             "region",
         ),
