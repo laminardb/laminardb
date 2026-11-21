@@ -150,27 +150,17 @@ async fn delta_ids(table: &str) -> Vec<i64> {
         .collect()
 }
 
-/// The first ten rows insert ids 0 to 9; the next ten delete the odd ids through a cast `_op`.
+/// Runs ten generated changes, with `_op` cast from `operation`, into the Delta upsert table at
+/// `table`, checkpointing until it holds `expected` ids.
 #[cfg(feature = "delta-lake")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_cast_operation_column_upserts_and_deletes_in_delta() {
-    let directory = tempfile::tempdir().unwrap();
-    let table = directory
-        .path()
-        .join("table")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let db = open(
-        &directory.path().join("storage"),
-        DeliveryGuarantee::AtLeastOnce,
-    )
-    .await;
+async fn upsert_cast_changes(table: &str, operation: &str, expected: &[i64]) -> Vec<i64> {
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path(), DeliveryGuarantee::AtLeastOnce).await;
     for statement in [
-        "CREATE SOURCE gen FROM GENERATOR ('max.rows' = '20', 'rows.per.second' = '1000')".into(),
-        "CREATE STREAM changes AS SELECT seq % 10 AS id, \
-         CAST(CASE WHEN seq >= 10 AND seq % 2 = 1 THEN 'D' ELSE 'U' END AS VARCHAR) AS _op \
-         FROM gen"
-            .into(),
+        "CREATE SOURCE gen FROM GENERATOR ('max.rows' = '10', 'rows.per.second' = '1000')".into(),
+        format!(
+            "CREATE STREAM changes AS SELECT seq AS id, CAST({operation} AS VARCHAR) AS _op FROM gen"
+        ),
         format!(
             "CREATE SINK lake FROM changes INTO \"delta-lake\" ('table.path' = '{table}', \
              'write.mode' = 'upsert', 'merge.key.columns' = 'id', 'auto.create' = 'true')"
@@ -181,10 +171,29 @@ async fn a_cast_operation_column_upserts_and_deletes_in_delta() {
             .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
     db.start().await.expect("start");
-    let expected = vec![0, 2, 4, 6, 8];
-    let ids = checkpoint_until(&db, || delta_ids(&table), |ids: &Vec<i64>| *ids == expected).await;
+    let ids = checkpoint_until(&db, || delta_ids(table), |ids: &Vec<i64>| ids == expected).await;
     db.shutdown().await.expect("shutdown");
-    assert_eq!(ids, expected);
+    ids
+}
+
+/// One pipeline writes ids 0 to 9; a second deletes the odd ones from the table.
+#[cfg(feature = "delta-lake")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cast_operation_column_upserts_and_deletes_in_delta() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = directory
+        .path()
+        .join("table")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let inserted: Vec<i64> = (0..10).collect();
+    assert_eq!(
+        upsert_cast_changes(&table, "'U'", &inserted).await,
+        inserted
+    );
+    let kept = [0, 2, 4, 6, 8];
+    let deletes = "CASE WHEN seq % 2 = 1 THEN 'D' ELSE 'U' END";
+    assert_eq!(upsert_cast_changes(&table, deletes, &kept).await, kept);
 }
 
 #[cfg(feature = "iceberg")]
