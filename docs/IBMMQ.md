@@ -155,11 +155,11 @@ get MQ to convert it.
 | `persistence` | `persistent` | `MQMD` `Persistence`: `persistent`, `not-persistent`, or `as-queue-definition` |
 | `priority` or `priority.column` | queue default | `MQMD` `Priority` (0 to 9) |
 | `expiry` | unlimited | `MQMD` `Expiry` in tenths of a second |
-| `message.id.column` | new id | `MQMD` `MsgId` from a Binary or Utf8 column (at most 24 bytes, zero-padded); NULL gets a new id (`MQPMO_NEW_MSG_ID`) |
+| `message.id.column` | new id | `MQMD` `MsgId` from a Binary or Utf8 column, or its view form (at most 24 bytes, zero-padded); NULL gets a new id (`MQPMO_NEW_MSG_ID`) |
 | `correlation.id.column` | none | `MQMD` `CorrelId`, the same way |
 | `reply.to.queue`, `reply.to.queue.manager` | | `MQMD` `ReplyToQ`, `ReplyToQMgr` |
 | `message.format`, `ccsid` | `MQSTR` for text, `MQFMT_NONE` for binary; `1208` | `MQMD` `Format`, `CodedCharSetId` |
-| `property.columns` | | Columns written as typed message properties (`MQSETMP`): Utf8 as string, Binary as byte string, Boolean, Int8 to Int64, Float32/64; NULL omits the property |
+| `property.columns` | | Columns written as typed message properties (`MQSETMP`): Utf8 or Utf8View as string, Binary or BinaryView as byte string, Boolean, Int8 to Int64, Float32/64; NULL omits the property |
 | `max.uow.messages` | `1000` | Messages per committed unit of work |
 
 The sink sets no context: the queue manager records the connector's own user and application.

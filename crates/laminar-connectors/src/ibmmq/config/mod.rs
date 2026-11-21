@@ -267,9 +267,10 @@ pub struct IbmMqSinkConfig {
     pub priority: Option<Valued<i32>>,
     /// `MQMD` `Expiry` in tenths of a second.
     pub expiry: Option<i32>,
-    /// Column providing `MsgId` (Binary or Utf8, at most 24 bytes); otherwise a new id.
+    /// Column providing `MsgId` (Binary, Utf8 or their view forms, at most 24 bytes); otherwise a
+    /// new id.
     pub message_id_column: Option<String>,
-    /// Column providing `CorrelId` (Binary or Utf8, at most 24 bytes).
+    /// Column providing `CorrelId` (Binary, Utf8 or their view forms, at most 24 bytes).
     pub correlation_id_column: Option<String>,
     /// `MQMD` `ReplyToQ`.
     pub reply_to_queue: Option<String>,

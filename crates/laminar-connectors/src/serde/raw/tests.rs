@@ -1,5 +1,5 @@
 use super::*;
-use arrow_array::{Array, BinaryArray, StringArray};
+use arrow_array::{Array, BinaryArray, BinaryViewArray, StringArray, StringViewArray};
 
 fn binary_schema(data_type: DataType) -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("value", data_type, false)]))
@@ -48,6 +48,26 @@ fn utf8_value_still_rejects_invalid_text_and_protocol_selection_is_declared() {
         Field::new("other", DataType::Binary, false),
     ]));
     assert_eq!(raw_protocol_for(Some(&two)), raw_schema());
+}
+
+#[test]
+fn serializer_emits_view_columns() {
+    let text = "a value past the inline prefix";
+    for column in [
+        Arc::new(StringViewArray::from(vec![Some(text), None])) as ArrayRef,
+        Arc::new(BinaryViewArray::from(vec![Some(text.as_bytes()), None])) as ArrayRef,
+    ] {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        assert_eq!(
+            RawBytesSerializer::new().serialize(&batch).unwrap(),
+            vec![text.as_bytes().to_vec(), Vec::new()]
+        );
+    }
 }
 
 #[test]

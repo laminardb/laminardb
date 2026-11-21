@@ -119,15 +119,15 @@ can carry one binary or text column alongside them.
 | connection options | | As for the source; the default connection name is `laminardb-rabbitmq-sink` |
 | `exchange` | `""` (default exchange) | Target exchange; checked with a passive declare at open |
 | `exchange.declare`, `exchange.type`, `exchange.durable` | `false`, , `true` | Idempotent `exchange.declare` |
-| `routing.key` or `routing.key.column` | one is required | Publish routing key (Utf8 column, at most 255 bytes, no NULLs) |
+| `routing.key` or `routing.key.column` | one is required | Publish routing key (Utf8 or Utf8View column, at most 255 bytes, no NULLs) |
 | `mandatory` | `true` | `mandatory` publish flag; a returned message fails the write |
 | `delivery.mode` | `persistent` | `delivery-mode` 2 or 1 |
 | `content.type` | by format | `application/json`, `text/csv`, `text/plain; charset=utf-8`, or `application/octet-stream` |
 | `content.encoding`, `reply.to`, `type`, `app.id` | | Literal message properties |
-| `message.id.column`, `correlation.id.column` | | Utf8 columns for `message-id` and `correlation-id`; NULL omits the property |
+| `message.id.column`, `correlation.id.column` | | Utf8 or Utf8View columns for `message-id` and `correlation-id`; NULL omits the property |
 | `priority` or `priority.column` | | `priority` (0 to 255) |
 | `expiration.ms` | | `expiration`, the broker-enforced per-message TTL |
-| `header.columns` | | Columns written as typed headers: Utf8 and Binary as long strings, Boolean, Int8 to Int64 and UInt8 to UInt32 as the matching AMQP integer, Float32/64 as float/double; NULL omits the header |
+| `header.columns` | | Columns written as typed headers: Utf8, Binary and their view forms as long strings, Boolean, Int8 to Int64 and UInt8 to UInt32 as the matching AMQP integer, Float32/64 as float/double; NULL omits the header |
 | `max.pending`, `max.pending.bytes` | `4096`, `67108864` | Publishes and payload bytes awaiting a broker confirm |
 | `confirm.timeout.ms` | `30000` | Bound on waiting for confirms within one write or flush |
 

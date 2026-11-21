@@ -1,4 +1,7 @@
 use super::*;
+use arrow_array::{Int64Array, StringViewArray};
+use arrow_schema::{DataType, Field, Schema};
+use std::sync::Arc;
 
 fn sink_config(mode: Mode) -> ConnectorConfig {
     let mut config = ConnectorConfig::new("nats");
@@ -214,9 +217,31 @@ fn dynamic_headers_are_validated_before_publish() {
     let name = HeaderName::from_str("trace_id").unwrap();
     let values = StringArray::from(vec![Some("valid"), Some("invalid\r\nvalue")]);
 
-    let error = validate_headers_and_encoded_len(None, None, &[(&name, &values)], 1).unwrap_err();
+    let error = validate_headers_and_encoded_len(None, None, &[(&name, values)], 1).unwrap_err();
     assert!(matches!(error, ConnectorError::ConfigurationError(_)));
     assert!(error.to_string().contains("row 1"));
+}
+
+#[test]
+fn view_text_columns_resolve_as_utf8() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("subject", DataType::Utf8View, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringViewArray::from(vec!["events.eu"])),
+            Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_utf8(&batch, "subject").unwrap().value(0),
+        "events.eu"
+    );
+    assert!(resolve_utf8(&batch, "count").is_err());
 }
 
 #[test]
@@ -235,10 +260,9 @@ fn later_row_publish_wildcard_is_rejected_by_batch_preflight() {
 fn max_payload_preflight_includes_encoded_headers() {
     let name = HeaderName::from_str("trace_id").unwrap();
     let values = StringArray::from(vec![Some("abc")]);
-    let headers = build_headers(None, None, &[(&name, &values)], 0)
-        .unwrap()
-        .unwrap();
-    let encoded_len = validate_headers_and_encoded_len(None, None, &[(&name, &values)], 0).unwrap();
+    let columns = [(&name, values)];
+    let headers = build_headers(None, None, &columns, 0).unwrap().unwrap();
+    let encoded_len = validate_headers_and_encoded_len(None, None, &columns, 0).unwrap();
     assert_eq!(encoded_len, 27);
     assert_eq!(encoded_header_len(&headers), 27);
 

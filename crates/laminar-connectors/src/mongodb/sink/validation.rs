@@ -18,6 +18,7 @@ pub(super) fn is_supported_mongodb_arrow_type(data_type: &DataType) -> bool {
             | DataType::Float64
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Utf8View
             | DataType::Timestamp(..)
     )
 }
