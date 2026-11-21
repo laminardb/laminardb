@@ -42,15 +42,11 @@ impl PostgresSink {
             )
         })?;
 
-        let op_array = batch
-            .column(op_idx)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
-            })?;
+        let op_array = crate::schema::utf8_column(batch.column(op_idx))?.ok_or_else(|| {
+            ConnectorError::ConfigurationError("'_op' column must be Utf8 or Utf8View".into())
+        })?;
 
-        validate_operation_values(op_array)?;
+        validate_operation_values(&op_array)?;
 
         let mut insert_indices = Vec::new();
         let mut delete_indices = Vec::new();
@@ -151,8 +147,7 @@ pub(super) fn validate_sink_schema(
     if config.changelog_mode {
         if op.is_none() && weight.is_none() {
             return Err(ConnectorError::ConfigurationError(
-                "PostgreSQL changelog mode requires an Utf8 '_op' or Int64 '__weight' column"
-                    .into(),
+                "PostgreSQL changelog mode requires an '_op' or '__weight' column".into(),
             ));
         }
     } else if op.is_some() || weight.is_some() || timestamp.is_some() {
@@ -162,9 +157,10 @@ pub(super) fn validate_sink_schema(
         ));
     }
     if let Some(field) = op {
-        if field.data_type() != &DataType::Utf8 || field.is_nullable() {
+        if !matches!(field.data_type(), DataType::Utf8 | DataType::Utf8View) || field.is_nullable()
+        {
             return Err(ConnectorError::ConfigurationError(
-                "PostgreSQL changelog '_op' must be non-null Utf8".into(),
+                "PostgreSQL changelog '_op' must be non-null Utf8 or Utf8View".into(),
             ));
         }
     }
@@ -252,14 +248,12 @@ pub(super) fn validate_changelog_input(batch: &RecordBatch) -> Result<(), Connec
     let mut encoding_found = false;
     if let Ok(index) = schema.index_of("_op") {
         encoding_found = true;
-        let operations = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError("PostgreSQL changelog '_op' must be Utf8".into())
-            })?;
-        validate_operation_values(operations)?;
+        let operations = crate::schema::utf8_column(batch.column(index))?.ok_or_else(|| {
+            ConnectorError::ConfigurationError(
+                "PostgreSQL changelog '_op' must be Utf8 or Utf8View".into(),
+            )
+        })?;
+        validate_operation_values(&operations)?;
     }
     if let Ok(index) = schema.index_of("__weight") {
         encoding_found = true;

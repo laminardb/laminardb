@@ -217,3 +217,47 @@ impl KafkaSink {
         Ok(WriteResult::new(records_written, bytes_written))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[test]
+    fn view_operations_become_keyed_upserts_and_tombstones() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_op", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1])),
+                Arc::new(StringArray::from(vec!["I", "I", "D"])),
+            ],
+        )
+        .unwrap();
+        let batch = crate::testing::with_view_column(&batch, "_op");
+
+        let collapsed = collapse_changelog(&batch, &["id".to_string()]).unwrap();
+        let (values, operations) = project_upsert_values(&collapsed).unwrap();
+
+        let ids = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut keyed: Vec<(i64, &str)> = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(operations.iter().flatten())
+            .collect();
+        keyed.sort_unstable();
+        assert_eq!(keyed, [(1, "D"), (2, "U")]);
+    }
+}

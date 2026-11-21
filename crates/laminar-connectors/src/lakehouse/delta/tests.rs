@@ -1,4 +1,5 @@
 use super::*;
+use crate::testing::with_view_column;
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
@@ -809,22 +810,6 @@ fn zset_changelog(rows: &[(&str, i64, i64)]) -> RecordBatch {
     .unwrap()
 }
 
-/// The changelog with its `region` key as a view column, as a SQL string cast produces it.
-#[cfg(feature = "delta-lake")]
-fn view_regions(changelog: &RecordBatch) -> RecordBatch {
-    let region = changelog.schema().index_of("region").unwrap();
-    let mut fields = changelog.schema().fields().to_vec();
-    fields[region] = Arc::new(
-        fields[region]
-            .as_ref()
-            .clone()
-            .with_data_type(DataType::Utf8View),
-    );
-    let mut columns = changelog.columns().to_vec();
-    columns[region] = arrow_cast::cast(&columns[region], &DataType::Utf8View).unwrap();
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-}
-
 /// Land one at-least-once write cut through the durable flush path.
 #[cfg(feature = "delta-lake")]
 async fn flush_batch(sink: &mut DeltaLakeSink, batch: &RecordBatch) {
@@ -967,20 +952,26 @@ async fn upsert_keyed_on_a_view_column_merges_into_its_offset_form() {
     cfg.merge_key_columns = vec!["region".to_string()];
     cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     cfg.auto_create = true;
-    let mut sink = opened_sink(cfg, view_regions(&zset_changelog(&[])).schema()).await;
+    let mut sink = opened_sink(
+        cfg,
+        with_view_column(&zset_changelog(&[]), "region").schema(),
+    )
+    .await;
 
     flush_batch(
         &mut sink,
-        &view_regions(&zset_changelog(&[("east", 10, 1), ("west", 5, 1)])),
+        &with_view_column(
+            &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
+            "region",
+        ),
     )
     .await;
     flush_batch(
         &mut sink,
-        &view_regions(&zset_changelog(&[
-            ("east", 10, -1),
-            ("east", 30, 1),
-            ("west", 5, -1),
-        ])),
+        &with_view_column(
+            &zset_changelog(&[("east", 10, -1), ("east", 30, 1), ("west", 5, -1)]),
+            "region",
+        ),
     )
     .await;
 

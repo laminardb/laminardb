@@ -1,4 +1,5 @@
 use super::*;
+use arrow::array::{StringArray, StringViewArray};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -185,6 +186,24 @@ async fn cache_hits_emit_in_the_same_cycle() {
         .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(label_column(&out[0]), vec![Some("cached".to_string())]);
+}
+
+#[tokio::test]
+async fn view_input_column_is_read_like_utf8() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "text",
+        DataType::Utf8View,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringViewArray::from(vec![Some("hello"), None]))],
+    )
+    .unwrap();
+    assert_eq!(
+        operator(Arc::new(Failing)).input_texts(&batch).unwrap(),
+        vec![Some("hello"), None]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

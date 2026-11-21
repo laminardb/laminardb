@@ -454,6 +454,15 @@ fn test_split_changelog_batch() {
 }
 
 #[test]
+fn view_operations_validate_like_utf8() {
+    let batch = crate::testing::with_view_column(&changelog_batch(), "_op");
+    let mut config = upsert_config();
+    config.changelog_mode = true;
+    input::validate_sink_schema(&batch.schema(), &config).unwrap();
+    input::validate_changelog_input(&batch).unwrap();
+}
+
+#[test]
 fn test_split_changelog_all_inserts() {
     let schema = changelog_schema();
     let batch = RecordBatch::try_new(

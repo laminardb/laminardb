@@ -244,7 +244,8 @@ impl MongoDbSink {
                         Ok(schema_field) if schema_field.data_type() == &DataType::Utf8 => {}
                         Ok(schema_field) => {
                             return Err(ConnectorError::ConfigurationError(format!(
-                                "MongoDB CDC replay field '{field}' must be Utf8, got {:?}",
+                                "MongoDB CDC replay field '{field}' must be Utf8 (a SQL string \
+                                 cast produces Utf8View), got {:?}",
                                 schema_field.data_type()
                             )));
                         }

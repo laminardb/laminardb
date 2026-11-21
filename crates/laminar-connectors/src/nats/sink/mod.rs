@@ -8,7 +8,7 @@ use std::future::IntoFuture;
 use std::str::FromStr;
 use std::time::Duration;
 
-use arrow_array::{cast::AsArray, Array, RecordBatch, StringArray};
+use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use async_nats::jetstream::{self, context::PublishAckFuture};
 use async_nats::{Client, HeaderMap, HeaderName, HeaderValue, Subject};

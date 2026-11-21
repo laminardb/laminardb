@@ -310,6 +310,27 @@ impl SinkConnector for MockSinkConnector {
     }
 }
 
+/// `batch` with its `name` column copied into `Utf8View`, the type a SQL string cast such as
+/// `CAST(x AS VARCHAR)` produces.
+///
+/// # Panics
+///
+/// Panics if `batch` has no Utf8 column `name`.
+#[must_use]
+pub fn with_view_column(batch: &RecordBatch, name: &str) -> RecordBatch {
+    let index = batch.schema().index_of(name).unwrap();
+    let mut fields = batch.schema().fields().to_vec();
+    fields[index] = Arc::new(
+        fields[index]
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Utf8View),
+    );
+    let mut columns = batch.columns().to_vec();
+    columns[index] = arrow_cast::cast(&columns[index], &DataType::Utf8View).unwrap();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
 /// Registers a mock source connector with the registry.
 ///
 /// # Errors
