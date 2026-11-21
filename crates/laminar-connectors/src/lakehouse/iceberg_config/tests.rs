@@ -729,6 +729,29 @@ fn test_validate_extra_table_columns_ok() {
 }
 
 #[test]
+fn view_columns_widen_only_into_their_offset_form() {
+    for (view, offset) in [
+        (DataType::Utf8View, DataType::Utf8),
+        (DataType::Utf8View, DataType::LargeUtf8),
+        (DataType::BinaryView, DataType::Binary),
+        (DataType::BinaryView, DataType::LargeBinary),
+    ] {
+        assert!(
+            is_safe_iceberg_widening(&view, &offset),
+            "{view} -> {offset}"
+        );
+        assert!(
+            !is_safe_iceberg_widening(&offset, &view),
+            "{offset} -> {view}"
+        );
+    }
+    assert!(!is_safe_iceberg_widening(
+        &DataType::Utf8View,
+        &DataType::Binary
+    ));
+}
+
+#[test]
 fn test_validate_safe_widening() {
     let pipeline = schema(vec![("n", DataType::Int32), ("f", DataType::Float32)]);
     let table = schema(vec![("n", DataType::Int64), ("f", DataType::Float64)]);

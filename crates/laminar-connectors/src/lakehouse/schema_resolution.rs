@@ -294,7 +294,7 @@ fn validate_delta_creation_schema(schema: &SchemaRef) -> Result<(), ConnectorErr
             "Delta cannot represent the query schema: {reason}; cast in CREATE STREAM"
         ))
     })?;
-    let normalized = super::delta_io::widen_millisecond_timestamps(schema);
+    let normalized = super::delta_io::delta_storage_schema(schema);
     let kernel: deltalake::kernel::StructType =
         normalized.as_ref().try_into_kernel().map_err(|error| {
             ConnectorError::SchemaMismatch(format!(
@@ -329,12 +329,11 @@ fn delta_bind_writer(
 ) -> Result<(), ConnectorError> {
     let native = super::delta_io::get_table_schema(table)?;
     let mut normalized = binding.clone();
-    normalized.logical =
-        super::delta_io::widen_millisecond_timestamps(&Arc::new(binding.logical.clone()))
-            .as_ref()
-            .clone();
+    normalized.logical = super::delta_io::delta_storage_schema(&Arc::new(binding.logical.clone()))
+        .as_ref()
+        .clone();
     bind_external(&mut normalized, &native)?;
-    // The established Delta write path performs this lossless top-level widening. Persist
+    // The established Delta write path performs these lossless top-level conversions. Persist
     // both its input encoding and the native table types; no general SQL cast is inferred.
     let encoding = arrow_schema::Schema::new_with_metadata(
         native
@@ -494,14 +493,42 @@ pub(super) async fn iceberg_sink(
         parsed.catalog.request_timeout,
     )
     .await?;
-    let external = Arc::new(
+    let native =
         iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()).map_err(|error| {
             ConnectorError::SchemaMismatch(format!("Iceberg native schema: {error}"))
-        })?,
-    );
-    bind_external(&mut binding, &external)?;
+        })?;
+    bind_external(
+        &mut binding,
+        &Arc::new(iceberg_writer_encoding(&input, &native)),
+    )?;
     binding.value = Some(iceberg_native(&table));
     Ok(binding)
+}
+
+/// The table's fields as the query binds them: where the table holds a query view column's
+/// offset form, the field keeps the view type, which the writer's schema alignment copies into
+/// that form.
+#[cfg(feature = "iceberg-core")]
+fn iceberg_writer_encoding(
+    input: &SchemaRef,
+    native: &arrow_schema::Schema,
+) -> arrow_schema::Schema {
+    let fields: Vec<_> = native
+        .fields()
+        .iter()
+        .map(|field| match input.field_with_name(field.name()) {
+            Ok(query) if super::is_view_of_offset_type(query.data_type(), field.data_type()) => {
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(query.data_type().clone()),
+                )
+            }
+            _ => Arc::clone(field),
+        })
+        .collect();
+    arrow_schema::Schema::new_with_metadata(fields, native.metadata().clone())
 }
 
 #[cfg(feature = "iceberg-core")]

@@ -103,6 +103,13 @@
   `Utf8View`, so a pipeline that wrote a cast string column into a PostgreSQL sink failed at
   startup with "PostgreSQL sink does not support Arrow type Utf8View" (#740).
 
+- The Delta Lake and Iceberg sinks write `Utf8View` and `BinaryView` columns, which a SQL string
+  cast such as `CAST(x AS VARCHAR)` produces, into the table's string and binary types. Before,
+  `CREATE SINK` failed: Delta refused to create the table ("Delta native schema changes query types
+  or nullability") or to bind an existing one, and Iceberg refused to bind the table ("field
+  differs in type or directional nullability"). Delta writes them in append, upsert and
+  exactly-once append mode, Iceberg in every write mode, in every deployment mode (#741).
+
 - A pipeline over a PostgreSQL CDC or Delta Lake change data feed source with a `WATERMARK`
   faulted at the source's first batch ("ordered event-time source checkpoint omitted its
   input-channel inventory"). Their checkpoints now name the one input channel their rows use: the

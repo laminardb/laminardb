@@ -84,15 +84,7 @@ pub(super) fn validate_snapshot_schema(
 }
 
 fn snapshot_types_compatible(source: &DataType, declared: &DataType) -> bool {
-    source == declared
-        || matches!(
-            (source, declared),
-            (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
-                | (
-                    DataType::BinaryView,
-                    DataType::Binary | DataType::LargeBinary
-                )
-        )
+    source == declared || super::is_view_of_offset_type(source, declared)
 }
 
 #[cfg(test)]

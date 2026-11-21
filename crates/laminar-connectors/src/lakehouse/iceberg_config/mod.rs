@@ -899,7 +899,7 @@ pub(crate) fn is_safe_iceberg_widening(
             | (DataType::Int32, DataType::Int64)
             | (DataType::Float32, DataType::Float64)
             | (DataType::Utf8, DataType::LargeUtf8)
-    )
+    ) || super::is_view_of_offset_type(from, to)
 }
 
 #[cfg(test)]

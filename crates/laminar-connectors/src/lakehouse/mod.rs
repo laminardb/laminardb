@@ -77,6 +77,23 @@ use std::sync::Arc;
 use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
+/// SQL string casts produce view columns, which a table holding the offset form reads and
+/// writes by copying.
+pub(crate) fn is_view_of_offset_type(
+    view: &arrow_schema::DataType,
+    offset: &arrow_schema::DataType,
+) -> bool {
+    use arrow_schema::DataType;
+    matches!(
+        (view, offset),
+        (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+            | (
+                DataType::BinaryView,
+                DataType::Binary | DataType::LargeBinary
+            )
+    )
+}
+
 /// Registers the Delta Lake sink connector with the given registry.
 ///
 /// # Errors
