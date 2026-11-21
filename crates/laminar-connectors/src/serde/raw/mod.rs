@@ -177,10 +177,16 @@ impl RecordSerializer for RawBytesSerializer {
                     .iter()
                     .map(|v| v.map(str::as_bytes)),
             )),
+            DataType::Utf8View => Ok(owned(
+                column.as_string_view().iter().map(|v| v.map(str::as_bytes)),
+            )),
             DataType::Binary => Ok(owned(column.as_binary::<i32>().iter())),
             DataType::LargeBinary => Ok(owned(column.as_binary::<i64>().iter())),
+            DataType::BinaryView => Ok(owned(column.as_binary_view().iter())),
             _ => Err(SerdeError::UnsupportedFormat(
-                "raw serializer expects a Utf8, Binary, or LargeBinary column".into(),
+                "raw serializer expects a Utf8, Utf8View, Binary, LargeBinary, or BinaryView \
+                 column"
+                    .into(),
             )),
         }
     }

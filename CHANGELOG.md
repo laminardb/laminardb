@@ -110,6 +110,14 @@
   differs in type or directional nullability"). Delta writes them in append, upsert and
   exactly-once append mode, Iceberg in every write mode, in every deployment mode (#741).
 
+- The `raw` format and the RabbitMQ, NATS and IBM MQ property columns (routing key, subject,
+  message, correlation and dedup ids, headers, properties) take `Utf8View` columns, and
+  `BinaryView` wherever they take `Binary`; the MongoDB sink writes `Utf8View` as a BSON string,
+  upsert keys included. A raw text payload from a view keeps its text content type (`text/plain`
+  on RabbitMQ, `MQSTR` on IBM MQ). Before, `CREATE SINK` failed ("unsupported Arrow type
+  Utf8View", "property column must be Utf8"), or for NATS the first batch faulted. This applies in
+  every deployment mode (#741).
+
 - A pipeline over a PostgreSQL CDC or Delta Lake change data feed source with a `WATERMARK`
   faulted at the source's first batch ("ordered event-time source checkpoint omitted its
   input-channel inventory"). Their checkpoints now name the one input channel their rows use: the

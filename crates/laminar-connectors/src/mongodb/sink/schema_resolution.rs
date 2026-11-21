@@ -246,7 +246,7 @@ fn bson_type(data_type: &DataType) -> Option<&'static str> {
         }
         DataType::Int64 | DataType::UInt32 => Some("long"),
         DataType::Float32 | DataType::Float64 => Some("double"),
-        DataType::Utf8 | DataType::LargeUtf8 => Some("string"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some("string"),
         DataType::Timestamp(..) => Some("date"),
         _ => None,
     }
@@ -276,5 +276,10 @@ mod tests {
         assert!(validate_validator(&input, &incompatible, false).is_err());
         assert!(validate_validator(&input, &validator, true).is_err());
         assert!(validate_validator(&input, &doc! {"$expr":{"$gt":["$id",0]}}, false).is_err());
+        let cast = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8View, true),
+        ]));
+        validate_validator(&cast, &validator, false).unwrap();
     }
 }

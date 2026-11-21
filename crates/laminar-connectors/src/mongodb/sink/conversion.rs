@@ -114,7 +114,7 @@ pub(super) fn arrow_value_to_bson(
 ) -> Result<mongodb::bson::Bson, ConnectorError> {
     use arrow_array::{
         BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        LargeStringArray, StringArray, UInt16Array, UInt32Array, UInt8Array,
+        LargeStringArray, StringArray, StringViewArray, UInt16Array, UInt32Array, UInt8Array,
     };
     use mongodb::bson::Bson;
 
@@ -159,6 +159,12 @@ pub(super) fn arrow_value_to_bson(
         ),
         DataType::LargeUtf8 => Bson::String(
             a.downcast_ref::<LargeStringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Utf8View => Bson::String(
+            a.downcast_ref::<StringViewArray>()
                 .unwrap()
                 .value(row)
                 .to_string(),

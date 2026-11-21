@@ -533,7 +533,7 @@ impl SinkConnector for NatsSink {
             SubjectSpec::Column(name) => Some(resolve_utf8(batch, name)?),
             SubjectSpec::Literal(_) => None,
         };
-        let header_cols: Vec<(&HeaderName, &StringArray)> = cfg
+        let header_cols: Vec<(&HeaderName, StringArray)> = cfg
             .header_columns
             .iter()
             .map(|name| resolve_utf8(batch, name.as_ref()).map(|array| (name, array)))
@@ -552,14 +552,14 @@ impl SinkConnector for NatsSink {
 
         // Validate required per-row routing metadata before the first publish. A late null would
         // otherwise turn a deterministic input error into a partially dispatched batch.
-        if let Some(arr) = subject_col {
+        if let Some(arr) = &subject_col {
             let SubjectSpec::Column(name) = &cfg.subject else {
                 unreachable!("subject column exists only for a column subject")
             };
             validate_non_null(arr, "subject.column", name)?;
         }
-        validate_publish_subjects(&cfg.subject, subject_col, batch.num_rows())?;
-        if let Some((name, arr)) = dedup_col {
+        validate_publish_subjects(&cfg.subject, subject_col.as_ref(), batch.num_rows())?;
+        if let Some((name, arr)) = &dedup_col {
             validate_non_null(arr, "dedup.id.column", name)?;
         }
 
@@ -582,7 +582,7 @@ impl SinkConnector for NatsSink {
             Runtime::JetStream { context } => context.client().server_info().max_payload,
         };
         for (row, payload) in records.iter().enumerate() {
-            let msg_id = dedup_col.map(|(_, array)| array.value(row));
+            let msg_id = dedup_col.as_ref().map(|(_, array)| array.value(row));
             let header_len =
                 validate_headers_and_encoded_len(expected_stream, msg_id, &header_cols, row)?;
             validate_message_size(row, payload.len(), header_len, max_payload)?;
@@ -592,13 +592,13 @@ impl SinkConnector for NatsSink {
         let mut rows_written: usize = 0;
         let mut acknowledged_in_write: usize = 0;
         for (row, payload) in records.into_iter().enumerate() {
-            let subject = match (&cfg.subject, subject_col) {
+            let subject = match (&cfg.subject, subject_col.as_ref()) {
                 (SubjectSpec::Literal(subject), _) => subject.as_str(),
                 (SubjectSpec::Column(_), Some(array)) => array.value(row),
                 (SubjectSpec::Column(_), None) => unreachable!("resolved above"),
             };
             let subject = Subject::from(subject);
-            let msg_id = dedup_col.map(|(_, array)| array.value(row));
+            let msg_id = dedup_col.as_ref().map(|(_, array)| array.value(row));
             let headers = build_headers(expected_stream, msg_id, &header_cols, row)?;
             let payload = bytes::Bytes::from(payload);
             let payload_len = payload.len() as u64;

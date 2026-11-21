@@ -3,20 +3,24 @@
 //! Validation completes before a row is published so malformed batches cannot produce a partial
 //! prefix. Header-size accounting uses the exact bytes emitted by async-nats.
 
+use arrow_schema::DataType;
+
 use super::{
     err, Array, AsArray, ConnectorError, FromStr, HeaderMap, HeaderName, HeaderValue, RecordBatch,
     StringArray, SubjectSpec,
 };
 
-pub(super) fn resolve_utf8<'a>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> Result<&'a StringArray, ConnectorError> {
+/// The named column as `Utf8`; a view column is copied into that form.
+pub(super) fn resolve_utf8(batch: &RecordBatch, name: &str) -> Result<StringArray, ConnectorError> {
     let col = batch
         .column_by_name(name)
         .ok_or_else(|| err(&format!("column '{name}' not in batch schema")))?;
-    col.as_string_opt::<i32>()
-        .ok_or_else(|| err(&format!("column '{name}' must be Utf8")))
+    if !matches!(col.data_type(), DataType::Utf8 | DataType::Utf8View) {
+        return Err(err(&format!("column '{name}' must be Utf8 or Utf8View")));
+    }
+    let strings = arrow_cast::cast(col, &DataType::Utf8)
+        .map_err(|error| err(&format!("column '{name}': {error}")))?;
+    Ok(strings.as_string::<i32>().clone())
 }
 
 pub(super) fn validate_non_null(
@@ -90,7 +94,7 @@ pub(super) fn header_value_is_valid(value: &str) -> bool {
 pub(super) fn validate_headers_and_encoded_len(
     expected_stream: Option<&str>,
     msg_id: Option<&str>,
-    header_cols: &[(&HeaderName, &StringArray)],
+    header_cols: &[(&HeaderName, StringArray)],
     row: usize,
 ) -> Result<usize, ConnectorError> {
     let mut entries_len = 0usize;
@@ -183,7 +187,7 @@ pub(super) fn parse_header_value(
 pub(super) fn build_headers(
     expected_stream: Option<&str>,
     msg_id: Option<&str>,
-    header_cols: &[(&HeaderName, &StringArray)],
+    header_cols: &[(&HeaderName, StringArray)],
     row: usize,
 ) -> Result<Option<HeaderMap>, ConnectorError> {
     if header_cols.is_empty() && expected_stream.is_none() && msg_id.is_none() {

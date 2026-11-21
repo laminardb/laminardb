@@ -1,5 +1,5 @@
 use super::*;
-use arrow_array::{BinaryArray, Int64Array, StringArray};
+use arrow_array::{BinaryArray, BinaryViewArray, Int64Array, StringArray, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use mqi::properties::Value;
 use std::sync::Arc;
@@ -78,6 +78,45 @@ fn rows_become_binary_descriptors_and_typed_properties() {
         mqi::constants::MQPRI_PRIORITY_AS_Q_DEF.0
     );
     assert!(messages[1].properties.is_empty());
+}
+
+#[test]
+fn view_columns_bind_like_their_offset_forms() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Utf8View, false),
+        Field::new("id", DataType::BinaryView, true),
+        Field::new("correl", DataType::Utf8View, true),
+        Field::new("tenant", DataType::Utf8View, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringViewArray::from(vec!["payload"])),
+            Arc::new(BinaryViewArray::from(vec![Some(&[1_u8; 24][..])])),
+            Arc::new(StringViewArray::from(vec![Some("c-1")])),
+            Arc::new(StringViewArray::from(vec![Some("acme")])),
+        ],
+    )
+    .unwrap();
+    let config = parsed(&[
+        ("format", "raw"),
+        ("message.id.column", "id"),
+        ("correlation.id.column", "correl"),
+        ("property.columns", "tenant"),
+    ]);
+    let writer = IbmMqSink::writer(&config, &schema).unwrap();
+    assert_eq!(super::super::metadata::text(&writer.base.Format), "MQSTR");
+    let payloads = writer
+        .serializer
+        .serialize(&batch.project(&writer.payload_indices).unwrap())
+        .unwrap();
+    let messages = message::messages(&config, &writer.base, &batch, payloads).unwrap();
+    assert_eq!(messages[0].data, b"payload");
+    assert_eq!(messages[0].md.MsgId, [1; 24]);
+    assert_eq!(&messages[0].md.CorrelId[..3], b"c-1");
+    assert!(
+        matches!(messages[0].properties.as_slice(), [(name, Value::String(_))] if name == "tenant")
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use super::*;
-use arrow_array::{BinaryArray, Int64Array, StringArray};
+use arrow_array::{BinaryArray, BinaryViewArray, Int64Array, StringArray, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use lapin::types::{AMQPValue, ShortString};
 use std::sync::Arc;
@@ -80,6 +80,53 @@ fn rows_bind_to_native_typed_properties() {
     let second = rows.properties(1, &base);
     assert!(second.message_id().is_none() && second.priority().is_none());
     assert!(second.headers().as_ref().unwrap().inner().is_empty());
+}
+
+#[test]
+fn view_columns_bind_like_their_offset_forms() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Utf8View, false),
+        Field::new("key", DataType::Utf8View, false),
+        Field::new("id", DataType::Utf8View, true),
+        Field::new("tenant", DataType::BinaryView, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringViewArray::from(vec!["payload"])),
+            Arc::new(StringViewArray::from(vec!["a.b"])),
+            Arc::new(StringViewArray::from(vec![Some("m-1")])),
+            Arc::new(BinaryViewArray::from(vec![Some(&b"acme"[..])])),
+        ],
+    )
+    .unwrap();
+    let config = parsed(&[
+        ("format", "raw"),
+        ("routing.key.column", "key"),
+        ("message.id.column", "id"),
+        ("header.columns", "tenant"),
+    ]);
+    let writer = RabbitMqSink::writer(&config, &schema).unwrap();
+    assert_eq!(
+        writer.base.content_type().as_ref().map(ShortString::as_str),
+        Some("text/plain; charset=utf-8")
+    );
+    let rows = properties::BoundProperties::bind(&config, &batch).unwrap();
+    assert_eq!(rows.routing_key(0), "a.b");
+    let first = rows.properties(0, &writer.base);
+    assert_eq!(
+        first.message_id().as_ref().map(ShortString::as_str),
+        Some("m-1")
+    );
+    assert_eq!(
+        first
+            .headers()
+            .as_ref()
+            .unwrap()
+            .inner()
+            .get(&ShortString::from("tenant")),
+        Some(&AMQPValue::LongString(b"acme".to_vec().into()))
+    );
 }
 
 #[test]

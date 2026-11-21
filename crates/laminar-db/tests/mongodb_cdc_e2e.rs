@@ -316,6 +316,65 @@ fn mirrors(storage: &Path, database: &str, collection: &str) -> Mirrors {
     }
 }
 
+/// A SQL string cast types as `Utf8View`; the sink writes it as a BSON string, here also as the
+/// upsert key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cast_string_column_is_written_as_a_bson_string() {
+    let Some(client) = mongo(MONGO_URI).await else {
+        return;
+    };
+    let database = unique("cast");
+    let storage = tempfile::tempdir().unwrap();
+    let statements = [
+        "CREATE SOURCE gen FROM GENERATOR ('max.rows' = '20', 'rows.per.second' = '1000')"
+            .to_string(),
+        "CREATE STREAM labelled AS SELECT seq, CAST(seq AS VARCHAR) AS label FROM gen".to_string(),
+        format!(
+            "CREATE SINK labelled_mongo FROM labelled INTO \"mongodb-sink\" (\
+             'connection.uri' = '{MONGO_URI}', 'database' = '{database}', \
+             'collection' = 'labelled', 'write.mode' = 'upsert', \
+             'write.mode.key_fields' = 'label', 'auto.create' = 'true')"
+        ),
+    ];
+    let db = open(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let collection = client
+        .database(&database)
+        .collection::<Document>("labelled");
+    let documents: Vec<Document> = eventually(
+        CONVERGE,
+        || async {
+            collection
+                .find(doc! {})
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        },
+        |documents: &Vec<Document>| documents.len() >= 20,
+    )
+    .await;
+    db.shutdown().await.expect("shutdown");
+    let mut labels: Vec<(i64, String)> = documents
+        .iter()
+        .map(|document| {
+            (
+                document.get_i64("seq").unwrap(),
+                document.get_str("label").unwrap().to_owned(),
+            )
+        })
+        .collect();
+    labels.sort();
+    assert_eq!(
+        labels,
+        (0..20)
+            .map(|seq| (seq, seq.to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn document_and_history_mirrors_apply_puts_and_key_only_deletes_across_restart() {
     let Some(client) = mongo(MONGO_URI).await else {

@@ -50,7 +50,7 @@ limitation before activation.
 | `kafka` | Streaming source | Registry-backed Avro | Metadata | Registry scope, concrete value subject/version/ID, complete native schema and references |
 | `kafka` | Streaming source | Plain JSON, CSV, Debezium JSON | Explicit fields required | A registry URL requires Avro; it does not select a different codec |
 | `kafka` | Streaming source | Raw / bytes | Built-in `value` (Utf8), or a declared Binary `value` that keeps bytes exactly | Existing Kafka metadata/header settings remain separate |
-| `kafka` | Sink | Avro, JSON, CSV, raw | Bound query | Avro uses a concrete registry writer ID; raw needs one Utf8 or Binary query field; no Debezium writer |
+| `kafka` | Sink | Avro, JSON, CSV, raw | Bound query | Avro uses a concrete registry writer ID; raw needs one Utf8 or Binary query field, or its view form; no Debezium writer |
 | `postgres-cdc` | Streaming source | Declared typed columns of one published table; `output.mode=changelog` adds a trailing `__weight` | Explicit fields required | PostgreSQL 17+; the declared `PRIMARY KEY` must equal the table's and every column must map exactly; system, timeline, database, publication and table identities, the exact claimed slot (`<slot.name>_<claim id>`, recorded in the source checkpoint) and the relation layout are persisted and revalidated on resume; layout drift stops the source |
 | `postgres` | Reference / lookup source | PostgreSQL table catalog | Metadata | Database/relation OIDs, column OIDs/modifiers/defaults/constraints; keys separately declared and validated |
 | `postgres-sink` | Sink | Named PostgreSQL COPY / keyed writes | Bound query plus target metadata | Database/relation OIDs and target layout; explicit table-creation policy; no implicit evolution |
@@ -66,11 +66,11 @@ limitation before activation.
 | `mongodb` | Lookup source | BSON collection validator | Closed flat validator, otherwise explicit projection | Collection UUID and validator retained; supported scalar types only; unique single-column key/index separately validated |
 | `mongodb-sink` | Sink | BSON query writer plus collection validator | Bound query | Standard collection UUID or explicit time-series bucket UUID; flat validator checks; explicit `auto.create` for a missing standard collection; explicit time-series settings retain their existing preparation policy |
 | `nats` | Streaming source | JSON / CSV / Debezium JSON; raw | Explicit fields; raw built-in | No authoritative JSON descriptor; existing ephemeral source contract remains |
-| `nats` | Sink | JSON / CSV / raw | Bound query | Core and JetStream delivery admission remains; raw requires one Utf8 or Binary field |
+| `nats` | Sink | JSON / CSV / raw | Bound query | Core and JetStream delivery admission remains; raw requires one Utf8 or Binary field, or its view form |
 | `rabbitmq` | Streaming source | JSON / CSV; raw (Utf8 `value`, or Binary to keep bytes) | Explicit fields; raw built-in | Payload fields followed by the configured `metadata.columns`; commit-coupled at-least-once |
-| `rabbitmq` | Sink | JSON / CSV / raw | Bound query minus routing/property columns | Property columns are type-checked; raw needs one Utf8 or Binary payload field |
+| `rabbitmq` | Sink | JSON / CSV / raw | Bound query minus routing/property columns | Property columns are type-checked; raw needs one Utf8 or Binary payload field, or its view form |
 | `ibmmq` | Streaming source | JSON / CSV; raw (Utf8 `value`, or Binary to keep bytes) | Explicit fields; raw built-in | Payload fields followed by the configured `metadata.columns`; commit-coupled at-least-once |
-| `ibmmq` | Sink | JSON / CSV / raw | Bound query minus descriptor/property columns | Descriptor and property columns are type-checked; raw needs one Utf8 or Binary payload field |
+| `ibmmq` | Sink | JSON / CSV / raw | Bound query minus descriptor/property columns | Descriptor and property columns are type-checked; raw needs one Utf8 or Binary payload field, or its view form |
 | `websocket` | Streaming source | JSON / CSV / binary | Explicit fields required | Validate the installed decoder before connecting; no remote discovery API |
 | `websocket` | Sink server / client | JSON | Bound query | Server and client retain their different topology contracts |
 | `otel` | Streaming source | OTLP traces / metrics / logs | Built-in per signal | Explicit fields must retain that signal's full protocol layout |

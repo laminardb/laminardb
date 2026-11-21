@@ -14,9 +14,10 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use laminar_db::{DeliveryGuarantee, LaminarDB};
 use lapin::options::{
-    BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions, QueueDeleteOptions,
+    BasicConsumeOptions, BasicGetOptions, BasicPublishOptions, QueueDeclareOptions,
+    QueueDeleteOptions,
 };
-use lapin::types::FieldTable;
+use lapin::types::{AMQPValue, FieldTable, LongString};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 
 /// Broker endpoint without credentials: the durable catalog accepts secrets only as references.
@@ -327,6 +328,83 @@ async fn raw_binary_payloads_round_trip_byte_for_byte() {
     db.shutdown().await.expect("shutdown");
     assert_eq!(ready(&channel, &input).await, 0);
     delete(&channel, &[&input, &output]).await;
+}
+
+/// A SQL string cast types as `Utf8View`; it can be the raw payload, the routing key, the message
+/// id and a header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cast_string_columns_become_the_payload_and_properties() {
+    let Some((url, channel)) = broker().await else {
+        return;
+    };
+    let output = unique("cast.out");
+    queue(&channel, &output).await;
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path(), DeliveryGuarantee::AtLeastOnce).await;
+    for statement in [
+        "CREATE SOURCE gen FROM GENERATOR ('max.rows' = '20', 'rows.per.second' = '1000')"
+            .to_string(),
+        format!(
+            "CREATE STREAM labelled AS SELECT CAST(seq AS VARCHAR) AS body, \
+             CAST('{output}' AS VARCHAR) AS route, CAST(seq AS VARCHAR) AS id, \
+             CAST(seq AS VARCHAR) AS tag FROM gen"
+        ),
+        format!(
+            "CREATE SINK labelled_out FROM labelled INTO RABBITMQ ('url' = '{url}', {CREDENTIALS}, \
+             'routing.key.column' = 'route', 'message.id.column' = 'id', \
+             'header.columns' = 'tag') FORMAT RAW"
+        ),
+    ] {
+        db.execute(&statement)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    db.start().await.expect("start");
+    let mut messages = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while messages.len() < 20 {
+        let fetched = channel
+            .basic_get(output.as_str().into(), BasicGetOptions { no_ack: true })
+            .await
+            .expect("get");
+        match fetched {
+            Some(message) => messages.push(message.delivery),
+            None => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{} of 20 messages arrived",
+                    messages.len()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    db.shutdown().await.expect("shutdown");
+
+    let mut seqs = Vec::new();
+    for message in &messages {
+        let body = std::str::from_utf8(&message.data).unwrap();
+        let properties = &message.properties;
+        assert_eq!(
+            properties.message_id().as_ref().map(|id| id.as_str()),
+            Some(body)
+        );
+        assert_eq!(
+            properties
+                .headers()
+                .as_ref()
+                .and_then(|headers| headers.inner().get("tag")),
+            Some(&AMQPValue::LongString(LongString::from(body)))
+        );
+        assert_eq!(
+            properties.content_type().as_ref().map(|kind| kind.as_str()),
+            Some("text/plain; charset=utf-8")
+        );
+        seqs.push(body.parse::<i64>().unwrap());
+    }
+    seqs.sort_unstable();
+    assert_eq!(seqs, (0..20).collect::<Vec<_>>());
+    delete(&channel, &[&output]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

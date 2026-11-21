@@ -24,7 +24,12 @@ pub(in crate::ibmmq) struct Outgoing {
     pub(in crate::ibmmq) properties: Vec<(String, Value)>,
 }
 
-const IDENTIFIER: &[DataType] = &[DataType::Binary, DataType::Utf8];
+const IDENTIFIER: &[DataType] = &[
+    DataType::Binary,
+    DataType::Utf8,
+    DataType::BinaryView,
+    DataType::Utf8View,
+];
 const INTEGERS: &[DataType] = &[
     DataType::Int8,
     DataType::Int16,
@@ -34,6 +39,8 @@ const INTEGERS: &[DataType] = &[
 const PROPERTY_TYPES: &[DataType] = &[
     DataType::Utf8,
     DataType::Binary,
+    DataType::Utf8View,
+    DataType::BinaryView,
     DataType::Boolean,
     DataType::Int8,
     DataType::Int16,
@@ -49,10 +56,20 @@ pub(super) fn payload_schema(
     input: &SchemaRef,
 ) -> Result<SchemaRef, ConnectorError> {
     if let Some(name) = &config.message_id_column {
-        require(input, name, IDENTIFIER, "Binary or Utf8")?;
+        require(
+            input,
+            name,
+            IDENTIFIER,
+            "Binary, BinaryView, Utf8, or Utf8View",
+        )?;
     }
     if let Some(name) = &config.correlation_id_column {
-        require(input, name, IDENTIFIER, "Binary or Utf8")?;
+        require(
+            input,
+            name,
+            IDENTIFIER,
+            "Binary, BinaryView, Utf8, or Utf8View",
+        )?;
     }
     if let Some(Valued::Column(name)) = &config.priority {
         require(input, name, INTEGERS, "an integer")?;
@@ -62,7 +79,7 @@ pub(super) fn payload_schema(
             input,
             name,
             PROPERTY_TYPES,
-            "Utf8, Binary, Boolean, integer, or floating point",
+            "Utf8, Utf8View, Binary, BinaryView, Boolean, integer, or floating point",
         )?;
     }
     let mapped = config.property_columns();
@@ -118,7 +135,7 @@ pub(super) fn base_descriptor(
         && payload
             .fields()
             .first()
-            .is_some_and(|field| field.data_type() != &DataType::Utf8);
+            .is_some_and(|field| !matches!(field.data_type(), DataType::Utf8 | DataType::Utf8View));
     let format = match (&config.message_format, binary) {
         (Some(format), _) => format.as_str(),
         (None, true) => "",
@@ -220,6 +237,8 @@ fn identifier(array: &ArrayRef, row: usize) -> Result<Option<[u8; 24]>, Connecto
     }
     let bytes: &[u8] = match array.data_type() {
         DataType::Utf8 => array.as_string::<i32>().value(row).as_bytes(),
+        DataType::Utf8View => array.as_string_view().value(row).as_bytes(),
+        DataType::BinaryView => array.as_binary_view().value(row),
         _ => array.as_binary::<i32>().value(row),
     };
     if bytes.len() > 24 {
@@ -259,7 +278,9 @@ fn property(array: &ArrayRef, row: usize) -> Option<Value> {
     }
     Some(match array.data_type() {
         DataType::Utf8 => Value::String(StrCcsidOwned::from(array.as_string::<i32>().value(row))),
+        DataType::Utf8View => Value::String(StrCcsidOwned::from(array.as_string_view().value(row))),
         DataType::Binary => Value::ByteString(array.as_binary::<i32>().value(row).to_vec()),
+        DataType::BinaryView => Value::ByteString(array.as_binary_view().value(row).to_vec()),
         DataType::Boolean => Value::Boolean(array.as_boolean().value(row)),
         DataType::Int8 => Value::Int8(array.as_primitive::<Int8Type>().value(row)),
         DataType::Int16 => Value::Int16(array.as_primitive::<Int16Type>().value(row)),

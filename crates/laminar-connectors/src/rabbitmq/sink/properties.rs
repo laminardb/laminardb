@@ -28,7 +28,14 @@ pub(super) fn payload_schema(
     config: &RabbitMqSinkConfig,
     input: &SchemaRef,
 ) -> Result<SchemaRef, ConnectorError> {
-    let text = |name: &str| require(input, name, &[DataType::Utf8], "Utf8");
+    let text = |name: &str| {
+        require(
+            input,
+            name,
+            &[DataType::Utf8, DataType::Utf8View],
+            "Utf8 or Utf8View",
+        )
+    };
     if let Valued::Column(name) = &config.routing_key {
         text(name)?;
     }
@@ -46,7 +53,7 @@ pub(super) fn payload_schema(
             input,
             name,
             HEADER_TYPES,
-            "Utf8, Binary, Boolean, integer, or floating point",
+            "Utf8, Utf8View, Binary, BinaryView, Boolean, integer, or floating point",
         )?;
     }
     let property_columns = config.property_columns();
@@ -75,6 +82,8 @@ const INTEGERS: &[DataType] = &[
 const HEADER_TYPES: &[DataType] = &[
     DataType::Utf8,
     DataType::Binary,
+    DataType::Utf8View,
+    DataType::BinaryView,
     DataType::Boolean,
     DataType::Int8,
     DataType::Int16,
@@ -113,7 +122,7 @@ pub(super) fn default_content_type(format: Format, payload: &Schema) -> Option<&
         Format::Json => Some("application/json"),
         Format::Csv => Some("text/csv"),
         Format::Raw => match payload.fields().first().map(|field| field.data_type()) {
-            Some(DataType::Utf8) => Some("text/plain; charset=utf-8"),
+            Some(DataType::Utf8 | DataType::Utf8View) => Some("text/plain; charset=utf-8"),
             _ => Some("application/octet-stream"),
         },
         Format::Debezium | Format::Avro | Format::Fpml => None,
@@ -154,15 +163,15 @@ pub(super) fn base_properties(config: &RabbitMqSinkConfig, payload: &Schema) -> 
 /// Columns of one batch bound to their message properties.
 pub(super) struct BoundProperties<'a> {
     routing_key: RoutingKey<'a>,
-    message_id: Option<&'a StringArray>,
-    correlation_id: Option<&'a StringArray>,
+    message_id: Option<StringArray>,
+    correlation_id: Option<StringArray>,
     priority: Option<Vec<Option<u8>>>,
     headers: Vec<(ShortString, &'a ArrayRef)>,
 }
 
 enum RoutingKey<'a> {
     Literal(&'a str),
-    Column(&'a StringArray),
+    Column(StringArray),
 }
 
 impl<'a> BoundProperties<'a> {
@@ -178,18 +187,22 @@ impl<'a> BoundProperties<'a> {
                 ))
             })
         };
-        let text = |name: &str| -> Result<&'a StringArray, ConnectorError> {
-            let array = batch.column_by_name(name).ok_or_else(|| {
-                ConnectorError::SchemaMismatch(format!(
-                    "RabbitMQ property column '{name}' is missing"
-                ))
-            })?;
-            let strings = array.as_string_opt::<i32>().ok_or_else(|| {
-                ConnectorError::SchemaMismatch(format!(
-                    "RabbitMQ property column '{name}' must be Utf8"
-                ))
-            })?;
-            short_strings(strings, name)?;
+        let text = |name: &str| -> Result<StringArray, ConnectorError> {
+            let array = column(name)?;
+            if !matches!(array.data_type(), DataType::Utf8 | DataType::Utf8View) {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "RabbitMQ property column '{name}' must be Utf8 or Utf8View"
+                )));
+            }
+            let strings = arrow_cast::cast(array, &DataType::Utf8)
+                .map_err(|error| {
+                    ConnectorError::SchemaMismatch(format!(
+                        "RabbitMQ property column '{name}': {error}"
+                    ))
+                })?
+                .as_string::<i32>()
+                .clone();
+            short_strings(&strings, name)?;
             Ok(strings)
         };
         let routing_key = match &config.routing_key {
@@ -244,10 +257,10 @@ impl<'a> BoundProperties<'a> {
     /// The complete properties of `row`.
     pub(super) fn properties(&self, row: usize, base: &BasicProperties) -> BasicProperties {
         let mut properties = base.clone();
-        if let Some(id) = self.message_id.and_then(|ids| value(ids, row)) {
+        if let Some(id) = self.message_id.as_ref().and_then(|ids| value(ids, row)) {
             properties = properties.with_message_id(id.into());
         }
-        if let Some(id) = self.correlation_id.and_then(|ids| value(ids, row)) {
+        if let Some(id) = self.correlation_id.as_ref().and_then(|ids| value(ids, row)) {
             properties = properties.with_correlation_id(id.into());
         }
         if let Some(priority) = self
@@ -316,9 +329,15 @@ fn header_value(array: &ArrayRef, row: usize) -> Option<AMQPValue> {
         DataType::Utf8 => {
             AMQPValue::LongString(LongString::from(array.as_string::<i32>().value(row)))
         }
+        DataType::Utf8View => {
+            AMQPValue::LongString(LongString::from(array.as_string_view().value(row)))
+        }
         DataType::Binary => AMQPValue::LongString(LongString::from(
             array.as_binary::<i32>().value(row).to_vec(),
         )),
+        DataType::BinaryView => {
+            AMQPValue::LongString(LongString::from(array.as_binary_view().value(row).to_vec()))
+        }
         DataType::Boolean => AMQPValue::Boolean(array.as_boolean().value(row)),
         DataType::Int8 => AMQPValue::ShortShortInt(array.as_primitive::<Int8Type>().value(row)),
         DataType::Int16 => AMQPValue::ShortInt(array.as_primitive::<Int16Type>().value(row)),

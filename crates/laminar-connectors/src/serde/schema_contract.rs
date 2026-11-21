@@ -115,12 +115,16 @@ pub(crate) fn validate_writer(format: Format, schema: &SchemaRef) -> Result<(), 
             if schema.fields().len() != 1
                 || !matches!(
                     schema.field(0).data_type(),
-                    DataType::Utf8 | DataType::Binary | DataType::LargeBinary
+                    DataType::Utf8
+                        | DataType::Utf8View
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                        | DataType::BinaryView
                 )
             {
                 return Err(ConnectorError::SchemaMismatch(
-                    "raw writer requires exactly one Utf8, Binary, or LargeBinary query field; \
-                     project it in CREATE STREAM"
+                    "raw writer requires exactly one Utf8, Utf8View, Binary, LargeBinary, or \
+                     BinaryView query field; project it in CREATE STREAM"
                         .into(),
                 ));
             }
@@ -215,6 +219,14 @@ mod tests {
         let binding = reader_binding(&ConnectorConfig::new("nats"), Format::Raw, None).unwrap();
         assert_eq!(binding.origin, SchemaOrigin::BuiltIn);
         assert_eq!(binding.logical, *super::super::raw::raw_schema());
+    }
+
+    #[test]
+    fn raw_writer_accepts_view_columns() {
+        for data_type in [DataType::Utf8View, DataType::BinaryView] {
+            let schema = Arc::new(Schema::new(vec![Field::new("value", data_type, true)]));
+            validate_writer(Format::Raw, &schema).unwrap();
+        }
     }
 
     /// Only a connector with its own `FpML` decoder may read the format; generic readers such as
