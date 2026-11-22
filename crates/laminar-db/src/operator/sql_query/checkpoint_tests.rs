@@ -2004,12 +2004,14 @@ async fn drained_peer_events_owe_one_snapshot_that_holds_capture_until_settled()
             .unwrap();
         assert!(output.is_empty());
     }
-    assert!(operator.owes_drained_snapshot());
+    assert!(operator.owes_deferred_snapshot());
     let Err(error) = operator.subscription_checkpoint_scope() else {
         panic!("capture must wait for the owed snapshot");
     };
     assert!(
-        error.to_string().contains("drained snapshot is still owed"),
+        error
+            .to_string()
+            .contains("deferred snapshot is still owed"),
         "{error}"
     );
 
@@ -2035,7 +2037,7 @@ async fn drained_peer_events_owe_one_snapshot_that_holds_capture_until_settled()
         1
     );
     operator.publish_prepared_subscription_output();
-    assert!(!operator.owes_drained_snapshot());
+    assert!(!operator.owes_deferred_snapshot());
     assert_eq!(operator.queued_remote_events, 1);
     let settled = operator
         .process_cluster(&[Vec::new()], InputFrontier::default())
@@ -2096,7 +2098,7 @@ async fn owed_snapshot_survives_a_vnode_transition_and_settles_under_the_target(
             .unwrap();
         assert!(output.is_empty());
     }
-    assert!(operator.owes_drained_snapshot());
+    assert!(operator.owes_deferred_snapshot());
 
     let participant = |node_id| CheckpointParticipant {
         node_id,
@@ -2138,7 +2140,7 @@ async fn owed_snapshot_survives_a_vnode_transition_and_settles_under_the_target(
         .unwrap();
     operator.publish_vnode_transition();
     operator.finish_vnode_transition();
-    assert!(operator.owes_drained_snapshot());
+    assert!(operator.owes_deferred_snapshot());
     assert!(operator.subscription_checkpoint_scope().is_err());
 
     operator.set_execution_mode(GraphExecutionMode::CheckpointSettle);
@@ -2157,12 +2159,110 @@ async fn owed_snapshot_survives_a_vnode_transition_and_settles_under_the_target(
         .take_prepared_subscription_output_frames()
         .is_some());
     operator.publish_prepared_subscription_output();
-    assert!(!operator.owes_drained_snapshot());
+    assert!(!operator.owes_deferred_snapshot());
     assert_eq!(
         operator.cluster_assignment.as_ref().unwrap().version(),
         target.assignment_version
     );
     assert!(operator.subscription_checkpoint_scope().is_ok());
+}
+
+/// While subscription output waits for a checkpoint, local applies owe one snapshot instead of
+/// emitting each; the checkpoint's settle pass emits it, and a normal pass emits at once again.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn held_output_owes_local_applies_until_the_checkpoint_settles() {
+    use crate::operator_graph::GraphExecutionMode;
+
+    let scope = cluster_scope([1; 8]).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope);
+    attach_test_subscription_certificate(&mut operator);
+    let (key, _) = projected_batch_for_vnode(&operator, 0, 1);
+    let local = |value: i64| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![key.as_str()])),
+                Arc::new(Int64Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    };
+    let at = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let total = |output: &[RecordBatch]| {
+        assert_eq!(output.len(), 1);
+        output[0]
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+
+    operator.set_execution_mode(GraphExecutionMode::OutputHeld);
+    for (watermark, value) in [(100, 10), (101, 20)] {
+        let output = operator
+            .process_cluster(&[vec![local(value)]], at(watermark))
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+    }
+    assert!(operator.owes_deferred_snapshot());
+    assert!(operator.subscription_checkpoint_scope().is_err());
+
+    operator.set_execution_mode(GraphExecutionMode::CheckpointSettle);
+    let output = operator
+        .process_cluster(&[Vec::new()], at(101))
+        .await
+        .unwrap();
+    assert_eq!(total(&output), 30);
+    assert!(operator
+        .take_prepared_subscription_output_frames()
+        .is_some());
+    operator.publish_prepared_subscription_output();
+    assert!(!operator.owes_deferred_snapshot());
+    assert!(operator.subscription_checkpoint_scope().is_ok());
+
+    operator.set_execution_mode(GraphExecutionMode::Normal);
+    let output = operator
+        .process_cluster(&[vec![local(5)]], at(102))
+        .await
+        .unwrap();
+    assert_eq!(total(&output), 35);
+    operator.publish_prepared_subscription_output();
+
+    // A snapshot owed when the hold ends is emitted by the next normal pass, input or not.
+    operator.set_execution_mode(GraphExecutionMode::OutputHeld);
+    let output = operator
+        .process_cluster(&[vec![local(1)]], at(103))
+        .await
+        .unwrap();
+    assert!(output.is_empty());
+    operator.set_execution_mode(GraphExecutionMode::Normal);
+    let output = operator
+        .process_cluster(&[Vec::new()], at(103))
+        .await
+        .unwrap();
+    assert_eq!(total(&output), 36);
+    operator.publish_prepared_subscription_output();
+    assert!(!operator.owes_deferred_snapshot());
 }
 
 #[cfg(feature = "cluster")]

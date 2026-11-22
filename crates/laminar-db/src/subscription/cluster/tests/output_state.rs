@@ -339,6 +339,32 @@ fn one_stream_can_use_but_not_exceed_the_process_pending_budget() {
 }
 
 #[test]
+fn pressure_diagnostics_name_the_largest_streams() {
+    let first = batch(vec![1; 64]);
+    let certificate = certificate(first.schema().as_ref());
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
+    for sequence in 0..3 {
+        state
+            .stage_cycle(
+                vec![partition_burst(&certificate, sequence, 1, &first)],
+                authority(),
+            )
+            .unwrap();
+        state.commit_cycle();
+    }
+
+    assert_eq!(
+        state.largest_open_streams(),
+        format!(
+            "{} {} bytes in 3 frames over 1 partitions",
+            certificate.stream_id,
+            3 * first.get_array_memory_size()
+        )
+    );
+}
+
+#[test]
 fn prepared_cut_applies_backpressure_until_commit_releases_it() {
     const MIB: usize = 1024 * 1024;
     const PARTITIONS: u16 = 48;

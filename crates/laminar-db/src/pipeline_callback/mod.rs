@@ -4944,6 +4944,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         } else {
             Some(&self.source_frontiers_buf)
         };
+        #[cfg(feature = "cluster")]
+        self.graph
+            .set_snapshot_output_held(self.output_pressure().holds_snapshot_output());
         let results = match self
             .graph
             .execute_cycle(source_batches, watermark, source_frontiers)

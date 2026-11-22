@@ -82,6 +82,16 @@
 
 ### Changed
 
+- In cluster mode, while a node's subscription output is held at its commit high water (three
+  quarters of the 256 MiB bound), an aggregate without `EMIT CHANGES` applies its input without
+  emitting a full snapshot each cycle, and the next checkpoint emits one snapshot of the result.
+  Readers see only committed cuts, so the snapshots this skips were superseded before anyone could
+  read them. Previously each cycle staged a snapshot of every owned group, and a long checkpoint
+  hold, such as a topology request being admitted, could pass the bound and fault the pipeline.
+  Sinks and streams fed by such an aggregate get its updates at checkpoint cadence while output is
+  held; ordinary operation is unchanged, and so are `EMIT CHANGES` aggregates. The high-water
+  warning now names the five streams holding the most pending output. The hold covers every such
+  aggregate on the node, as the intake pause does (#712, #677).
 - `SourceConnector::finish_drain` takes a `SourceDrainSettlement` instead of a
   `SourceDrainResolution`. A commit carries the source's merged cursor at the committed handoff
   checkpoint, and a connector that implements cluster drains positions every input it acquires

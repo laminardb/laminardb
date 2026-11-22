@@ -99,13 +99,13 @@ struct PreparedSqlVnodeTransition {
     topology: PreparedAggTopology,
 }
 
-/// The certified snapshot a checkpoint drain defers while it applies queued peer events.
+/// The certified snapshot an aggregate defers to the next checkpoint while it applies input.
 #[cfg(feature = "cluster")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DrainedSnapshot {
+enum DeferredSnapshot {
     Clear,
-    /// Peer events were applied without their snapshot; one snapshot of the resulting state is
-    /// owed before the cut.
+    /// Input was applied without its snapshot; one snapshot of the resulting state is owed before
+    /// the cut.
     Owed,
 }
 
@@ -797,7 +797,7 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     execution_mode: GraphExecutionMode,
     #[cfg(feature = "cluster")]
-    drained_snapshot: DrainedSnapshot,
+    deferred_snapshot: DeferredSnapshot,
     #[cfg(feature = "cluster")]
     pending_cluster_input: Option<PendingAggClusterInput>,
     #[cfg(feature = "cluster")]
@@ -885,7 +885,7 @@ impl SqlQueryOperator {
             #[cfg(feature = "cluster")]
             execution_mode: GraphExecutionMode::Normal,
             #[cfg(feature = "cluster")]
-            drained_snapshot: DrainedSnapshot::Clear,
+            deferred_snapshot: DeferredSnapshot::Clear,
             #[cfg(feature = "cluster")]
             pending_cluster_input: None,
             #[cfg(feature = "cluster")]
@@ -1252,15 +1252,6 @@ impl SqlQueryOperator {
         Ok(batches)
     }
 
-    fn apply_routed_aggregate(
-        &mut self,
-        batches: &[(RecordBatch, Option<u32>)],
-        watermark: i64,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        self.apply_routed_rows(batches, watermark)?;
-        self.emit_agg_output()
-    }
-
     fn apply_routed_rows(
         &mut self,
         batches: &[(RecordBatch, Option<u32>)],
@@ -1293,7 +1284,8 @@ impl SqlQueryOperator {
             .map(|batch| (batch, None))
             .collect::<Vec<_>>();
         let output = self
-            .apply_routed_aggregate(&routed, watermark)
+            .apply_routed_rows(&routed, watermark)
+            .and_then(|()| self.emit_agg_output())
             .map_err(|error| {
                 stateful_apply_outcome_unknown(&self.op_name, "state update or output", error)
             })?;
@@ -1985,19 +1977,16 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         }
-        let defers = self.defers_drained_snapshots();
         // A settle pass only emits what is owed; the rest of the queue stays as replay state.
-        if defers && self.execution_mode == GraphExecutionMode::CheckpointSettle {
+        if self.execution_mode == GraphExecutionMode::CheckpointSettle
+            && self.emits_certified_snapshots()
+        {
             return Ok(Vec::new());
         }
         if !self.apply_remote_event(assignment, config)? {
             return Ok(Vec::new());
         }
-        if defers {
-            self.drained_snapshot = DrainedSnapshot::Owed;
-            return Ok(Vec::new());
-        }
-        self.emit_agg_output()
+        self.emit_or_owe_snapshot()
             .map_err(|error| self.remote_replay_error(error))
     }
 
@@ -2087,7 +2076,8 @@ impl SqlQueryOperator {
         let output = if pending.local_batches.is_empty() {
             Vec::new()
         } else {
-            self.apply_routed_aggregate(&pending.local_batches, Self::frontier_watermark(effective))
+            self.apply_routed_rows(&pending.local_batches, Self::frontier_watermark(effective))
+                .and_then(|()| self.emit_or_owe_snapshot())
                 .map_err(|error| self.outbound_finalize_error(error))?
         };
         self.local_frontier = pending.local_frontier;
@@ -2206,10 +2196,11 @@ impl SqlQueryOperator {
         let output = if plan.local_batches.is_empty() {
             Vec::new()
         } else {
-            self.apply_routed_aggregate(
+            self.apply_routed_rows(
                 &plan.local_batches,
                 Self::frontier_watermark(plan.effective_frontier),
             )
+            .and_then(|()| self.emit_or_owe_snapshot())
             .map_err(|error| {
                 stateful_apply_outcome_unknown(&self.op_name, "state update or output", error)
             })?
@@ -3100,8 +3091,8 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn owes_drained_snapshot(&self) -> bool {
-        self.drained_snapshot == DrainedSnapshot::Owed
+    fn owes_deferred_snapshot(&self) -> bool {
+        self.deferred_snapshot == DeferredSnapshot::Owed
     }
 
     #[cfg(feature = "cluster")]
