@@ -10,6 +10,7 @@ use super::{ClusterShuffleConfig, QueryState, SqlQueryOperator};
 use crate::aggregate_state::IncrementalAggState;
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
+use crate::operator_graph::GraphExecutionMode;
 use crate::subscription::{CertifiedSubscriptionFrontiers, PreparedSubscriptionOutput};
 
 impl SqlQueryOperator {
@@ -90,7 +91,7 @@ impl SqlQueryOperator {
     pub(super) fn subscription_checkpoint_scope(
         &self,
     ) -> Result<(ClusterShuffleConfig, VnodeAssignmentSnapshot, Arc<[u64]>), DbError> {
-        self.require_no_prepared_subscription_output("capture a checkpoint")?;
+        self.require_settled_subscription_output("capture a checkpoint")?;
         self.active_cluster_scope()
     }
 
@@ -124,7 +125,7 @@ impl SqlQueryOperator {
     }
 
     pub(super) fn require_vnode_state_boundary(&self, context: &str) -> Result<(), DbError> {
-        self.require_no_prepared_subscription_output(context)?;
+        self.require_settled_subscription_output(context)?;
         if self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' cannot {context} across pending shuffle work",
@@ -134,6 +135,9 @@ impl SqlQueryOperator {
         Ok(())
     }
 
+    /// An owed snapshot does not hold a transition back: it stays owed and is emitted for the vnodes
+    /// owned after it. A revoked vnode's unemitted rows were never committed output; its new owner
+    /// restores the committed frame and replays.
     pub(super) fn begin_subscription_vnode_transition(&mut self) -> Result<(), DbError> {
         self.require_no_prepared_subscription_output("prepare a vnode transition")?;
         self.invalidate_local_aggregate_output_cache();
@@ -163,6 +167,7 @@ impl SqlQueryOperator {
                 super::AggregateBatchCoalescing::PublishedOutput,
             )?;
             self.prepared_aggregate_emission = Some(prepared);
+            self.drained_snapshot = super::DrainedSnapshot::Clear;
             Ok(batches)
         })())
     }
@@ -209,10 +214,51 @@ impl SqlQueryOperator {
         )
     }
 
+    /// In a checkpoint drain a certified snapshot aggregate applies its queued peer events without
+    /// emitting: each snapshot replaces the whole partition, and every snapshot a drain emits is
+    /// staged against the bounded subscription output before the cut.
+    pub(super) fn defers_drained_snapshots(&self) -> bool {
+        self.execution_mode != GraphExecutionMode::Normal
+            && !self.emit_changelog
+            && self.subscription_certificate.is_some()
+    }
+
+    /// The drain's settle pass emits an owed snapshot, as does a later normal pass once the queue
+    /// is empty; a drain pass keeps applying instead.
+    pub(super) fn owed_snapshot_is_due(&self, has_input: bool) -> bool {
+        self.drained_snapshot == super::DrainedSnapshot::Owed
+            && !has_input
+            && match self.execution_mode {
+                GraphExecutionMode::CheckpointSettle => true,
+                GraphExecutionMode::Normal => self.queued_remote_events == 0,
+                GraphExecutionMode::CheckpointDrain => false,
+            }
+    }
+
+    /// Pending sends, queued peer events and an owed snapshot all mean the output frontier has
+    /// rows still to emit, so it cannot be idle.
+    pub(super) fn has_unemitted_cluster_work(&self) -> bool {
+        self.pending_cluster_input.is_some()
+            || self.queued_remote_events != 0
+            || self.drained_snapshot == super::DrainedSnapshot::Owed
+    }
+
     fn require_no_prepared_subscription_output(&self, context: &str) -> Result<(), DbError> {
         if self.prepared_aggregate_emission.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' cannot {context} while subscription output publication is pending",
+                self.op_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Captured state must not run ahead of the output emitted for it.
+    fn require_settled_subscription_output(&self, context: &str) -> Result<(), DbError> {
+        self.require_no_prepared_subscription_output(context)?;
+        if self.drained_snapshot == super::DrainedSnapshot::Owed {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' cannot {context} while a drained snapshot is still owed",
                 self.op_name
             )));
         }

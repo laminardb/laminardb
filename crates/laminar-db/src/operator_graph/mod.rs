@@ -513,6 +513,16 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn bind_cluster_topology(&mut self, _topology: laminar_core::shuffle::ShuffleTopologyFence) {}
 
+    /// The kind of pass the graph runs next. The graph calls this whenever the kind changes, so an
+    /// aborted drain cannot leave an operator in drain behaviour.
+    #[cfg(feature = "cluster")]
+    fn set_execution_mode(&mut self, _mode: GraphExecutionMode) {}
+
+    /// Whether a checkpoint drain deferred a snapshot that a settle pass must emit before the cut.
+    fn owes_drained_snapshot(&self) -> bool {
+        false
+    }
+
     /// Retain a peer-shipped shuffle batch as channel state outside the normal `process` path so
     /// the barrier-aligned row and its pending downstream emission enter the snapshot together.
     #[cfg(feature = "cluster")]
@@ -676,16 +686,20 @@ enum GateDecision {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GraphExecutionMode {
+pub(crate) enum GraphExecutionMode {
     Normal,
+    /// A pass toward a checkpoint cut.
     CheckpointDrain,
+    /// The pass that ends a drain whose other work is done, in which operators emit the snapshots
+    /// they deferred during the drain.
+    CheckpointSettle,
 }
 
 impl GraphExecutionMode {
     const fn metric_label(self) -> &'static str {
         match self {
             Self::Normal => "normal",
-            Self::CheckpointDrain => "checkpoint_drain",
+            Self::CheckpointDrain | Self::CheckpointSettle => "checkpoint_drain",
         }
     }
 }
@@ -1158,6 +1172,8 @@ pub(crate) struct OperatorGraph {
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
     last_execution_assignment_version: Option<u64>,
+    #[cfg(feature = "cluster")]
+    last_execution_mode: GraphExecutionMode,
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
@@ -1234,6 +1250,8 @@ impl OperatorGraph {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             last_execution_assignment_version: None,
+            #[cfg(feature = "cluster")]
+            last_execution_mode: GraphExecutionMode::Normal,
             #[cfg(feature = "cluster")]
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
@@ -1438,12 +1456,33 @@ impl OperatorGraph {
             .fold(0usize, usize::saturating_add)
     }
 
-    /// Whether an aligned checkpoint can snapshot without leaving queued graph input outside the
-    /// cut. A staged vnode transition is pending graph work too: an idle pipeline must run one
-    /// drain pass to publish operator state against the target assignment. Buffer presence is
-    /// checked separately from bytes because Arrow permits positive-row record batches whose
-    /// arrays occupy zero bytes.
+    /// Whether an aligned checkpoint can snapshot without leaving queued graph input or deferred
+    /// output outside the cut.
+    #[cfg(any(test, feature = "cluster"))]
     pub(crate) fn checkpoint_is_quiescent(&self) -> bool {
+        self.next_checkpoint_pass(false).is_none()
+    }
+
+    /// The pass a drain toward a checkpoint cut, or toward a vnode handoff when `handoff`, runs
+    /// next; `None` once the graph is quiescent for it.
+    pub(crate) fn next_checkpoint_pass(&self, handoff: bool) -> Option<GraphExecutionMode> {
+        let work_is_drained = if handoff {
+            self.handoff_work_is_drained()
+        } else {
+            self.checkpoint_work_is_drained()
+        };
+        if !work_is_drained {
+            return Some(GraphExecutionMode::CheckpointDrain);
+        }
+        self.owes_drained_snapshots()
+            .then_some(GraphExecutionMode::CheckpointSettle)
+    }
+
+    /// A staged vnode transition is pending graph work too: an idle pipeline must run one drain
+    /// pass to publish operator state against the target assignment. Buffer presence is checked
+    /// separately from bytes because Arrow permits positive-row record batches whose arrays
+    /// occupy zero bytes.
+    fn checkpoint_work_is_drained(&self) -> bool {
         #[cfg(feature = "cluster")]
         if !self.checkpoint_transition_is_applied() {
             return false;
@@ -1460,12 +1499,22 @@ impl OperatorGraph {
     /// Whether the graph can hand off vnode state without transferring retained shuffle replay.
     #[cfg(feature = "cluster")]
     pub(crate) fn handoff_is_quiescent(&self) -> bool {
-        self.checkpoint_is_quiescent()
+        self.next_checkpoint_pass(true).is_none()
+    }
+
+    fn handoff_work_is_drained(&self) -> bool {
+        self.checkpoint_work_is_drained()
             && self
                 .nodes
                 .iter()
                 .filter(|node| !node.removed)
                 .all(|node| !node.operator.checkpoint_aligned_replay_pending())
+    }
+
+    fn owes_drained_snapshots(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| !node.removed && node.operator.owes_drained_snapshot())
     }
 
     #[cfg(feature = "cluster")]
@@ -1501,7 +1550,8 @@ impl OperatorGraph {
             if !node.removed
                 && (self.node_has_buffered_input(node_id)
                     || node.operator.checkpoint_aligned_replay_pending()
-                    || node.operator.checkpoint_drain_pending())
+                    || node.operator.checkpoint_drain_pending()
+                    || node.operator.owes_drained_snapshot())
             {
                 drain.insert(node_id);
                 pending.push_back(node_id);
@@ -3335,11 +3385,13 @@ impl OperatorGraph {
         result
     }
 
-    /// Execute one aligned-checkpoint drain pass. This shares the normal cycle path but does not
-    /// defer operators because the interactive query budget elapsed; backpressure gates and all
-    /// operator error, watermark, state-limit, and routing behavior remain unchanged.
-    pub(crate) async fn execute_checkpoint_drain_cycle(
+    /// Execute one pass toward a checkpoint cut, of the kind [`Self::next_checkpoint_pass`] chose.
+    /// This shares the normal cycle path but does not defer operators because the interactive
+    /// query budget elapsed; backpressure gates and all operator error, watermark, state-limit,
+    /// and routing behavior remain unchanged.
+    pub(crate) async fn execute_checkpoint_pass(
         &mut self,
+        mode: GraphExecutionMode,
         current_watermark: i64,
         frozen_source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
@@ -3348,9 +3400,19 @@ impl OperatorGraph {
             &source_batches,
             current_watermark,
             frozen_source_frontiers,
-            GraphExecutionMode::CheckpointDrain,
+            mode,
         )
         .await
+    }
+
+    #[cfg(feature = "cluster")]
+    fn set_execution_mode(&mut self, mode: GraphExecutionMode) {
+        if self.last_execution_mode != mode {
+            self.last_execution_mode = mode;
+            for node in &mut self.nodes {
+                node.operator.set_execution_mode(mode);
+            }
+        }
     }
 
     async fn execute_cycle_with_mode(
@@ -3382,6 +3444,7 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         {
             self.execution_started = true;
+            self.set_execution_mode(mode);
         }
         let mut attempt = GraphExecutionAttemptGuard::new(self);
         let result = self
@@ -3440,10 +3503,10 @@ impl OperatorGraph {
             source_frontiers,
         )?;
 
-        let checkpoint_drain_nodes = if mode == GraphExecutionMode::CheckpointDrain {
-            Some(self.checkpoint_drain_nodes())
-        } else {
+        let checkpoint_drain_nodes = if mode == GraphExecutionMode::Normal {
             None
+        } else {
+            Some(self.checkpoint_drain_nodes())
         };
 
         let mut results = FxHashMap::default();

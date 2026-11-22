@@ -1951,6 +1951,220 @@ async fn ready_pending_send_waits_for_certified_remote_publication() {
     assert_eq!(operator.queued_remote_events, 0);
 }
 
+/// A drain applies queued peer events without a snapshot each. The one snapshot it owes holds
+/// capture back until the settle pass emits it, and events still queued then stay queued as replay
+/// state.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn drained_peer_events_owe_one_snapshot_that_holds_capture_until_settled() {
+    use crate::operator_graph::GraphExecutionMode;
+
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    attach_test_subscription_certificate(&mut operator);
+
+    let (key, first) = projected_batch_for_vnode(&operator, 0, 10);
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+    for batch in [
+        first,
+        projected_batch_for_key(&operator, &key, 20),
+        projected_batch_for_key(&operator, &key, 30),
+    ] {
+        operator
+            .stage_checkpointed_shuffle(
+                "sum",
+                crate::operator::RetainedBatch::restored_channel(
+                    batch,
+                    2,
+                    assignment,
+                    recovery,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+    }
+
+    operator.set_execution_mode(GraphExecutionMode::CheckpointDrain);
+    for _ in 0..2 {
+        let output = operator
+            .process_cluster(&[Vec::new()], InputFrontier::default())
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+    }
+    assert!(operator.owes_drained_snapshot());
+    let Err(error) = operator.subscription_checkpoint_scope() else {
+        panic!("capture must wait for the owed snapshot");
+    };
+    assert!(
+        error.to_string().contains("drained snapshot is still owed"),
+        "{error}"
+    );
+
+    operator.set_execution_mode(GraphExecutionMode::CheckpointSettle);
+    let output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    assert_eq!(output.len(), 1);
+    let totals = output[0]
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(totals.value(0), 30);
+    assert_eq!(
+        operator
+            .take_prepared_subscription_output_frames()
+            .unwrap()
+            .frames
+            .len(),
+        1
+    );
+    operator.publish_prepared_subscription_output();
+    assert!(!operator.owes_drained_snapshot());
+    assert_eq!(operator.queued_remote_events, 1);
+    let settled = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    assert!(settled.is_empty());
+    assert_eq!(operator.queued_remote_events, 1);
+    assert!(operator.subscription_checkpoint_scope().is_ok());
+}
+
+/// A vnode transition staged while a drain owes its snapshot proceeds; the snapshot stays owed and
+/// the settle pass emits it, with the drained events, under the new assignment.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn owed_snapshot_survives_a_vnode_transition_and_settles_under_the_target() {
+    use crate::operator_graph::GraphExecutionMode;
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+
+    let predecessor_owners = [1, 2, 1, 1, 1, 1, 1, 1];
+    let target_owners = [1, 3, 1, 1, 1, 1, 1, 1];
+    let scope = cluster_scope(predecessor_owners).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    attach_test_subscription_certificate(&mut operator);
+
+    let (key, first) = projected_batch_for_vnode(&operator, 0, 10);
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+    for batch in [first, projected_batch_for_key(&operator, &key, 20)] {
+        operator
+            .stage_checkpointed_shuffle(
+                "sum",
+                crate::operator::RetainedBatch::restored_channel(
+                    batch,
+                    2,
+                    assignment,
+                    recovery,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+    }
+    operator.set_execution_mode(GraphExecutionMode::CheckpointDrain);
+    while operator.queued_remote_events != 0 {
+        let output = operator
+            .process_cluster(&[Vec::new()], InputFrontier::default())
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+    }
+    assert!(operator.owes_drained_snapshot());
+
+    let participant = |node_id| CheckpointParticipant {
+        node_id,
+        boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+    };
+    let predecessor = CheckpointAssignmentFence::from_owner_map(
+        assignment,
+        &predecessor_owners,
+        vec![participant(1), participant(2)],
+    )
+    .unwrap();
+    let target = CheckpointAssignmentFence::from_owner_map(
+        assignment + 1,
+        &target_owners,
+        vec![participant(1), participant(3)],
+    )
+    .unwrap();
+    scope.registry.set_assignment_and_version(
+        Arc::from(target_owners.map(NodeId)),
+        target.assignment_version,
+    );
+    scope
+        .sender
+        .install_assignment_fence(&target, &target_owners)
+        .unwrap();
+    scope
+        .receiver
+        .install_assignment_fence(&target, &target_owners)
+        .unwrap();
+    operator
+        .prepare_vnode_transition(ManagedVnodeTransition {
+            predecessor: &predecessor,
+            target: &target,
+            revoked: &rustc_hash::FxHashSet::default(),
+            restores: &[],
+            whole_restores: &[],
+            mode: ManagedVnodeTransitionMode::Live,
+        })
+        .unwrap();
+    operator.publish_vnode_transition();
+    operator.finish_vnode_transition();
+    assert!(operator.owes_drained_snapshot());
+    assert!(operator.subscription_checkpoint_scope().is_err());
+
+    operator.set_execution_mode(GraphExecutionMode::CheckpointSettle);
+    let output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    let totals = output[0]
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((output.len(), totals.value(0)), (1, 30));
+    assert!(operator
+        .take_prepared_subscription_output_frames()
+        .is_some());
+    operator.publish_prepared_subscription_output();
+    assert!(!operator.owes_drained_snapshot());
+    assert_eq!(
+        operator.cluster_assignment.as_ref().unwrap().version(),
+        target.assignment_version
+    );
+    assert!(operator.subscription_checkpoint_scope().is_ok());
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn pending_certified_emission_defers_the_next_remote_event() {

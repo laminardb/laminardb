@@ -28,9 +28,9 @@ use rustc_hash::FxHashMap;
 
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
-use crate::operator_graph::InputFrontier;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::ShuffleAlignmentOutcome;
+use crate::operator_graph::{GraphExecutionMode, InputFrontier};
 use crate::pipeline::CheckpointCompletion;
 use state_capture::CapturedOperatorState;
 
@@ -4401,6 +4401,21 @@ impl ConnectorPipelineCallback {
         self.drain_checkpoint_edges_until_mode(deadline, true).await
     }
 
+    async fn execute_checkpoint_pass(
+        &mut self,
+        mode: GraphExecutionMode,
+        watermark: i64,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        let source_frontiers = if self.source_frontiers_buf.is_empty() {
+            None
+        } else {
+            Some(&self.source_frontiers_buf)
+        };
+        self.graph
+            .execute_checkpoint_pass(mode, watermark, source_frontiers)
+            .await
+    }
+
     async fn drain_checkpoint_edges_until_mode(
         &mut self,
         deadline: tokio::time::Instant,
@@ -4419,21 +4434,7 @@ impl ConnectorPipelineCallback {
         let shuffle_work_wake: Option<Arc<tokio::sync::Notify>> = None;
         let mut completed_pass = false;
         let mut activity = false;
-        while {
-            #[cfg(feature = "cluster")]
-            {
-                if handoff {
-                    !self.graph.handoff_is_quiescent()
-                } else {
-                    !self.graph.checkpoint_is_quiescent()
-                }
-            }
-            #[cfg(not(feature = "cluster"))]
-            {
-                let _ = handoff;
-                !self.graph.checkpoint_is_quiescent()
-            }
-        } {
+        while let Some(mode) = self.graph.next_checkpoint_pass(handoff) {
             #[cfg(feature = "cluster")]
             self.require_process_authority("checkpoint graph execution")?;
             if tokio::time::Instant::now() >= deadline {
@@ -4452,7 +4453,12 @@ impl ConnectorPipelineCallback {
                 .is_some_and(|shuffle| shuffle.receiver.queued_work_ready());
             #[cfg(not(feature = "cluster"))]
             let shuffle_work_ready = false;
-            if completed_pass && !shuffle_work_ready && !self.graph.has_runnable_deferred_work() {
+            // A settle pass runs at once: the drain has nothing else to wait for.
+            if mode != GraphExecutionMode::CheckpointSettle
+                && completed_pass
+                && !shuffle_work_ready
+                && !self.graph.has_runnable_deferred_work()
+            {
                 tokio::select! {
                     biased;
                     // Do not start another graph pass once the attempt deadline has elapsed.
@@ -4474,15 +4480,9 @@ impl ConnectorPipelineCallback {
                 // `has_runnable_deferred_work` has changed. Fall through and poll once.
             }
 
-            let source_frontiers = if self.source_frontiers_buf.is_empty() {
-                None
-            } else {
-                Some(&self.source_frontiers_buf)
-            };
             let results = match tokio::time::timeout_at(
                 deadline,
-                self.graph
-                    .execute_checkpoint_drain_cycle(watermark, source_frontiers),
+                self.execute_checkpoint_pass(mode, watermark),
             )
             .await
             {
