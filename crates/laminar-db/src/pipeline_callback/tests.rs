@@ -467,6 +467,121 @@ impl crate::operator_graph::GraphOperator for SnapshotableAlignedReplayDrainOper
     }
 }
 
+/// What a [`DeferringDrainOperator`] has left to do, shared with the test that drives it.
+#[cfg(feature = "cluster")]
+#[derive(Default)]
+struct DeferringDrainState {
+    queued_events: std::sync::atomic::AtomicUsize,
+    owes_snapshot: std::sync::atomic::AtomicBool,
+    settled_snapshots: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug, PartialEq, Eq)]
+struct DeferringDrainProgress {
+    queued_events: usize,
+    owes_snapshot: bool,
+    settled_snapshots: usize,
+}
+
+#[cfg(feature = "cluster")]
+impl DeferringDrainState {
+    fn install(
+        callback: &mut ConnectorPipelineCallback,
+        queued_events: usize,
+        owes_snapshot: bool,
+    ) -> Arc<Self> {
+        let state = Arc::new(Self {
+            queued_events: queued_events.into(),
+            owes_snapshot: owes_snapshot.into(),
+            settled_snapshots: 0.into(),
+        });
+        callback.graph.push_test_node(
+            "deferring-drain",
+            Box::new(DeferringDrainOperator {
+                mode: crate::operator_graph::GraphExecutionMode::Normal,
+                state: Arc::clone(&state),
+            }),
+        );
+        state
+    }
+
+    fn progress(&self) -> DeferringDrainProgress {
+        use std::sync::atomic::Ordering;
+        DeferringDrainProgress {
+            queued_events: self.queued_events.load(Ordering::Acquire),
+            owes_snapshot: self.owes_snapshot.load(Ordering::Acquire),
+            settled_snapshots: self.settled_snapshots.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Defers like a certified snapshot aggregate: a drain pass applies one queued peer event and
+/// owes its snapshot, and the settle pass emits what is owed without applying more.
+#[cfg(feature = "cluster")]
+struct DeferringDrainOperator {
+    mode: crate::operator_graph::GraphExecutionMode,
+    state: Arc<DeferringDrainState>,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for DeferringDrainOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        use crate::operator_graph::GraphExecutionMode;
+        use std::sync::atomic::Ordering;
+        let state = &self.state;
+        match self.mode {
+            GraphExecutionMode::CheckpointDrain => {
+                if state.queued_events.load(Ordering::Acquire) != 0 {
+                    state.queued_events.fetch_sub(1, Ordering::AcqRel);
+                    state.owes_snapshot.store(true, Ordering::Release);
+                }
+            }
+            GraphExecutionMode::CheckpointSettle => {
+                if state.owes_snapshot.swap(false, Ordering::AcqRel) {
+                    state.settled_snapshots.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            GraphExecutionMode::Normal => {}
+        }
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        self.state
+            .queued_events
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        self.checkpoint_aligned_replay_pending()
+    }
+
+    fn set_execution_mode(&mut self, mode: crate::operator_graph::GraphExecutionMode) {
+        self.mode = mode;
+    }
+
+    fn owes_drained_snapshot(&self) -> bool {
+        self.state
+            .owes_snapshot
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 #[cfg(feature = "cluster")]
 struct FollowerCheckpointEvidenceOperator;
 
@@ -2324,6 +2439,66 @@ async fn handoff_graph_drain_consumes_snapshotable_aligned_replay_and_reports_ac
         .drain_handoff_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1),)
         .await
         .unwrap());
+}
+
+/// A handoff drain applies the whole queue, then settles the owed snapshot in one pass.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn handoff_drain_applies_the_queue_then_settles_owed_output_once() {
+    let mut callback = empty_callback_fixture();
+    let state = DeferringDrainState::install(&mut callback, 3, false);
+
+    callback
+        .drain_handoff_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("handoff drain must settle its owed snapshot");
+
+    assert_eq!(
+        state.progress(),
+        DeferringDrainProgress {
+            queued_events: 0,
+            owes_snapshot: false,
+            settled_snapshots: 1,
+        }
+    );
+    assert!(callback.graph.handoff_is_quiescent());
+}
+
+/// A checkpoint drain settles an owed snapshot in one pass and leaves the rest of the queue as
+/// replay state; with nothing owed it runs no pass at all.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_drain_settles_owed_output_and_keeps_queued_replay() {
+    let mut callback = empty_callback_fixture();
+    let state = DeferringDrainState::install(&mut callback, 2, true);
+    callback
+        .drain_checkpoint_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("checkpoint drain must settle its owed snapshot");
+    assert_eq!(
+        state.progress(),
+        DeferringDrainProgress {
+            queued_events: 2,
+            owes_snapshot: false,
+            settled_snapshots: 1,
+        }
+    );
+    assert!(callback.graph.checkpoint_is_quiescent());
+
+    let mut callback = empty_callback_fixture();
+    let state = DeferringDrainState::install(&mut callback, 2, false);
+    callback
+        .drain_checkpoint_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        state.progress(),
+        DeferringDrainProgress {
+            queued_events: 2,
+            owes_snapshot: false,
+            settled_snapshots: 0,
+        }
+    );
 }
 
 #[cfg(feature = "cluster")]

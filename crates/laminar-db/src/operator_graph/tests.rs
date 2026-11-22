@@ -1953,6 +1953,352 @@ async fn alignment_consumes_an_exposed_frontier_cut_before_holdover() {
 }
 
 #[cfg(feature = "cluster")]
+const CERTIFIED_SUM_SQL: &str = "SELECT key, SUM(value) AS total FROM events GROUP BY key";
+
+#[cfg(feature = "cluster")]
+fn certified_sum_events_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+#[cfg(feature = "cluster")]
+fn certified_sum_certificate(
+    vnode_count: u16,
+) -> Arc<laminar_core::checkpoint::OutputDistributionCertificate> {
+    use laminar_core::checkpoint::{
+        ChangelogMode, OutputDistribution, OutputDistributionCertificate, PipelineIdentity,
+        StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+        OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+    };
+
+    Arc::new(OutputDistributionCertificate {
+        version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+        protocol_version: SubscriptionProtocolVersion::CURRENT,
+        stream_id: "sum".into(),
+        catalog_generation: 1,
+        stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes([1; 32])),
+        final_operator_id: "stream:sum".into(),
+        distribution: OutputDistribution::VnodePartitioned {
+            key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+            partition_abi: laminar_core::state::PARTITIONING_ABI_VERSION,
+            vnode_count,
+        },
+        schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+        changelog_mode: ChangelogMode::FullPartitionSnapshot,
+        history_retention_bytes: 0,
+        query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
+        pipeline_identity: PipelineIdentity::empty(),
+    })
+}
+
+/// Node 1's graph with a certified snapshot aggregate, built in production order: the
+/// certificate and cluster scope are installed before the operator exists, then managed state
+/// is initialized and the aggregate's first frontier broadcast settles.
+#[cfg(feature = "cluster")]
+async fn certified_sum_leader(
+    scope: crate::operator::sql_query::ClusterShuffleConfig,
+) -> OperatorGraph {
+    let key_groups = KeyGroupCount::try_from(scope.registry.vnode_count()).unwrap();
+    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(key_groups);
+    graph.set_subscription_certificates(FxHashMap::from_iter([(
+        "sum".to_string(),
+        certified_sum_certificate(key_groups.get()),
+    )]));
+    graph.set_cluster_shuffle(scope);
+    graph.register_source_schema("events".to_string(), certified_sum_events_schema());
+    graph.add_query(
+        "sum".to_string(),
+        CERTIFIED_SUM_SQL.to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    graph.take_build_errors().unwrap();
+    let mut graph = graph.initialize_managed_state().await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !graph.handoff_is_quiescent() {
+        assert!(tokio::time::Instant::now() < deadline);
+        graph
+            .execute_cycle(&FxHashMap::default(), 0, None)
+            .await
+            .unwrap();
+        assert!(graph.take_prepared_subscription_outputs().is_empty());
+        tokio::task::yield_now().await;
+    }
+    graph
+}
+
+/// Peer pre-aggregate slices for one key on `vnode`, projected by a twin of the leader's
+/// aggregate so each frame carries the exact schema and routing the leader validates.
+#[cfg(feature = "cluster")]
+async fn certified_sum_peer_slices(
+    graph: &OperatorGraph,
+    vnode: u32,
+    values: &[i64],
+) -> (String, Vec<RecordBatch>) {
+    let twin = crate::aggregate_state::IncrementalAggState::try_from_sql(
+        &graph.ctx,
+        CERTIFIED_SUM_SQL,
+        false,
+        graph.key_group_count,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let projection = twin.compiled_projection().unwrap();
+    let project = |key: &str, value: i64| {
+        let raw = RecordBatch::try_new(
+            certified_sum_events_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![key])),
+                Arc::new(Int64Array::from(vec![value])),
+            ],
+        )
+        .unwrap();
+        projection.evaluate(&raw).unwrap()
+    };
+    let key = (0..1_000)
+        .map(|index| format!("K{index}"))
+        .find(|key| {
+            crate::operator::sql_query::hash_rows_to_vnodes(
+                &project(key, 0),
+                twin.num_group_cols(),
+                u32::from(graph.key_group_count),
+            )
+            .unwrap()
+                == [vnode]
+        })
+        .expect("no test key hashes to the leader's vnode");
+    let slices = values.iter().map(|value| project(&key, *value)).collect();
+    (key, slices)
+}
+
+/// A certified snapshot aggregate on node 1 with node 2's backlog of peer slices queued in its
+/// ordered channel. Each slice is pre-aggregate rows for one key followed by the peer frontier
+/// marker that closes it, as a live peer's aggregate sends them.
+#[cfg(feature = "cluster")]
+struct CertifiedPeerBacklog {
+    graph: OperatorGraph,
+    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    key: String,
+    backlog_total: i64,
+    _peer_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    _peer_sender: laminar_core::shuffle::ShuffleSender,
+}
+
+#[cfg(feature = "cluster")]
+async fn certified_peer_backlog(slices: i64) -> CertifiedPeerBacklog {
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let AlignmentHarness {
+        graph: transport,
+        local_receiver,
+        remote_receiver,
+        remote_sender,
+        ..
+    } = alignment_harness().await;
+    let mut graph = certified_sum_leader(transport.cluster_shuffle_config().unwrap().clone()).await;
+    drop(transport);
+    let values = (1..=slices).collect::<Vec<_>>();
+    let (key, batches) = certified_sum_peer_slices(&graph, 0, &values).await;
+    for (batch, slice) in batches.into_iter().zip(1_i64..) {
+        let frontier = ShuffleMessage::Frontier {
+            stage: "sum".into(),
+            watermark: Some(slice * 1_000),
+            idle: false,
+        };
+        for message in [
+            ShuffleMessage::checkpointed("sum".into(), 0, batch),
+            frontier,
+        ] {
+            remote_sender.send_to(1, &message).await.unwrap();
+        }
+    }
+    queue_peer_backlog(&mut graph, &local_receiver, values.len()).await;
+    CertifiedPeerBacklog {
+        graph,
+        receiver: local_receiver,
+        key,
+        backlog_total: values.iter().sum(),
+        _peer_receiver: remote_receiver,
+        _peer_sender: remote_sender,
+    }
+}
+
+/// Moves the whole peer backlog into the aggregate's ordered channel through the receiver drains
+/// and graph staging that `pump_ordered_shuffle_prefix` uses, counting batches and frontier cuts.
+/// The receiver reports no frame count, and a slice arriving mid-drain would split the drain.
+#[cfg(feature = "cluster")]
+async fn queue_peer_backlog(
+    graph: &mut OperatorGraph,
+    receiver: &laminar_core::shuffle::ShuffleReceiver,
+    slices: usize,
+) {
+    let scope = graph.cluster_shuffle.clone().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (mut batches, mut frontiers) = (0, 0);
+    while batches < slices || frontiers < slices {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leader received {batches} batches and {frontiers} frontiers of {slices} slices"
+        );
+        let staged = receiver.drain_checkpointed_staged();
+        let cuts = receiver.drain_staged_frontiers();
+        graph
+            .validate_received_frontier_cuts(&scope, &cuts)
+            .unwrap();
+        batches += staged.len() + cuts.iter().map(|cut| cut.preceding().len()).sum::<usize>();
+        frontiers += cuts.len();
+        for (stage, batch) in staged {
+            graph
+                .stage_checkpointed_shuffle(&stage, RetainedBatch::from_received(batch), 0)
+                .unwrap();
+        }
+        graph.dispatch_validated_frontier_cuts(cuts, 0).unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!((batches, frontiers), (slices, slices));
+}
+
+/// The certified snapshots one drain staged and the backlog key's final total.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Default)]
+struct CertifiedDrainOutput {
+    passes: usize,
+    staged_snapshots: usize,
+    final_total: Option<i64>,
+}
+
+#[cfg(feature = "cluster")]
+impl CertifiedDrainOutput {
+    fn record(&mut self, outputs: Vec<crate::subscription::PreparedSubscriptionOutput>, key: &str) {
+        let frames = outputs
+            .into_iter()
+            .flat_map(|output| output.frames)
+            .collect::<Vec<_>>();
+        if frames.is_empty() {
+            return;
+        }
+        self.staged_snapshots += 1;
+        for frame in frames {
+            let keys = frame.batch.column_by_name("key").unwrap();
+            let keys = keys.as_any().downcast_ref::<StringArray>().unwrap();
+            let totals = frame.batch.column_by_name("total").unwrap();
+            let totals = totals.as_any().downcast_ref::<Int64Array>().unwrap();
+            if let Some(row) = (0..keys.len()).find(|row| keys.value(*row) == key) {
+                self.final_total = Some(totals.value(row));
+            }
+        }
+    }
+
+    fn assert_one_snapshot_with_total(&self, expected_total: i64) {
+        assert_eq!(self.final_total, Some(expected_total), "{self:?}");
+        assert_eq!(self.staged_snapshots, 1, "{self:?}");
+    }
+}
+
+/// Drives the leader as `drain_checkpoint_edges_until_mode` does: the pass the graph chooses until
+/// it is quiescent, the take and commit of prepared subscription output after each pass, and a
+/// wait on the receiver when nothing runs.
+#[cfg(feature = "cluster")]
+async fn drain_certified_output(
+    backlog: &mut CertifiedPeerBacklog,
+    handoff: bool,
+) -> CertifiedDrainOutput {
+    let graph = &mut backlog.graph;
+    let wake = backlog.receiver.work_ready_notify();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut drained = CertifiedDrainOutput::default();
+    while let Some(mode) = graph.next_checkpoint_pass(handoff) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "drain did not settle: {drained:?}"
+        );
+        if mode != GraphExecutionMode::CheckpointSettle
+            && drained.passes != 0
+            && !backlog.receiver.queued_work_ready()
+            && !graph.has_runnable_deferred_work()
+        {
+            let _ = tokio::time::timeout(
+                crate::pipeline::streaming_coordinator::IDLE_TIMEOUT,
+                wake.notified(),
+            )
+            .await;
+        }
+        graph.execute_checkpoint_pass(mode, 0, None).await.unwrap();
+        assert!(!graph.take_cycle_failures().0);
+        drained.passes += 1;
+        drained.record(graph.take_prepared_subscription_outputs(), &backlog.key);
+        graph.commit_prepared_subscription_outputs();
+    }
+    drained
+}
+
+/// A handoff drain, which each wave of the shuffle fixed-point flush runs, stages one full-state
+/// snapshot of a certified aggregate for a whole queued peer backlog.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_drain_stages_one_certified_snapshot_for_a_peer_backlog() {
+    let mut backlog = certified_peer_backlog(5).await;
+    let drained = drain_certified_output(&mut backlog, true).await;
+    drained.assert_one_snapshot_with_total(backlog.backlog_total);
+}
+
+/// The coordinator's replay drain runs to checkpoint quiescence, which ignores queued peer events
+/// but not input buffered on the aggregate's port. The leader's own rows arrive while the
+/// aggregate replays peer events, so they stay buffered and the drain applies the rest of the
+/// backlog before them; it should still stage one full-state snapshot.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_drain_stages_one_certified_snapshot_for_a_peer_backlog_behind_buffered_input() {
+    const LOCAL_VALUE: i64 = 100;
+    let mut backlog = certified_peer_backlog(5).await;
+    let local = RecordBatch::try_new(
+        certified_sum_events_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![backlog.key.as_str()])),
+            Arc::new(Int64Array::from(vec![LOCAL_VALUE])),
+        ],
+    )
+    .unwrap();
+    let sources = FxHashMap::from_iter([(Arc::from("events"), vec![local])]);
+    backlog
+        .graph
+        .execute_cycle(&sources, 0, None)
+        .await
+        .unwrap();
+    assert!(!backlog
+        .graph
+        .take_prepared_subscription_outputs()
+        .is_empty());
+    backlog.graph.commit_prepared_subscription_outputs();
+    let aggregate = backlog.graph.find_node("sum").unwrap();
+    assert!(backlog.graph.node_has_buffered_input(aggregate));
+
+    let drained = drain_certified_output(&mut backlog, false).await;
+    drained.assert_one_snapshot_with_total(backlog.backlog_total + LOCAL_VALUE);
+}
+
+/// With nothing else pending, a checkpoint drain runs no pass: the queued peer backlog stays as
+/// replay state for the cut.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_drain_leaves_a_peer_backlog_queued_when_nothing_else_is_pending() {
+    let mut backlog = certified_peer_backlog(5).await;
+    let drained = drain_certified_output(&mut backlog, false).await;
+    assert_eq!((drained.passes, drained.staged_snapshots), (0, 0));
+    let aggregate = backlog.graph.find_node("sum").unwrap();
+    assert!(backlog.graph.nodes[aggregate]
+        .operator
+        .checkpoint_aligned_replay_pending());
+}
+
+#[cfg(feature = "cluster")]
 struct ThreeNodeAlignmentHarness {
     graph: OperatorGraph,
     local_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
@@ -5833,7 +6179,7 @@ async fn checkpoint_drain_bypasses_query_budget_and_emits_each_row_once() {
     let mut emitted_symbols = Vec::new();
     for _ in 0..3 {
         let mut drained = graph
-            .execute_checkpoint_drain_cycle(i64::MAX, None)
+            .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, i64::MAX, None)
             .await
             .unwrap();
         for output_batch in drained.remove("output").unwrap_or_default() {
@@ -5855,7 +6201,7 @@ async fn checkpoint_drain_bypasses_query_budget_and_emits_each_row_once() {
     assert_eq!(emitted_symbols, ["AAPL", "GOOG"]);
 
     let after_quiescence = graph
-        .execute_checkpoint_drain_cycle(i64::MAX, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, i64::MAX, None)
         .await
         .unwrap();
     assert_eq!(
@@ -5908,7 +6254,7 @@ async fn checkpoint_drain_accounting_includes_deferred_source_ports() {
     assert!(!graph.checkpoint_is_quiescent());
 
     let drained = graph
-        .execute_checkpoint_drain_cycle(10, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 10, None)
         .await
         .unwrap();
     assert_eq!(total_rows(&drained, "output_a"), 2);
@@ -5939,7 +6285,7 @@ async fn checkpoint_drain_quiescence_detects_zero_byte_row_batch() {
     assert!(!graph.checkpoint_is_quiescent());
 
     let drained = graph
-        .execute_checkpoint_drain_cycle(10, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 10, None)
         .await
         .unwrap();
     assert_eq!(total_rows(&drained, "output"), 3);
@@ -5978,7 +6324,7 @@ async fn checkpoint_drain_does_not_poll_unrelated_aggregate_branch() {
     prefill_port(&mut graph, other_source, 0, vec![test_batch()]);
 
     let drained = graph
-        .execute_checkpoint_drain_cycle(10, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 10, None)
         .await
         .unwrap();
     assert_eq!(total_rows(&drained, "other_output"), 2);
@@ -6050,7 +6396,7 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
 
     graph.set_backpressure_policy(BackpressurePolicy::Fail);
     let error = graph
-        .execute_checkpoint_drain_cycle(i64::MAX, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, i64::MAX, None)
         .await
         .expect_err("the checkpoint drain must preserve Fail backpressure semantics");
     assert!(matches!(error, DbError::BackpressureFail(_)));
@@ -6063,7 +6409,7 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
 
     graph.set_backpressure_policy(BackpressurePolicy::Backpressure);
     graph
-        .execute_checkpoint_drain_cycle(i64::MAX, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, i64::MAX, None)
         .await
         .unwrap();
     assert_eq!(
@@ -6128,7 +6474,7 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
         .expect_err("cancelled graph generation executed again");
     assert_graph_execution_poison(&execution_error);
     let drain_error = graph
-        .execute_checkpoint_drain_cycle(i64::MIN, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, i64::MIN, None)
         .await
         .expect_err("cancelled graph generation entered checkpoint drain");
     assert_graph_execution_poison(&drain_error);
@@ -6945,7 +7291,7 @@ async fn graph_prospective_source_gate_retains_input_frontier_and_cached_sql_ret
     assert!(!graph.has_deferred_work());
     assert!(!graph.has_runnable_deferred_work());
     let third = graph
-        .execute_checkpoint_drain_cycle(100, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 100, None)
         .await
         .unwrap();
     assert_eq!(total_rows(&third, "sorted"), 0);
@@ -7001,7 +7347,12 @@ async fn graph_deferred_union_keeps_each_sources_provider_input_distinct() {
     let mut values = Vec::new();
     let mut results = vec![graph.execute_cycle(&sources, 0, None).await.unwrap()];
     assert_eq!(graph.input_bufs[left][0].len(), 1);
-    results.push(graph.execute_checkpoint_drain_cycle(0, None).await.unwrap());
+    results.push(
+        graph
+            .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 0, None)
+            .await
+            .unwrap(),
+    );
     for result in results {
         for batch in &result["combined"] {
             let column = batch
@@ -7190,7 +7541,7 @@ async fn graph_post_mutation_admission_failure_under_fail_fences_retry_and_resto
         .unwrap_err();
     assert_graph_execution_poison(&retry);
     let drain = graph
-        .execute_checkpoint_drain_cycle(0, None)
+        .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 0, None)
         .await
         .unwrap_err();
     assert_graph_execution_poison(&drain);
@@ -7721,7 +8072,7 @@ async fn interval_output_admission_under_fail_preserves_terminal_rejection_for_b
             .unwrap_err();
         assert_graph_execution_poison(&retry);
         let drain = graph
-            .execute_checkpoint_drain_cycle(0, None)
+            .execute_checkpoint_pass(GraphExecutionMode::CheckpointDrain, 0, None)
             .await
             .unwrap_err();
         assert_graph_execution_poison(&drain);

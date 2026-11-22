@@ -220,7 +220,11 @@ async fn graph_barrier_alignment_retains_pre_cut_input_until_the_existing_drain_
     tokio::time::timeout(DEADLINE, async {
         while !graph.checkpoint_is_quiescent() {
             let emitted = graph
-                .execute_checkpoint_drain_cycle(100, Some(&frozen))
+                .execute_checkpoint_pass(
+                    crate::operator_graph::GraphExecutionMode::CheckpointDrain,
+                    100,
+                    Some(&frozen),
+                )
                 .await
                 .unwrap();
             if let Some(batches) = emitted.get("activity") {

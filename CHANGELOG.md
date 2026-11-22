@@ -98,6 +98,14 @@
 
 ### Fixed
 
+- In cluster mode, a checkpoint drain no longer stages one full snapshot of a certified aggregate
+  subscription (one without `EMIT CHANGES`) for every queued peer shuffle event. The aggregate
+  applies the events without emitting, and a final settle pass, run once the drain's other work is
+  done, emits one snapshot of the result before the cut. Events still queued then stay as replay
+  state, as before. Previously a topology-migration cut could fill the bounded subscription output
+  ("cluster subscription total pending output reached its bounded … limit") and abort the
+  migration. Cluster mode only (#712).
+
 - The NATS sink checks `subject.column`, `header.columns` and `dedup.id.column` at `CREATE SINK`:
   each must name a `Utf8` or `Utf8View` query column. Before, a missing or wrongly typed column
   passed `CREATE SINK` and faulted the pipeline at its first batch. With `FORMAT RAW`, the error notes
@@ -159,6 +167,8 @@
   beyond the stream limit) and RUSTSEC-2026-0524 (a long Retry token could panic or exhaust memory
   in a QUIC client), and quinn-udp to 0.5.16 for RUSTSEC-2026-0538 (the receive loop could spin
   after a truncated datagram).
+- url moves to 2.5.9 for RUSTSEC-2026-0592 (`Url::origin()` overflowed the stack on nested
+  `blob:` URLs).
 
 ## [0.40.2]
 

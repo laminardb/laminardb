@@ -254,21 +254,21 @@ impl SqlQueryOperator {
 
     /// Apply batches a peer shuffled here: partial rows for an aggregate that gathers them,
     /// otherwise pre-aggregate rows.
-    pub(super) fn apply_remote_aggregate(
+    pub(super) fn apply_remote_rows(
         &mut self,
         batches: &[(RecordBatch, Option<u32>)],
         watermark: i64,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    ) -> Result<(), DbError> {
         self.invalidate_local_aggregate_output_cache();
         match &mut self.state {
             QueryState::Agg(aggregate) if aggregate.gathers_partials() => {
                 for (batch, _) in batches {
                     aggregate.merge_global_partials(batch, watermark)?;
                 }
+                Ok(())
             }
-            _ => return self.apply_routed_aggregate(batches, watermark),
+            _ => self.apply_routed_rows(batches, watermark),
         }
-        self.emit_agg_output()
     }
 }
 
