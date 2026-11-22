@@ -167,6 +167,8 @@
   beyond the stream limit) and RUSTSEC-2026-0524 (a long Retry token could panic or exhaust memory
   in a QUIC client), and quinn-udp to 0.5.16 for RUSTSEC-2026-0538 (the receive loop could spin
   after a truncated datagram).
+- url moves to 2.5.9 for RUSTSEC-2026-0592 (`Url::origin()` overflowed the stack on nested
+  `blob:` URLs).
 
 ## [0.40.2]
 
