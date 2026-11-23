@@ -19,6 +19,17 @@ pub(crate) struct MutationRoutes {
     pub(crate) changelog: FxHashSet<String>,
 }
 
+impl MutationRoutes {
+    /// A cluster topology's routes: it has no direct keyed-mutation sink route, whose singleton
+    /// sources and sinks lack fenced placement.
+    pub(crate) fn cluster(changelog: FxHashSet<String>) -> Self {
+        Self {
+            direct: FxHashSet::default(),
+            changelog,
+        }
+    }
+}
+
 type Registrations<'a> = (
     &'a HashMap<String, crate::connector_manager::SourceRegistration>,
     &'a HashMap<String, crate::connector_manager::SinkRegistration>,

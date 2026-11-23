@@ -99,6 +99,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[path = "cluster_soak/delta_cdf_source.rs"]
+mod delta_cdf_source;
 #[cfg(all(feature = "kafka", feature = "files", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/files_source.rs"]
 mod files_source;
@@ -10290,6 +10293,7 @@ fn custom_s3_endpoint_configured() -> bool {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[derive(Clone)]
 struct DeltaSoakStorage {
     endpoint: String,
     access_key: String,

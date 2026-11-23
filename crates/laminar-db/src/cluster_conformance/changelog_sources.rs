@@ -9,7 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use super::oracle::OutputForm;
 use super::source::{FixtureKind, FixtureSource, QueueCommit, QueueRows};
 use super::tests::verdict;
-use super::{Case, Verdict};
+use super::{views, Case, Verdict};
 
 const KEYS: i64 = 23;
 const ROWS_PER_BATCH: usize = 16;
@@ -144,4 +144,39 @@ async fn aggregate_over_a_projected_changelog_singleton_is_equal() {
         ),
     );
     assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Keyed and global views over a full-changelog singleton apply every retraction the one reading
+/// node forwards, and every node reads them at the committed cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn views_over_a_changelog_singleton_match_batch_sql_in_cluster() {
+    let case = views::ViewCase {
+        name: "views_over_a_changelog_singleton",
+        sources: vec![changes()],
+        views: views::views(&[
+            "CREATE MATERIALIZED VIEW by_group AS \
+             SELECT v % 7 AS g, COUNT(*) AS n, SUM(k) AS s FROM changes GROUP BY v % 7",
+            "CREATE MATERIALIZED VIEW totals AS \
+             SELECT COUNT(*) AS n, SUM(v) AS total, MIN(k) AS lo, MAX(k) AS hi FROM changes",
+        ]),
+        reads: vec![
+            (
+                "SELECT * FROM by_group",
+                concat!(
+                    "SELECT v % 7 AS g, COUNT(*) AS n, SUM(k) AS s FROM ",
+                    final_rows!(),
+                    " GROUP BY v % 7"
+                ),
+            ),
+            (
+                "SELECT * FROM totals",
+                concat!(
+                    "SELECT COUNT(*) AS n, SUM(v) AS total, MIN(k) AS lo, MAX(k) AS hi FROM ",
+                    final_rows!()
+                ),
+            ),
+        ],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(views::verdict(case).await, Verdict::Equal);
 }

@@ -4,6 +4,15 @@
 
 ### Added
 
+- In cluster mode, a Delta Lake change feed on object storage (or a Unity Catalog `uc://` table)
+  runs at-least-once on one node at a time and feeds aggregates, materialized views and Delta
+  `append` sinks, as it does in embedded mode. Full-changelog sources now have a cluster route:
+  one node reads a changelog in log order, and the aggregates and views over it spread across
+  the nodes by their keys. A survivor resumes the feed from the committed cursor, and a rescale
+  moves it at the handoff checkpoint. A local `table.path` is now rejected in cluster mode as
+  node-local storage; `read.mode = 'snapshot'`, adding the source to a running cluster, and
+  exactly-once stay rejected there.
+
 - A PostgreSQL CDC source takes `change.time.column`: a declared, non-key `TIMESTAMP NOT NULL`
   column that is not a table column, filled with each change's transaction commit time to the
   millisecond, deletes included, with `snapshot.mode=never`. With a watermark on it, an `upsert`

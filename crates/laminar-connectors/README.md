@@ -21,7 +21,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node, and in a cluster on one node at a time with `queue.manager` set ([guide](../../docs/IBMMQ.md)) | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
-| Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
+| Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node, and in a cluster on one node at a time for a change feed on object storage | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; `read.splits` reads appends in parallel, across cluster nodes too; changelog fails closed | Implemented |
 | File Auto-Loader | `files` | Local directory watch/glob discovery (Parquet/CSV/JSON), or a listed S3/GCS/Azure directory (CSV/JSON/text) | Implemented |
 | FpML documents | `fpml` | `FORMAT FPML` on the files, Kafka, RabbitMQ, and IBM MQ sources, and `fpml.field` on the FIX source: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
@@ -944,8 +944,7 @@ has them instead of deriving changes from its `add`/`remove` actions, and skips
 `dataChange = false` rewrites such as `OPTIMIZE`. It rejects column-mapped tables in changes mode
 (snapshots read them) and any reader feature it does not support.
 
-Recovery is at-least-once in embedded and single-node mode; cluster mode and exactly-once reject
-the source. Replay units are one commit, or one file of the pinned snapshot in path order. The
+Recovery is at-least-once; exactly-once rejects the source. Replay units are one commit, or one file of the pinned snapshot in path order. The
 checkpoint cursor (table id, phase, next commit or completed files) only ever stands between
 units, so a barrier that arrives inside a commit waits for the commit's last row. A checkpoint
 therefore takes at least as long as reading the largest commit or snapshot file; keep the
@@ -957,6 +956,26 @@ A recreated table (new table id), a log that regressed behind the cursor, an exp
 commit or snapshot file, or a schema change fails the source instead of reading another position.
 Reset the source (DROP/CREATE) to start again. Reference tables stream their snapshot batch by
 batch; lookups are separate.
+
+#### Delta Lake change feed in a cluster
+
+- A change feed (`read.mode = 'changes'`) on object storage (`s3://`, `gs://`, `az://` and the
+  other object-store schemes) or a Unity Catalog `uc://` table runs at-least-once on one node at a
+  time: the node that owns the source's home vnode. A changelog must reach each group in log
+  order, so one node reads it; the aggregates and views over it spread across every node by
+  their keys.
+- When that node fails, a survivor resumes from the committed cursor; when the source moves at a
+  rescale or a rejoin, the node giving it up stops at the handoff checkpoint and the node taking it
+  resumes there. Operator state and the cursor commit in one checkpoint, so an aggregate or view
+  over the feed holds each change once even though replayed changes can repeat in a sink.
+- A checkpoint waits for the commit or snapshot file the node is reading, and in a cluster every
+  node's checkpoint waits with it; keep the cluster checkpoint timeout above the time to read
+  the largest one.
+- Until mutable sinks run in a cluster, the feed's consumers there are aggregates, materialized
+  views, and Delta `append` sinks on object storage, which keep `__weight`. Upsert sinks stay
+  rejected in a cluster.
+- A local `table.path`, a Glue catalog name, `read.mode = 'snapshot'`, adding the source to a
+  running cluster, and exactly-once are rejected in a cluster.
 
 ### Iceberg append splits
 

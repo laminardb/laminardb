@@ -111,6 +111,12 @@ const SOURCES: &[Variant] = &[
         exact_properties: &[],
     },
     Variant {
+        label: "Delta Lake change feed (local table)",
+        connector: "delta-lake",
+        properties: &[("table.path", "/data/orders"), ("read.mode", "changes")],
+        exact_properties: &[],
+    },
+    Variant {
         label: "Iceberg (snapshot read)",
         connector: "iceberg",
         properties: &[

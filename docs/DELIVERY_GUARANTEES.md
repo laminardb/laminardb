@@ -215,6 +215,17 @@ a stream to a MongoDB sink, through the same kills. Every written id must reach 
 collection, ids never written fail the run, duplicates are counted, and more than one node must
 have read the directory.
 
+A Delta Lake change feed on object storage runs on one node at a time, the owner of the source's
+home vnode, because a changelog must reach each group in log order; the aggregates and views over
+it spread across the nodes by their keys. Operator state and the source cursor commit in one
+checkpoint, so a view over the feed holds each change once.
+`delta_cdf_source::three_node_delta_cdf_kill9_soak` (candidate) seeds a change-feed table on S3
+with one large snapshot before the nodes start, then commits inserts, updates and deletes while a
+keyed materialized view folds the feed, through the same kills. One more round freezes the node
+reading the table until a survivor reads it, then resumes it: the frozen node must exit fenced.
+Once the writer stops, every node's committed read of the view must equal the same aggregate over
+the table's final snapshot, and more than one node must have read the table.
+
 ## Materialized view reads
 
 A materialized view is not a sink, so the pipeline's delivery guarantee does not describe it.

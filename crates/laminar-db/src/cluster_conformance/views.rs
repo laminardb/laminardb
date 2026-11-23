@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 
-use super::changelog_sources::changes;
 use super::cluster::{Cluster, Startup};
 use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
@@ -24,15 +23,15 @@ use crate::subscription::{
 };
 use crate::{CommittedRead, ExecuteResult, LaminarDB};
 
-struct ViewCase {
-    name: &'static str,
-    sources: Vec<FixtureSource>,
-    views: Vec<String>,
+pub(super) struct ViewCase {
+    pub name: &'static str,
+    pub sources: Vec<FixtureSource>,
+    pub views: Vec<String>,
     /// Each read and the batch SQL over the complete input whose rows it must equal.
-    reads: Vec<(&'static str, &'static str)>,
+    pub reads: Vec<(&'static str, &'static str)>,
     /// Reads that return no rows whenever every view they scan comes from one cycle. They run
     /// repeatedly while the sources deliver.
-    same_cycle_invariants: Vec<&'static str>,
+    pub same_cycle_invariants: Vec<&'static str>,
 }
 
 impl ViewCase {
@@ -375,14 +374,14 @@ async fn read_all(db: &LaminarDB, sql: &str) -> Result<Vec<RecordBatch>, String>
         .map_err(|e| format!("`{sql}`: {e}"))
 }
 
-async fn verdict(case: ViewCase) -> Verdict {
+pub(super) async fn verdict(case: ViewCase) -> Verdict {
     match case.run().await {
         Ok(verdict) => verdict,
         Err(bug) => panic!("view conformance bug: {bug}"),
     }
 }
 
-fn views(statements: &[&str]) -> Vec<String> {
+pub(super) fn views(statements: &[&str]) -> Vec<String> {
     statements.iter().map(|s| (*s).to_owned()).collect()
 }
 
@@ -429,36 +428,6 @@ async fn keyed_and_chained_views_match_batch_sql_in_cluster() {
             "SELECT k FROM busy b WHERE NOT EXISTS \
              (SELECT 1 FROM counts c WHERE c.k = b.k AND c.n = b.n)",
         ],
-    };
-    assert_eq!(verdict(case).await, Verdict::Equal);
-}
-
-/// Keyed and global views over a full-changelog singleton apply every retraction the one reading
-/// node forwards, and every node reads them at the committed cut.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn views_over_a_changelog_singleton_match_batch_sql_in_cluster() {
-    let case = ViewCase {
-        name: "views_over_a_changelog_singleton",
-        sources: vec![changes()],
-        views: views(&[
-            "CREATE MATERIALIZED VIEW by_group AS \
-             SELECT v % 7 AS g, COUNT(*) AS n, SUM(k) AS s FROM changes GROUP BY v % 7",
-            "CREATE MATERIALIZED VIEW totals AS \
-             SELECT COUNT(*) AS n, SUM(v) AS total, MIN(k) AS lo, MAX(k) AS hi FROM changes",
-        ]),
-        reads: vec![
-            (
-                "SELECT * FROM by_group",
-                "SELECT v % 7 AS g, COUNT(*) AS n, SUM(k) AS s FROM \
-                 (SELECT k, v FROM changes GROUP BY k, v HAVING SUM(__weight) > 0) GROUP BY v % 7",
-            ),
-            (
-                "SELECT * FROM totals",
-                "SELECT COUNT(*) AS n, SUM(v) AS total, MIN(k) AS lo, MAX(k) AS hi FROM \
-                 (SELECT k, v FROM changes GROUP BY k, v HAVING SUM(__weight) > 0)",
-            ),
-        ],
-        same_cycle_invariants: vec![],
     };
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
