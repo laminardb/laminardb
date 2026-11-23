@@ -19,17 +19,6 @@ pub(crate) struct MutationRoutes {
     pub(crate) changelog: FxHashSet<String>,
 }
 
-impl MutationRoutes {
-    /// A cluster topology's routes: it has no direct keyed-mutation sink route, whose singleton
-    /// sources and sinks lack fenced placement.
-    pub(crate) fn cluster(changelog: FxHashSet<String>) -> Self {
-        Self {
-            direct: FxHashSet::default(),
-            changelog,
-        }
-    }
-}
-
 type Registrations<'a> = (
     &'a HashMap<String, crate::connector_manager::SourceRegistration>,
     &'a HashMap<String, crate::connector_manager::SinkRegistration>,
@@ -87,6 +76,24 @@ impl LaminarDB {
             )?;
         }
         Ok(routes)
+    }
+
+    /// A cluster topology's routes. Cluster sinks read streams only, so no source has a direct
+    /// keyed-mutation sink route.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cluster_mutation_routes(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        ordered_interval_admissions: &OrderedIntervalAdmissions,
+    ) -> Result<MutationRoutes, DbError> {
+        Ok(MutationRoutes {
+            changelog: self.validate_changelog_source_routes(
+                source_regs,
+                ordered_interval_admissions,
+                RuntimeMode::Cluster,
+            )?,
+            ..MutationRoutes::default()
+        })
     }
 
     /// The direct keyed-mutation and changelog routes the registrations admit.

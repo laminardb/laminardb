@@ -10317,6 +10317,23 @@ impl DeltaSoakStorage {
         }
     }
 
+    /// The `storage.*` connector properties. Cluster catalog DDL rejects literal secrets;
+    /// `$${...}` survives server TOML substitution as a `${...}` env reference the catalog
+    /// accepts and the connector resolves from the env.
+    fn connector_properties(&self) -> String {
+        format!(
+            r#""storage.aws_endpoint" = "{endpoint}"
+"storage.aws_access_key_id" = "{access_key}"
+"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
+"storage.aws_region" = "{region}"
+"storage.aws_allow_http" = "true"
+"#,
+            endpoint = self.endpoint,
+            access_key = self.access_key,
+            region = self.region,
+        )
+    }
+
     fn options(&self) -> HashMap<String, String> {
         [
             ("aws_endpoint", self.endpoint.as_str()),
@@ -10687,8 +10704,6 @@ fn delta_append_sink_config(
     table_uri: &str,
     storage: &DeltaSoakStorage,
 ) -> String {
-    // Cluster catalog DDL rejects literal secrets; `$${...}` survives server TOML substitution
-    // as a `${...}` env reference the catalog accepts and the connector resolves from the env.
     format!(
         r#"
 [[sink]]
@@ -10699,15 +10714,8 @@ connector = "delta-lake"
 "table.path" = "{table_uri}"
 "write.mode" = "append"
 "auto.create" = "true"
-"storage.aws_endpoint" = "{endpoint}"
-"storage.aws_access_key_id" = "{access_key}"
-"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
-"storage.aws_region" = "{region}"
-"storage.aws_allow_http" = "true"
-"#,
-        endpoint = storage.endpoint,
-        access_key = storage.access_key,
-        region = storage.region,
+{}"#,
+        storage.connector_properties()
     )
 }
 

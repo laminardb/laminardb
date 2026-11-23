@@ -505,6 +505,10 @@ impl LaminarDB {
                 manager.streams().clone(),
             )
         };
+        // A candidate interval join owns its mutable inputs, which the changelog route then skips.
+        for candidate in candidates {
+            stream_regs.insert(candidate.name.clone(), candidate);
+        }
         let ordered = self
             .validate_persisted_interval_source_contracts(
                 &source_regs,
@@ -515,9 +519,6 @@ impl LaminarDB {
             .await?;
         let changelog_sources =
             self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
-        for candidate in candidates {
-            stream_regs.insert(candidate.name.clone(), candidate);
-        }
         crate::pipeline_lifecycle::resolve_stream_output_schemas(
             &self.ctx,
             &stream_regs,

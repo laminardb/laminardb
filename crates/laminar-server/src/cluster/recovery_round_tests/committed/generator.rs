@@ -1,7 +1,7 @@
 //! A sequence over two databases: the built-in generator split four ways, or one placed
-//! singleton sequence or changelog that only the owner of its home vnode reads. A failed database's share
-//! resumes on the survivor from the committed cut, and a draining database hands its share over
-//! live at the handoff cut. At every committed cut the keyed view holds exactly the rows that the
+//! singleton sequence or changelog that only the owner of its home vnode reads. A failed
+//! database's share resumes on the survivor from the committed cut, and a draining database hands
+//! its share over live at the handoff cut. At every committed cut the keyed view holds exactly the rows that the
 //! cut's cursor says were read, so no row is lost or counted twice.
 
 use std::num::NonZeroU32;
@@ -80,7 +80,7 @@ impl Sequence {
             }
             Self::Changelog => format!(
                 "CREATE SOURCE {source} (seq BIGINT NOT NULL, __weight BIGINT NOT NULL) \
-                 FROM \"{PLACED_CHANGELOG}\""
+                 FROM \"{PLACED_SEQUENCE}\""
             ),
         };
         [
@@ -281,23 +281,18 @@ async fn drain(processes: &mut [Process; 2], sequence: Sequence) -> Result<()> {
 }
 
 const PLACED_SEQUENCE: &str = "placed-sequence";
-const PLACED_CHANGELOG: &str = "placed-changelog";
 
 /// Register the placed singleton `sequence` for this database.
 pub(super) fn register_placed_sequence(
     registry: &laminar_connectors::registry::ConnectorRegistry,
     sequence: Sequence,
 ) -> Result<(), ConnectorError> {
-    let name = match sequence {
-        Sequence::Changelog => PLACED_CHANGELOG,
-        Sequence::Splits | Sequence::Singleton => PLACED_SEQUENCE,
-    };
     registry.register_source(
-        name,
+        PLACED_SEQUENCE,
         ConnectorInfo {
             schema_capabilities:
                 laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
-            name: name.into(),
+            name: PLACED_SEQUENCE.into(),
             display_name: "Placed singleton sequence".into(),
             version: "1".into(),
             is_source: true,
@@ -328,19 +323,21 @@ struct PlacedSequence {
 #[async_trait::async_trait]
 impl SourceConnector for PlacedSequence {
     fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        let contract = if self.sequence == Sequence::Changelog {
-            SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Singleton,
-                SourceInputMode::FullChangelog,
-            )
-            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        let changelog = self.sequence == Sequence::Changelog;
+        let input_mode = if changelog {
+            SourceInputMode::FullChangelog
         } else {
-            SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Singleton,
-                SourceInputMode::AppendOnly,
-            )
+            SourceInputMode::AppendOnly
+        };
+        let contract = SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            input_mode,
+        );
+        let contract = if changelog {
+            contract.with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        } else {
+            contract
         };
         Ok(laminar_connectors::testing::with_cluster_singleton_placement(contract))
     }
@@ -383,19 +380,20 @@ impl SourceConnector for PlacedSequence {
             .clone()
             .map(|index| self.sequence.change(index))
             .unzip();
+        let changelog = self.sequence == Sequence::Changelog;
         let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(Int64Array::from(values))];
-        if self.sequence != Sequence::Changelog {
-            let batch = RecordBatch::try_new(self.schema(), columns)
-                .map_err(|error| ConnectorError::Internal(error.to_string()))?;
-            return Ok(Some(SourceBatch::new(batch)));
+        if changelog {
+            columns.push(Arc::new(Int64Array::from(weights)));
         }
-        columns.push(Arc::new(Int64Array::from(weights)));
         let batch = RecordBatch::try_new(self.schema(), columns)
             .map_err(|error| ConnectorError::Internal(error.to_string()))?;
+        if !changelog {
+            return Ok(Some(SourceBatch::new(batch)));
+        }
         // Each change keeps its index as its position whichever generation emits it.
         let orders: Vec<_> = indexes.map(|index| index.to_be_bytes()).collect();
         let positions = SourceRowPositions::try_new(
-            BinaryArray::from_vec(vec![PLACED_CHANGELOG.as_bytes(); orders.len()]),
+            BinaryArray::from_vec(vec![PLACED_SEQUENCE.as_bytes(); orders.len()]),
             BinaryArray::from_vec(orders.iter().map(<[u8; 8]>::as_slice).collect()),
             UInt32Array::from(vec![0; orders.len()]),
         )?;

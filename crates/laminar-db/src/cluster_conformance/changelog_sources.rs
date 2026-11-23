@@ -8,7 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use super::oracle::OutputForm;
 use super::source::{FixtureKind, FixtureSource, QueueCommit, QueueRows};
-use super::tests::verdict;
+use super::tests::{case, verdict};
 use super::{views, Case, Verdict};
 
 const KEYS: i64 = 23;
@@ -81,13 +81,8 @@ pub(super) fn changes() -> FixtureSource {
 
 fn changelog_case(name: &'static str, streams: &[&str], ground_truth: &'static str) -> Case {
     Case {
-        name,
         sources: vec![changes()],
-        streams: streams.iter().map(|s| (*s).to_string()).collect(),
-        observe: "out",
-        form: OutputForm::Changelog,
-        ground_truth: Some(ground_truth),
-        checkpoint_under_load: false,
+        ..case(name, streams, OutputForm::Changelog, Some(ground_truth))
     }
 }
 

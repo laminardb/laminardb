@@ -33,7 +33,7 @@ use crate::connector::{
 };
 use crate::error::ConnectorError;
 
-use super::delta_config::DeltaCatalogType;
+use super::delta_config::{names_shared_table, DeltaCatalogType};
 #[cfg(feature = "delta-lake")]
 use super::delta_source_config::DeltaStartingVersion;
 use super::delta_source_config::{DeltaReadMode, DeltaSourceConfig};
@@ -690,16 +690,19 @@ impl SourceConnector for DeltaSource {
             SourceInputMode::FullChangelog,
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic);
+        let shared = names_shared_table(&cfg.table_path);
+        let contract = if !shared && cfg.catalog_type == DeltaCatalogType::None {
+            contract.with_locality(SourceLocality::LocalFiles)
+        } else {
+            contract
+        };
         // Any one node may follow a change feed every node reaches: the cursor names the next
         // unit and nothing upstream is held. A bounded snapshot read is not qualified for
         // cluster placement.
-        let shared = super::delta_config::names_shared_table(&cfg.table_path);
-        Ok(match (&cfg.catalog_type, shared, &cfg.read_mode) {
-            (_, true, DeltaReadMode::Changes) => contract.with_cluster_singleton_placement(),
-            (DeltaCatalogType::None, false, _) => {
-                contract.with_locality(SourceLocality::LocalFiles)
-            }
-            _ => contract,
+        Ok(if shared && cfg.read_mode == DeltaReadMode::Changes {
+            contract.with_cluster_singleton_placement()
+        } else {
+            contract
         })
     }
 

@@ -944,9 +944,9 @@ has them instead of deriving changes from its `add`/`remove` actions, and skips
 `dataChange = false` rewrites such as `OPTIMIZE`. It rejects column-mapped tables in changes mode
 (snapshots read them) and any reader feature it does not support.
 
-Recovery is at-least-once; exactly-once rejects the source. Replay units are one commit, or one file of the pinned snapshot in path order. The
-checkpoint cursor (table id, phase, next commit or completed files) only ever stands between
-units, so a barrier that arrives inside a commit waits for the commit's last row. A checkpoint
+Recovery is at-least-once; exactly-once rejects the source. Replay units are one commit, or one
+file of the pinned snapshot in path order. The checkpoint cursor (table id, phase, next commit or
+completed files) only ever stands between units, so a barrier that arrives inside a commit waits for the commit's last row. A checkpoint
 therefore takes at least as long as reading the largest commit or snapshot file; keep the
 checkpoint timeout above that. Resuming re-reads the unit after the cursor and never resumes
 inside one. The reader runs on the blocking pool with at most 256 MiB of decoded rows queued and

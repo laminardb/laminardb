@@ -92,9 +92,7 @@ impl LaminarDB {
             .await?;
         self.revalidate_persisted_cluster_query_shapes(&streams)
             .await?;
-        let routes = super::direct_mutation_routes::MutationRoutes::cluster(
-            self.validate_changelog_source_routes(&sources, &interval, RuntimeMode::Cluster)?,
-        );
+        let routes = self.cluster_mutation_routes(&sources, &interval)?;
         let mut resolved = super::resolve_stream_output_schemas(
             &self.ctx,
             &streams,

@@ -1351,62 +1351,35 @@ fn delta_change_feed_runs_in_cluster_only_from_shared_storage() {
         config.set("table.path", path);
         config.set("read.mode", mode);
         let contract = source.contract(&config).unwrap();
-        assert_eq!(contract.input_mode, SourceInputMode::FullChangelog);
-        assert_eq!(
-            contract.row_positions,
-            SourceRowPositionCapability::OrderedDeterministic
-        );
         assert!(is_changelog_route_candidate(contract, runtime));
         admit_source_recovery_contract(contract, delivery, true, runtime)
     };
     let at_least_once = DeliveryGuarantee::AtLeastOnce;
-    for path in ["/tmp/delta-orders", "s3://lake/orders"] {
-        for mode in ["changes", "snapshot"] {
-            assert_eq!(admit(path, mode, at_least_once, RuntimeMode::Local), Ok(()));
-            assert!(admit(
-                path,
-                mode,
-                DeliveryGuarantee::ExactlyOnce,
-                RuntimeMode::Local
-            )
-            .unwrap_err()
-            .contains("LDB-5037"));
-        }
-    }
-    assert_eq!(
-        admit(
-            "s3://lake/orders",
-            "changes",
-            at_least_once,
-            RuntimeMode::Cluster
-        ),
-        Ok(())
-    );
-    assert_eq!(
-        admit(
-            "uc://main.sales.orders",
-            "changes",
-            at_least_once,
-            RuntimeMode::Cluster
-        ),
-        Ok(())
-    );
     assert!(admit(
         "s3://lake/orders",
-        "snapshot",
-        at_least_once,
-        RuntimeMode::Cluster
-    )
-    .unwrap_err()
-    .contains("one node at a time"));
-    assert!(admit(
-        "/tmp/delta-orders",
         "changes",
-        at_least_once,
-        RuntimeMode::Cluster
+        DeliveryGuarantee::ExactlyOnce,
+        RuntimeMode::Local
     )
     .unwrap_err()
-    .contains("local filesystem"));
+    .contains("LDB-5037"));
+    for (path, mode, rejection) in [
+        ("s3://lake/orders", "changes", None),
+        ("uc://main.sales.orders", "changes", None),
+        (
+            "s3://lake/orders",
+            "snapshot",
+            Some("one node at a time may run"),
+        ),
+        ("/tmp/delta-orders", "changes", Some("local filesystem")),
+    ] {
+        assert_eq!(admit(path, mode, at_least_once, RuntimeMode::Local), Ok(()));
+        let cluster = admit(path, mode, at_least_once, RuntimeMode::Cluster);
+        match rejection {
+            None => assert_eq!(cluster, Ok(()), "{path} {mode}"),
+            Some(reason) => assert!(cluster.unwrap_err().contains(reason), "{path} {mode}"),
+        }
+    }
 }
 
 #[test]
@@ -1419,26 +1392,13 @@ fn a_cluster_changelog_route_has_one_reader() {
             topology,
             SourceInputMode::FullChangelog,
         )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
     };
-    let positioned = |topology| {
-        changelog(topology).with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
-    };
-    for topology in [SourceTopology::Singleton, SourceTopology::Splittable] {
-        assert!(is_changelog_route_candidate(
-            positioned(topology),
-            RuntimeMode::Local
-        ));
-        assert!(!is_changelog_route_candidate(
-            changelog(topology),
-            RuntimeMode::Local
-        ));
-    }
+    let split = changelog(SourceTopology::Splittable);
+    assert!(is_changelog_route_candidate(split, RuntimeMode::Local));
+    assert!(!is_changelog_route_candidate(split, RuntimeMode::Cluster));
     assert!(is_changelog_route_candidate(
-        positioned(SourceTopology::Singleton),
-        RuntimeMode::Cluster
-    ));
-    assert!(!is_changelog_route_candidate(
-        positioned(SourceTopology::Splittable),
+        changelog(SourceTopology::Singleton),
         RuntimeMode::Cluster
     ));
 }

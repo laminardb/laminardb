@@ -380,7 +380,7 @@ fn parse_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Result<ViewRow
     Ok(rows)
 }
 
-enum ReadFailure {
+pub(super) enum ReadFailure {
     /// The node is down, paused or recovering; the reader moves on.
     Retryable(String),
     Fatal(String),
@@ -401,7 +401,10 @@ impl From<tokio_postgres::Error> for ReadFailure {
     }
 }
 
-async fn connect(node: usize, level: &str) -> Result<tokio_postgres::Client, ReadFailure> {
+pub(super) async fn connect(
+    node: usize,
+    level: &str,
+) -> Result<tokio_postgres::Client, ReadFailure> {
     let mut config = tokio_postgres::Config::new();
     config
         .host("127.0.0.1")

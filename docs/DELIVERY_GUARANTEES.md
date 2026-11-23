@@ -31,7 +31,8 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | ALO | rejected |
 | PostgreSQL CDC (no initial copy) | ALO | ALO |
 | MongoDB change stream | ALO, BE | ALO |
-| Delta Lake change feed | ALO, BE | rejected |
+| Delta Lake change feed | ALO, BE | ALO |
+| Delta Lake change feed (local table) | ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
 | Iceberg (append read, splits) | ALO, BE | ALO |
@@ -73,6 +74,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Delta Lake change feed | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed (local table) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
 | Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
@@ -96,7 +98,8 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | — | — | — | — | — | — | — | — | — | — | — | — |
 | PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed | — | — | — | — | — | — | — | — | — | — | — | — |
+| Delta Lake change feed | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |

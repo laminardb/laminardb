@@ -325,14 +325,13 @@ impl LaminarDB {
                 RuntimeMode::Cluster,
             )
             .await?;
-        let changelog =
-            self.validate_changelog_source_routes(&sources, &interval, RuntimeMode::Cluster)?;
+        let routes = self.cluster_mutation_routes(&sources, &interval)?;
         crate::pipeline_lifecycle::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
             &self.static_table_names(),
             &interval.joins,
-            &changelog,
+            &routes.changelog,
             &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await

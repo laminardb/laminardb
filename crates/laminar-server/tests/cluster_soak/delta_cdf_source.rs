@@ -24,7 +24,7 @@
 //! `LAMINAR_SOAK_RPS` (rows per second the writer inserts, default 400) and
 //! `LAMINAR_SOAK_DELTA_SEED_ROWS` (rows of the seeded snapshot, default 200000).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,9 +40,9 @@ use super::kill_rejoin::{
     boot, cluster_nodes, kill_round, record_consumers, rejoin, steady_phase, SoakSettings,
     CHECKPOINTS_COMPLETED, EVENTS_INGESTED,
 };
-use super::view_reads::pgwire_port;
+use super::view_reads::{connect, ReadFailure};
 use super::{
-    scoped_soak_storage_url, soak_run_id, wait_for, wait_for_converged_durable_checkpoint,
+    env_u64, scoped_soak_storage_url, soak_run_id, wait_for, wait_for_converged_durable_checkpoint,
     DeltaSoakStorage, DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, NODES,
 };
 
@@ -52,6 +52,8 @@ const BUCKETS: i64 = 16;
 type Buckets = Vec<[i64; 4]>;
 const COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 const COMMIT_ATTEMPTS: u32 = 20;
+/// Updates and deletes touch the ids of this many most recent inserts.
+const RECENT_INSERTS: i64 = 8;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
@@ -70,9 +72,8 @@ fn three_node_delta_cdf_kill9_soak() {
         uri: scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "delta-cdf-input"),
         storage: DeltaSoakStorage::from_environment(),
     };
-    let seed_rows = std::env::var("LAMINAR_SOAK_DELTA_SEED_ROWS").map_or(200_000, |rows| {
-        rows.parse().expect("seed rows are an integer")
-    });
+    let seed_rows = i64::try_from(env_u64("LAMINAR_SOAK_DELTA_SEED_ROWS", 200_000))
+        .expect("LAMINAR_SOAK_DELTA_SEED_ROWS fits i64");
     runtime().block_on(table.seed(seed_rows));
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -149,25 +150,17 @@ FROM cdf_input GROUP BY id % {BUCKETS};
 }
 
 fn workload(table: &Table) -> String {
-    // `$${...}` survives server TOML substitution as an env reference the catalog accepts.
     format!(
         r#"
 [[source]]
 name = "cdf_input"
 connector = "delta-lake"
 [source.properties]
-"table.path" = "{uri}"
+"table.path" = "{}"
 "poll.interval.ms" = "250"
-"storage.aws_endpoint" = "{endpoint}"
-"storage.aws_access_key_id" = "{access_key}"
-"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
-"storage.aws_region" = "{region}"
-"storage.aws_allow_http" = "true"
-"#,
-        uri = table.uri,
-        endpoint = table.storage.endpoint,
-        access_key = table.storage.access_key,
-        region = table.storage.region,
+{}"#,
+        table.uri,
+        table.storage.connector_properties()
     )
 }
 
@@ -271,9 +264,11 @@ impl Table {
     }
 }
 
-/// Paced writer that cycles an insert of new ids, an update of every seventh id, and a delete of
-/// some even ids, one commit each. A failed commit is retried on a reopened table, so a commit
-/// whose acknowledgement was lost may apply twice; the oracle reads the table itself.
+/// Paced writer that cycles an insert of new ids, an update of every seventh recent id, and a
+/// delete of some even recent ids, one commit each. Updates and deletes touch only the last few
+/// inserts, so file statistics prune the rest of the table. A failed commit is retried on a
+/// reopened table, so a commit whose acknowledgement was lost may apply twice; the oracle reads
+/// the table itself.
 struct Writer {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<u64>>,
@@ -327,26 +322,23 @@ async fn write(table: &Table, first_id: i64, rps: u64, stop: &AtomicBool) -> u64
     let per_insert = i64::try_from(rps).expect("rps fits i64") * 3 / 2;
     let mut next_id = first_id;
     let mut round = 0;
+    let mut delta = None;
     while !stop.load(Ordering::Acquire) {
         tokio::time::sleep(COMMIT_INTERVAL).await;
-        let mut failures = 0;
-        loop {
-            let committed = match table.open().await {
-                Ok(delta) => commit(delta, round, next_id, per_insert).await,
-                Err(error) => Err(error),
-            };
-            match committed {
-                Ok(()) => break,
+        let mut attempt = 1;
+        delta = loop {
+            match commit(delta.take(), table, round, next_id, per_insert).await {
+                Ok(committed) => break Some(committed),
                 Err(error) => {
-                    failures += 1;
                     assert!(
-                        failures < COMMIT_ATTEMPTS,
+                        attempt < COMMIT_ATTEMPTS,
                         "Delta commit {round} never succeeded: {error}"
                     );
+                    attempt += 1;
                     tokio::time::sleep(COMMIT_INTERVAL).await;
                 }
             }
-        }
+        };
         if round % 3 == 0 {
             next_id += per_insert;
         }
@@ -355,42 +347,54 @@ async fn write(table: &Table, first_id: i64, rps: u64, stop: &AtomicBool) -> u64
     round
 }
 
+/// Commit round `round` on `delta`, or on a reopened table after a failed attempt.
 async fn commit(
-    table: DeltaTable,
+    delta: Option<DeltaTable>,
+    table: &Table,
     round: u64,
     next_id: i64,
     per_insert: i64,
-) -> Result<(), String> {
+) -> Result<DeltaTable, String> {
+    let delta = match delta {
+        Some(delta) => delta,
+        None => table.open().await?,
+    };
+    let recent = next_id - per_insert * RECENT_INSERTS;
     let shard = round / 3;
     match round % 3 {
-        0 => table
-            .write(vec![Table::rows(next_id..next_id + per_insert)])
-            .await
-            .map(drop),
-        1 => table
+        0 => {
+            delta
+                .write(vec![Table::rows(next_id..next_id + per_insert)])
+                .await
+        }
+        1 => delta
             .update()
-            .with_predicate(format!("id % 7 = {}", shard % 7))
+            .with_predicate(format!("id >= {recent} AND id % 7 = {}", shard % 7))
             .with_update("amount", "amount + 1")
             .await
-            .map(drop),
-        _ => table
+            .map(|(delta, _)| delta),
+        _ => delta
             .delete()
-            .with_predicate(format!("id % 11 = {} AND id % 2 = 0", shard % 11))
+            .with_predicate(format!(
+                "id >= {recent} AND id % 11 = {} AND id % 2 = 0",
+                shard % 11
+            ))
             .await
-            .map(drop),
+            .map(|(delta, _)| delta),
     }
     .map_err(|error| format!("Delta commit {round}: {error}"))
+}
+
+fn ingested(nodes: &[Node]) -> Vec<f64> {
+    nodes
+        .iter()
+        .map(|node| node.metric(EVENTS_INGESTED).unwrap_or(0.0))
+        .collect()
 }
 
 /// The node reading the table: the one whose ingested-event count grows over a window in which
 /// the writer commits.
 fn table_reader(nodes: &mut [Node], live: &mut dyn FnMut(), settings: &SoakSettings) -> usize {
-    let ingested = |nodes: &[Node]| -> Vec<f64> {
-        nodes
-            .iter()
-            .map(|node| node.metric(EVENTS_INGESTED).unwrap_or(0.0))
-            .collect()
-    };
     let mut reader = None;
     wait_for(
         "one node to read the change feed",
@@ -423,11 +427,7 @@ fn paused_reader_round(
     latest: DurableCheckpointStatus,
 ) -> DurableCheckpointStatus {
     let reader = table_reader(nodes, live, settings);
-    let survivors: Vec<usize> = (0..nodes.len()).filter(|id| *id != reader).collect();
-    let before: HashMap<usize, f64> = survivors
-        .iter()
-        .map(|id| (*id, nodes[*id].metric(EVENTS_INGESTED).unwrap_or(0.0)))
-        .collect();
+    let before = ingested(nodes);
     let paused = nodes[reader].pause();
     eprintln!("soak: SIGSTOP delivered to node {reader}, which reads the change feed");
     let survived = wait_for_converged_durable_checkpoint(
@@ -441,10 +441,11 @@ fn paused_reader_round(
         settings.recovery_ceiling,
         || {
             live();
-            survivors.iter().any(|id| {
-                nodes[*id]
-                    .metric(EVENTS_INGESTED)
-                    .is_some_and(|rows| rows > before[id])
+            nodes.iter().any(|node| {
+                node.id != reader
+                    && node
+                        .metric(EVENTS_INGESTED)
+                        .is_some_and(|rows| rows > before[node.id])
             })
         },
     );
@@ -475,13 +476,17 @@ fn converged_reads(
         Some(latest),
     );
     let runtime = runtime();
-    let mut last = Err(String::from("no read yet"));
+    let mut last = None;
     let converged = super::wait_until(settings.recovery_ceiling + Duration::from_secs(60), || {
-        last = runtime.block_on(committed_read(nodes[0].id, 0));
-        last.as_ref().is_ok_and(|(_, rows)| rows == expected)
+        match runtime.block_on(committed_read(nodes[0].id, 0)) {
+            Ok(read) => last = Some(read),
+            Err(ReadFailure::Retryable(_)) => {}
+            Err(ReadFailure::Fatal(reason)) => panic!("node0 committed view read: {reason}"),
+        }
+        last.as_ref().is_some_and(|(_, rows)| rows == expected)
     });
     let epoch = match (converged, last) {
-        (true, Ok((epoch, _))) => epoch,
+        (true, Some((epoch, _))) => epoch,
         (_, last) => panic!(
             "no committed view read equals the final snapshot {expected:?}; last read {last:?}"
         ),
@@ -496,27 +501,20 @@ fn converged_reads(
                 );
                 assert_eq!(&rows, expected, "node{} view at {read_epoch}", node.id);
             }
-            Err(error) => panic!("node{} committed view read failed: {error}", node.id),
+            Err(ReadFailure::Retryable(reason) | ReadFailure::Fatal(reason)) => {
+                panic!("node{} committed view read failed: {reason}", node.id)
+            }
         }
     }
     epoch
 }
 
 /// One committed read of the view on node `node` at epoch `floor` or later.
-async fn committed_read(node: usize, floor: u64) -> Result<(u64, Buckets), String> {
+async fn committed_read(node: usize, floor: u64) -> Result<(u64, Buckets), ReadFailure> {
     let read = async {
-        let (client, connection) = tokio_postgres::Config::new()
-            .host("127.0.0.1")
-            .port(pgwire_port(node))
-            .user("soak")
-            .dbname("laminardb")
-            .connect(tokio_postgres::NoTls)
-            .await?;
-        tokio::spawn(connection);
+        let client = connect(node, "committed").await?;
         client
-            .batch_execute(&format!(
-                "SET laminar.read_level = 'committed'; SET laminar.min_epoch = {floor}"
-            ))
+            .batch_execute(&format!("SET laminar.min_epoch = {floor}"))
             .await?;
         let rows = client
             .simple_query(&format!(
@@ -524,40 +522,35 @@ async fn committed_read(node: usize, floor: u64) -> Result<(u64, Buckets), Strin
             ))
             .await?;
         let epoch = client.simple_query("SHOW laminar.read_epoch").await?;
-        Ok::<_, tokio_postgres::Error>((rows, epoch))
+        Ok::<_, ReadFailure>((rows, epoch))
     };
     let (rows, epoch) = tokio::time::timeout(READ_TIMEOUT, read)
         .await
-        .map_err(|_| "read timeout".to_owned())?
-        .map_err(|error| {
-            error.as_db_error().map_or_else(
-                || error.to_string(),
-                |db| format!("{}: {}", db.code().code(), db.message()),
-            )
-        })?;
-    let epoch = rows_of(epoch.iter())
+        .map_err(|_| ReadFailure::Retryable("read timeout".to_owned()))??;
+    let fatal = |reason: &str| ReadFailure::Fatal(reason.to_owned());
+    let epoch = rows_of(&epoch)
         .next()
         .and_then(|row| row.get(0)?.parse::<u64>().ok())
-        .ok_or("SHOW laminar.read_epoch returned no epoch")?;
-    let buckets = rows_of(rows.iter())
+        .ok_or_else(|| fatal("SHOW laminar.read_epoch returned no epoch"))?;
+    let buckets = rows_of(&rows)
         .map(|row| {
             let mut values = [0; 4];
             for (index, value) in values.iter_mut().enumerate() {
                 *value = row
                     .get(index)
                     .and_then(|text| text.parse().ok())
-                    .ok_or_else(|| format!("view column {index} is not a BIGINT"))?;
+                    .ok_or_else(|| fatal("a view column is not a BIGINT"))?;
             }
             Ok(values)
         })
-        .collect::<Result<_, String>>()?;
+        .collect::<Result<_, ReadFailure>>()?;
     Ok((epoch, buckets))
 }
 
-fn rows_of<'a>(
-    messages: impl Iterator<Item = &'a tokio_postgres::SimpleQueryMessage>,
-) -> impl Iterator<Item = &'a tokio_postgres::SimpleQueryRow> {
-    messages.filter_map(|message| match message {
+fn rows_of(
+    messages: &[tokio_postgres::SimpleQueryMessage],
+) -> impl Iterator<Item = &tokio_postgres::SimpleQueryRow> {
+    messages.iter().filter_map(|message| match message {
         tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
         _ => None,
     })

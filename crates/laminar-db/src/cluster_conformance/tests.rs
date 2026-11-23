@@ -81,7 +81,7 @@ pub(super) fn events_in(
     }
 }
 
-fn case(
+pub(super) fn case(
     name: &'static str,
     streams: &[&str],
     form: OutputForm,

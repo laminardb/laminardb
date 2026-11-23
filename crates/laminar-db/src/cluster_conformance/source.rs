@@ -242,24 +242,20 @@ struct QueueSource {
 #[async_trait]
 impl SourceConnector for QueueSource {
     fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        let contract = match self.rows {
-            QueueRows::Append => SourceContract::new(
-                SourceConsistency::CommitCoupled,
-                SourceTopology::Singleton,
-                SourceInputMode::AppendOnly,
-            ),
-            QueueRows::KeyedUpsert => SourceContract::new(
-                SourceConsistency::CommitCoupled,
-                SourceTopology::Singleton,
-                SourceInputMode::KeyedUpsert,
-            )
-            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
-            QueueRows::FullChangelog => SourceContract::new(
-                SourceConsistency::CommitCoupled,
-                SourceTopology::Singleton,
-                SourceInputMode::FullChangelog,
-            )
-            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
+        let input_mode = match self.rows {
+            QueueRows::Append => SourceInputMode::AppendOnly,
+            QueueRows::KeyedUpsert => SourceInputMode::KeyedUpsert,
+            QueueRows::FullChangelog => SourceInputMode::FullChangelog,
+        };
+        let contract = SourceContract::new(
+            SourceConsistency::CommitCoupled,
+            SourceTopology::Singleton,
+            input_mode,
+        );
+        let contract = if self.rows == QueueRows::Append {
+            contract
+        } else {
+            contract.with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
         };
         Ok(laminar_connectors::testing::with_cluster_singleton_placement(contract))
     }
