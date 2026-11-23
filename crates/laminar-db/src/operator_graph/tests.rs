@@ -2344,6 +2344,49 @@ async fn held_output_stages_one_certified_snapshot_at_the_next_checkpoint() {
     drained.assert_one_snapshot_with_total(backlog.backlog_total + LOCAL_VALUE);
 }
 
+#[cfg(feature = "cluster")]
+struct ExecutionModeProbe(Arc<parking_lot::Mutex<Option<GraphExecutionMode>>>);
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl GraphOperator for ExecutionModeProbe {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn set_execution_mode(&mut self, mode: GraphExecutionMode) {
+        *self.0.lock() = Some(mode);
+    }
+}
+
+/// An operator installed while output is held joins the held mode instead of staging a snapshot
+/// every cycle until the mode next changes.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn an_operator_placed_while_output_is_held_joins_the_held_mode() {
+    let mut graph = OperatorGraph::new(SessionContext::new());
+    graph.set_snapshot_output_held(true);
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .unwrap();
+    let mode = Arc::new(parking_lot::Mutex::new(None));
+    graph.place_prepared_operator_node("probe", Box::new(ExecutionModeProbe(Arc::clone(&mode))), 1);
+    assert!(*mode.lock() == Some(GraphExecutionMode::OutputHeld));
+}
+
 /// With nothing else pending, a checkpoint drain runs no pass: the queued peer backlog stays as
 /// replay state for the cut.
 #[cfg(feature = "cluster")]

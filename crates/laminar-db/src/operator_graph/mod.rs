@@ -2512,9 +2512,14 @@ impl OperatorGraph {
     fn place_prepared_operator_node(
         &mut self,
         name: &str,
-        operator: Box<dyn GraphOperator>,
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))] mut operator: Box<
+            dyn GraphOperator,
+        >,
         input_port_count: usize,
     ) -> usize {
+        // Modes reach operators only when they change, so a live install joins the current one.
+        #[cfg(feature = "cluster")]
+        operator.set_execution_mode(self.last_execution_mode);
         if let Some(&id) = self.source_map.get(name) {
             self.nodes[id].replace_operator(operator);
             self.nodes[id].input_port_count = input_port_count;
