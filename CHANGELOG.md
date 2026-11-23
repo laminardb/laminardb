@@ -169,6 +169,9 @@
   after a truncated datagram).
 - url moves to 2.5.9 for RUSTSEC-2026-0592 (`Url::origin()` overflowed the stack on nested
   `blob:` URLs).
+- zstd moves to 0.13.5 and zstd-safe to 7.4.1, which fix RUSTSEC-2026-0391 and RUSTSEC-2026-0395
+  to 0406 within the zstd versions Arrow, DataFusion and Parquet require. Their dependency
+  exceptions are removed. The remaining exceptions are renewed to 2026-12-30.
 
 ## [0.40.2]
 
