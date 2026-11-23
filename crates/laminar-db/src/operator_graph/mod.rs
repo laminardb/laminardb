@@ -518,8 +518,8 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn set_execution_mode(&mut self, _mode: GraphExecutionMode) {}
 
-    /// Whether a checkpoint drain deferred a snapshot that a settle pass must emit before the cut.
-    fn owes_drained_snapshot(&self) -> bool {
+    /// Whether the operator owes a deferred snapshot that a settle pass must emit before the cut.
+    fn owes_deferred_snapshot(&self) -> bool {
         false
     }
 
@@ -691,16 +691,25 @@ pub(crate) enum GraphExecutionMode {
     /// A pass toward a checkpoint cut.
     CheckpointDrain,
     /// The pass that ends a drain whose other work is done, in which operators emit the snapshots
-    /// they deferred during the drain.
+    /// they deferred.
     CheckpointSettle,
+    /// A normal pass while cluster subscription output waits for a checkpoint: operators defer
+    /// snapshots the next cut would supersede, and the checkpoint drain settles them.
+    #[cfg(feature = "cluster")]
+    OutputHeld,
 }
 
 impl GraphExecutionMode {
     const fn metric_label(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::CheckpointDrain | Self::CheckpointSettle => "checkpoint_drain",
+        if self.is_checkpoint_pass() {
+            "checkpoint_drain"
+        } else {
+            "normal"
         }
+    }
+
+    const fn is_checkpoint_pass(self) -> bool {
+        matches!(self, Self::CheckpointDrain | Self::CheckpointSettle)
     }
 }
 
@@ -1174,6 +1183,8 @@ pub(crate) struct OperatorGraph {
     last_execution_assignment_version: Option<u64>,
     #[cfg(feature = "cluster")]
     last_execution_mode: GraphExecutionMode,
+    #[cfg(feature = "cluster")]
+    snapshot_output_held: bool,
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
@@ -1252,6 +1263,8 @@ impl OperatorGraph {
             last_execution_assignment_version: None,
             #[cfg(feature = "cluster")]
             last_execution_mode: GraphExecutionMode::Normal,
+            #[cfg(feature = "cluster")]
+            snapshot_output_held: false,
             #[cfg(feature = "cluster")]
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
@@ -1474,7 +1487,7 @@ impl OperatorGraph {
         if !work_is_drained {
             return Some(GraphExecutionMode::CheckpointDrain);
         }
-        self.owes_drained_snapshots()
+        self.owes_deferred_snapshots()
             .then_some(GraphExecutionMode::CheckpointSettle)
     }
 
@@ -1511,10 +1524,10 @@ impl OperatorGraph {
                 .all(|node| !node.operator.checkpoint_aligned_replay_pending())
     }
 
-    fn owes_drained_snapshots(&self) -> bool {
+    fn owes_deferred_snapshots(&self) -> bool {
         self.nodes
             .iter()
-            .any(|node| !node.removed && node.operator.owes_drained_snapshot())
+            .any(|node| !node.removed && node.operator.owes_deferred_snapshot())
     }
 
     #[cfg(feature = "cluster")]
@@ -1551,7 +1564,7 @@ impl OperatorGraph {
                 && (self.node_has_buffered_input(node_id)
                     || node.operator.checkpoint_aligned_replay_pending()
                     || node.operator.checkpoint_drain_pending()
-                    || node.operator.owes_drained_snapshot())
+                    || node.operator.owes_deferred_snapshot())
             {
                 drain.insert(node_id);
                 pending.push_back(node_id);
@@ -2499,9 +2512,14 @@ impl OperatorGraph {
     fn place_prepared_operator_node(
         &mut self,
         name: &str,
-        operator: Box<dyn GraphOperator>,
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))] mut operator: Box<
+            dyn GraphOperator,
+        >,
         input_port_count: usize,
     ) -> usize {
+        // Modes reach operators only when they change, so a live install joins the current one.
+        #[cfg(feature = "cluster")]
+        operator.set_execution_mode(self.last_execution_mode);
         if let Some(&id) = self.source_map.get(name) {
             self.nodes[id].replace_operator(operator);
             self.nodes[id].input_port_count = input_port_count;
@@ -3305,13 +3323,33 @@ impl OperatorGraph {
         current_watermark: i64,
         source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
-        self.execute_cycle_with_mode(
-            source_batches,
-            current_watermark,
-            source_frontiers,
-            GraphExecutionMode::Normal,
-        )
-        .await
+        #[cfg(feature = "cluster")]
+        let mode = if self.snapshot_output_held {
+            GraphExecutionMode::OutputHeld
+        } else {
+            GraphExecutionMode::Normal
+        };
+        #[cfg(not(feature = "cluster"))]
+        let mode = GraphExecutionMode::Normal;
+        self.execute_cycle_with_mode(source_batches, current_watermark, source_frontiers, mode)
+            .await
+    }
+
+    /// Runs later normal passes as [`GraphExecutionMode::OutputHeld`] while `held`.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_snapshot_output_held(&mut self, held: bool) {
+        if self.snapshot_output_held != held {
+            tracing::info!(
+                held,
+                "full-snapshot aggregate output {} the next checkpoint",
+                if held {
+                    "waits for"
+                } else {
+                    "no longer waits for"
+                }
+            );
+        }
+        self.snapshot_output_held = held;
     }
 
     /// Complete only the staged vnode transition, without stepping operators on source or
@@ -3503,11 +3541,9 @@ impl OperatorGraph {
             source_frontiers,
         )?;
 
-        let checkpoint_drain_nodes = if mode == GraphExecutionMode::Normal {
-            None
-        } else {
-            Some(self.checkpoint_drain_nodes())
-        };
+        let checkpoint_drain_nodes = mode
+            .is_checkpoint_pass()
+            .then(|| self.checkpoint_drain_nodes());
 
         let mut results = FxHashMap::default();
         let cycle_start = std::time::Instant::now();
@@ -3551,7 +3587,7 @@ impl OperatorGraph {
                 }
             }
 
-            if mode == GraphExecutionMode::Normal && i > 0 {
+            if !mode.is_checkpoint_pass() && i > 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
                 if elapsed_ns > self.query_budget_ns {

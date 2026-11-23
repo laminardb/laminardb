@@ -167,7 +167,7 @@ impl SqlQueryOperator {
                 super::AggregateBatchCoalescing::PublishedOutput,
             )?;
             self.prepared_aggregate_emission = Some(prepared);
-            self.drained_snapshot = super::DrainedSnapshot::Clear;
+            self.deferred_snapshot = super::DeferredSnapshot::Clear;
             Ok(batches)
         })())
     }
@@ -214,24 +214,36 @@ impl SqlQueryOperator {
         )
     }
 
-    /// In a checkpoint drain a certified snapshot aggregate applies its queued peer events without
-    /// emitting: each snapshot replaces the whole partition, and every snapshot a drain emits is
-    /// staged against the bounded subscription output before the cut.
-    pub(super) fn defers_drained_snapshots(&self) -> bool {
-        self.execution_mode != GraphExecutionMode::Normal
-            && !self.emit_changelog
-            && self.subscription_certificate.is_some()
+    /// Each certified snapshot replaces its whole partition and is staged against the bounded
+    /// subscription output until a cut publishes it.
+    pub(super) fn emits_certified_snapshots(&self) -> bool {
+        !self.emit_changelog && self.subscription_certificate.is_some()
+    }
+
+    /// Emits the aggregate's output, or owes one snapshot when this pass defers it: a checkpoint
+    /// drain, or a normal pass while subscription output waits for a checkpoint. Either way the
+    /// next cut would supersede the snapshot before anyone reads it.
+    pub(super) fn emit_or_owe_snapshot(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        let defers = matches!(
+            self.execution_mode,
+            GraphExecutionMode::CheckpointDrain | GraphExecutionMode::OutputHeld
+        );
+        if defers && self.emits_certified_snapshots() {
+            self.deferred_snapshot = super::DeferredSnapshot::Owed;
+            return Ok(Vec::new());
+        }
+        self.emit_agg_output()
     }
 
     /// The drain's settle pass emits an owed snapshot, as does a later normal pass once the queue
-    /// is empty; a drain pass keeps applying instead.
+    /// is empty; other passes keep applying instead.
     pub(super) fn owed_snapshot_is_due(&self, has_input: bool) -> bool {
-        self.drained_snapshot == super::DrainedSnapshot::Owed
+        self.deferred_snapshot == super::DeferredSnapshot::Owed
             && !has_input
             && match self.execution_mode {
                 GraphExecutionMode::CheckpointSettle => true,
                 GraphExecutionMode::Normal => self.queued_remote_events == 0,
-                GraphExecutionMode::CheckpointDrain => false,
+                GraphExecutionMode::CheckpointDrain | GraphExecutionMode::OutputHeld => false,
             }
     }
 
@@ -240,7 +252,7 @@ impl SqlQueryOperator {
     pub(super) fn has_unemitted_cluster_work(&self) -> bool {
         self.pending_cluster_input.is_some()
             || self.queued_remote_events != 0
-            || self.drained_snapshot == super::DrainedSnapshot::Owed
+            || self.deferred_snapshot == super::DeferredSnapshot::Owed
     }
 
     fn require_no_prepared_subscription_output(&self, context: &str) -> Result<(), DbError> {
@@ -256,9 +268,9 @@ impl SqlQueryOperator {
     /// Captured state must not run ahead of the output emitted for it.
     fn require_settled_subscription_output(&self, context: &str) -> Result<(), DbError> {
         self.require_no_prepared_subscription_output(context)?;
-        if self.drained_snapshot == super::DrainedSnapshot::Owed {
+        if self.deferred_snapshot == super::DeferredSnapshot::Owed {
             return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' cannot {context} while a drained snapshot is still owed",
+                "aggregate '{}' cannot {context} while a deferred snapshot is still owed",
                 self.op_name
             )));
         }

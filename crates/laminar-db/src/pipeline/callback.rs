@@ -87,6 +87,16 @@ impl ExternalOutputPressure {
         matches!(self, Self::CheckpointDue | Self::CheckpointBackpressured)
     }
 
+    /// Whether full-snapshot output waits for the next checkpoint: at the commit high water, a cut
+    /// in flight releases intake, and each snapshot staged before the cut would be superseded.
+    #[cfg(feature = "cluster")]
+    pub(crate) const fn holds_snapshot_output(self) -> bool {
+        matches!(
+            self,
+            Self::CheckpointBackpressured | Self::CommitBackpressured
+        )
+    }
+
     /// Whether compute intake must stop. Checkpoint barriers and assignment drain cuts reach the
     /// coordinator through the same source FIFO as data, and an active drain defers every
     /// checkpoint until its cut arrives, so checkpoint backpressure releases intake while either

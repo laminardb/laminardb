@@ -2284,6 +2284,109 @@ async fn checkpoint_drain_stages_one_certified_snapshot_for_a_peer_backlog_behin
     drained.assert_one_snapshot_with_total(backlog.backlog_total + LOCAL_VALUE);
 }
 
+/// While subscription output waits for a checkpoint, normal cycles apply a peer backlog and local
+/// input without staging a snapshot each; the next checkpoint drain stages one for all of it.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_output_stages_one_certified_snapshot_at_the_next_checkpoint() {
+    const LOCAL_VALUE: i64 = 100;
+    let mut backlog = certified_peer_backlog(5).await;
+    backlog.graph.set_snapshot_output_held(true);
+    let local = RecordBatch::try_new(
+        certified_sum_events_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![backlog.key.as_str()])),
+            Arc::new(Int64Array::from(vec![LOCAL_VALUE])),
+        ],
+    )
+    .unwrap();
+    let mut sources = FxHashMap::from_iter([(Arc::from("events"), vec![local])]);
+    let aggregate = backlog.graph.find_node("sum").unwrap();
+    let wake = backlog.receiver.work_ready_notify();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        backlog
+            .graph
+            .execute_cycle(&sources, 0, None)
+            .await
+            .unwrap();
+        sources.clear();
+        assert!(backlog
+            .graph
+            .take_prepared_subscription_outputs()
+            .iter()
+            .all(|output| output.frames.is_empty()));
+        let settled = !backlog.graph.nodes[aggregate]
+            .operator
+            .checkpoint_aligned_replay_pending()
+            && !backlog.graph.node_has_buffered_input(aggregate)
+            && !backlog.receiver.queued_work_ready();
+        if settled {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held cycles stalled"
+        );
+        if !backlog.graph.has_runnable_deferred_work() {
+            let _ = tokio::time::timeout(
+                crate::pipeline::streaming_coordinator::IDLE_TIMEOUT,
+                wake.notified(),
+            )
+            .await;
+        }
+    }
+    assert!(backlog.graph.nodes[aggregate]
+        .operator
+        .owes_deferred_snapshot());
+
+    let drained = drain_certified_output(&mut backlog, false).await;
+    drained.assert_one_snapshot_with_total(backlog.backlog_total + LOCAL_VALUE);
+}
+
+#[cfg(feature = "cluster")]
+struct ExecutionModeProbe(Arc<parking_lot::Mutex<Option<GraphExecutionMode>>>);
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl GraphOperator for ExecutionModeProbe {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn set_execution_mode(&mut self, mode: GraphExecutionMode) {
+        *self.0.lock() = Some(mode);
+    }
+}
+
+/// An operator installed while output is held joins the held mode instead of staging a snapshot
+/// every cycle until the mode next changes.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn an_operator_placed_while_output_is_held_joins_the_held_mode() {
+    let mut graph = OperatorGraph::new(SessionContext::new());
+    graph.set_snapshot_output_held(true);
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .unwrap();
+    let mode = Arc::new(parking_lot::Mutex::new(None));
+    graph.place_prepared_operator_node("probe", Box::new(ExecutionModeProbe(Arc::clone(&mode))), 1);
+    assert!(*mode.lock() == Some(GraphExecutionMode::OutputHeld));
+}
+
 /// With nothing else pending, a checkpoint drain runs no pass: the queued peer backlog stays as
 /// replay state for the cut.
 #[cfg(feature = "cluster")]

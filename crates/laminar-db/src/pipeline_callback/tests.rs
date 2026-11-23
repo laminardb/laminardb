@@ -551,7 +551,7 @@ impl crate::operator_graph::GraphOperator for DeferringDrainOperator {
                     state.settled_snapshots.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            GraphExecutionMode::Normal => {}
+            GraphExecutionMode::Normal | GraphExecutionMode::OutputHeld => {}
         }
         Ok(Vec::new())
     }
@@ -575,7 +575,7 @@ impl crate::operator_graph::GraphOperator for DeferringDrainOperator {
         self.mode = mode;
     }
 
-    fn owes_drained_snapshot(&self) -> bool {
+    fn owes_deferred_snapshot(&self) -> bool {
         self.state
             .owes_snapshot
             .load(std::sync::atomic::Ordering::Acquire)

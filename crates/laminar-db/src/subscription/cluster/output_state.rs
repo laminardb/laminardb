@@ -56,16 +56,16 @@ pub(super) struct PartitionBuffer {
     retained_bytes: usize,
 }
 
-struct StreamBuffer {
-    certificate: Arc<OutputDistributionCertificate>,
-    partitions: BTreeMap<OutputPartitionId, PartitionBuffer>,
-    retained_bytes: usize,
-    frame_count: usize,
+pub(super) struct StreamBuffer {
+    pub(super) certificate: Arc<OutputDistributionCertificate>,
+    pub(super) partitions: BTreeMap<OutputPartitionId, PartitionBuffer>,
+    pub(super) retained_bytes: usize,
+    pub(super) frame_count: usize,
 }
 
 #[derive(Default)]
-struct OutputBuffer {
-    streams: BTreeMap<StreamGeneration, StreamBuffer>,
+pub(super) struct OutputBuffer {
+    pub(super) streams: BTreeMap<StreamGeneration, StreamBuffer>,
     retained_bytes: usize,
     frame_count: usize,
 }
@@ -78,7 +78,7 @@ struct CycleAppend {
 pub(crate) struct ClusterSubscriptionOutputState {
     certificates: BTreeMap<String, Arc<OutputDistributionCertificate>>,
     bound_process: Option<LocalProcessAuthorityIdentity>,
-    open: OutputBuffer,
+    pub(super) open: OutputBuffer,
     staged_cycle: Option<CycleAppend>,
     reserved_attempt: Option<CheckpointAttempt>,
     pub(super) prepared: Option<Arc<PreparedNodeSubscriptionOutput>>,
@@ -308,7 +308,7 @@ impl ClusterSubscriptionOutputState {
             .retained_bytes()
             .checked_add(plan.retained_bytes)
             .filter(|bytes| *bytes <= MAX_PENDING_OUTPUT_BYTES)
-            .ok_or_else(|| resource_error("total pending output", MAX_PENDING_OUTPUT_BYTES))?;
+            .ok_or_else(|| self.pending_output_bound_error(plan))?;
         let frames = self
             .frame_count()
             .checked_add(plan.frame_count)
