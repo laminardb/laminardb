@@ -11,10 +11,19 @@
 //! at-least-once. More than one node must have read the table, and every node must keep
 //! committing checkpoints.
 //!
+//! The exactly-once leg runs the same rounds with `delivery = exactly_once` and also writes the
+//! aggregate's `EMIT CHANGES` stream to a Delta append table on S3, which keeps each change's
+//! `__weight`. A change committed twice leaves a row whose weights do not net to zero or one, so
+//! after every round the table's weights must net to one row per bucket, and once the writer
+//! stops those rows must equal the aggregate over the final snapshot.
+//!
 //! ```text
 //! cargo test --profile soak -p laminar-server --no-default-features \
 //!   --features cluster,aws,kafka,delta-lake-s3 --test cluster_soak \
 //!   delta_cdf_source::three_node_delta_cdf_kill9_soak -- --ignored --exact --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features \
+//!   --features cluster,aws,kafka,delta-lake-s3 --test cluster_soak \
+//!   delta_cdf_source::three_node_delta_cdf_delta_eo_kill9_soak -- --ignored --exact --nocapture
 //! ```
 //!
 //! It reads the shared `LAMINAR_SOAK_CHECKPOINT_URL` (the input table is created under it),
@@ -22,7 +31,8 @@
 //! `LAMINAR_SOAK_MAX_RECOVERY_MS` and `LAMINAR_SOAK_DISCOVERY` knobs, plus `LAMINAR_SOAK_KILLS`
 //! (default 4), `LAMINAR_SOAK_SECONDS` (steady phase after the rounds, default 30),
 //! `LAMINAR_SOAK_RPS` (rows per second the writer inserts, default 400) and
-//! `LAMINAR_SOAK_DELTA_SEED_ROWS` (rows of the seeded snapshot, default 200000).
+//! `LAMINAR_SOAK_DELTA_SEED_ROWS` (rows of the seeded snapshot, default 200000). The exactly-once
+//! leg also reads `LAMINAR_SOAK_DELTA_BUCKET`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -42,11 +52,13 @@ use super::kill_rejoin::{
 };
 use super::view_reads::{connect, ReadFailure};
 use super::{
-    env_u64, scoped_soak_storage_url, soak_run_id, wait_for, wait_for_converged_durable_checkpoint,
-    DeltaSoakStorage, DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, NODES,
+    delta_append_sink_config, delta_soak_table_uri, env_u64, scoped_soak_storage_url, soak_run_id,
+    wait_for, wait_for_converged_durable_checkpoint, wait_until, DeltaSoakStorage,
+    DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, NODES,
 };
 
 const VIEW: &str = "cdf_buckets";
+const CHANGES: &str = "cdf_bucket_changes";
 const BUCKETS: i64 = 16;
 /// Each key of a bucket: `(bucket, n, total, peak)`.
 type Buckets = Vec<[i64; 4]>;
@@ -59,12 +71,22 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 #[test]
 #[ignore = "spawns 3 real laminardb processes reading a Delta change feed on S3"]
 fn three_node_delta_cdf_kill9_soak() {
+    run(JoinDelivery::AtLeastOnce);
+}
+
+#[test]
+#[ignore = "spawns 3 real laminardb processes reading a Delta change feed on S3 into a Delta sink"]
+fn three_node_delta_cdf_delta_eo_kill9_soak() {
+    run(JoinDelivery::ExactlyOnce);
+}
+
+fn run(delivery: JoinDelivery) {
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
     );
     executable.describe();
-    let settings = SoakSettings::from_environment(JoinDelivery::AtLeastOnce);
+    let settings = SoakSettings::from_environment(delivery);
     let run_id = soak_run_id();
     let checkpoint_url =
         scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
@@ -75,6 +97,10 @@ fn three_node_delta_cdf_kill9_soak() {
     let seed_rows = i64::try_from(env_u64("LAMINAR_SOAK_DELTA_SEED_ROWS", 200_000))
         .expect("LAMINAR_SOAK_DELTA_SEED_ROWS fits i64");
     runtime().block_on(table.seed(seed_rows));
+    let output = (delivery == JoinDelivery::ExactlyOnce).then(|| Table {
+        uri: delta_soak_table_uri(&run_id, "delta-cdf"),
+        storage: table.storage.clone(),
+    });
 
     let dir = tempfile::tempdir().expect("tempdir");
     let log_dir: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
@@ -87,7 +113,7 @@ fn three_node_delta_cdf_kill9_soak() {
         &settings,
         &checkpoint_url,
         &view_sql(),
-        &workload(&table),
+        &workload(&table, output.as_ref()),
     );
     let mut writer = Writer::spawn(table.clone(), seed_rows, settings.rps);
     let mut live = || writer.assert_running();
@@ -106,6 +132,17 @@ fn three_node_delta_cdf_kill9_soak() {
             latest,
         );
         record_consumers(&nodes, &mut consumers);
+        if let Some(output) = &output {
+            let buckets = runtime()
+                .block_on(netted_buckets(output))
+                .unwrap_or_else(|error| {
+                    panic!("read the Delta output after round {round}: {error}")
+                });
+            eprintln!(
+                "soak round {round}: the Delta output nets to {} buckets",
+                buckets.len()
+            );
+        }
     }
     latest = paused_reader_round(&mut nodes, &mut live, &settings, latest);
     record_consumers(&nodes, &mut consumers);
@@ -118,14 +155,18 @@ fn three_node_delta_cdf_kill9_soak() {
     let commits = writer.stop();
     let expected = runtime().block_on(table.buckets());
     let epoch = converged_reads(&mut nodes, &expected, &settings, latest);
+    if let Some(output) = &output {
+        converge_output(output, &expected, settings.recovery_ceiling);
+        eprintln!("soak: the Delta output nets to the final snapshot's buckets");
+    }
     assert!(
         consumers.len() > 1,
         "only node {consumers:?} ever read the table: the change feed never moved"
     );
     eprintln!(
-        "soak: Delta change feed across {NODES} nodes: {seed_rows} seeded rows, {commits} later \
-         commits, every node read the final snapshot's {} buckets at epoch {epoch}, \
-         consumers={consumers:?} kills={} (followers {killed_followers:?})",
+        "soak: Delta change feed across {NODES} nodes ({delivery:?}): {seed_rows} seeded rows, \
+         {commits} later commits, every node read the final snapshot's {} buckets at epoch \
+         {epoch}, consumers={consumers:?} kills={} (followers {killed_followers:?})",
         expected.len(),
         settings.kills
     );
@@ -138,19 +179,27 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("soak runtime")
 }
 
-fn view_sql() -> String {
+/// The aggregate the view, the output stream and the oracle compute over the table.
+fn bucket_sql(table: &str) -> String {
     format!(
-        r#"sql = """
-CREATE MATERIALIZED VIEW {VIEW} AS
-SELECT id % {BUCKETS} AS bucket, COUNT(*) AS n, SUM(amount) AS total, MAX(amount) AS peak
-FROM cdf_input GROUP BY id % {BUCKETS};
-"""
-"#
+        "SELECT id % {BUCKETS} AS bucket, COUNT(*) AS n, SUM(amount) AS total, MAX(amount) AS peak \
+         FROM {table} GROUP BY id % {BUCKETS}"
     )
 }
 
-fn workload(table: &Table) -> String {
+fn view_sql() -> String {
     format!(
+        r#"sql = """
+CREATE MATERIALIZED VIEW {VIEW} AS {};
+"""
+"#,
+        bucket_sql("cdf_input")
+    )
+}
+
+/// The change-feed source, plus for the exactly-once leg the aggregate's changes into `output`.
+fn workload(table: &Table, output: Option<&Table>) -> String {
+    let source = format!(
         r#"
 [[source]]
 name = "cdf_input"
@@ -161,10 +210,22 @@ connector = "delta-lake"
 {}"#,
         table.uri,
         table.storage.connector_properties()
+    );
+    let Some(output) = output else {
+        return source;
+    };
+    format!(
+        r#"{source}
+[[pipeline]]
+name = "{CHANGES}"
+sql = "{} EMIT CHANGES"
+{}"#,
+        bucket_sql("cdf_input"),
+        delta_append_sink_config("cdf_delta", CHANGES, &output.uri, &output.storage)
     )
 }
 
-/// The change-feed table on S3.
+/// A Delta table on S3: the change-feed input, or the exactly-once leg's output.
 #[derive(Clone)]
 struct Table {
     uri: String,
@@ -195,7 +256,44 @@ impl Table {
             .map_err(|error| format!("invalid Delta table URI: {error}"))?;
         deltalake::open_table_with_storage_options(uri, self.storage.options())
             .await
-            .map_err(|error| format!("open the Delta input: {error}"))
+            .map_err(|error| format!("open {}: {error}", self.uri))
+    }
+
+    /// BIGINT rows that `sql` returns over the table's current snapshot, registered as `t`.
+    async fn query<const N: usize>(&self, sql: &str) -> Result<Vec<[i64; N]>, String> {
+        let table = self.open().await?;
+        let context = deltalake::datafusion::prelude::SessionContext::new();
+        table
+            .update_datafusion_session(&context.state())
+            .map_err(|error| format!("register the Delta object store: {error}"))?;
+        let provider = table
+            .table_provider()
+            .build()
+            .await
+            .map_err(|error| format!("Delta table provider: {error}"))?;
+        context
+            .register_table("t", Arc::new(provider))
+            .map_err(|error| format!("register {}: {error}", self.uri))?;
+        let batches = context
+            .sql(sql)
+            .await
+            .map_err(|error| format!("plan {sql}: {error}"))?
+            .collect()
+            .await
+            .map_err(|error| format!("scan {}: {error}", self.uri))?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| column.as_any().downcast_ref::<Int64Array>())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("{sql} returned a column that is not BIGINT"))?;
+            rows.extend(
+                (0..batch.num_rows()).map(|row| std::array::from_fn(|i| columns[i].value(row))),
+            );
+        }
+        Ok(rows)
     }
 
     /// Create the change-feed table holding `rows` ids in one commit.
@@ -221,47 +319,54 @@ impl Table {
 
     /// The view's rows over the table's current snapshot.
     async fn buckets(&self) -> Buckets {
-        let table = self.open().await.expect("open the final snapshot");
-        let context = deltalake::datafusion::prelude::SessionContext::new();
-        table
-            .update_datafusion_session(&context.state())
-            .expect("register the Delta object store");
-        let provider = table
-            .table_provider()
-            .build()
+        self.query(&format!("{} ORDER BY bucket", bucket_sql("t")))
             .await
-            .expect("Delta table provider");
-        context
-            .register_table("cdf_table", Arc::new(provider))
-            .expect("register the snapshot");
-        let batches = context
-            .sql(&format!(
-                "SELECT id % {BUCKETS} AS bucket, COUNT(*) AS n, SUM(amount) AS total, \
-                 MAX(amount) AS peak FROM cdf_table GROUP BY id % {BUCKETS} ORDER BY bucket"
-            ))
-            .await
-            .expect("plan the snapshot aggregate")
-            .collect()
-            .await
-            .expect("scan the final snapshot");
-        let mut buckets = Vec::new();
-        for batch in &batches {
-            let columns: Vec<&Int64Array> = batch
-                .columns()
-                .iter()
-                .map(|column| {
-                    column
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("BIGINT aggregate column")
-                })
-                .collect();
-            buckets.extend(
-                (0..batch.num_rows()).map(|row| std::array::from_fn(|i| columns[i].value(row))),
-            );
-        }
-        buckets
+            .unwrap_or_else(|error| panic!("aggregate the final snapshot: {error}"))
     }
+}
+
+/// The buckets the exactly-once leg's committed changes net to. Each change is committed once, so
+/// every row's weights net to zero or one and each bucket keeps at most one row.
+async fn netted_buckets(output: &Table) -> Result<Buckets, String> {
+    let netted: Vec<[i64; 5]> = output
+        .query(
+            "SELECT bucket, n, total, peak, SUM(__weight) AS net FROM t \
+             GROUP BY bucket, n, total, peak HAVING SUM(__weight) <> 0 ORDER BY bucket",
+        )
+        .await?;
+    let doubled: Vec<_> = netted.iter().filter(|row| row[4] != 1).take(8).collect();
+    assert!(
+        doubled.is_empty(),
+        "Delta output rows whose weights net outside zero and one (bucket, n, total, peak, net): \
+         {doubled:?}"
+    );
+    let buckets: Buckets = netted
+        .iter()
+        .map(|row| [row[0], row[1], row[2], row[3]])
+        .collect();
+    let repeated: Vec<_> = buckets
+        .windows(2)
+        .filter(|pair| pair[0][0] == pair[1][0])
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "Delta output buckets with more than one current row: {repeated:?}"
+    );
+    Ok(buckets)
+}
+
+/// Wait until the exactly-once leg's committed changes net to `expected`.
+fn converge_output(output: &Table, expected: &Buckets, timeout: Duration) {
+    let runtime = runtime();
+    let mut last = None;
+    let converged = wait_until(timeout, || {
+        last = Some(runtime.block_on(netted_buckets(output)));
+        matches!(&last, Some(Ok(buckets)) if buckets == expected)
+    });
+    assert!(
+        converged,
+        "the Delta output never netted to the final snapshot {expected:?}; last {last:?}"
+    );
 }
 
 /// Paced writer that cycles an insert of new ids, an update of every seventh recent id, and a
@@ -477,7 +582,7 @@ fn converged_reads(
     );
     let runtime = runtime();
     let mut last = None;
-    let converged = super::wait_until(settings.recovery_ceiling + Duration::from_secs(60), || {
+    let converged = wait_until(settings.recovery_ceiling + Duration::from_secs(60), || {
         match runtime.block_on(committed_read(nodes[0].id, 0)) {
             Ok(read) => last = Some(read),
             Err(ReadFailure::Retryable(_)) => {}

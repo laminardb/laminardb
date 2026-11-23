@@ -31,8 +31,8 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | ALO | rejected |
 | PostgreSQL CDC (no initial copy) | ALO | ALO |
 | MongoDB change stream | ALO, BE | ALO |
-| Delta Lake change feed | ALO, BE | ALO |
-| Delta Lake change feed (local table) | ALO, BE | rejected |
+| Delta Lake change feed | EO, ALO, BE | EO, ALO |
+| Delta Lake change feed (local table) | EO, ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
 | Iceberg (append read, splits) | ALO, BE | ALO |
@@ -73,8 +73,8 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Delta Lake change feed | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Delta Lake change feed (local table) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed (local table) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
 | Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
@@ -98,7 +98,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | — | — | — | — | — | — | — | — | — | — | — | — |
 | PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -127,9 +127,11 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 | Kafka → Iceberg append (REST + S3) | Cluster | `three_node_eo_join_kill9_soak`: the same join also writes to Iceberg through every `kill -9` and paused-leader round; the table's data files must hold every join pair exactly once, and every snapshot must belong to exactly one checkpoint. `iceberg_cluster_soak`: leader killed at the external commit gate and restarted; one snapshot per checkpoint and an exact data-file oracle. |
 | Generator (splits) → Delta Lake append (S3/S3A) | Cluster | `generator_splits::three_node_generator_splits_delta_eo_kill9_soak` (candidate): `kill -9` of the leader and each follower inside a checkpoint, each restarted and rejoining while the bounded sequence still runs. After every round the Delta table may hold no row twice, and when the sequence ends it must hold each row exactly once; committed view reads on every node must hold an exact prefix of every split. It has no paused-leader or sink-commit-gate faults. Emulated S3 (SeaweedFS). |
 | Generator (splits) → Iceberg append (REST + S3) | Cluster | Admitted through the Iceberg sink's certification (the Kafka → Iceberg row); no leg writes a split generator to Iceberg. |
+| Delta Lake change feed → Delta Lake append (S3/S3A) | Cluster | `delta_cdf_source::three_node_delta_cdf_delta_eo_kill9_soak` (candidate): the at-least-once change-feed leg's rounds (`kill -9` of the leader and each follower inside a checkpoint, then the node reading the feed frozen with `SIGSTOP` until a survivor reads it, resumed and fenced) under exactly-once, with a keyed `EMIT CHANGES` aggregate over the feed written to a Delta append table that keeps each change's `__weight`. After every round the table's weights must net to zero or one per row and to one row per bucket; once the writer stops, those rows must equal the aggregate over the input's final snapshot. Emulated S3 (SeaweedFS). |
 | Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |
+| Delta Lake change feed → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/delta_change_feed_exactly_once.rs`: a child process forwards a change feed (inserts of several polls each, updates and deletes) through a stream into a local append table and is killed four times; the table must hold every change of the feed, read independently through delta-rs, exactly once. Object-store tables rest on the Delta sink's own certification. The feed carries retractions, so the Iceberg append sink, which takes no changelog, rejects it even where the matrix pairs the contracts. |
 | Generator (splits) → managed state | Embedded / single-node | `local_exact_source_state_kill9_soak` with `LAMINAR_SOAK_SPLITS=4` (candidate step): `kill -9` inside a checkpoint while the finite source moves and three times after it is exhausted; each recovery must restore the exact aggregate of the finite prefix, from a cursor with one offset per split, without replaying input. `crates/laminar-db/tests/generator_splits.rs` restarts an embedded split generator under exactly-once. |
 
 ## Evidence for cluster at-least-once sinks
@@ -221,7 +223,8 @@ have read the directory.
 A Delta Lake change feed on object storage runs on one node at a time, the owner of the source's
 home vnode, because a changelog must reach each group in log order; the aggregates and views over
 it spread across the nodes by their keys. Operator state and the source cursor commit in one
-checkpoint, so a view over the feed holds each change once.
+checkpoint, so a view over the feed holds each change once (the exactly-once evidence above
+covers sinks).
 `delta_cdf_source::three_node_delta_cdf_kill9_soak` (candidate) seeds a change-feed table on S3
 with one large snapshot before the nodes start, then commits inserts, updates and deletes while a
 keyed materialized view folds the feed, through the same kills. One more round freezes the node

@@ -190,7 +190,7 @@ impl DeltaSource {
         self.check_read_features(snapshot.metadata().configuration())?;
         let latest = snapshot.version();
         let cursor = match recovered {
-            Some(cursor) => self.validate_recovered(cursor, &table_id)?,
+            Some(cursor) => self.validate_recovered(cursor, &table_id, latest)?,
             None => self.initial_cursor(table_id, latest)?,
         };
 
@@ -258,7 +258,7 @@ impl DeltaSource {
     /// changes; the table must keep its location and incarnation.
     async fn renew_credentials(&mut self) -> Result<(), ConnectorError> {
         let resolved = self.resolve_table().await?;
-        let table_id = self.cursor()?.table_id.clone();
+        let cursor = self.cursor()?.clone();
         let reader = self.reader_mut()?;
         if resolved.location != reader.resolved.location {
             return Err(ConnectorError::ConfigurationError(
@@ -271,7 +271,7 @@ impl DeltaSource {
             resolved.storage_options.clone(),
         )
         .await?;
-        ensure_same_table(&table, &table_id)?;
+        ensure_cursor_table(&table, &cursor)?;
         reader.context.engine = table.log_store().engine(None);
         reader.context.renew_at =
             super::delta_io::credentials_refresh_at(resolved.credentials_expire_at);
@@ -342,10 +342,13 @@ impl DeltaSource {
         Ok(DeltaCursor { table_id, phase })
     }
 
+    /// A recovered cursor must belong to this table incarnation and read mode, and the log must
+    /// reach it.
     fn validate_recovered(
         &self,
         cursor: DeltaCursor,
         table_id: &str,
+        latest: u64,
     ) -> Result<DeltaCursor, ConnectorError> {
         if cursor.table_id != table_id {
             return Err(ConnectorError::ConfigurationError(
@@ -354,6 +357,7 @@ impl DeltaSource {
                     .into(),
             ));
         }
+        ensure_log_reaches(latest, &cursor.phase)?;
         let compatible = match (&cursor.phase, self.config.read_mode) {
             (DeltaPhase::Snapshot { .. }, _)
             | (DeltaPhase::Changes { .. }, DeltaReadMode::Changes)
@@ -565,39 +569,25 @@ impl DeltaSource {
     async fn refresh_table(&mut self, next_version: u64) -> Result<u64, ConnectorError> {
         use super::delta_io;
 
-        let table_id = self.cursor()?.table_id.clone();
+        let cursor = self.cursor()?.clone();
         let reader = self.reader_mut()?;
         reader.last_version_check = Some(Instant::now());
         // The cheap incremental listing only answers "is there anything new"; it cannot see a
         // table recreated at the same location, whose log restarts at version 0.
-        let listed = delta_io::get_latest_version(&mut reader.table).await;
-        if let Ok(latest) = &listed {
-            let latest = delta_io::to_delta_version(*latest)?;
+        if let Ok(latest) = delta_io::get_latest_version(&mut reader.table).await {
+            let latest = delta_io::to_delta_version(latest)?;
             if latest < next_version {
                 return Ok(latest);
             }
         }
-        // New commits (or an unreadable listing): load the metadata from scratch, so a
-        // replacement's own metaData action is the one compared with the cursor.
+        // New commits, or a failed listing (as once the log no longer holds the version it lists
+        // from): reload, so the replacement's own metaData and log are checked against the cursor.
         let fresh = delta_io::open_table_metadata(
             &reader.resolved.location,
             reader.resolved.storage_options.clone(),
         )
         .await?;
-        ensure_same_table(&fresh, &table_id)?;
-        listed?;
-        let latest = fresh.version().ok_or_else(|| {
-            ConnectorError::ReadError("opened Delta table has no committed version".into())
-        })?;
-        if latest
-            .checked_add(1)
-            .is_none_or(|after| after < next_version)
-        {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "the Delta log regressed to version {latest} behind the cursor at {next_version}; \
-                 the table was replaced or its history rewritten — reset the source"
-            )));
-        }
+        let latest = ensure_cursor_table(&fresh, &cursor)?;
         reader.table = fresh;
         if latest < next_version {
             return Ok(latest);
@@ -619,19 +609,37 @@ impl DeltaSource {
     }
 }
 
+/// Confirm a freshly loaded table is the cursor's incarnation and its log reaches the cursor.
+/// Returns the table's latest version.
 #[cfg(feature = "delta-lake")]
-fn ensure_same_table(table: &DeltaTable, table_id: &str) -> Result<(), ConnectorError> {
+fn ensure_cursor_table(table: &DeltaTable, cursor: &DeltaCursor) -> Result<u64, ConnectorError> {
     let snapshot = table.snapshot().map_err(|error| {
         super::delta_io::classify_delta_metadata_error("read Delta table metadata", &error)
     })?;
-    if snapshot.metadata().id() != table_id {
+    if snapshot.metadata().id() != cursor.table_id {
         return Err(ConnectorError::ConfigurationError(
             "the Delta table was replaced at its location (its table id changed); reset the \
              source to read the new table"
                 .into(),
         ));
     }
-    Ok(())
+    let latest = snapshot.version();
+    ensure_log_reaches(latest, &cursor.phase)?;
+    Ok(latest)
+}
+
+/// A log that ends before a version the position reached would give new commits versions the
+/// position already passed, and reading on would skip them.
+#[cfg(feature = "delta-lake")]
+fn ensure_log_reaches(latest: u64, phase: &DeltaPhase) -> Result<(), ConnectorError> {
+    match phase.reached_version() {
+        Some(reached) if latest < reached => Err(ConnectorError::ConfigurationError(format!(
+            "the Delta log regressed to version {latest}, behind version {reached} that the \
+             source position reached; the table was replaced or its history rewritten — reset \
+             the source"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Retrying cannot shrink the unit, so the position overflow is terminal.
@@ -696,11 +704,18 @@ impl SourceConnector for DeltaSource {
         } else {
             contract
         };
-        // Any one node may follow a change feed every node reaches: the cursor names the next
-        // unit and nothing upstream is held. A bounded snapshot read is not qualified for
-        // cluster placement.
-        Ok(if shared && cfg.read_mode == DeltaReadMode::Changes {
-            contract.with_cluster_singleton_placement()
+        if cfg.read_mode == DeltaReadMode::Snapshot {
+            return Ok(contract);
+        }
+        // A change feed's cut is exact: the cursor stands between whole units, a replayed unit
+        // reproduces its rows, and missing or regressed history fails the read. Any one node may
+        // follow a feed every node reaches, since nothing upstream is held, and the read is the
+        // same on every store. A completing snapshot read is exercised under neither.
+        let contract = contract.with_exact_delivery_certification();
+        Ok(if shared {
+            contract
+                .with_cluster_singleton_placement()
+                .with_cluster_exact_delivery_certification()
         } else {
             contract
         })

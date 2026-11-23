@@ -18,7 +18,7 @@ fn contract_is_a_replayable_positioned_full_changelog() {
         contract.row_positions,
         SourceRowPositionCapability::OrderedDeterministic
     );
-    assert!(!contract.is_exact_delivery_certified());
+    assert!(contract.is_exact_delivery_certified());
     assert_eq!(
         source.checkpoint_unavailable_policy(),
         SourceCheckpointUnavailablePolicy::PollToReplayBoundary
@@ -30,9 +30,12 @@ fn contract_is_a_replayable_positioned_full_changelog() {
     assert!(source.contract(&config).is_err());
 }
 
+/// A change feed is exactly-once certified on one node, and on shared storage across cluster
+/// nodes, where one node at a time may read it; a snapshot read is neither.
 #[test]
-fn only_a_change_feed_on_shared_storage_may_move_between_cluster_nodes() {
+fn only_a_change_feed_is_exactly_once_and_moves_between_cluster_nodes_from_shared_storage() {
     let source = DeltaSource::new(test_config(), None);
+    // (placement, locality, exactly-once on one node, across cluster nodes)
     let contract = |path: &str, mode: &str, catalog: Option<&str>| {
         let mut config = ConnectorConfig::new("delta-lake");
         config.set("table.path", path);
@@ -45,6 +48,8 @@ fn only_a_change_feed_on_shared_storage_may_move_between_cluster_nodes() {
         (
             contract.supports_cluster_singleton_placement(),
             contract.locality,
+            contract.is_exact_delivery_certified(),
+            contract.is_cluster_exact_delivery_certified(),
         )
     };
     for path in [
@@ -54,25 +59,27 @@ fn only_a_change_feed_on_shared_storage_may_move_between_cluster_nodes() {
     ] {
         assert_eq!(
             contract(path, "changes", None),
-            (true, SourceLocality::Portable),
+            (true, SourceLocality::Portable, true, true),
             "{path}"
         );
         assert_eq!(
             contract(path, "snapshot", None),
-            (false, SourceLocality::Portable),
+            (false, SourceLocality::Portable, false, false),
             "{path}"
         );
     }
-    for mode in ["changes", "snapshot"] {
-        assert_eq!(
-            contract("/data/orders", mode, None),
-            (false, SourceLocality::LocalFiles)
-        );
-    }
+    assert_eq!(
+        contract("/data/orders", "changes", None),
+        (false, SourceLocality::LocalFiles, true, false)
+    );
+    assert_eq!(
+        contract("/data/orders", "snapshot", None),
+        (false, SourceLocality::LocalFiles, false, false)
+    );
     // A catalog name is resolved to its storage only when the table opens.
     assert_eq!(
         contract("orders", "changes", Some("glue")),
-        (false, SourceLocality::Portable)
+        (false, SourceLocality::Portable, true, false)
     );
 }
 
@@ -303,6 +310,28 @@ mod table {
         changes
     }
 
+    /// The first error the source returns once it has nothing more to read; a row read before
+    /// it fails the test.
+    pub(super) async fn first_error(source: &mut DeltaSource, after: &str) -> ConnectorError {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "no error {after}");
+            match source.poll_batch(10).await {
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                Ok(Some(batch)) => panic!("read {:?} {after}", changes(&batch)),
+                Err(error) => return error,
+            }
+        }
+    }
+
+    /// Delete the commit files of `versions` from the log at `dir`.
+    pub(super) fn remove_commits(dir: &std::path::Path, versions: &[u64]) {
+        for version in versions {
+            std::fs::remove_file(dir.join("_delta_log").join(format!("{version:020}.json")))
+                .unwrap();
+        }
+    }
+
     /// Net multiset (row -> weight) of a changelog, without zero entries.
     pub(super) fn net(changes: &[Change]) -> Vec<(i64, String, i64)> {
         let mut net = std::collections::BTreeMap::<(i64, String), i64>::new();
@@ -442,7 +471,8 @@ async fn a_closed_source_starts_again_from_the_committed_cursor() {
 }
 
 /// Resuming from any checkpoint the source offered reproduces exactly the rows emitted after
-/// it: no unit is split across a checkpoint, and maintenance rewrites emit nothing.
+/// it, in the same order: no unit is split across a checkpoint, and maintenance rewrites emit
+/// nothing.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
 async fn resume_from_every_offered_checkpoint_reproduces_the_remaining_rows() {
@@ -498,11 +528,7 @@ async fn resume_from_every_offered_checkpoint_reproduces_the_remaining_rows() {
     for (checkpoint, offset) in boundaries {
         let mut resumed = start(&path, &[], resume(checkpoint.clone())).await.unwrap();
         let (replayed, _) = drain(&mut resumed, 3).await;
-        assert_eq!(
-            sorted(replayed),
-            sorted(emitted[offset..].to_vec()),
-            "resume from {checkpoint:?}"
-        );
+        assert_eq!(replayed, emitted[offset..], "resume from {checkpoint:?}");
     }
 }
 
@@ -671,13 +697,7 @@ async fn a_replaced_table_fails_closed() {
     let table = table.write(vec![rows(&[2], "b")]).await.unwrap();
     table.write(vec![rows(&[3], "c")]).await.unwrap();
 
-    let error = loop {
-        match source.poll_batch(10).await {
-            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
-            Ok(Some(batch)) => panic!("read {:?} from the replacement", table::changes(&batch)),
-            Err(error) => break error,
-        }
-    };
+    let error = table::first_error(&mut source, "from the replacement").await;
     assert!(error.to_string().contains("replaced"), "{error}");
     let error = start(&path, &[], resume(checkpoint)).await.unwrap_err();
     assert!(error.to_string().contains("replaced"), "{error}");
@@ -696,14 +716,7 @@ async fn missing_change_history_fails_closed() {
     deltalake::checkpoints::create_checkpoint(&table, None)
         .await
         .unwrap();
-    for version in [0, 1] {
-        std::fs::remove_file(
-            dir.path()
-                .join("_delta_log")
-                .join(format!("{version:020}.json")),
-        )
-        .unwrap();
-    }
+    table::remove_commits(dir.path(), &[0, 1]);
 
     let mut source = start(&path, &[("starting.version", "1")], SourcePosition::Initial)
         .await
@@ -715,6 +728,82 @@ async fn missing_change_history_fails_closed() {
         cursor.phase,
         super::cursor::DeltaPhase::Changes { next_version: 1 }
     );
+}
+
+/// A log that ends before a version the cursor reached, as when a table directory is restored
+/// from an older copy that keeps its table id, fails closed while running and on resume instead
+/// of reading new commits at versions the cursor already passed.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn a_log_behind_the_cursor_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let mut table = cdf_table(&path).await;
+    for id in 1..=3 {
+        table = table.write(vec![rows(&[id], "a")]).await.unwrap();
+    }
+    let mut source = start(&path, &[("starting.version", "1")], SourcePosition::Initial)
+        .await
+        .unwrap();
+    assert_eq!(drain_until(&mut source, 3).await.len(), 3);
+    let checkpoint = source.checkpoint();
+
+    table::remove_commits(dir.path(), &[2, 3]);
+    table::open(&path)
+        .await
+        .write(vec![rows(&[9], "rewritten")])
+        .await
+        .unwrap();
+
+    let error = table::first_error(&mut source, "from the rewritten log").await;
+    assert!(error.to_string().contains("regressed"), "{error}");
+    assert!(!error.is_transient(), "{error}");
+    let error = start(&path, &[], resume(checkpoint)).await.unwrap_err();
+    assert!(error.to_string().contains("regressed"), "{error}");
+}
+
+/// A data file removed before the source read it, by a vacuum ahead of the reader, fails the
+/// read; the cursor stays on the unit it could not read, in the bootstrap and in the feed.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn a_vacuumed_data_file_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    cdf_table(&path)
+        .await
+        .write(vec![rows(&[1, 2], "a")])
+        .await
+        .unwrap();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let file = entry.unwrap().path();
+        if file
+            .extension()
+            .is_some_and(|extension| extension == "parquet")
+        {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    for (extra, unread) in [
+        (
+            &[][..],
+            DeltaPhase::Snapshot {
+                version: 1,
+                files_done: 0,
+                last_file: None,
+            },
+        ),
+        (
+            &[("starting.version", "1")][..],
+            DeltaPhase::Changes { next_version: 1 },
+        ),
+    ] {
+        let mut source = start(&path, extra, SourcePosition::Initial).await.unwrap();
+        let error = source.poll_batch(10).await.unwrap_err();
+        assert!(!error.is_transient(), "{error}");
+        let cursor = DeltaCursor::from_checkpoint(&source.checkpoint()).unwrap();
+        assert_eq!(cursor.phase, unread);
+    }
 }
 
 /// The source binding is fixed: a schema change fails closed before any row of it is read.
@@ -740,13 +829,7 @@ async fn a_schema_change_fails_closed() {
         )])
         .await
         .unwrap();
-    let error = loop {
-        match source.poll_batch(10).await {
-            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
-            Ok(Some(batch)) => panic!("read {:?} after the schema change", table::changes(&batch)),
-            Err(error) => break error,
-        }
-    };
+    let error = table::first_error(&mut source, "after the schema change").await;
     assert!(error.to_string().contains("schema changed"), "{error}");
 }
 

@@ -282,7 +282,6 @@ impl SourceContract {
 
     /// Mark a built-in connector whose multi-node exact-delivery suite is an engine release gate.
     /// Cluster exactly-once also requires [`Self::with_exact_delivery_certification`].
-    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     #[must_use]
     pub(crate) const fn with_cluster_exact_delivery_certification(mut self) -> Self {
         self.cluster_exact_delivery_certified = true;
@@ -301,10 +300,6 @@ impl SourceContract {
     /// in `notify_epoch_committed`. A node keeps one instance, so a closed instance must start
     /// again when the source comes back, keeping its terminal task tracker. Its positioned rows,
     /// if any, share one partition: the engine renames it to the source's one input channel.
-    #[cfg_attr(
-        not(any(feature = "rabbitmq", feature = "testing", test)),
-        allow(dead_code)
-    )]
     #[must_use]
     pub(crate) const fn with_cluster_singleton_placement(mut self) -> Self {
         self.cluster_singleton_placement = true;

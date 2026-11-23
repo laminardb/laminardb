@@ -29,6 +29,17 @@ pub(super) enum DeltaPhase {
     Complete { version: u64 },
 }
 
+impl DeltaPhase {
+    /// The latest table version this position has seen exist, if any.
+    #[cfg(feature = "delta-lake")]
+    pub(super) fn reached_version(&self) -> Option<u64> {
+        match self {
+            Self::Changes { next_version } => next_version.checked_sub(1),
+            Self::Snapshot { version, .. } | Self::Complete { version } => Some(*version),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DeltaCursor {
     /// Delta `metaData.id`, never empty; a table recreated at the same location has a

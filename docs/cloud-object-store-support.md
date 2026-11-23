@@ -45,7 +45,7 @@ current commit. “ALO” means at-least-once only in cluster mode.
 | Consumer | AWS S3 | Azure Blob / ADLS Gen2 | Google Cloud Storage | Local filesystem | S3-compatible endpoint |
 |---|---|---|---|---|---|
 | Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; local-native certification, no CI artifact (see status note) | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; keyless native job enabled; no current native artifact | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
-| Delta source | URI/config; MinIO smoke; native job; embedded/single-node replayable change feed, cluster rejected | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; keyless native job enabled; no current native artifact | Supported | MinIO smoke; compatibility tier only |
+| Delta source | URI/config; MinIO smoke; native job; replayable change feed, exactly-once certified; in a cluster on one node at a time | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; keyless native job enabled; no current native artifact | Supported | MinIO smoke; compatibility tier only |
 | Delta sink | URI/config; MinIO smoke; native job; S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; keyless native job enabled; no current native artifact; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; S3/S3A cluster exact requires native ETag conditional put and a successful atomic conditional-create startup probe. Any configured `s3_locking_provider` and enabled unsafe-rename mode are rejected; a lock provider is not required. |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
@@ -65,8 +65,8 @@ actionable error. No object-store sink was added because a safe remote sink need
 keys, conditional publication, content validation on retry, and a durable visibility manifest;
 POSIX rename semantics are not emulated over object storage.
 
-Cluster exact-delivery admission remains limited to Kafka or split generator input with an S3/S3A
-append-mode Delta sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom
+Cluster exact-delivery admission remains limited to Kafka, split generator or Delta Lake change
+feed input (Delta only, since its changes carry retractions) with an S3/S3A append-mode Delta sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom
 S3 endpoint's atomic conditional create before new table creation; failure closes admission. Azure
 and GCS remain at-least-once in cluster mode.
 
