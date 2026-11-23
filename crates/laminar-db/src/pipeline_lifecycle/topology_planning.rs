@@ -92,13 +92,22 @@ impl LaminarDB {
             .await?;
         self.revalidate_persisted_cluster_query_shapes(&streams)
             .await?;
-        // Cluster mode admits no changelog source.
+        // Cluster topologies have no direct keyed-mutation sink route: its singleton sources and
+        // sinks lack fenced placement.
+        let routes = super::direct_mutation_routes::MutationRoutes {
+            direct: rustc_hash::FxHashSet::default(),
+            changelog: self.validate_changelog_source_routes(
+                &sources,
+                &interval,
+                RuntimeMode::Cluster,
+            )?,
+        };
         let mut resolved = super::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
             &self.static_table_names(),
             &interval.joins,
-            &rustc_hash::FxHashSet::default(),
+            &routes.changelog,
             &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await?;
@@ -126,14 +135,8 @@ impl LaminarDB {
         let mut source_names = self.catalog.list_sources();
         source_names.sort_unstable();
         for name in source_names {
-            // Cluster topologies have no direct keyed-mutation sink route: its singleton
-            // sources and sinks lack fenced placement.
             self.validate_registered_mutation_source_admission(
-                &name,
-                &sources,
-                &temporal,
-                &interval,
-                &super::direct_mutation_routes::MutationRoutes::default(),
+                &name, &sources, &temporal, &interval, &routes,
             )?;
             let source = self.catalog.get_source(&name).ok_or_else(|| {
                 TopologyError::Invalid(format!(

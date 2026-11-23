@@ -11,7 +11,9 @@ use crate::connector::DeliveryGuarantee;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
-use crate::storage::{CloudConfigValidator, SecretMasker, StorageCredentialResolver};
+use crate::storage::{
+    CloudConfigValidator, SecretMasker, StorageCredentialResolver, StorageProvider,
+};
 
 /// Configuration for the Delta Lake sink connector.
 ///
@@ -424,6 +426,17 @@ impl fmt::Display for DeltaWriteMode {
             Self::Upsert => write!(f, "upsert"),
         }
     }
+}
+
+/// Whether `table_path` names a table every node reaches: an object-store URI or a Unity
+/// Catalog `uc://` name. A local path, or a catalog name resolved only when the table opens,
+/// does not.
+#[must_use]
+pub(crate) fn names_shared_table(table_path: &str) -> bool {
+    StorageProvider::is_shared_uri(table_path)
+        || table_path
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("uc"))
 }
 
 /// Delta Lake catalog type for table discovery.

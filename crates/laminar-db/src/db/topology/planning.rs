@@ -301,7 +301,7 @@ impl LaminarDB {
     }
 
     /// The registered streams' exchange plan exactly as cluster startup resolves it: cluster
-    /// interval admissions and no changelog source.
+    /// interval admissions and changelog routes.
     pub(crate) async fn cluster_exchange_plan(&self) -> Result<ExchangePlan, DbError> {
         Ok(self.cluster_stream_outputs().await?.exchange_plan)
     }
@@ -325,12 +325,14 @@ impl LaminarDB {
                 RuntimeMode::Cluster,
             )
             .await?;
+        let changelog =
+            self.validate_changelog_source_routes(&sources, &interval, RuntimeMode::Cluster)?;
         crate::pipeline_lifecycle::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
             &self.static_table_names(),
             &interval.joins,
-            &rustc_hash::FxHashSet::default(),
+            &changelog,
             &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await

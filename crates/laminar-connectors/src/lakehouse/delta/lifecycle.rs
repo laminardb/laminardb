@@ -48,12 +48,9 @@ impl SinkConnector for DeltaLakeSink {
         } else {
             SinkConsistency::DurableAtLeastOnce
         };
-        let unity_target = cfg
-            .table_path
-            .split_once("://")
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("uc"));
-        let shared_target = StorageProvider::is_shared_uri(&cfg.table_path) || unity_target;
-        let topology = if cfg.write_mode == DeltaWriteMode::Append && shared_target {
+        let topology = if cfg.write_mode == DeltaWriteMode::Append
+            && super::super::delta_config::names_shared_table(&cfg.table_path)
+        {
             SinkTopology::MultiWriter
         } else {
             // Node-local files plus overwrite/MERGE lack fenced distributed ownership.

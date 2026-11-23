@@ -1338,15 +1338,17 @@ fn node_local_sources_are_rejected_in_cluster_whatever_their_topology() {
 
 #[cfg(feature = "delta-lake")]
 #[test]
-fn delta_change_feed_is_a_local_replayable_changelog_route_source() {
-    use super::admit_source_recovery_contract;
+fn delta_change_feed_runs_in_cluster_only_from_shared_storage() {
+    use super::{admit_source_recovery_contract, is_changelog_route_candidate};
 
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
     laminar_connectors::lakehouse::register_delta_lake_source(&registry).unwrap();
     let mut config = ConnectorConfig::new("delta-lake");
     config.set("table.path", "/tmp/delta-orders");
     let source = registry.create_source(&config, None).unwrap();
-    for mode in ["changes", "snapshot"] {
+    let admit = |path: &str, mode: &str, delivery, runtime| {
+        let mut config = config.clone();
+        config.set("table.path", path);
         config.set("read.mode", mode);
         let contract = source.contract(&config).unwrap();
         assert_eq!(contract.input_mode, SourceInputMode::FullChangelog);
@@ -1354,17 +1356,91 @@ fn delta_change_feed_is_a_local_replayable_changelog_route_source() {
             contract.row_positions,
             SourceRowPositionCapability::OrderedDeterministic
         );
-        let admit =
-            |delivery, runtime| admit_source_recovery_contract(contract, delivery, true, runtime);
-        assert_eq!(
-            admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local),
-            Ok(())
-        );
-        assert!(admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster).is_err());
-        assert!(admit(DeliveryGuarantee::ExactlyOnce, RuntimeMode::Local)
+        assert!(is_changelog_route_candidate(contract, runtime));
+        admit_source_recovery_contract(contract, delivery, true, runtime)
+    };
+    let at_least_once = DeliveryGuarantee::AtLeastOnce;
+    for path in ["/tmp/delta-orders", "s3://lake/orders"] {
+        for mode in ["changes", "snapshot"] {
+            assert_eq!(admit(path, mode, at_least_once, RuntimeMode::Local), Ok(()));
+            assert!(admit(
+                path,
+                mode,
+                DeliveryGuarantee::ExactlyOnce,
+                RuntimeMode::Local
+            )
             .unwrap_err()
             .contains("LDB-5037"));
+        }
     }
+    assert_eq!(
+        admit(
+            "s3://lake/orders",
+            "changes",
+            at_least_once,
+            RuntimeMode::Cluster
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        admit(
+            "uc://main.sales.orders",
+            "changes",
+            at_least_once,
+            RuntimeMode::Cluster
+        ),
+        Ok(())
+    );
+    assert!(admit(
+        "s3://lake/orders",
+        "snapshot",
+        at_least_once,
+        RuntimeMode::Cluster
+    )
+    .unwrap_err()
+    .contains("one node at a time"));
+    assert!(admit(
+        "/tmp/delta-orders",
+        "changes",
+        at_least_once,
+        RuntimeMode::Cluster
+    )
+    .unwrap_err()
+    .contains("local filesystem"));
+}
+
+#[test]
+fn a_cluster_changelog_route_has_one_reader() {
+    use super::is_changelog_route_candidate;
+
+    let changelog = |topology| {
+        SourceContract::new(
+            SourceConsistency::Replayable,
+            topology,
+            SourceInputMode::FullChangelog,
+        )
+    };
+    let positioned = |topology| {
+        changelog(topology).with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+    };
+    for topology in [SourceTopology::Singleton, SourceTopology::Splittable] {
+        assert!(is_changelog_route_candidate(
+            positioned(topology),
+            RuntimeMode::Local
+        ));
+        assert!(!is_changelog_route_candidate(
+            changelog(topology),
+            RuntimeMode::Local
+        ));
+    }
+    assert!(is_changelog_route_candidate(
+        positioned(SourceTopology::Singleton),
+        RuntimeMode::Cluster
+    ));
+    assert!(!is_changelog_route_candidate(
+        positioned(SourceTopology::Splittable),
+        RuntimeMode::Cluster
+    ));
 }
 
 #[test]

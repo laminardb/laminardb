@@ -100,6 +100,16 @@ pub(super) fn admit_source_recovery_contract(
     Ok(())
 }
 
+/// Whether a source may feed the changelog route: a replayable full changelog in a deterministic
+/// order. A retraction must reach its group after the row it retracts, so in cluster one node at
+/// a time reads the changelog, in log order; the shuffle keeps that order per destination.
+pub(super) fn is_changelog_route_candidate(contract: SourceContract, runtime: RuntimeMode) -> bool {
+    contract.input_mode == SourceInputMode::FullChangelog
+        && contract.supports_replay()
+        && contract.row_positions == SourceRowPositionCapability::OrderedDeterministic
+        && (runtime != RuntimeMode::Cluster || contract.topology == SourceTopology::Singleton)
+}
+
 /// Whether a cluster source follows the vnode assignment: a split source, or a singleton the
 /// engine runs on the owner of its home vnode.
 pub(crate) fn cluster_assignment_scoped(contract: SourceContract) -> bool {
@@ -159,7 +169,7 @@ pub(super) fn admit_routed_source(
             admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
         }
         SourceRoute::Changelog => {
-            if contract.input_mode != SourceInputMode::FullChangelog {
+            if !is_changelog_route_candidate(contract, runtime) {
                 return Err("changelog source contract changed after startup admission");
             }
             admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)

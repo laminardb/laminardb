@@ -4,11 +4,11 @@
 use rustc_hash::FxHashSet;
 
 use super::{
-    admit_source_recovery_contract, DbError, FxHashMap, HashMap, LaminarDB,
-    OrderedIntervalAdmissions, RuntimeMode, TemporalSourceRole,
+    admit_source_recovery_contract, is_changelog_route_candidate, DbError, FxHashMap, HashMap,
+    LaminarDB, OrderedIntervalAdmissions, RuntimeMode, TemporalSourceRole,
 };
 use crate::direct_mutation::{direct_sink_consumers, validate_route_shape};
-use laminar_connectors::connector::{SourceInputMode, SourceRowPositionCapability};
+use laminar_connectors::connector::SourceInputMode;
 
 /// Mutation sources admitted to a route other than a temporal or bounded-interval join.
 #[derive(Debug, Clone, Default)]
@@ -101,9 +101,10 @@ impl LaminarDB {
     }
 
     /// Full-changelog sources admitted to the changelog route: replayable, deterministically
-    /// positioned, local, and not owned by a bounded interval join. Their streams and sinks are
-    /// then held to the same rules as consumers of an engine changelog: projection/filter,
-    /// retractable aggregates, certified static enrichment, and full-changelog sinks only.
+    /// positioned, admissible in `runtime`, and not owned by a bounded interval join. Their
+    /// streams and sinks are then held to the same rules as consumers of an engine changelog:
+    /// projection/filter, retractable aggregates, certified static enrichment, and
+    /// full-changelog sinks only.
     pub(crate) fn validate_changelog_source_routes(
         &self,
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -111,9 +112,6 @@ impl LaminarDB {
         runtime: RuntimeMode,
     ) -> Result<FxHashSet<String>, DbError> {
         let mut admitted = FxHashSet::default();
-        if runtime == RuntimeMode::Cluster {
-            return Ok(admitted);
-        }
         let mut names = source_regs.keys().collect::<Vec<_>>();
         names.sort_unstable();
         for name in names {
@@ -127,10 +125,7 @@ impl LaminarDB {
             else {
                 continue;
             };
-            if contract.input_mode != SourceInputMode::FullChangelog
-                || !contract.supports_replay()
-                || contract.row_positions != SourceRowPositionCapability::OrderedDeterministic
-            {
+            if !is_changelog_route_candidate(contract, runtime) {
                 continue;
             }
             admit_source_recovery_contract(

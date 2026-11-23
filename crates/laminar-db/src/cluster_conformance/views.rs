@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 
+use super::changelog_sources::changes;
 use super::cluster::{Cluster, Startup};
 use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
@@ -428,6 +429,36 @@ async fn keyed_and_chained_views_match_batch_sql_in_cluster() {
             "SELECT k FROM busy b WHERE NOT EXISTS \
              (SELECT 1 FROM counts c WHERE c.k = b.k AND c.n = b.n)",
         ],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Keyed and global views over a full-changelog singleton apply every retraction the one reading
+/// node forwards, and every node reads them at the committed cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn views_over_a_changelog_singleton_match_batch_sql_in_cluster() {
+    let case = ViewCase {
+        name: "views_over_a_changelog_singleton",
+        sources: vec![changes()],
+        views: views(&[
+            "CREATE MATERIALIZED VIEW by_group AS \
+             SELECT v % 7 AS g, COUNT(*) AS n, SUM(k) AS s FROM changes GROUP BY v % 7",
+            "CREATE MATERIALIZED VIEW totals AS \
+             SELECT COUNT(*) AS n, SUM(v) AS total, MIN(k) AS lo, MAX(k) AS hi FROM changes",
+        ]),
+        reads: vec![
+            (
+                "SELECT * FROM by_group",
+                "SELECT v % 7 AS g, COUNT(*) AS n, SUM(k) AS s FROM \
+                 (SELECT k, v FROM changes GROUP BY k, v HAVING SUM(__weight) > 0) GROUP BY v % 7",
+            ),
+            (
+                "SELECT * FROM totals",
+                "SELECT COUNT(*) AS n, SUM(v) AS total, MIN(k) AS lo, MAX(k) AS hi FROM \
+                 (SELECT k, v FROM changes GROUP BY k, v HAVING SUM(__weight) > 0)",
+            ),
+        ],
+        same_cycle_invariants: vec![],
     };
     assert_eq!(verdict(case).await, Verdict::Equal);
 }

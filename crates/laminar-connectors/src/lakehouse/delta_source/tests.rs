@@ -30,6 +30,52 @@ fn contract_is_a_replayable_positioned_full_changelog() {
     assert!(source.contract(&config).is_err());
 }
 
+#[test]
+fn only_a_change_feed_on_shared_storage_may_move_between_cluster_nodes() {
+    let source = DeltaSource::new(test_config(), None);
+    let contract = |path: &str, mode: &str, catalog: Option<&str>| {
+        let mut config = ConnectorConfig::new("delta-lake");
+        config.set("table.path", path);
+        config.set("read.mode", mode);
+        if let Some(catalog) = catalog {
+            config.set("catalog.type", catalog);
+            config.set("catalog.database", "sales");
+        }
+        let contract = source.contract(&config).unwrap();
+        (
+            contract.supports_cluster_singleton_placement(),
+            contract.locality,
+        )
+    };
+    for path in [
+        "s3://lake/orders",
+        "gs://lake/orders",
+        "uc://main.sales.orders",
+    ] {
+        assert_eq!(
+            contract(path, "changes", None),
+            (true, SourceLocality::Portable),
+            "{path}"
+        );
+        assert_eq!(
+            contract(path, "snapshot", None),
+            (false, SourceLocality::Portable),
+            "{path}"
+        );
+    }
+    for mode in ["changes", "snapshot"] {
+        assert_eq!(
+            contract("/data/orders", mode, None),
+            (false, SourceLocality::LocalFiles)
+        );
+    }
+    // A catalog name is resolved to its storage only when the table opens.
+    assert_eq!(
+        contract("orders", "changes", Some("glue")),
+        (false, SourceLocality::Portable)
+    );
+}
+
 #[tokio::test]
 async fn start_rejects_removed_option_before_opening_table() {
     let mut source = DeltaSource::new(test_config(), None);
@@ -341,6 +387,57 @@ async fn snapshot_then_changes_emits_bootstrap_and_every_later_commit() {
     assert_eq!(
         sorted(emitted),
         vec![(2, "a".into(), -1), (2, "z".into(), 1), (3, "a".into(), -1)]
+    );
+}
+
+/// A cluster node closes the source when another node takes the table over and starts the same
+/// instance again from the committed cursor when the table comes back to it.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn a_closed_source_starts_again_from_the_committed_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    cdf_table(&path)
+        .await
+        .write(vec![rows(&[1, 2], "a")])
+        .await
+        .unwrap();
+    let mut source = start(&path, &[], SourcePosition::Initial).await.unwrap();
+    let (emitted, _) = drain(&mut source, 8).await;
+    assert_eq!(
+        sorted(emitted),
+        vec![(1, "a".into(), 1), (2, "a".into(), 1)]
+    );
+    let committed = source.checkpoint();
+    source.close().await.unwrap();
+
+    let table = table::open(&path)
+        .await
+        .write(vec![rows(&[3], "b")])
+        .await
+        .unwrap();
+    table
+        .update()
+        .with_predicate("id = 1")
+        .with_update("label", "'x'")
+        .await
+        .unwrap();
+    source
+        .start(
+            SourceStart::new(
+                table::connector_config(&path, &[]),
+                resume(committed),
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(source.state(), ConnectorState::Running);
+    let emitted = drain_until(&mut source, 3).await;
+    assert_eq!(
+        sorted(emitted),
+        vec![(1, "a".into(), -1), (1, "x".into(), 1), (3, "b".into(), 1)]
     );
 }
 

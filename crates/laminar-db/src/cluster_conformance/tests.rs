@@ -98,7 +98,7 @@ fn case(
     }
 }
 
-async fn verdict(case: Case) -> Verdict {
+pub(super) async fn verdict(case: Case) -> Verdict {
     match case.run().await {
         Ok(verdict) => verdict,
         Err(bug) => panic!("conformance bug: {bug}"),

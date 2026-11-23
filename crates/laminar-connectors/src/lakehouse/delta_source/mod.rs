@@ -28,14 +28,15 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceCheckpointUnavailablePolicy,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
-    SourceRowPositionCapability, SourceStart, SourceTopology,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceLocality,
+    SourcePosition, SourceRowPositionCapability, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
-use super::delta_source_config::DeltaSourceConfig;
+use super::delta_config::DeltaCatalogType;
 #[cfg(feature = "delta-lake")]
-use super::delta_source_config::{DeltaReadMode, DeltaStartingVersion};
+use super::delta_source_config::DeltaStartingVersion;
+use super::delta_source_config::{DeltaReadMode, DeltaSourceConfig};
 use cursor::DeltaCursor;
 #[cfg(feature = "delta-lake")]
 use cursor::DeltaPhase;
@@ -673,19 +674,33 @@ impl SourceConnector for DeltaSource {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        if config.properties().is_empty() {
-            self.config.validate()?;
+        let parsed;
+        let cfg = if config.properties().is_empty() {
+            &self.config
         } else {
-            DeltaSourceConfig::from_config(config)?.validate()?;
-        }
+            parsed = DeltaSourceConfig::from_config(config)?;
+            &parsed
+        };
+        cfg.validate()?;
         // Replay re-reads complete commits or snapshot files from the checkpointed cursor in
         // the kernel's sequential order; nothing is acknowledged upstream.
-        Ok(SourceContract::new(
+        let contract = SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Singleton,
             SourceInputMode::FullChangelog,
         )
-        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic);
+        // Any one node may follow a change feed every node reaches: the cursor names the next
+        // unit and nothing upstream is held. A bounded snapshot read is not qualified for
+        // cluster placement.
+        let shared = super::delta_config::names_shared_table(&cfg.table_path);
+        Ok(match (&cfg.catalog_type, shared, &cfg.read_mode) {
+            (_, true, DeltaReadMode::Changes) => contract.with_cluster_singleton_placement(),
+            (DeltaCatalogType::None, false, _) => {
+                contract.with_locality(SourceLocality::LocalFiles)
+            }
+            _ => contract,
+        })
     }
 
     async fn resolve_schema(
