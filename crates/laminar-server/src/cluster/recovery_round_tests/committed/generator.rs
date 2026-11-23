@@ -1,15 +1,16 @@
 //! A sequence over two databases: the built-in generator split four ways, or one placed
-//! singleton sequence that only the owner of its home vnode reads. A failed database's share
-//! resumes on the survivor from the committed cut, and a draining database hands its share over
-//! live at the handoff cut. At every committed cut the keyed view holds exactly the rows that the
+//! singleton sequence or changelog that only the owner of its home vnode reads. A failed
+//! database's share resumes on the survivor from the committed cut, and a draining database hands
+//! its share over live at the handoff cut. At every committed cut the keyed view holds exactly the rows that the
 //! cut's cursor says were read, so no row is lost or counted twice.
 
 use std::num::NonZeroU32;
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{BinaryArray, Int64Array, RecordBatch, UInt32Array};
 use laminar_connectors::config::ConnectorInfo;
 use laminar_connectors::connector::{
-    SourceBatch, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
+    SourceBatch, SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceRowPositions,
+    SourceStart, SourceTopology,
 };
 use laminar_core::state::SourceChannelRoute;
 
@@ -30,13 +31,24 @@ pub(super) enum Sequence {
     Splits,
     /// One placed singleton sequence, homed on node 8 so that each handover moves it.
     Singleton,
+    /// [`Self::Singleton`] as a full changelog: every fourth change retracts the value inserted
+    /// two changes before it.
+    Changelog,
 }
 
 impl Sequence {
     fn channels(self) -> i64 {
         match self {
             Self::Splits => SPLITS,
-            Self::Singleton => 1,
+            Self::Singleton | Self::Changelog => 1,
+        }
+    }
+
+    /// Change `index` of the sequence as `(seq, weight)`.
+    fn change(self, index: i64) -> (i64, i64) {
+        match self {
+            Self::Changelog if index % 4 == 3 => (index - 2, -1),
+            Self::Splits | Self::Singleton | Self::Changelog => (index, 1),
         }
     }
 
@@ -45,7 +57,7 @@ impl Sequence {
     pub(super) fn source(self) -> String {
         match self {
             Self::Splits => "recovery_input".into(),
-            Self::Singleton => (0..)
+            Self::Singleton | Self::Changelog => (0..)
                 .map(|n| format!("placed_input_{n}"))
                 .find(|name| {
                     let vnodes = NonZeroU32::new(2).expect("two vnodes");
@@ -66,6 +78,10 @@ impl Sequence {
             Self::Singleton => {
                 format!("CREATE SOURCE {source} (seq BIGINT NOT NULL) FROM \"{PLACED_SEQUENCE}\"")
             }
+            Self::Changelog => format!(
+                "CREATE SOURCE {source} (seq BIGINT NOT NULL, __weight BIGINT NOT NULL) \
+                 FROM \"{PLACED_SEQUENCE}\""
+            ),
         };
         [
             create,
@@ -89,17 +105,19 @@ pub(super) enum Handover {
 /// A committed cut: its epoch and the next sequence number of every channel.
 #[derive(Debug)]
 struct Cut {
+    sequence: Sequence,
     epoch: u64,
     next: Vec<i64>,
 }
 
 impl Cut {
-    /// Channel `s` of `n` read `s, s + n, …` below its next sequence number.
-    fn read(&self) -> impl Iterator<Item = i64> + '_ {
+    /// Channel `s` of `n` read changes `s, s + n, …` below its next sequence number.
+    fn read(&self) -> impl Iterator<Item = (i64, i64)> + '_ {
         let channels = self.next.len();
         (0_i64..)
             .zip(&self.next)
             .flat_map(move |(channel, next)| (channel..*next).step_by(channels))
+            .map(|index| self.sequence.change(index))
     }
 
     fn rows(&self) -> i64 {
@@ -110,16 +128,17 @@ impl Cut {
         self.next.iter().any(|next| *next < ROWS)
     }
 
-    /// The sorted `(lane, n, total)` rows of the view over the rows this cut read.
+    /// The sorted `(lane, n, total)` rows of the view over the changes this cut read.
     fn lanes(&self) -> Vec<Vec<i64>> {
         let mut lanes = BTreeMap::<i64, (i64, i64)>::new();
-        for seq in self.read() {
+        for (seq, weight) in self.read() {
             let (n, total) = lanes.entry(seq % LANES).or_default();
-            *n += 1;
-            *total += seq;
+            *n += weight;
+            *total += seq * weight;
         }
         lanes
             .into_iter()
+            .filter(|(_, (n, _))| *n != 0)
             .map(|(lane, (n, total))| vec![lane, n, total])
             .collect()
     }
@@ -155,6 +174,7 @@ async fn commit(process: &mut Process, sequence: Sequence, participants: &[u64])
         })
         .collect::<Result<_>>()?;
     Ok(Cut {
+        sequence,
         epoch: reference.epoch,
         next,
     })
@@ -262,9 +282,10 @@ async fn drain(processes: &mut [Process; 2], sequence: Sequence) -> Result<()> {
 
 const PLACED_SEQUENCE: &str = "placed-sequence";
 
-/// Register the placed singleton sequence for this database.
+/// Register the placed singleton `sequence` for this database.
 pub(super) fn register_placed_sequence(
     registry: &laminar_connectors::registry::ConnectorRegistry,
+    sequence: Sequence,
 ) -> Result<(), ConnectorError> {
     registry.register_source(
         PLACED_SEQUENCE,
@@ -278,8 +299,9 @@ pub(super) fn register_placed_sequence(
             is_sink: false,
             config_keys: Vec::new(),
         },
-        Arc::new(|_| {
+        Arc::new(move |_| {
             Ok(Box::new(PlacedSequence {
+                sequence,
                 next: 0,
                 started: None,
                 emitted: 0,
@@ -288,9 +310,10 @@ pub(super) fn register_placed_sequence(
     )
 }
 
-/// `0..ROWS` at `ROWS_PER_SECOND`, which one node at a time may read. Its cursor `seq.0` is the
-/// next value, so a reader started from a cut continues exactly where the cut ended.
+/// Changes `0..ROWS` at `ROWS_PER_SECOND`, which one node at a time may read. Its cursor `seq.0`
+/// is the next change, so a reader started from a cut continues exactly where the cut ended.
 struct PlacedSequence {
+    sequence: Sequence,
     next: i64,
     /// When this generation started, and how many rows it has emitted since.
     started: Option<tokio::time::Instant>,
@@ -300,13 +323,23 @@ struct PlacedSequence {
 #[async_trait::async_trait]
 impl SourceConnector for PlacedSequence {
     fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(
-            laminar_connectors::testing::with_cluster_singleton_placement(SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Singleton,
-                SourceInputMode::AppendOnly,
-            )),
-        )
+        let changelog = self.sequence == Sequence::Changelog;
+        let input_mode = if changelog {
+            SourceInputMode::FullChangelog
+        } else {
+            SourceInputMode::AppendOnly
+        };
+        let contract = SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            input_mode,
+        );
+        let contract = if changelog {
+            contract.with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        } else {
+            contract
+        };
+        Ok(laminar_connectors::testing::with_cluster_singleton_placement(contract))
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -340,16 +373,43 @@ impl SourceConnector for PlacedSequence {
         if rows <= 0 {
             return Ok(None);
         }
-        let values = Int64Array::from_iter_values(self.next..self.next + rows);
+        let indexes = self.next..self.next + rows;
         self.next += rows;
         self.emitted += rows;
-        let batch = RecordBatch::try_new(self.schema(), vec![Arc::new(values)])
+        let (values, weights): (Vec<_>, Vec<_>) = indexes
+            .clone()
+            .map(|index| self.sequence.change(index))
+            .unzip();
+        let changelog = self.sequence == Sequence::Changelog;
+        let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(Int64Array::from(values))];
+        if changelog {
+            columns.push(Arc::new(Int64Array::from(weights)));
+        }
+        let batch = RecordBatch::try_new(self.schema(), columns)
             .map_err(|error| ConnectorError::Internal(error.to_string()))?;
-        Ok(Some(SourceBatch::new(batch)))
+        if !changelog {
+            return Ok(Some(SourceBatch::new(batch)));
+        }
+        // Each change keeps its index as its position whichever generation emits it.
+        let orders: Vec<_> = indexes.map(|index| index.to_be_bytes()).collect();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from_vec(vec![PLACED_SEQUENCE.as_bytes(); orders.len()]),
+            BinaryArray::from_vec(orders.iter().map(<[u8; 8]>::as_slice).collect()),
+            UInt32Array::from(vec![0; orders.len()]),
+        )?;
+        Ok(Some(SourceBatch::positioned(batch, positions)?))
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]))
+        let mut fields = vec![Field::new("seq", DataType::Int64, false)];
+        if self.sequence == Sequence::Changelog {
+            fields.push(Field::new(
+                laminar_core::changelog::WEIGHT_COLUMN,
+                DataType::Int64,
+                false,
+            ));
+        }
+        Arc::new(Schema::new(fields))
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {

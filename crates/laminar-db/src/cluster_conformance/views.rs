@@ -23,15 +23,15 @@ use crate::subscription::{
 };
 use crate::{CommittedRead, ExecuteResult, LaminarDB};
 
-struct ViewCase {
-    name: &'static str,
-    sources: Vec<FixtureSource>,
-    views: Vec<String>,
+pub(super) struct ViewCase {
+    pub name: &'static str,
+    pub sources: Vec<FixtureSource>,
+    pub views: Vec<String>,
     /// Each read and the batch SQL over the complete input whose rows it must equal.
-    reads: Vec<(&'static str, &'static str)>,
+    pub reads: Vec<(&'static str, &'static str)>,
     /// Reads that return no rows whenever every view they scan comes from one cycle. They run
     /// repeatedly while the sources deliver.
-    same_cycle_invariants: Vec<&'static str>,
+    pub same_cycle_invariants: Vec<&'static str>,
 }
 
 impl ViewCase {
@@ -374,14 +374,14 @@ async fn read_all(db: &LaminarDB, sql: &str) -> Result<Vec<RecordBatch>, String>
         .map_err(|e| format!("`{sql}`: {e}"))
 }
 
-async fn verdict(case: ViewCase) -> Verdict {
+pub(super) async fn verdict(case: ViewCase) -> Verdict {
     match case.run().await {
         Ok(verdict) => verdict,
         Err(bug) => panic!("view conformance bug: {bug}"),
     }
 }
 
-fn views(statements: &[&str]) -> Vec<String> {
+pub(super) fn views(statements: &[&str]) -> Vec<String> {
     statements.iter().map(|s| (*s).to_owned()).collect()
 }
 

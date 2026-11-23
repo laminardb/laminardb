@@ -1338,33 +1338,85 @@ fn node_local_sources_are_rejected_in_cluster_whatever_their_topology() {
 
 #[cfg(feature = "delta-lake")]
 #[test]
-fn delta_change_feed_is_a_local_replayable_changelog_route_source() {
-    use super::admit_source_recovery_contract;
+fn delta_change_feed_runs_in_cluster_only_from_shared_storage() {
+    use super::{admit_source_recovery_contract, is_changelog_route_candidate};
 
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
     laminar_connectors::lakehouse::register_delta_lake_source(&registry).unwrap();
     let mut config = ConnectorConfig::new("delta-lake");
     config.set("table.path", "/tmp/delta-orders");
     let source = registry.create_source(&config, None).unwrap();
-    for mode in ["changes", "snapshot"] {
+    let admit = |path: &str, mode: &str, delivery, runtime| {
+        let mut config = config.clone();
+        config.set("table.path", path);
         config.set("read.mode", mode);
         let contract = source.contract(&config).unwrap();
-        assert_eq!(contract.input_mode, SourceInputMode::FullChangelog);
-        assert_eq!(
-            contract.row_positions,
-            SourceRowPositionCapability::OrderedDeterministic
-        );
-        let admit =
-            |delivery, runtime| admit_source_recovery_contract(contract, delivery, true, runtime);
-        assert_eq!(
-            admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local),
-            Ok(())
-        );
-        assert!(admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster).is_err());
-        assert!(admit(DeliveryGuarantee::ExactlyOnce, RuntimeMode::Local)
-            .unwrap_err()
-            .contains("LDB-5037"));
+        assert!(is_changelog_route_candidate(contract, runtime));
+        admit_source_recovery_contract(contract, delivery, true, runtime)
+    };
+    let at_least_once = DeliveryGuarantee::AtLeastOnce;
+    assert!(admit(
+        "s3://lake/orders",
+        "changes",
+        DeliveryGuarantee::ExactlyOnce,
+        RuntimeMode::Local
+    )
+    .unwrap_err()
+    .contains("LDB-5037"));
+    for (path, mode, rejection) in [
+        ("s3://lake/orders", "changes", None),
+        ("uc://main.sales.orders", "changes", None),
+        (
+            "s3://lake/orders",
+            "snapshot",
+            Some("one node at a time may run"),
+        ),
+        ("/tmp/delta-orders", "changes", Some("local filesystem")),
+    ] {
+        assert_eq!(admit(path, mode, at_least_once, RuntimeMode::Local), Ok(()));
+        let cluster = admit(path, mode, at_least_once, RuntimeMode::Cluster);
+        match rejection {
+            None => assert_eq!(cluster, Ok(()), "{path} {mode}"),
+            Some(reason) => assert!(cluster.unwrap_err().contains(reason), "{path} {mode}"),
+        }
     }
+}
+
+#[test]
+fn a_cluster_changelog_route_has_one_reader() {
+    use super::is_changelog_route_candidate;
+
+    let changelog = |topology| {
+        SourceContract::new(
+            SourceConsistency::Replayable,
+            topology,
+            SourceInputMode::FullChangelog,
+        )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+    };
+    let split = changelog(SourceTopology::Splittable);
+    assert!(is_changelog_route_candidate(split, RuntimeMode::Local));
+    assert!(!is_changelog_route_candidate(split, RuntimeMode::Cluster));
+    let placed = laminar_connectors::testing::with_cluster_singleton_placement(changelog(
+        SourceTopology::Singleton,
+    ));
+    assert!(is_changelog_route_candidate(placed, RuntimeMode::Cluster));
+    let admit = |delivery| {
+        super::admit_routed_source(
+            placed,
+            super::SourceRoute::Changelog,
+            false,
+            true,
+            delivery,
+            true,
+            RuntimeMode::Cluster,
+        )
+    };
+    assert_eq!(admit(DeliveryGuarantee::AtLeastOnce), Ok(()));
+    assert_eq!(
+        admit(DeliveryGuarantee::BestEffort),
+        Err(CLUSTER_BEST_EFFORT)
+    );
 }
 
 #[test]

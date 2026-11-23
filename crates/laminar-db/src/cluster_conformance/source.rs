@@ -48,6 +48,9 @@ pub(super) enum QueueRows {
     /// a row whose `v` is negative is a tombstone. Like a MongoDB collection incarnation, the
     /// queue's own channel identity differs from its catalog name.
     KeyedUpsert,
+    /// A full changelog, like a table's change feed: each row carries its `__weight` and is
+    /// positioned by the batch's place in the queue, on the queue's own channel identity.
+    FullChangelog,
 }
 
 /// How a queue reader releases deliveries at a commit.
@@ -239,18 +242,20 @@ struct QueueSource {
 #[async_trait]
 impl SourceConnector for QueueSource {
     fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        let contract = match self.rows {
-            QueueRows::Append => SourceContract::new(
-                SourceConsistency::CommitCoupled,
-                SourceTopology::Singleton,
-                SourceInputMode::AppendOnly,
-            ),
-            QueueRows::KeyedUpsert => SourceContract::new(
-                SourceConsistency::CommitCoupled,
-                SourceTopology::Singleton,
-                SourceInputMode::KeyedUpsert,
-            )
-            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
+        let input_mode = match self.rows {
+            QueueRows::Append => SourceInputMode::AppendOnly,
+            QueueRows::KeyedUpsert => SourceInputMode::KeyedUpsert,
+            QueueRows::FullChangelog => SourceInputMode::FullChangelog,
+        };
+        let contract = SourceContract::new(
+            SourceConsistency::CommitCoupled,
+            SourceTopology::Singleton,
+            input_mode,
+        );
+        let contract = if self.rows == QueueRows::Append {
+            contract
+        } else {
+            contract.with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
         };
         Ok(laminar_connectors::testing::with_cluster_singleton_placement(contract))
     }
@@ -290,6 +295,10 @@ impl SourceConnector for QueueSource {
         let batch = match self.rows {
             QueueRows::Append => SourceBatch::new(records),
             QueueRows::KeyedUpsert => keyed_upserts(&self.channel, batch, records)?,
+            QueueRows::FullChangelog => {
+                let positions = batch_positions(&self.channel, batch, records.num_rows())?;
+                SourceBatch::positioned(records, positions)?
+            }
         };
         // A unit of work binds its own cursor, so that only a barrier capture seals it.
         Ok(Some(match self.commit {
@@ -353,7 +362,7 @@ impl QueueSource {
             checkpoint.set_offset("consumer", consumer.to_string());
             checkpoint.set_offset("tag", self.delivered.to_string());
         }
-        if self.rows == QueueRows::KeyedUpsert {
+        if self.rows != QueueRows::Append {
             checkpoint
                 .set_input_channels(vec![self.channel.clone()])
                 .expect("one channel is a valid inventory");

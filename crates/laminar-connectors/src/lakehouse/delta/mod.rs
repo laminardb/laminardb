@@ -54,7 +54,7 @@ use crate::connector::{
 use crate::error::ConnectorError;
 use crate::storage::{StorageCredentialResolver, StorageProvider};
 
-use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
+use super::delta_config::{names_shared_table, DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
 use crate::connector::DeliveryGuarantee;
 

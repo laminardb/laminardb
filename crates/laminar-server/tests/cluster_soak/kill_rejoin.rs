@@ -26,14 +26,20 @@ use super::{
     feature = "rabbitmq",
     feature = "ibmmq",
     feature = "mongodb-cdc",
-    feature = "postgres-cdc"
+    feature = "postgres-cdc",
+    feature = "delta-lake-s3"
 ))]
 pub(super) const CHECKPOINTS_COMPLETED: &str = "laminardb_checkpoints_completed_total";
 /// Grows only on the nodes that read the source.
 pub(super) const EVENTS_INGESTED: &str = "laminardb_events_ingested_total";
 
 /// Add every node that has read the source since it last started.
-#[cfg(any(feature = "rabbitmq", feature = "ibmmq", feature = "mongodb-cdc"))]
+#[cfg(any(
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "mongodb-cdc",
+    feature = "delta-lake-s3"
+))]
 pub(super) fn record_consumers(nodes: &[Node], consumers: &mut BTreeSet<usize>) {
     consumers.extend(
         nodes

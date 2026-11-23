@@ -325,7 +325,7 @@ impl LaminarDB {
             return Ok(());
         }
         Err(DbError::Config(format!(
-            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right, bounded interval, direct keyed-mutation sink, or local changelog route"
+            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right, bounded interval, direct keyed-mutation sink, or changelog route"
         )))
     }
 

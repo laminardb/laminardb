@@ -2,6 +2,7 @@
 //! cluster nodes or is rejected at `CREATE`. Embedded output is also checked against batch SQL
 //! over the complete input, so a defect shared by both modes cannot pass as agreement.
 
+mod changelog_sources;
 mod cluster;
 mod oracle;
 mod source;

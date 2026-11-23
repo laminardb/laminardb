@@ -99,6 +99,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[path = "cluster_soak/delta_cdf_source.rs"]
+mod delta_cdf_source;
 #[cfg(all(feature = "kafka", feature = "files", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/files_source.rs"]
 mod files_source;
@@ -10290,6 +10293,7 @@ fn custom_s3_endpoint_configured() -> bool {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[derive(Clone)]
 struct DeltaSoakStorage {
     endpoint: String,
     access_key: String,
@@ -10311,6 +10315,23 @@ impl DeltaSoakStorage {
             secret_key: required("LAMINAR_SOAK_S3_SECRET_KEY"),
             region: required("LAMINAR_SOAK_S3_REGION"),
         }
+    }
+
+    /// The `storage.*` connector properties. Cluster catalog DDL rejects literal secrets;
+    /// `$${...}` survives server TOML substitution as a `${...}` env reference the catalog
+    /// accepts and the connector resolves from the env.
+    fn connector_properties(&self) -> String {
+        format!(
+            r#""storage.aws_endpoint" = "{endpoint}"
+"storage.aws_access_key_id" = "{access_key}"
+"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
+"storage.aws_region" = "{region}"
+"storage.aws_allow_http" = "true"
+"#,
+            endpoint = self.endpoint,
+            access_key = self.access_key,
+            region = self.region,
+        )
     }
 
     fn options(&self) -> HashMap<String, String> {
@@ -10683,8 +10704,6 @@ fn delta_append_sink_config(
     table_uri: &str,
     storage: &DeltaSoakStorage,
 ) -> String {
-    // Cluster catalog DDL rejects literal secrets; `$${...}` survives server TOML substitution
-    // as a `${...}` env reference the catalog accepts and the connector resolves from the env.
     format!(
         r#"
 [[sink]]
@@ -10695,15 +10714,8 @@ connector = "delta-lake"
 "table.path" = "{table_uri}"
 "write.mode" = "append"
 "auto.create" = "true"
-"storage.aws_endpoint" = "{endpoint}"
-"storage.aws_access_key_id" = "{access_key}"
-"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
-"storage.aws_region" = "{region}"
-"storage.aws_allow_http" = "true"
-"#,
-        endpoint = storage.endpoint,
-        access_key = storage.access_key,
-        region = storage.region,
+{}"#,
+        storage.connector_properties()
     )
 }
 

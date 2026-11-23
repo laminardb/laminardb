@@ -4,6 +4,15 @@
 
 ### Added
 
+- In cluster mode, a Delta Lake change feed on object storage (or a Unity Catalog `uc://` table)
+  runs at-least-once on one node at a time and feeds aggregates, materialized views and Delta
+  `append` sinks, as it does in embedded mode. Full-changelog sources now have a cluster route:
+  one node reads a changelog in log order, and the aggregates and views over it spread across
+  the nodes by their keys. A survivor resumes the feed from the committed cursor, and a rescale
+  moves it at the handoff checkpoint. A local `table.path` is now rejected in cluster mode as
+  node-local storage; `read.mode = 'snapshot'`, adding the source to a running cluster, and
+  exactly-once stay rejected there.
+
 - A PostgreSQL CDC source takes `change.time.column`: a declared, non-key `TIMESTAMP NOT NULL`
   column that is not a table column, filled with each change's transaction commit time to the
   millisecond, deletes included, with `snapshot.mode=never`. With a watermark on it, an `upsert`
@@ -179,6 +188,8 @@
   after a truncated datagram).
 - url moves to 2.5.9 for RUSTSEC-2026-0592 (`Url::origin()` overflowed the stack on nested
   `blob:` URLs).
+- Arrow and Parquet move to 59.3.3, which fixes RUSTSEC-2026-0595: Parquet bloom filters were
+  written as plaintext when writing encrypted Parquet.
 - zstd moves to 0.13.5 and zstd-safe to 7.4.1, which fix RUSTSEC-2026-0391 and RUSTSEC-2026-0395
   to 0406 within the zstd versions Arrow, DataFusion and Parquet require. Their dependency
   exceptions are removed. The remaining exceptions are renewed to 2026-12-30.

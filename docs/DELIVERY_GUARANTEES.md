@@ -31,7 +31,8 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | ALO | rejected |
 | PostgreSQL CDC (no initial copy) | ALO | ALO |
 | MongoDB change stream | ALO, BE | ALO |
-| Delta Lake change feed | ALO, BE | rejected |
+| Delta Lake change feed | ALO, BE | ALO |
+| Delta Lake change feed (local table) | ALO, BE | rejected |
 | Iceberg (snapshot read) | BE | rejected |
 | Iceberg (append read) | ALO, BE | rejected |
 | Iceberg (append read, splits) | ALO, BE | ALO |
@@ -73,6 +74,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Delta Lake change feed | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed (local table) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
 | Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
@@ -96,7 +98,8 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | PostgreSQL CDC | — | — | — | — | — | — | — | — | — | — | — | — |
 | PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed | — | — | — | — | — | — | — | — | — | — | — | — |
+| Delta Lake change feed | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
@@ -214,6 +217,17 @@ puts objects of ids into an S3 prefix, seeded before the nodes start, and forwar
 a stream to a MongoDB sink, through the same kills. Every written id must reach the output
 collection, ids never written fail the run, duplicates are counted, and more than one node must
 have read the directory.
+
+A Delta Lake change feed on object storage runs on one node at a time, the owner of the source's
+home vnode, because a changelog must reach each group in log order; the aggregates and views over
+it spread across the nodes by their keys. Operator state and the source cursor commit in one
+checkpoint, so a view over the feed holds each change once.
+`delta_cdf_source::three_node_delta_cdf_kill9_soak` (candidate) seeds a change-feed table on S3
+with one large snapshot before the nodes start, then commits inserts, updates and deletes while a
+keyed materialized view folds the feed, through the same kills. One more round freezes the node
+reading the table until a survivor reads it, then resumes it: the frozen node must exit fenced.
+Once the writer stops, every node's committed read of the view must equal the same aggregate over
+the table's final snapshot, and more than one node must have read the table.
 
 ## Materialized view reads
 

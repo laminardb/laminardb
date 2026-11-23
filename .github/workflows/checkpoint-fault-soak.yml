@@ -441,6 +441,23 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs
             candidate: "true"
+          - label: Cluster ALO Delta change feed source (gossip)
+            test: delta_cdf_source::three_node_delta_cdf_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: alo
+            topology: cluster-delta-cdf-source
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # One node at a time reads a change-feed table seeded with a large snapshot; kills,
+            # rejoins and a paused reader move it, and every node's committed read of the view
+            # over it must equal the table's final snapshot.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs
+            candidate: "true"
           - label: Cluster EO split generator to Delta (gossip)
             test: generator_splits::three_node_generator_splits_delta_eo_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3

@@ -81,7 +81,7 @@ pub(super) fn events_in(
     }
 }
 
-fn case(
+pub(super) fn case(
     name: &'static str,
     streams: &[&str],
     form: OutputForm,
@@ -98,7 +98,7 @@ fn case(
     }
 }
 
-async fn verdict(case: Case) -> Verdict {
+pub(super) async fn verdict(case: Case) -> Verdict {
     match case.run().await {
         Ok(verdict) => verdict,
         Err(bug) => panic!("conformance bug: {bug}"),

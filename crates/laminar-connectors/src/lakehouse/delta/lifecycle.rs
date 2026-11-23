@@ -1,10 +1,11 @@
 //! Runtime sink lifecycle and coordinated-committer protocol implementations.
 
 use super::{
-    async_trait, debug, info, warn, Arc, ConnectorConfig, ConnectorError, ConnectorState,
-    ConnectorTaskTracker, DeliveryGuarantee, DeltaLakeSink, DeltaLakeSinkConfig, DeltaWriteMode,
-    Duration, Instant, RecordBatch, SchemaRef, SinkConnector, SinkConsistency, SinkContract,
-    SinkInputMode, SinkTopology, StorageCredentialResolver, StorageProvider, WriteResult,
+    async_trait, debug, info, names_shared_table, warn, Arc, ConnectorConfig, ConnectorError,
+    ConnectorState, ConnectorTaskTracker, DeliveryGuarantee, DeltaLakeSink, DeltaLakeSinkConfig,
+    DeltaWriteMode, Duration, Instant, RecordBatch, SchemaRef, SinkConnector, SinkConsistency,
+    SinkContract, SinkInputMode, SinkTopology, StorageCredentialResolver, StorageProvider,
+    WriteResult,
 };
 #[cfg(feature = "delta-lake")]
 use super::{
@@ -48,17 +49,13 @@ impl SinkConnector for DeltaLakeSink {
         } else {
             SinkConsistency::DurableAtLeastOnce
         };
-        let unity_target = cfg
-            .table_path
-            .split_once("://")
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("uc"));
-        let shared_target = StorageProvider::is_shared_uri(&cfg.table_path) || unity_target;
-        let topology = if cfg.write_mode == DeltaWriteMode::Append && shared_target {
-            SinkTopology::MultiWriter
-        } else {
-            // Node-local files plus overwrite/MERGE lack fenced distributed ownership.
-            SinkTopology::Singleton
-        };
+        let topology =
+            if cfg.write_mode == DeltaWriteMode::Append && names_shared_table(&cfg.table_path) {
+                SinkTopology::MultiWriter
+            } else {
+                // Node-local files plus overwrite/MERGE lack fenced distributed ownership.
+                SinkTopology::Singleton
+            };
         let input_mode = match cfg.write_mode {
             DeltaWriteMode::Append | DeltaWriteMode::Upsert => SinkInputMode::FullChangelog,
             DeltaWriteMode::Overwrite => SinkInputMode::AppendOnly,
