@@ -6,8 +6,8 @@ import sys
 
 
 EXPECTED_GENERATIONS = (
-    ("Arrow", r"^arrow(?:$|-)", ("59.3.2",)),
-    ("Parquet", r"^parquet$", ("59.3.2",)),
+    ("Arrow", r"^arrow(?:$|-)", ("59.3.3",)),
+    ("Parquet", r"^parquet$", ("59.3.3",)),
     ("DataFusion", r"^datafusion(?:$|-)", ("55.2.0",)),
     ("object_store", r"^object_store$", ("0.13.2",)),
     (

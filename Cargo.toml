@@ -84,17 +84,17 @@ globset = "0.4"
 
 # Arrow row encoding participates in the partitioning ABI. Upgrade these exact
 # pins only with an ABI version bump and updated golden vectors.
-arrow = { version = "=59.3.2", default-features = true }
-arrow-array = "=59.3.2"
-arrow-avro = "=59.3.2"
-arrow-schema = { version = "=59.3.2", features = ["serde"] }
-arrow-cast = "=59.3.2"
-arrow-csv = "=59.3.2"
-arrow-ipc = { version = "=59.3.2", features = ["lz4"] }
-arrow-json = "=59.3.2"
-arrow-row = "=59.3.2"
-arrow-select = "=59.3.2"
-parquet = { version = "=59.3.2", default-features = false }
+arrow = { version = "=59.3.3", default-features = true }
+arrow-array = "=59.3.3"
+arrow-avro = "=59.3.3"
+arrow-schema = { version = "=59.3.3", features = ["serde"] }
+arrow-cast = "=59.3.3"
+arrow-csv = "=59.3.3"
+arrow-ipc = { version = "=59.3.3", features = ["lz4"] }
+arrow-json = "=59.3.3"
+arrow-row = "=59.3.3"
+arrow-select = "=59.3.3"
+parquet = { version = "=59.3.3", default-features = false }
 datafusion = "=55.2.0"
 datafusion-common = "=55.2.0"
 datafusion-expr = "=55.2.0"

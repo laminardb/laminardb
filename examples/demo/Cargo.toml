@@ -30,9 +30,9 @@ laminar-derive = { path = "../../crates/laminar-derive" }
 laminar-core = { path = "../../crates/laminar-core" }
 
 # Arrow
-arrow = "=59.3.2"
-arrow-array = "=59.3.2"
-arrow-schema = "=59.3.2"
+arrow = "=59.3.3"
+arrow-array = "=59.3.3"
+arrow-schema = "=59.3.3"
 
 # Async
 tokio = { version = "1.50", features = ["full"] }
