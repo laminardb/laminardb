@@ -16,9 +16,6 @@ pub(super) fn admit_source_contract(
     checkpointing_enabled: bool,
     runtime: RuntimeMode,
 ) -> Result<(), &'static str> {
-    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
-        return Err(CLUSTER_BEST_EFFORT);
-    }
     if contract.input_mode == SourceInputMode::KeyedUpsert && !has_primary_key {
         return Err(KEYED_SOURCE_PRIMARY_KEY);
     }
@@ -32,6 +29,9 @@ pub(super) fn admit_source_recovery_contract(
     checkpointing_enabled: bool,
     runtime: RuntimeMode,
 ) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
+        return Err(CLUSTER_BEST_EFFORT);
+    }
     if delivery == DeliveryGuarantee::ExactlyOnce && !contract.is_exact_delivery_certified() {
         return Err(
             "[LDB-5037] exactly-once source delivery is not production-certified for this \

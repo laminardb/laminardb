@@ -1397,10 +1397,26 @@ fn a_cluster_changelog_route_has_one_reader() {
     let split = changelog(SourceTopology::Splittable);
     assert!(is_changelog_route_candidate(split, RuntimeMode::Local));
     assert!(!is_changelog_route_candidate(split, RuntimeMode::Cluster));
-    assert!(is_changelog_route_candidate(
-        changelog(SourceTopology::Singleton),
-        RuntimeMode::Cluster
+    let placed = laminar_connectors::testing::with_cluster_singleton_placement(changelog(
+        SourceTopology::Singleton,
     ));
+    assert!(is_changelog_route_candidate(placed, RuntimeMode::Cluster));
+    let admit = |delivery| {
+        super::admit_routed_source(
+            placed,
+            super::SourceRoute::Changelog,
+            false,
+            true,
+            delivery,
+            true,
+            RuntimeMode::Cluster,
+        )
+    };
+    assert_eq!(admit(DeliveryGuarantee::AtLeastOnce), Ok(()));
+    assert_eq!(
+        admit(DeliveryGuarantee::BestEffort),
+        Err(CLUSTER_BEST_EFFORT)
+    );
 }
 
 #[test]
