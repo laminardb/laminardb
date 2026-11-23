@@ -197,3 +197,22 @@ async fn a_draining_database_hands_its_singleton_over_at_the_handoff_cut() {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_failed_databases_changelog_resumes_on_the_survivor_from_the_committed_cut() {
+    scenario::run_generator(
+        generator::Sequence::Changelog,
+        generator::Handover::FailedOwner,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_hands_its_changelog_over_at_the_handoff_cut() {
+    scenario::run_generator(generator::Sequence::Changelog, generator::Handover::Drain)
+        .await
+        .unwrap();
+}
