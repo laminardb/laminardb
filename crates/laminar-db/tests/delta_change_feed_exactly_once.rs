@@ -267,6 +267,10 @@ async fn committed(output: &Path) -> Changes {
     changes
 }
 
+fn total(changes: &Changes) -> u64 {
+    changes.values().map(|count| u64::from(*count)).sum()
+}
+
 /// Every committed change must be a change of the feed, committed at most as often as it
 /// occurs there. The output is read before the feed, so the feed holds everything committed.
 fn assert_committed_once(committed: &Changes, feed: &Changes) {
@@ -302,9 +306,7 @@ async fn process_kills_commit_every_change_of_the_feed_exactly_once() {
         let now = loop {
             child.assert_running();
             let now = committed(&output).await;
-            let count = now.values().map(|count| u64::from(*count)).sum::<u64>();
-            if count > seen {
-                seen = count;
+            if total(&now) > seen {
                 break now;
             }
             assert!(
@@ -316,6 +318,8 @@ async fn process_kills_commit_every_change_of_the_feed_exactly_once() {
         assert_committed_once(&now, &feed(&input).await);
         tokio::time::sleep(Duration::from_millis(100 + 173 * kill % 400)).await;
         drop(child);
+        // Only what the next generation commits counts as its progress.
+        seen = total(&committed(&output).await);
         child = ChildPipeline::spawn(dir.path());
     }
     stop.store(true, Ordering::Release);

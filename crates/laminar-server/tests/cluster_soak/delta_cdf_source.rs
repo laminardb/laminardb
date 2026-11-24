@@ -326,7 +326,9 @@ impl Table {
 }
 
 /// The buckets the exactly-once leg's committed changes net to. Each change is committed once, so
-/// every row's weights net to zero or one and each bucket keeps at most one row.
+/// every row's weights net to zero or one and each bucket keeps at most one row. The aggregate
+/// writes a bucket's change as a retraction of its old row with the new one, so output committed
+/// twice leaves an old row at -1 or a second current row for its bucket.
 async fn netted_buckets(output: &Table) -> Result<Buckets, String> {
     let netted: Vec<[i64; 5]> = output
         .query(

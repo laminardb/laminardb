@@ -10,10 +10,10 @@
   changes carry retractions, so an exactly-once pipeline writes them to a sink that takes a full
   changelog, such as Delta Lake `append`, which keeps each change's `__weight`; in cluster mode
   that is the one such sink, on direct S3/S3A, and a feed on object storage or a Unity Catalog
-  `uc://` table still runs on one node at a time. The Iceberg append sink takes no changelog. Under exactly-once a checkpoint that
-  cannot reach the end of the commit or file being read within the checkpoint timeout faults the
-  pipeline, so keep the timeout above the time to read the largest commit. `read.mode =
-  'snapshot'` stays at-least-once.
+  `uc://` table still runs on one node at a time. The Iceberg append sink takes no changelog.
+  Under exactly-once a checkpoint that cannot reach the end of the commit or file being read
+  within the checkpoint timeout faults the pipeline, so keep the timeout above the time to read
+  the largest commit or snapshot file. `read.mode = 'snapshot'` stays at-least-once.
 
 - In cluster mode, a Delta Lake change feed on object storage (or a Unity Catalog `uc://` table)
   runs at-least-once on one node at a time and feeds aggregates, materialized views and Delta
