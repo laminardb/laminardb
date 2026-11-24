@@ -744,8 +744,9 @@ fn changelog_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// A changelog source cannot resume inside the copy: a target fed before the restart may keep a
-/// row the failed attempt copied and that was deleted before the range was copied again.
+/// A changelog source whose replay must repeat its output cannot resume inside the copy: a keyed
+/// target fed before the restart may keep a row the failed attempt copied and that was deleted
+/// before the range was copied again.
 #[tokio::test]
 async fn fresh_starts_leave_existing_slots_alone_and_an_interrupted_snapshot_fails_closed() {
     let Some(fixture) = Fixture::new(ORDERS).await else {
@@ -788,7 +789,10 @@ async fn fresh_starts_leave_existing_slots_alone_and_an_interrupted_snapshot_fai
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("changelog source cannot resume"), "{error}");
+    assert!(
+        error.contains("resumes only when no at-least-once sink that applies changes by key"),
+        "{error}"
+    );
     assert!(
         error.contains(&format!("SELECT pg_drop_replication_slot('{slot}')")),
         "{error}"

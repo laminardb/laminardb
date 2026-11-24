@@ -15,6 +15,7 @@ use super::super::super::postgres_io::{
     self, layout_fingerprint_sql, ControlConnection, CONNECT_TIMEOUT,
 };
 use super::super::super::typed_rows::RowLayout;
+use super::super::claim::require_live;
 use super::super::{RowImage, RowValues};
 use super::classify::key_row;
 use super::merge::{encode_key, HeldRows};
@@ -219,6 +220,7 @@ impl ChunkedSnapshot {
         if let Some(connection) = self.connection.take() {
             return Ok(connection);
         }
+        require_live(self.process_lease.as_ref())?;
         let guard = owner.track().ok_or_else(|| {
             ConnectorError::Internal(
                 "PostgreSQL CDC connector generation is already retired".into(),

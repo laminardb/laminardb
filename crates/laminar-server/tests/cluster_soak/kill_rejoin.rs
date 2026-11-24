@@ -38,7 +38,8 @@ pub(super) const EVENTS_INGESTED: &str = "laminardb_events_ingested_total";
     feature = "rabbitmq",
     feature = "ibmmq",
     feature = "mongodb-cdc",
-    feature = "delta-lake-s3"
+    feature = "delta-lake-s3",
+    all(feature = "postgres-cdc", feature = "postgres-sink")
 ))]
 pub(super) fn record_consumers(nodes: &[Node], consumers: &mut BTreeSet<usize>) {
     consumers.extend(
@@ -47,6 +48,49 @@ pub(super) fn record_consumers(nodes: &[Node], consumers: &mut BTreeSet<usize>) 
             .filter(|node| node.metric(EVENTS_INGESTED).is_some_and(|rows| rows > 0.0))
             .map(|node| node.id),
     );
+}
+
+/// Each node's `metric`, zero where a node does not report it.
+#[cfg(any(
+    feature = "delta-lake-s3",
+    all(feature = "postgres-cdc", feature = "postgres-sink")
+))]
+pub(super) fn per_node(nodes: &[Node], metric: &str) -> Vec<f64> {
+    nodes
+        .iter()
+        .map(|node| node.metric(metric).unwrap_or(0.0))
+        .collect()
+}
+
+/// The one node whose `metric` grows over `window`, as `what` describes it.
+#[cfg(any(
+    feature = "delta-lake-s3",
+    all(feature = "postgres-cdc", feature = "postgres-sink")
+))]
+pub(super) fn growing_node(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    settings: &SoakSettings,
+    metric: &str,
+    window: Duration,
+    what: &str,
+) -> usize {
+    let mut grower = None;
+    wait_for(what, settings.recovery_ceiling, || {
+        live();
+        let before = per_node(nodes, metric);
+        std::thread::sleep(window);
+        let grew: Vec<usize> = per_node(nodes, metric)
+            .iter()
+            .zip(&before)
+            .enumerate()
+            .filter(|(_, (after, before))| after > before)
+            .map(|(id, _)| id)
+            .collect();
+        grower = (grew.len() == 1).then(|| grew[0]);
+        grower.is_some()
+    });
+    grower.expect("the wait returned a node")
 }
 
 pub(super) struct SoakSettings {

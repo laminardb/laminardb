@@ -922,6 +922,7 @@ pub(super) fn copy_gate() -> ChunkedSnapshot {
     ChunkedSnapshot::new(
         Arc::new(copy_plan()),
         "laminar:0123456789abcdef:89abcdef".into(),
+        None,
         Some(PgSnapshot::parse("900:905:901").unwrap()),
     )
 }

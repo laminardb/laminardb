@@ -59,6 +59,27 @@ pub(crate) struct StreamRegistration {
     pub subscription_certificate: Option<laminar_core::checkpoint::OutputDistributionCertificate>,
 }
 
+impl StreamRegistration {
+    /// The streams, sources and tables the stream reads. The generic SQL parse misses a temporal
+    /// join's `FOR SYSTEM_TIME AS OF` inputs, so join inputs come from the join configuration.
+    pub(crate) fn input_names(&self) -> rustc_hash::FxHashSet<String> {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let mut inputs = crate::sql_analysis::extract_table_references(&self.query_sql);
+        for join in self.join_config.iter().flatten() {
+            let (left, right) = match join {
+                JoinOperatorConfig::StreamStream(config) => {
+                    (&config.left_table, &config.right_table)
+                }
+                JoinOperatorConfig::Temporal(config) => (&config.left_table, &config.right_table),
+                JoinOperatorConfig::Lookup(_) => continue,
+            };
+            inputs.extend([left.clone(), right.clone()]);
+        }
+        inputs
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TableRegistration {
     pub catalog_generation: u64,

@@ -361,7 +361,9 @@ Follow a PostgreSQL table through logical replication and keep a copy of it, or 
 over it, up to date. A mirror (`output.mode = 'upsert'`, the default) keeps one row per primary
 key in a sink. A changelog (`output.mode = 'changelog'`) retracts the old row and adds the new
 one, so filters and `SUM`/`COUNT`/`AVG` totals stay exact as rows change or disappear. It runs
-embedded or on a single-node server, with at-least-once delivery.
+embedded, on a single-node server, or in a cluster on one node at a time, with at-least-once
+delivery; in a cluster a changelog feeds aggregates and materialized views spread across the
+nodes.
 [Try it locally](crates/laminar-connectors/README.md#try-postgresql-cdc-locally) or read the
 [guide](crates/laminar-connectors/README.md#postgresql-cdc).
 

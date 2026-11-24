@@ -81,20 +81,6 @@ const SOURCES: &[Variant] = &[
         exact_properties: &[],
     },
     Variant {
-        label: "PostgreSQL CDC (no initial copy)",
-        connector: "postgres-cdc",
-        properties: &[
-            ("host", "localhost"),
-            ("database", "app"),
-            ("slot.name", "matrix"),
-            ("publication", "matrix"),
-            ("table", "public.orders"),
-            ("ssl.mode", "disable"),
-            ("snapshot.mode", "never"),
-        ],
-        exact_properties: &[],
-    },
-    Variant {
         label: "MongoDB change stream",
         connector: "mongodb-cdc",
         properties: &[
@@ -542,6 +528,59 @@ fn render_matrix() -> String {
         render_pairs(&mut out, mode, &sources, &sinks);
     }
     out
+}
+
+/// A changelog copy resumes after a failure only where its at-least-once sinks keep changes as a
+/// log; every other sink that takes changes applies them by key and keeps the failed attempt's
+/// rows.
+#[test]
+fn only_a_delta_append_sink_keeps_changes_as_a_log() {
+    let registry = registry();
+    let applies_by_key = |label: &str, extra: &[(&str, &str)]| {
+        let variant = SINKS
+            .iter()
+            .find(|variant| variant.label == label)
+            .unwrap_or_else(|| panic!("no '{label}' sink variant"));
+        let mut config = variant.sink_config(DeliveryGuarantee::AtLeastOnce);
+        for (key, value) in extra {
+            config.set(*key, *value);
+        }
+        let sink = registry.create_sink(&config, None).unwrap();
+        sink.contract(&config).unwrap().applies_changes_by_key()
+    };
+    assert!(!applies_by_key("Delta Lake append (S3/S3A)", &[]));
+    assert!(!applies_by_key("Kafka", &[]));
+    assert!(applies_by_key("Delta Lake upsert", &[]));
+    assert!(applies_by_key(
+        "Kafka",
+        &[
+            ("envelope", "upsert"),
+            ("key.column", "id"),
+            ("partition.count", "4"),
+        ],
+    ));
+    let weighted = encode_arrow_schema(&Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, true),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]));
+    assert!(applies_by_key(
+        "PostgreSQL",
+        &[
+            ("write.mode", "upsert"),
+            ("primary.key", "id"),
+            ("changelog.mode", "true"),
+            ("_arrow_schema", &weighted),
+        ],
+    ));
+    assert!(applies_by_key(
+        "MongoDB",
+        &[("write.mode", "upsert"), ("write.mode.key_fields", "id")],
+    ));
 }
 
 #[test]

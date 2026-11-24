@@ -18,9 +18,10 @@ use laminar_connectors::checkpoint::SourceCheckpointDelta;
 use laminar_connectors::connector::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
     strip_source_row_positions, ConnectorCancellationPolicy, ConnectorTaskTracker,
-    DeliveryGuarantee, SourceBatch, SourceBatchCursor, SourceCheckpointUnavailablePolicy,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
-    SourceRowPositionCapability, SourceStart, SOURCE_MUTATION_COLUMN,
+    DeliveryGuarantee, ReplayRequirement, SourceBatch, SourceBatchCursor,
+    SourceCheckpointUnavailablePolicy, SourceConnector, SourceConsistency, SourceContract,
+    SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart,
+    SOURCE_MUTATION_COLUMN,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -140,6 +141,7 @@ pub(crate) struct TrackedSourceRegistration {
     primary_key_indices: Vec<usize>,
     schema_admitted: bool,
     admitted_non_append_mode: Option<SourceInputMode>,
+    replay_requirement: ReplayRequirement,
     task_fence: ConnectorTaskFenceRegistration,
 }
 
@@ -212,6 +214,7 @@ impl TrackedSourceRegistration {
             primary_key_indices: Vec::new(),
             schema_admitted: false,
             admitted_non_append_mode: None,
+            replay_requirement: ReplayRequirement::default(),
             task_fence,
         })
     }
@@ -234,6 +237,7 @@ impl TrackedSourceRegistration {
             primary_key_indices: Vec::new(),
             schema_admitted: false,
             admitted_non_append_mode: None,
+            replay_requirement: ReplayRequirement::default(),
             task_fence,
         })
     }
@@ -265,6 +269,16 @@ impl TrackedSourceRegistration {
 
     pub(crate) const fn contract(&self) -> SourceContract {
         self.contract
+    }
+
+    pub(crate) const fn replay_requirement(&self) -> ReplayRequirement {
+        self.replay_requirement
+    }
+
+    /// Set what a replay owes the output a failed attempt emitted, from the sinks that read
+    /// this source.
+    pub(crate) fn set_replay_requirement(&mut self, requirement: ReplayRequirement) {
+        self.replay_requirement = requirement;
     }
 
     /// Admit keyed mutation metadata for a temporal-right or direct keyed-mutation sink route.

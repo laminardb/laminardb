@@ -447,6 +447,7 @@ impl StreamingCoordinator {
                     src.name, attempt.epoch, attempt.checkpoint_id
                 )),
             })?;
+            let start = start.with_replay_requirement(src.replay_requirement());
             #[cfg(feature = "cluster")]
             let start = match process_lease {
                 Some(lease) => start.with_process_lease(lease.clone()),

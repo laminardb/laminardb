@@ -1141,7 +1141,7 @@ fn a_split_iceberg_append_read_runs_in_cluster_at_least_once() {
 
 #[cfg(feature = "postgres-cdc")]
 #[test]
-fn postgres_cdc_is_admitted_at_least_once_with_checkpoints_and_in_cluster_only_streaming_upserts() {
+fn postgres_cdc_is_admitted_at_least_once_with_checkpoints_in_every_mode_and_output() {
     use super::admit_source_recovery_contract;
 
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
@@ -1157,10 +1157,10 @@ fn postgres_cdc_is_admitted_at_least_once_with_checkpoints_and_in_cluster_only_s
         config.set(key, value);
     }
     let source = registry.create_source(&config, None).unwrap();
-    for (mode, snapshot, placed) in [
-        ("upsert", "never", true),
-        ("upsert", "initial", false),
-        ("changelog", "initial", false),
+    for (mode, snapshot) in [
+        ("upsert", "never"),
+        ("upsert", "initial"),
+        ("changelog", "initial"),
     ] {
         config.set("output.mode", mode);
         config.set("snapshot.mode", snapshot);
@@ -1168,27 +1168,15 @@ fn postgres_cdc_is_admitted_at_least_once_with_checkpoints_and_in_cluster_only_s
         let admit = |delivery, checkpointing, runtime| {
             admit_source_recovery_contract(contract, delivery, checkpointing, runtime)
         };
-        assert_eq!(
-            admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Local),
-            Ok(()),
-            "{mode} {snapshot}"
-        );
-        let cluster = admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster);
-        if placed {
-            assert_eq!(cluster, Ok(()), "{mode} {snapshot}");
-        } else {
-            assert_eq!(
-                cluster,
-                Err(
-                    "cluster singleton sources require a connector that one node at a time may run"
-                ),
-                "{mode} {snapshot}"
-            );
-        }
         for runtime in [RuntimeMode::Local, RuntimeMode::Cluster] {
+            assert_eq!(
+                admit(DeliveryGuarantee::AtLeastOnce, true, runtime),
+                Ok(()),
+                "{mode} {snapshot} {runtime:?}"
+            );
             assert!(
                 admit(DeliveryGuarantee::ExactlyOnce, true, runtime).is_err(),
-                "{mode} {snapshot}"
+                "{mode} {snapshot} {runtime:?}"
             );
         }
         assert!(
@@ -2255,6 +2243,120 @@ fn temporal_source_contracts_enforce_recovery_positions_and_input_roles() {
     )
     .unwrap_err()
     .contains("not full changelogs"));
+}
+
+/// A source must repeat a failed attempt's output on replay only where an at-least-once sink that
+/// applies changes by key reads it, directly, through streams, or through a sink query.
+#[test]
+fn only_sources_read_by_a_keyed_at_least_once_sink_must_repeat_their_output() {
+    let stream = |name: &str, query_sql: &str| crate::connector_manager::StreamRegistration {
+        name: name.into(),
+        query_sql: query_sql.into(),
+        join_config: None,
+        ..temporal_stream_registration(name)
+    };
+    let streams = HashMap::from([
+        (
+            "totals".to_string(),
+            stream(
+                "totals",
+                "SELECT region, SUM(amount) AS total FROM orders GROUP BY region",
+            ),
+        ),
+        (
+            "regions".to_string(),
+            stream("regions", "SELECT region, total FROM totals"),
+        ),
+        (
+            "fills".to_string(),
+            stream("fills", "SELECT id FROM trades"),
+        ),
+    ]);
+    let sink = |name: &str, input: &str, query_inputs: &[&str]| {
+        (
+            name.to_string(),
+            crate::connector_manager::SinkRegistration {
+                schema_binding: None,
+                catalog_generation: 1,
+                name: name.into(),
+                input: input.into(),
+                query_inputs: query_inputs
+                    .iter()
+                    .map(|input| (*input).to_string())
+                    .collect(),
+                connector_type: Some("test".into()),
+                connector_options: HashMap::new(),
+                format: None,
+                format_options: HashMap::new(),
+                filter_expr: None,
+            },
+        )
+    };
+    let sinks = HashMap::from([
+        sink("current", "regions", &["payments"]),
+        sink("audit", "fills", &[]),
+    ]);
+    let changelog = |consistency| {
+        SinkContract::new(
+            consistency,
+            SinkTopology::Singleton,
+            SinkInputMode::FullChangelog,
+        )
+    };
+    let keyed = changelog(SinkConsistency::DurableAtLeastOnce);
+    let log = keyed.with_appended_changes();
+    for (contract, keeps_output) in [
+        (keyed, true),
+        (
+            SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::Singleton,
+                SinkInputMode::KeyedUpsert,
+            ),
+            true,
+        ),
+        (log, false),
+        (changelog(SinkConsistency::CheckpointCommittable), false),
+        (
+            SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ),
+            false,
+        ),
+    ] {
+        let upstream = super::sink_preparation::keyed_sink_upstream(
+            [("current", contract), ("audit", log)],
+            &sinks,
+            &streams,
+        )
+        .expect("every stream on the way parses");
+        for source in ["orders", "payments"] {
+            assert_eq!(
+                upstream.contains(source),
+                keeps_output,
+                "{source}: {contract:?}"
+            );
+        }
+        assert!(!upstream.contains("trades"), "{contract:?}");
+    }
+
+    // A temporal join's inputs come from its configuration, and a sink without a connector
+    // delivers to the application.
+    let mut streams = streams;
+    streams.insert("priced".into(), temporal_stream_registration("priced"));
+    let mut application = sink("application", "priced", &[]).1;
+    application.connector_type = None;
+    let sinks = HashMap::from([("application".to_string(), application)]);
+    let upstream =
+        super::sink_preparation::keyed_sink_upstream([("current", log)], &sinks, &streams)
+            .expect("every stream on the way parses");
+    assert!(upstream.contains("trades") && upstream.contains("prices"));
+
+    // A stream whose SQL names nothing did not parse, so nothing upstream of it is known.
+    streams.insert("priced".into(), stream("priced", "SELEC nothing"));
+    assert!(super::sink_preparation::keyed_sink_upstream([], &sinks, &streams).is_none());
 }
 
 fn temporal_stream_registration(name: &str) -> crate::connector_manager::StreamRegistration {

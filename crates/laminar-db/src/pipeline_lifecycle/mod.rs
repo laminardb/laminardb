@@ -291,8 +291,8 @@ use source_admission::{
     admit_routed_source, admit_source_contract, admit_source_recovery_contract,
     admit_temporal_source_contract, has_only_ordered_interval_consumers,
     has_only_temporal_right_consumers, is_changelog_route_candidate, PipelineRecoveryState,
-    PipelineSinkSetup, PipelineWatermarks, PreparedSink, SinkAdmissionContext, SourceRoute,
-    TemporalSourceRole,
+    PipelineSink, PipelineSinkSetup, PipelineWatermarks, PreparedSink, SinkAdmissionContext,
+    SourceRoute, TemporalSourceRole,
 };
 pub(crate) use source_admission::{
     admit_sink_contract, validate_source_recovery_assignment, OrderedIntervalAdmissions,

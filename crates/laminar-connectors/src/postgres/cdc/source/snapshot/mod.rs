@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, UInt32Array};
 use tokio::time::Instant;
 
-use crate::connector::{SourceBatch, SourceMutation};
+use crate::connector::{ProcessLeaseCheck, SourceBatch, SourceMutation};
 use crate::error::ConnectorError;
 
 use super::super::config::TableName;
@@ -208,6 +208,8 @@ impl HeldChunk {
 pub(super) struct ChunkedSnapshot {
     plan: Arc<CopyPlan>,
     application_name: String,
+    /// Checked before the copy opens a session: a node whose lease expired no longer owns it.
+    process_lease: Option<ProcessLeaseCheck>,
     /// A cursor naming the slot's snapshot phase committed.
     released: bool,
     /// Every key at or below this, in index order, is copied and emitted.
@@ -235,11 +237,13 @@ impl ChunkedSnapshot {
     pub(super) fn new(
         plan: Arc<CopyPlan>,
         application_name: String,
+        process_lease: Option<ProcessLeaseCheck>,
         floor: Option<PgSnapshot>,
     ) -> Self {
         Self {
             plan,
             application_name,
+            process_lease,
             released: false,
             bound: None,
             chunks: 0,
@@ -263,6 +267,7 @@ impl ChunkedSnapshot {
     pub(super) fn resume(
         plan: Arc<CopyPlan>,
         application_name: String,
+        process_lease: Option<ProcessLeaseCheck>,
         position: SnapshotPosition,
     ) -> Result<Self, ConnectorError> {
         if let Some(bound) = position
@@ -282,7 +287,7 @@ impl ChunkedSnapshot {
             bound: position.bound,
             chunks: position.chunks,
             pending: position.pending.into_iter().collect(),
-            ..Self::new(plan, application_name, position.floor)
+            ..Self::new(plan, application_name, process_lease, position.floor)
         })
     }
 
@@ -336,6 +341,13 @@ impl ChunkedSnapshot {
             next_slot: 0,
         });
         self
+    }
+
+    /// Whether the held chunk is partly emitted. The cursor records a chunk only with its last
+    /// piece, so a cut here would leave the emitted rows uncovered, and a resume reads the chunk
+    /// again at a newer snapshot.
+    pub(super) fn is_emitting_chunk(&self) -> bool {
+        self.held.as_ref().is_some_and(|held| held.emitted > 0)
     }
 
     /// `high` of the held chunk: the drain stops before any transaction ending after it.

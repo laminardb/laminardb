@@ -2,7 +2,8 @@
 //! home vnode, and only the node that owns that vnode runs the connector; every other node keeps
 //! it closed and reports an empty channel inventory. The home vnode moves like a split channel:
 //! at a committed drain the donor acknowledges the handoff cut and closes the connector, and the
-//! acquirer starts it from that cut. Recovery restarts every node from the committed cursor, so
+//! acquirer starts it from that cut. A drain stops intake at the connector's next replay boundary,
+//! where the handoff cut can stand. Recovery restarts every node from the committed cursor, so
 //! outside a drain only a node that never held the channel since it started may open it.
 
 use std::num::{NonZeroU32, NonZeroU64};
@@ -247,6 +248,18 @@ impl SingletonPlacement {
         }
     }
 
+    /// Whether the open connector stands where a cut can: a connector that polls to a replay
+    /// boundary offers no cursor inside a unit, so a drain reads it to the unit's end.
+    fn at_replay_boundary(&self) -> Result<bool, ConnectorError> {
+        if !self.open
+            || self.inner.checkpoint_unavailable_policy()
+                != SourceCheckpointUnavailablePolicy::PollToReplayBoundary
+        {
+            return Ok(true);
+        }
+        Ok(self.inner.try_checkpoint()?.is_some())
+    }
+
     /// Bind this node's share of the channel and the assignment it follows to a cursor.
     fn bind(&self, mut checkpoint: SourceCheckpoint) -> SourceCheckpoint {
         let owns = match &self.pending {
@@ -350,7 +363,10 @@ impl SourceConnector for SingletonPlacement {
     ) -> Result<Option<SourceBatch>, ConnectorError> {
         self.plan();
         self.settle().await?;
-        if !self.open || self.drain.is_some() || !self.follows_current_assignment() {
+        if !self.open
+            || !self.follows_current_assignment()
+            || (self.drain.is_some() && self.at_replay_boundary()?)
+        {
             return Ok(None);
         }
         let Some(mut batch) = self.inner.poll_batch(max_records).await? else {
@@ -476,7 +492,7 @@ impl SourceConnector for SingletonPlacement {
 
     fn poll_drain_ready(&mut self, round: AssignmentDrainId) -> Result<bool, ConnectorError> {
         match &self.drain {
-            Some(active) if active.round == round => Ok(true),
+            Some(active) if active.round == round => self.at_replay_boundary(),
             active => Err(ConnectorError::InvalidState {
                 expected: format!("singleton drain {round:?}"),
                 actual: format!("{:?}", active.as_ref().map(|active| active.round)),
@@ -830,6 +846,50 @@ mod tests {
         }
     }
 
+    /// Reads units of three rows, one row a poll, and offers a cursor only between units, as a
+    /// Delta commit or a PostgreSQL copy chunk does.
+    struct Units {
+        delivered: u64,
+    }
+
+    #[async_trait]
+    impl SourceConnector for Units {
+        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn poll_batch(&mut self, _max: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+            self.delivered += 1;
+            Ok(Some(
+                SourceBatch::new(row(self.delivered)).with_checkpoint(self.checkpoint()),
+            ))
+        }
+
+        fn schema(&self) -> SchemaRef {
+            recorded_schema()
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            delivered(self.delivered - self.delivered % 3)
+        }
+
+        fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+            Ok(self.delivered.is_multiple_of(3).then(|| self.checkpoint()))
+        }
+
+        fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
+            SourceCheckpointUnavailablePolicy::PollToReplayBoundary
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            Ok(placed_singleton())
+        }
+    }
+
     struct Node {
         source: SingletonPlacement,
         registry: Arc<VnodeRegistry>,
@@ -1057,6 +1117,44 @@ mod tests {
         assert_eq!(b.events(), [Event::Start("resume 5 at 2".into())]);
         assert_eq!(cursor.assignment_version().map(NonZeroU64::get), Some(2));
         assert_eq!(a.source.checkpoint().input_channels(), Some(&[][..]));
+    }
+
+    /// A drain that begins inside a unit reads the unit to its end, so the handoff cut can be
+    /// captured, and reads nothing past it.
+    #[tokio::test]
+    async fn a_drain_inside_a_unit_reads_to_its_end_before_the_handoff_cut() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut a = Node::placed(
+            1,
+            Box::new(Units { delivered: 0 }),
+            events,
+            recorded_schema(),
+        )
+        .await;
+        a.publish(1, 1);
+        a.poll()
+            .await
+            .expect("the owner reads the first row of a unit");
+        let request = SourceDrainRequest::new(round(1)).unwrap();
+        a.source.begin_drain(&request, deadline()).unwrap();
+        for _ in 0..2 {
+            assert!(
+                !a.source.poll_drain_ready(round(1)).unwrap(),
+                "inside the unit"
+            );
+            assert!(
+                a.poll().await.is_some(),
+                "the drain reads to the unit's end"
+            );
+        }
+        assert!(a.source.poll_drain_ready(round(1)).unwrap());
+        assert!(a.poll().await.is_none(), "nothing past the boundary");
+        let cut = a
+            .source
+            .try_checkpoint()
+            .unwrap()
+            .expect("a cut at the boundary");
+        assert_eq!(cut.get_offset("delivered"), Some("3"));
     }
 
     #[tokio::test]

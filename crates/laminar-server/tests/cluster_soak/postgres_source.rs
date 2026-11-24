@@ -51,14 +51,14 @@ use super::{
 };
 
 const BROKERS: &str = "LAMINAR_SOAK_KAFKA_SOURCE_BROKERS";
-/// Grows only on the node that streams the rates slot; every node reads trades.
-const RATES_RECEIVED: &str = "laminardb_postgres_cdc_events_received_total";
+/// Grows only on the node that streams the run's slot.
+const CDC_EVENTS_RECEIVED: &str = "laminardb_postgres_cdc_events_received_total";
 
-/// The tables, publication, and slot prefix of one run.
-struct Capture {
-    rates: String,
-    publication: String,
-    slot: String,
+/// The captured table, its publication, and the slot prefix of one run.
+pub(super) struct Capture {
+    pub(super) table: String,
+    pub(super) publication: String,
+    pub(super) slot: String,
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn three_node_postgres_temporal_kill9_soak() {
         scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
     let suffix = run_id.replace('-', "_");
     let capture = Capture {
-        rates: format!("rates_{suffix}"),
+        table: format!("rates_{suffix}"),
         publication: format!("rates_{suffix}"),
         slot: format!("soak_{suffix}"),
     };
@@ -88,7 +88,7 @@ fn three_node_postgres_temporal_kill9_soak() {
     let _cleanup = CaptureCleanup {
         postgres: &postgres,
         capture: &capture,
-        output: &output,
+        output: Some(&output),
     };
     kafka_create_topic(&brokers, &trades, TRADE_PARTITIONS);
     let mut oracle = postgres.spawn_oracle(&output);
@@ -120,15 +120,15 @@ fn three_node_postgres_temporal_kill9_soak() {
         &settings,
         CHECKPOINTS_COMPLETED,
     );
-    let mut heartbeat = spawn_heartbeat(&postgres, &capture.rates);
+    let mut heartbeat = spawn_heartbeat(&postgres, &capture.table);
     latest = warm_up(
         &mut nodes,
         &mut heartbeat,
         &settings,
         latest,
-        RATES_RECEIVED,
+        CDC_EVENTS_RECEIVED,
     );
-    write_rates(&postgres, &capture.rates);
+    write_rates(&postgres, &capture.table);
     std::thread::sleep(RATES_SETTLE);
     let mut trader = spawn_trader(brokers.clone(), trades.clone(), settings.rps);
     let mut live = || {
@@ -149,7 +149,12 @@ fn three_node_postgres_temporal_kill9_soak() {
         );
     }
     latest = paused_owner_round(
-        &mut nodes, &mut live, &settings, &postgres, &capture, latest,
+        &mut nodes,
+        &mut live,
+        &settings,
+        &postgres,
+        &capture.slot,
+        latest,
     );
     steady_phase(
         &mut nodes,
@@ -184,7 +189,7 @@ fn three_node_postgres_temporal_kill9_soak() {
 
 fn workload(brokers: &str, trades: &str, capture: &Capture, source: &str, sink: &str) -> String {
     let Capture {
-        rates,
+        table: rates,
         publication,
         slot,
     } = capture;
@@ -230,7 +235,9 @@ connector = "postgres-sink"
 /// carry the whole row only under `REPLICA IDENTITY FULL`.
 fn create_tables(postgres: &Postgres, capture: &Capture, output: &str) {
     let Capture {
-        rates, publication, ..
+        table: rates,
+        publication,
+        ..
     } = capture;
     block_on(async {
         postgres
@@ -249,19 +256,22 @@ fn create_tables(postgres: &Postgres, capture: &Capture, output: &str) {
 
 /// Ends every session on the run's slots, then drops them, the publication and the tables, when
 /// the soak ends or fails: a slot left behind keeps its WAL.
-struct CaptureCleanup<'a> {
-    postgres: &'a Postgres,
-    capture: &'a Capture,
-    output: &'a str,
+pub(super) struct CaptureCleanup<'a> {
+    pub(super) postgres: &'a Postgres,
+    pub(super) capture: &'a Capture,
+    pub(super) output: Option<&'a str>,
 }
 
 impl Drop for CaptureCleanup<'_> {
     fn drop(&mut self) {
         let Capture {
-            rates,
+            table,
             publication,
             slot,
         } = self.capture;
+        let tables = self
+            .output
+            .map_or_else(|| table.clone(), |output| format!("{table}, {output}"));
         let slots =
             format!("FROM pg_replication_slots WHERE starts_with(slot_name::text, '{slot}_')");
         self.postgres.execute_ignoring_errors(&[
@@ -271,7 +281,7 @@ impl Drop for CaptureCleanup<'_> {
             ),
             format!("SELECT pg_drop_replication_slot(slot_name) {slots}"),
             format!("DROP PUBLICATION IF EXISTS {publication}"),
-            format!("DROP TABLE IF EXISTS {rates}, {}", self.output),
+            format!("DROP TABLE IF EXISTS {tables}"),
         ]);
     }
 }
@@ -280,45 +290,44 @@ impl Drop for CaptureCleanup<'_> {
 /// require a survivor to take the slot over, then resume the frozen node: it must exit fenced
 /// while the survivor's session keeps the slot. Returns the checkpoint the cluster commits after
 /// the node rejoined.
-fn paused_owner_round(
+pub(super) fn paused_owner_round(
     nodes: &mut [Node],
     live: &mut dyn FnMut(),
     settings: &SoakSettings,
     postgres: &Postgres,
-    capture: &Capture,
+    slot: &str,
     latest: DurableCheckpointStatus,
 ) -> DurableCheckpointStatus {
-    let (owner, frozen) = slot_holder(nodes, live, settings, postgres, &capture.slot);
+    let (owner, frozen) = slot_holder(nodes, live, settings, postgres, slot);
     let paused = nodes[owner].pause();
     assert_eq!(
-        block_on(slot_session(postgres, &capture.slot)).as_ref(),
+        block_on(slot_session(postgres, slot)).as_ref(),
         Some(&frozen),
-        "the rates slot changed sessions before node {owner} was paused"
+        "the slot changed sessions before node {owner} was paused"
     );
-    eprintln!("soak: SIGSTOP delivered to node {owner}, which streams the rates slot");
+    eprintln!("soak: SIGSTOP delivered to node {owner}, which streams the slot");
     let survived = wait_for_converged_durable_checkpoint(
         nodes,
         Instant::now() + settings.recovery_ceiling,
-        "survivor progress with the rates owner paused",
+        "survivor progress with the slot owner paused",
         Some(latest),
     );
     let mut taken = None;
     wait_for(
-        "a survivor to take the rates slot over",
+        "a survivor to take the slot over",
         settings.recovery_ceiling,
         || {
             live();
-            taken = block_on(slot_session(postgres, &capture.slot))
-                .filter(|session| *session != frozen);
+            taken = block_on(slot_session(postgres, slot)).filter(|session| *session != frozen);
             taken.is_some()
         },
     );
     let taken = taken.expect("the takeover wait returned a session");
-    eprintln!("soak: a survivor took the rates slot over from node {owner}");
+    eprintln!("soak: a survivor took the slot over from node {owner}");
 
     paused.resume_until_fenced_exit(settings.recovery_ceiling);
     assert_eq!(
-        block_on(slot_session(postgres, &capture.slot)).as_ref(),
+        block_on(slot_session(postgres, slot)).as_ref(),
         Some(&taken),
         "the resumed node {owner} ended the session that took its slot over"
     );
@@ -333,7 +342,7 @@ fn paused_owner_round(
 }
 
 /// The node streaming the slot and its session: the one node whose received-event count grows
-/// while the heartbeat changes the table, over a window in which the slot keeps one session.
+/// while a writer changes the table, over a window in which the slot keeps one session.
 fn slot_holder(
     nodes: &mut [Node],
     live: &mut dyn FnMut(),
@@ -344,12 +353,12 @@ fn slot_holder(
     let received = |nodes: &[Node]| -> Vec<f64> {
         nodes
             .iter()
-            .map(|node| node.metric(RATES_RECEIVED).unwrap_or(0.0))
+            .map(|node| node.metric(CDC_EVENTS_RECEIVED).unwrap_or(0.0))
             .collect()
     };
     let mut holder = None;
     wait_for(
-        "one node to stream the rates slot through one session",
+        "one node to stream the slot through one session",
         settings.recovery_ceiling,
         || {
             live();
@@ -402,7 +411,7 @@ async fn slot_session(postgres: &Postgres, prefix: &str) -> Option<SlotSession> 
         })
 }
 
-async fn slots_under(postgres: &Postgres, prefix: &str) -> Vec<String> {
+pub(super) async fn slots_under(postgres: &Postgres, prefix: &str) -> Vec<String> {
     postgres
         .client()
         .await

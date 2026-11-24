@@ -15,7 +15,8 @@ use super::*;
 use crate::config::ConnectorState;
 use crate::connector::SourceMutation::{Put, Tombstone};
 use crate::connector::{
-    source_mutations, source_row_positions, SourceConnector, SourceRowPositions,
+    source_mutations, source_row_positions, SourceCheckpointUnavailablePolicy, SourceConnector,
+    SourceRowPositions,
 };
 use crate::postgres::cdc::config::OutputMode;
 use crate::postgres::cdc::postgres_io::IndexKeyColumn;
@@ -576,6 +577,38 @@ fn a_chunk_is_emitted_in_pieces_and_recorded_with_its_last() {
         .iter()
         .flat_map(|positions| positions.order_key().iter())
         .all(|key| key == Some(order_key.as_slice())));
+}
+
+/// A cursor stands only between chunks: inside a partly emitted chunk the source offers none, so
+/// a cut never holds rows of a chunk its cursor records as not emitted. A resume reads that chunk
+/// again, and a changelog would count the rows emitted before the cut twice.
+#[test]
+fn no_cursor_is_offered_inside_a_partly_emitted_chunk() {
+    for mode in [OutputMode::Upsert, OutputMode::Changelog] {
+        let mut source = copying_source(mode, "1:1:", &fetched(&["11", "12", "13"]));
+        assert_eq!(
+            source.checkpoint_unavailable_policy(),
+            SourceCheckpointUnavailablePolicy::PollToReplayBoundary
+        );
+        pass_held(&mut source);
+        let held = source.try_checkpoint().unwrap();
+        assert!(
+            held.is_some(),
+            "{mode:?}: nothing of the held chunk is emitted"
+        );
+        source.emit_held_chunk(2).unwrap().expect("a piece");
+        assert!(
+            source.try_checkpoint().unwrap().is_none(),
+            "{mode:?}: inside the chunk"
+        );
+        source.emit_held_chunk(2).unwrap().expect("the last piece");
+        let recorded = source.try_checkpoint().unwrap().expect("between chunks");
+        assert_eq!(
+            recorded.get_metadata("snapshot_bound"),
+            Some(r#"["20"]"#),
+            "{mode:?}"
+        );
+    }
 }
 
 /// A piece that fails to build leaves the copy's progress where it was, so a barrier captured
