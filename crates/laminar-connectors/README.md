@@ -21,7 +21,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node, and in a cluster on one node at a time with `queue.manager` set ([guide](../../docs/IBMMQ.md)) | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
-| Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node, and in a cluster on one node at a time for a change feed on object storage | Implemented |
+| Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog, replayed at commit/file boundaries; a change feed is exactly-once certified, embedded/single-node and, on object storage, in a cluster on one node at a time; snapshot reads are at-least-once | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; `read.splits` reads appends in parallel, across cluster nodes too; changelog fails closed | Implemented |
 | File Auto-Loader | `files` | Local directory watch/glob discovery (Parquet/CSV/JSON), or a listed S3/GCS/Azure directory (CSV/JSON/text) | Implemented |
 | FpML documents | `fpml` | `FORMAT FPML` on the files, Kafka, RabbitMQ, and IBM MQ sources, and `fpml.field` on the FIX source: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
@@ -944,11 +944,15 @@ has them instead of deriving changes from its `add`/`remove` actions, and skips
 `dataChange = false` rewrites such as `OPTIMIZE`. It rejects column-mapped tables in changes mode
 (snapshots read them) and any reader feature it does not support.
 
-Recovery is at-least-once; exactly-once rejects the source. Replay units are one commit, or one
-file of the pinned snapshot in path order. The checkpoint cursor (table id, phase, next commit or
-completed files) only ever stands between units, so a barrier that arrives inside a commit waits for the commit's last row. A checkpoint
-therefore takes at least as long as reading the largest commit or snapshot file; keep the
-checkpoint timeout above that. Resuming re-reads the unit after the cursor and never resumes
+Replay units are one commit, or one file of the pinned snapshot in path order. The checkpoint
+cursor (table id, phase, next commit or completed files) only ever stands between units, so a
+barrier that arrives inside a commit waits for the commit's last row, and a replayed unit emits
+the same rows in the same order. A change feed is therefore certified for exactly-once delivery
+with a checkpoint-committed sink that takes a changelog, such as Delta `append`; `read.mode =
+'snapshot'` is at-least-once. A checkpoint takes
+at least as long as reading the largest commit or snapshot file; keep the checkpoint timeout
+above that. Under exactly-once a checkpoint that times out waiting for a unit faults the pipeline,
+and recovery reads the same unit again. Resuming re-reads the unit after the cursor and never resumes
 inside one. The reader runs on the blocking pool with at most 256 MiB of decoded rows queued and
 hands batches out in `max_records` slices; one decoded batch above that bound fails the read.
 
@@ -960,22 +964,26 @@ batch; lookups are separate.
 #### Delta Lake change feed in a cluster
 
 - A change feed (`read.mode = 'changes'`) on object storage (`s3://`, `gs://`, `az://` and the
-  other object-store schemes) or a Unity Catalog `uc://` table runs at-least-once on one node at a
-  time: the node that owns the source's home vnode. A changelog must reach each group in log
+  other object-store schemes) or a Unity Catalog `uc://` table runs on one node at a time: the
+  node that owns the source's home vnode. A changelog must reach each group in log
   order, so one node reads it; the aggregates and views over it spread across every node by
   their keys.
 - When that node fails, a survivor resumes from the committed cursor; when the source moves at a
   rescale or a rejoin, the node giving it up stops at the handoff checkpoint and the node taking it
   resumes there. Operator state and the cursor commit in one checkpoint, so an aggregate or view
-  over the feed holds each change once even though replayed changes can repeat in a sink.
+  over the feed holds each change once; at-least-once, replayed changes can repeat in a sink.
 - A checkpoint waits for the commit or snapshot file the node is reading, and in a cluster every
   node's checkpoint waits with it; keep the cluster checkpoint timeout above the time to read
   the largest one.
 - Until mutable sinks run in a cluster, the feed's consumers there are aggregates, materialized
   views, and Delta `append` sinks on object storage, which keep `__weight`. Upsert sinks stay
   rejected in a cluster.
-- A local `table.path`, a Glue catalog name, `read.mode = 'snapshot'`, adding the source to a
-  running cluster, and exactly-once are rejected in a cluster.
+- With `delivery = exactly_once`, the feed's changes go to Delta `append` on direct S3/S3A, the
+  cluster exactly-once sink that takes a changelog (the Iceberg append sink takes none). The node
+  reading the feed and the nodes writing its aggregates commit in the same checkpoint, so the sink
+  holds each committed change once.
+- A local `table.path`, a Glue catalog name, `read.mode = 'snapshot'`, and adding the source to a
+  running cluster are rejected in a cluster.
 
 ### Iceberg append splits
 

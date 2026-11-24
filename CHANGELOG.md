@@ -4,14 +4,25 @@
 
 ### Added
 
+- A Delta Lake change feed (`read.mode = 'changes'`) is certified for exactly-once delivery. Its
+  cursor stands only between whole commits and snapshot files, a replayed commit or file
+  reproduces its rows in the same order, and missing or regressed history fails the read. Its
+  changes carry retractions, so an exactly-once pipeline writes them to a sink that takes a full
+  changelog, such as Delta Lake `append`, which keeps each change's `__weight`; in cluster mode
+  that is the one such sink, on direct S3/S3A, and a feed on object storage or a Unity Catalog
+  `uc://` table still runs on one node at a time. The Iceberg append sink takes no changelog.
+  Under exactly-once a checkpoint that cannot reach the end of the commit or file being read
+  within the checkpoint timeout faults the pipeline, so keep the timeout above the time to read
+  the largest commit or snapshot file. `read.mode = 'snapshot'` stays at-least-once.
+
 - In cluster mode, a Delta Lake change feed on object storage (or a Unity Catalog `uc://` table)
   runs at-least-once on one node at a time and feeds aggregates, materialized views and Delta
   `append` sinks, as it does in embedded mode. Full-changelog sources now have a cluster route:
   one node reads a changelog in log order, and the aggregates and views over it spread across
   the nodes by their keys. A survivor resumes the feed from the committed cursor, and a rescale
   moves it at the handoff checkpoint. A local `table.path` is now rejected in cluster mode as
-  node-local storage; `read.mode = 'snapshot'`, adding the source to a running cluster, and
-  exactly-once stay rejected there.
+  node-local storage; `read.mode = 'snapshot'` and adding the source to a running cluster stay
+  rejected there.
 
 - A PostgreSQL CDC source takes `change.time.column`: a declared, non-key `TIMESTAMP NOT NULL`
   column that is not a table column, filled with each change's transaction commit time to the
@@ -116,6 +127,12 @@
   `is_cluster_exact_delivery_certified()`.
 
 ### Fixed
+
+- A Delta Lake source whose table log ends before a version its cursor already reached (a table
+  directory restored from an older copy keeps its table id) now fails with a terminal error
+  that asks for a reset. Before, a source resumed from such a cursor waited for the log to catch
+  up and then skipped the new commits at the versions it had passed; a running source retried its
+  listing indefinitely, or skipped them the same way after renewing vended credentials. All modes.
 
 - In cluster mode, a checkpoint drain no longer stages one full snapshot of a certified aggregate
   subscription (one without `EMIT CHANGES`) for every queued peer shuffle event. The aggregate

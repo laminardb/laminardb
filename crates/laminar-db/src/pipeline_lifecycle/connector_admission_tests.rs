@@ -1338,7 +1338,7 @@ fn node_local_sources_are_rejected_in_cluster_whatever_their_topology() {
 
 #[cfg(feature = "delta-lake")]
 #[test]
-fn delta_change_feed_runs_in_cluster_only_from_shared_storage() {
+fn delta_change_feed_is_exactly_once_and_runs_in_cluster_only_from_shared_storage() {
     use super::{admit_source_recovery_contract, is_changelog_route_candidate};
 
     let registry = laminar_connectors::registry::ConnectorRegistry::new();
@@ -1354,30 +1354,53 @@ fn delta_change_feed_runs_in_cluster_only_from_shared_storage() {
         assert!(is_changelog_route_candidate(contract, runtime));
         admit_source_recovery_contract(contract, delivery, true, runtime)
     };
-    let at_least_once = DeliveryGuarantee::AtLeastOnce;
-    assert!(admit(
-        "s3://lake/orders",
-        "changes",
-        DeliveryGuarantee::ExactlyOnce,
-        RuntimeMode::Local
-    )
-    .unwrap_err()
-    .contains("LDB-5037"));
-    for (path, mode, rejection) in [
-        ("s3://lake/orders", "changes", None),
-        ("uc://main.sales.orders", "changes", None),
+    // Rejections at exactly-once on one node, at-least-once in a cluster and exactly-once in a
+    // cluster; at-least-once on one node admits every case.
+    for (path, mode, local_exact, cluster, cluster_exact) in [
+        ("s3://lake/orders", "changes", None, None, None),
+        ("uc://main.sales.orders", "changes", None, None, None),
         (
             "s3://lake/orders",
             "snapshot",
+            Some("production-certified"),
             Some("one node at a time may run"),
+            Some("production-certified"),
         ),
-        ("/tmp/delta-orders", "changes", Some("local filesystem")),
+        (
+            "/tmp/delta-orders",
+            "changes",
+            None,
+            Some("local filesystem"),
+            Some("across cluster nodes"),
+        ),
     ] {
-        assert_eq!(admit(path, mode, at_least_once, RuntimeMode::Local), Ok(()));
-        let cluster = admit(path, mode, at_least_once, RuntimeMode::Cluster);
-        match rejection {
-            None => assert_eq!(cluster, Ok(()), "{path} {mode}"),
-            Some(reason) => assert!(cluster.unwrap_err().contains(reason), "{path} {mode}"),
+        for (delivery, runtime, rejection) in [
+            (DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local, None),
+            (
+                DeliveryGuarantee::ExactlyOnce,
+                RuntimeMode::Local,
+                local_exact,
+            ),
+            (
+                DeliveryGuarantee::AtLeastOnce,
+                RuntimeMode::Cluster,
+                cluster,
+            ),
+            (
+                DeliveryGuarantee::ExactlyOnce,
+                RuntimeMode::Cluster,
+                cluster_exact,
+            ),
+        ] {
+            let admitted = admit(path, mode, delivery, runtime);
+            let case = format!("{path} {mode} {delivery} {runtime:?}: {admitted:?}");
+            match rejection {
+                None => assert_eq!(admitted, Ok(()), "{case}"),
+                Some(reason) => assert!(
+                    admitted.is_err_and(|error| error.contains(reason)),
+                    "{case}"
+                ),
+            }
         }
     }
 }

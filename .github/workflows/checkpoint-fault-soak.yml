@@ -458,6 +458,22 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs
             candidate: "true"
+          - label: Cluster EO Delta change feed to Delta (gossip)
+            test: delta_cdf_source::three_node_delta_cdf_delta_eo_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: eo
+            topology: cluster-delta-cdf-eo
+            discovery: gossip
+            emulator: "1"
+            # The same rounds exactly-once, with the aggregate's changes written to Delta on S3;
+            # after every round the output's weights must net to one row per bucket.
+            checkpoint_ms: "2000"
+            rps: "250"
+            visibility_ms: "120000"
+            slo_mode: observe
+            visibility_slo_mode: observe
+            services: seaweedfs
+            candidate: "true"
           - label: Cluster EO split generator to Delta (gossip)
             test: generator_splits::three_node_generator_splits_delta_eo_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3

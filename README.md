@@ -332,7 +332,8 @@ before any connector I/O, and never downgrades it silently.
 | Exactly-once | Committed output appears once. It needs a source certified for exact replay and a sink that commits with each checkpoint. |
 
 Exactly-once is admitted for Kafka into Kafka, Delta Lake or Iceberg when embedded or on a single
-node, and for Kafka into Delta Lake (direct S3) or Iceberg (REST catalog on S3) in a cluster.
+node, and for Kafka into Delta Lake (direct S3) or Iceberg (REST catalog on S3) in a cluster. A
+Delta Lake change feed is admitted into Delta Lake, on direct S3 in a cluster.
 [Delivery guarantees](docs/DELIVERY_GUARANTEES.md) has the full matrix and the test evidence
 behind each exactly-once composition.
 
