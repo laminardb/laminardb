@@ -99,6 +99,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(
+    feature = "kafka",
+    any(
+        feature = "delta-lake-s3",
+        all(feature = "postgres-cdc", feature = "postgres-sink")
+    )
+))]
+#[path = "cluster_soak/bucket_view.rs"]
+mod bucket_view;
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 #[path = "cluster_soak/delta_cdf_source.rs"]
 mod delta_cdf_source;
@@ -133,8 +142,14 @@ mod mongodb_source;
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
 #[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]
+#[path = "cluster_soak/postgres_changelog_source.rs"]
+mod postgres_changelog_source;
+#[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]
 #[path = "cluster_soak/postgres_source.rs"]
 mod postgres_source;
+#[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]
+#[path = "cluster_soak/postgres_upsert_copy_source.rs"]
+mod postgres_upsert_copy_source;
 #[cfg(all(feature = "kafka", feature = "rabbitmq"))]
 #[path = "cluster_soak/rabbitmq_source.rs"]
 mod rabbitmq_source;

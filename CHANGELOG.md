@@ -4,6 +4,21 @@
 
 ### Added
 
+- In cluster mode a PostgreSQL CDC source runs at-least-once on one node at a time in both output
+  modes, with or without the initial copy. A `changelog` source feeds aggregates, materialized
+  views and Delta `append` sinks; an `upsert` source with the copy feeds an interval join, as one
+  without the copy already did. When the node copying the table fails or gives the source up, the
+  next owner continues the copy from the committed checkpoint. A restart inside a `changelog`
+  copy now resumes it in every mode unless an at-least-once sink that applies changes by key
+  reads the source, directly or through streams (PostgreSQL, Kafka `envelope = 'upsert'`,
+  MongoDB or Delta upsert sinks, or a sink without a connector): the resumed copy reads its next
+  chunks at a newer snapshot, so such a sink could keep a row deleted while the copy was down,
+  and there the restart still fails closed with the reset. Adding a source that copies to a running cluster and exactly-once
+  stay rejected. `SourceStart` carries a `ReplayRequirement` (`with_replay_requirement`,
+  `replay_requirement`) that the engine derives from the sinks reading each source, and
+  `SinkContract::with_appended_changes` marks a sink that logs each change, such as Delta
+  `append`, instead of applying it by key.
+
 - A Delta Lake change feed (`read.mode = 'changes'`) is certified for exactly-once delivery. Its
   cursor stands only between whole commits and snapshot files, a replayed commit or file
   reproduces its rows in the same order, and missing or regressed history fails the read. Its
@@ -36,8 +51,8 @@
   just before it opens a session, creates the slot or ends a session, so a node that resumes after
   its lease expired does not take the slot back (the check is not atomic with the call, so a stall
   between the two can still let that one call through). `SourceStart` carries the cluster
-  `ProcessLeaseCheck` (`with_process_lease`, `process_lease`, `with_position`). Changelog mode,
-  the initial copy and exactly-once stay rejected in cluster mode.
+  `ProcessLeaseCheck` (`with_process_lease`, `process_lease`, `with_position`). Exactly-once
+  stays rejected in cluster mode.
 
 - The generator source takes `splits = n`, which spreads its sequence over `n` input channels:
   row `i` is on channel `i mod n`. In cluster mode each channel is read by the node that owns the
@@ -127,6 +142,16 @@
   `is_cluster_exact_delivery_certified()`.
 
 ### Fixed
+
+- A PostgreSQL CDC checkpoint no longer falls inside a chunk of the initial copy that is partly
+  emitted. Before, such a cut held rows the cursor did not cover, and the resumed copy read the
+  chunk again; harmless for upserts, it would have counted those rows twice in a changelog. A
+  checkpoint now waits for the rest of the chunk, which is already in memory. All modes.
+
+- In cluster mode, a placed source that offers a cursor only between replay units (a Delta Lake
+  change feed, a PostgreSQL copy) now reads the unit it is in to its end when a rescale or rejoin
+  drains it. Before, the drain stopped reading at once and the handoff checkpoint could not be
+  captured inside a commit or snapshot file, so the drain ran out its preparation deadline.
 
 - A Delta Lake source whose table log ends before a version its cursor already reached (a table
   directory restored from an older copy keeps its table id) now fails with a terminal error

@@ -393,6 +393,8 @@ pub struct SinkContract {
     /// True only for a built-in sink whose immutable phase-one and fenced
     /// external cursor protocol is certified for multi-node exact delivery.
     cluster_exact_delivery_certified: bool,
+    /// The sink appends each change as a row with its weight instead of applying it by key.
+    appends_changes: bool,
 }
 
 impl SinkContract {
@@ -408,7 +410,23 @@ impl SinkContract {
             topology,
             input_mode,
             cluster_exact_delivery_certified: false,
+            appends_changes: false,
         }
+    }
+
+    /// Mark a sink that appends each change as a row with its weight, as a log, instead of
+    /// applying it by key. Only meaningful with [`SinkInputMode::FullChangelog`].
+    #[must_use]
+    pub const fn with_appended_changes(mut self) -> Self {
+        self.appends_changes = true;
+        self
+    }
+
+    /// Whether the sink applies changes to rows by key (upserts and deletes) rather than
+    /// appending every change; see [`ReplayRequirement`](super::ReplayRequirement).
+    #[must_use]
+    pub const fn applies_changes_by_key(self) -> bool {
+        !matches!(self.input_mode, SinkInputMode::AppendOnly) && !self.appends_changes
     }
 
     /// Mark a built-in sink whose cluster exact-delivery protocol is a release gate.

@@ -83,6 +83,20 @@ impl std::fmt::Debug for ProcessLeaseCheck {
     }
 }
 
+/// What a replay after a failure owes the output the failed attempt emitted after the last
+/// committed checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplayRequirement {
+    /// An at-least-once sink that applies changes by key may read the source, directly or
+    /// through streams. It keeps what the failed attempt wrote, so a replay must repeat that
+    /// output: a different one can leave a row the sink never deletes.
+    #[default]
+    RepeatOutput,
+    /// Every reader restores from the checkpoint, discards uncommitted output, or appends changes
+    /// as a log, so a replay need only continue from the checkpoint.
+    FromCheckpoint,
+}
+
 /// Complete source startup request.
 ///
 /// Startup is intentionally a single operation so a connector cannot become
@@ -97,6 +111,8 @@ pub struct SourceStart {
     delivery: DeliveryGuarantee,
     /// The cluster process lease; `None` outside a cluster.
     process_lease: Option<ProcessLeaseCheck>,
+    /// What a replay owes output emitted after the last committed checkpoint.
+    replay_requirement: ReplayRequirement,
 }
 
 impl SourceStart {
@@ -137,6 +153,7 @@ impl SourceStart {
             position,
             delivery,
             process_lease: None,
+            replay_requirement: ReplayRequirement::default(),
         })
     }
 
@@ -147,14 +164,22 @@ impl SourceStart {
         self
     }
 
+    /// Run the source under the replay requirement its readers set.
+    #[must_use]
+    pub fn with_replay_requirement(mut self, requirement: ReplayRequirement) -> Self {
+        self.replay_requirement = requirement;
+        self
+    }
+
     /// The same request, starting at `position` instead.
     ///
     /// # Errors
     /// Returns the error [`Self::new`] returns for `position`.
     pub fn with_position(self, position: SourcePosition) -> Result<Self, ConnectorError> {
-        let process_lease = self.process_lease;
+        let (process_lease, replay_requirement) = (self.process_lease, self.replay_requirement);
         let mut start = Self::new(self.config, position, self.delivery)?;
         start.process_lease = process_lease;
+        start.replay_requirement = replay_requirement;
         Ok(start)
     }
 
@@ -162,6 +187,12 @@ impl SourceStart {
     #[must_use]
     pub fn process_lease(&self) -> Option<&ProcessLeaseCheck> {
         self.process_lease.as_ref()
+    }
+
+    /// What a replay owes output emitted after the last committed checkpoint.
+    #[must_use]
+    pub fn replay_requirement(&self) -> ReplayRequirement {
+        self.replay_requirement
     }
 
     /// Consume the request into connector-owned startup inputs.

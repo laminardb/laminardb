@@ -14,7 +14,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | Replayable ALO with typed record metadata; exact-certified input for coordinated EO pipelines | Implemented |
-| PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
+| PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node, and in a cluster on one node at a time | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node, and without a snapshot in a cluster on one node at a time (`document` as a temporal join's right side) | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node, and in a cluster on one node at a time ([guide](../../docs/RABBITMQ.md)) | Implemented |
@@ -323,8 +323,7 @@ history consumers tolerate that. Resume tokens are never decoded.
 `postgres-cdc` reads one table through PostgreSQL logical replication (`pgoutput`) and delivers
 typed rows straight to sinks or to retractable SQL: PostgreSQL → LaminarDB → destinations, with
 no broker or Debezium in between. It runs in embedded and single-node server mode; in cluster
-mode, `upsert` without the initial copy runs on one node at a time (see
-[Cluster](#postgresql-cdc-in-a-cluster)).
+mode it runs on one node at a time (see [Cluster](#postgresql-cdc-in-a-cluster)).
 
 New to it? [Try it locally](#try-postgresql-cdc-locally) first.
 
@@ -614,8 +613,8 @@ committed after it was copied: no gap and no overlap.
   most 5 s for its lock, each statement in it runs for at most 20 s, and an attempt that takes
   longer than 30 s is abandoned and retried on a new session. One poll can still take up to
   60 s against a slow server, so keep the checkpoint timeout above that while a copy runs (the
-  default is 120 s): a poll that exceeds it fails the source, and in `changelog` mode that
-  failure needs the reset below.
+  default is 120 s): a poll that exceeds it fails the source, and the restart resumes the copy
+  as described below.
 - A chunk is emitted once the stream has passed the position it was read at, in batches of the
   pipeline's poll size, so a chunk of wide rows still fits a sink's input limit. Changes its
   snapshot missed are merged into it first. A change is matched to a chunk by transaction
@@ -631,10 +630,12 @@ committed after it was copied: no gap and no overlap.
 - A change to the table's columns, types, replica identity or primary key during the copy stops
   the source before the next chunk is read. A table rewrite is not visible consistently to a
   snapshot taken across it.
-- A restart inside the copy resumes it in `upsert` mode. Deletes are always forwarded during the
-  copy, so rows the target received before the restart are corrected. In `changelog` mode the
-  restart fails closed and names the reset: a changelog consumer would keep rows it received
-  before the restart that changed before they were copied again.
+- A restart inside the copy resumes it from the last checkpoint. In `upsert` mode deletes are
+  always forwarded during the copy, so rows the target received before the restart are
+  corrected. In `changelog` mode it resumes unless a sink that applies changes by key reads the
+  source at at-least-once (see [Delivery, recovery and
+  resources](#delivery-recovery-and-resources)); then the restart fails closed and names the
+  reset.
 - The copy needs a primary server, because it reads WAL insert positions. Primary-key columns
   must use deterministic collations, the column's own collation in the index, and the default
   operator class: keys are compared on the server in the index's order, and equal keys must be
@@ -663,7 +664,16 @@ committed after it was copied: no gap and no overlap.
   checkpoint commits makes a new claim. A restart after the claim commits but before a checkpoint
   naming the slot commits has emitted nothing, so it creates the claimed slot or adopts it from
   its consistent point; neither needs a reset. A restart inside the initial snapshot resumes the
-  copy in `upsert` mode and fails closed with the reset in `changelog` mode.
+  copy from the last checkpoint, which stands only between chunks: a checkpoint waits until the
+  chunk being emitted is complete.
+- In `changelog` mode a restart inside the copy resumes only when no at-least-once sink that
+  applies changes by key reads the source, directly or through streams: a PostgreSQL upsert sink,
+  a Kafka `envelope = 'upsert'` sink, a MongoDB or Delta upsert sink, or a sink without a
+  connector, which hands rows to the application. The resumed copy reads its next chunks at a
+  newer snapshot, so such a sink could keep a row the failed attempt copied and that was deleted
+  before the copy reached it again; with one, the restart fails closed and asks for the reset. Aggregates, views and exactly-once sinks restart from the checkpoint, so
+  they hold each row once. A Delta `append` sink at at-least-once can keep a change the failed
+  attempt wrote without its retraction, as any at-least-once replay into it can.
 - The PostgreSQL sink paces itself by how fast the target applied its recent statements. It
   flushes before the next batch would make a flush take more than half of `statement.timeout.ms`
   (30 s by default), and splits a flush into statements of about a quarter of it inside one
@@ -702,10 +712,13 @@ committed after it was copied: no gap and no overlap.
 
 #### PostgreSQL CDC in a cluster
 
-- `output.mode=upsert` with `snapshot.mode=never` runs at-least-once on one node at a time: the
-  node that owns the source's home vnode. When it fails, a survivor resumes from the committed
-  slot position; when the source moves at a rescale or a rejoin, the node giving it up stops at
-  the handoff checkpoint and the node taking it resumes there.
+- Both output modes, with or without the initial copy, run at-least-once on one node at a time:
+  the node that owns the source's home vnode. When it fails, a survivor resumes from the
+  committed slot position, inside the copy too; when the source moves at a rescale or a rejoin,
+  the node giving it up reads to the end of the chunk it is emitting, stops at the handoff
+  checkpoint, and the node taking it resumes there. A changelog must reach each group in log
+  order, so one node reads it; the aggregates and views over it spread across every node by
+  their keys.
 - The slot allows one session at a time. A node ends a session of its own claim left by another
   node only once that node is fenced: it gave the source up at a committed handoff, or recovery
   proved its process lease expired. A node checks its own process lease just before it opens a
@@ -713,11 +726,15 @@ committed after it was copied: no gap and no overlap.
   it resumes. The check is not atomic with the call: a process that stalls between the two can
   still make that one call after its lease expired, before it exits fenced.
 - In a cluster an upsert source may only be a temporal join's right side, with the watermark on
-  `change.time.column`, or an interval join's input when its `PRIMARY KEY` holds every join column
-  and the watermarked event-time column.
-- A source that a topology change adds to a running cluster starts from a claim recorded when the
-  change was sealed; its first owner creates the slot.
-- `output.mode=changelog`, `snapshot.mode=initial` and exactly-once are rejected in a cluster.
+  `change.time.column` (so without the copy), or an interval join's input when its `PRIMARY KEY`
+  holds every join column and the watermarked event-time column.
+- Until mutable sinks run in a cluster, a changelog source's consumers there are aggregates,
+  materialized views, and Delta `append` sinks on object storage, which keep `__weight`; so a
+  restart inside its copy always resumes.
+- A source without the copy that a topology change adds to a running cluster starts from a claim
+  recorded when the change was sealed; its first owner creates the slot. Adding a source that
+  copies to a running cluster is rejected.
+- Exactly-once is rejected in a cluster.
 
 #### Unique constraints on the target
 
@@ -969,9 +986,10 @@ batch; lookups are separate.
   order, so one node reads it; the aggregates and views over it spread across every node by
   their keys.
 - When that node fails, a survivor resumes from the committed cursor; when the source moves at a
-  rescale or a rejoin, the node giving it up stops at the handoff checkpoint and the node taking it
-  resumes there. Operator state and the cursor commit in one checkpoint, so an aggregate or view
-  over the feed holds each change once; at-least-once, replayed changes can repeat in a sink.
+  rescale or a rejoin, the node giving it up reads to the end of the commit or snapshot file it is
+  reading, stops at the handoff checkpoint, and the node taking it resumes there. Operator state
+  and the cursor commit in one checkpoint, so an aggregate or view over the feed holds each change
+  once; at-least-once, replayed changes can repeat in a sink.
 - A checkpoint waits for the commit or snapshot file the node is reading, and in a cluster every
   node's checkpoint waits with it; keep the cluster checkpoint timeout above the time to read
   the largest one.

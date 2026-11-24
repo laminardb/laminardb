@@ -143,7 +143,7 @@ fn only_another_incarnation_of_this_claim_is_a_stale_holder() {
     }
 }
 
-/// Every phase against every slot state and both output modes.
+/// Every phase against every slot state.
 #[test]
 fn restart_matrix() {
     use ResumeAction::{Adopt, Busy, Create, FailClosed, NewClaim, TerminateStale};
@@ -160,122 +160,124 @@ fn restart_matrix() {
     let held_unusable = slot(Some(0x500), Some(stale.clone()), Some("is invalidated"));
 
     let claimed = CursorPhase::Claimed;
-    let streaming = |consistent_point, lsn| CursorPhase::Streaming {
-        consistent_point: Lsn::new(consistent_point),
-        lsn: Lsn::new(lsn),
-    };
-    let copying = |consistent_point, lsn| {
-        CursorPhase::Snapshot(SnapshotPosition {
-            consistent_point: Lsn::new(consistent_point),
-            lsn: Lsn::new(lsn),
-            bound: Some(vec!["17".into()]),
-            chunks: 3,
-            pending: vec![901],
-            floor: None,
-        })
-    };
 
-    let action = |phase: &CursorPhase, facts: Option<&SlotFacts>, output| {
-        resume_action(phase, facts, output, &claim(), INCARNATION)
+    let action = |phase: &CursorPhase, facts: Option<&SlotFacts>| {
+        resume_action(phase, facts, &claim(), INCARNATION)
     };
-    for output in [OutputMode::Upsert, OutputMode::Changelog] {
-        assert_eq!(action(&claimed, None, output), Create);
-        // Nothing was emitted under a claim, so a healthy slot is adopted from its consistent
-        // point; a copy takes its floor from a probe slot.
-        assert_eq!(
-            action(&claimed, Some(&healthy), output),
-            Adopt(Lsn::new(0x500))
+    assert_eq!(action(&claimed, None), Create);
+    // Nothing was emitted under a claim, so a healthy slot is adopted from its consistent
+    // point; a copy takes its floor from a probe slot.
+    assert_eq!(action(&claimed, Some(&healthy)), Adopt(Lsn::new(0x500)));
+    assert!(matches!(action(&claimed, Some(&positionless)), NewClaim(_)));
+    assert!(
+        matches!(action(&claimed, Some(&unusable)), NewClaim(reason) if reason.contains("invalidated"))
+    );
+    assert_eq!(
+        action(&claimed, Some(&held_stale)),
+        TerminateStale(stale.clone())
+    );
+    assert_eq!(
+        action(&claimed, Some(&held_unusable)),
+        TerminateStale(stale.clone())
+    );
+    assert_eq!(action(&claimed, Some(&held_foreign)), Busy(foreign.clone()));
+    assert_eq!(
+        action(&claimed, Some(&held_by_us)),
+        Busy(same_incarnation.clone())
+    );
+
+    for position in [streaming(0x400, 0x600), copying(0x400, 0x600)] {
+        assert!(
+            matches!(action(&position, None), FailClosed(reason) if reason.contains("missing"))
+        );
+        assert_eq!(action(&position, Some(&healthy)), Adopt(Lsn::new(0x600)));
+        assert!(
+            matches!(action(&position, Some(&unusable)), FailClosed(reason) if reason.contains("invalidated"))
         );
         assert!(matches!(
-            action(&claimed, Some(&positionless), output),
-            NewClaim(_)
+            action(&position, Some(&positionless)),
+            FailClosed(_)
         ));
-        assert!(
-            matches!(action(&claimed, Some(&unusable), output), NewClaim(reason) if reason.contains("invalidated"))
-        );
         assert_eq!(
-            action(&claimed, Some(&held_stale), output),
+            action(&position, Some(&held_stale)),
             TerminateStale(stale.clone())
         );
         assert_eq!(
-            action(&claimed, Some(&held_unusable), output),
-            TerminateStale(stale.clone())
-        );
-        assert_eq!(
-            action(&claimed, Some(&held_foreign), output),
+            action(&position, Some(&held_foreign)),
             Busy(foreign.clone())
         );
         assert_eq!(
-            action(&claimed, Some(&held_by_us), output),
+            action(&position, Some(&held_by_us)),
             Busy(same_incarnation.clone())
         );
-
-        for position in [streaming(0x400, 0x600), copying(0x400, 0x600)] {
-            if output == OutputMode::Changelog && matches!(position, CursorPhase::Snapshot(_)) {
-                continue;
-            }
-            assert!(
-                matches!(action(&position, None, output), FailClosed(reason) if reason.contains("missing"))
-            );
-            assert_eq!(
-                action(&position, Some(&healthy), output),
-                Adopt(Lsn::new(0x600))
-            );
-            assert!(
-                matches!(action(&position, Some(&unusable), output), FailClosed(reason) if reason.contains("invalidated"))
-            );
-            assert!(matches!(
-                action(&position, Some(&positionless), output),
-                FailClosed(_)
-            ));
-            assert_eq!(
-                action(&position, Some(&held_stale), output),
-                TerminateStale(stale.clone())
-            );
-            assert_eq!(
-                action(&position, Some(&held_foreign), output),
-                Busy(foreign.clone())
-            );
-            assert_eq!(
-                action(&position, Some(&held_by_us), output),
-                Busy(same_incarnation.clone())
-            );
-        }
-        // A slot behind the cursor is safe (slots persist at server checkpoints); one ahead lost
-        // WAL; one before the consistent point is not the slot the cursor was taken from.
-        for phase in [streaming as fn(u64, u64) -> CursorPhase, copying] {
-            if output == OutputMode::Changelog && matches!(phase(0, 0), CursorPhase::Snapshot(_)) {
-                continue;
-            }
-            assert_eq!(
-                action(&phase(0x400, 0x900), Some(&healthy), output),
-                Adopt(Lsn::new(0x900))
-            );
-            assert_eq!(
-                action(&phase(0x500, 0x500), Some(&healthy), output),
-                Adopt(Lsn::new(0x500))
-            );
-            assert!(
-                matches!(action(&phase(0x400, 0x4ff), Some(&healthy), output), FailClosed(reason) if reason.contains("advanced"))
-            );
-            assert!(
-                matches!(action(&phase(0x501, 0x900), Some(&healthy), output), FailClosed(reason) if reason.contains("consistent point"))
-            );
-        }
     }
-    // An upsert copy resumes inside the snapshot; a changelog copy cannot, whatever the slot.
-    for facts in [
-        None,
-        Some(&healthy),
-        Some(&unusable),
-        Some(&positionless),
-        Some(&held_stale),
-        Some(&held_foreign),
-    ] {
-        assert!(
-            matches!(action(&copying(0x400, 0x600), facts, OutputMode::Changelog), FailClosed(reason) if reason.contains("initial snapshot") && reason.contains("pg_drop_replication_slot('orders_0123456789abcdef')")),
-            "{facts:?}"
+    // A slot behind the cursor is safe (slots persist at server checkpoints); one ahead lost
+    // WAL; one before the consistent point is not the slot the cursor was taken from.
+    for phase in [streaming as fn(u64, u64) -> CursorPhase, copying] {
+        assert_eq!(
+            action(&phase(0x400, 0x900), Some(&healthy)),
+            Adopt(Lsn::new(0x900))
         );
+        assert_eq!(
+            action(&phase(0x500, 0x500), Some(&healthy)),
+            Adopt(Lsn::new(0x500))
+        );
+        assert!(
+            matches!(action(&phase(0x400, 0x4ff), Some(&healthy)), FailClosed(reason) if reason.contains("advanced"))
+        );
+        assert!(
+            matches!(action(&phase(0x501, 0x900), Some(&healthy)), FailClosed(reason) if reason.contains("consistent point"))
+        );
+    }
+}
+
+fn streaming(consistent_point: u64, lsn: u64) -> CursorPhase {
+    CursorPhase::Streaming {
+        consistent_point: Lsn::new(consistent_point),
+        lsn: Lsn::new(lsn),
+    }
+}
+
+fn copying(consistent_point: u64, lsn: u64) -> CursorPhase {
+    CursorPhase::Snapshot(SnapshotPosition {
+        consistent_point: Lsn::new(consistent_point),
+        lsn: Lsn::new(lsn),
+        bound: Some(vec!["17".into()]),
+        chunks: 3,
+        pending: vec![901],
+        floor: None,
+    })
+}
+
+/// A changelog copy resumes only where a replay need not repeat the failed attempt; an upsert
+/// copy and a stream always resume.
+#[test]
+fn only_a_changelog_copy_read_by_a_keyed_sink_refuses_to_resume() {
+    for phase in [
+        CursorPhase::Claimed,
+        streaming(0x400, 0x600),
+        copying(0x400, 0x600),
+    ] {
+        for output in [OutputMode::Upsert, OutputMode::Changelog] {
+            for replay in [
+                ReplayRequirement::RepeatOutput,
+                ReplayRequirement::FromCheckpoint,
+            ] {
+                let refused = matches!(phase, CursorPhase::Snapshot(_))
+                    && output == OutputMode::Changelog
+                    && replay == ReplayRequirement::RepeatOutput;
+                let checked = require_resumable_copy(&phase, output, replay, &claim());
+                assert_eq!(checked.is_err(), refused, "{phase:?} {output:?} {replay:?}");
+                if let Err(error) = checked {
+                    let text = error.to_string();
+                    assert!(text.contains("initial snapshot"), "{text}");
+                    assert!(
+                        text.contains("pg_drop_replication_slot('orders_0123456789abcdef')"),
+                        "{text}"
+                    );
+                }
+            }
+        }
     }
 }
 

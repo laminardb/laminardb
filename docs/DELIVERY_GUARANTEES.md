@@ -28,8 +28,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 |---|---|---|
 | Kafka | EO, ALO, BE | EO, ALO |
 | Kafka (Debezium) | EO, ALO, BE | EO, ALO |
-| PostgreSQL CDC | ALO | rejected |
-| PostgreSQL CDC (no initial copy) | ALO | ALO |
+| PostgreSQL CDC | ALO | ALO |
 | MongoDB change stream | ALO, BE | ALO |
 | Delta Lake change feed | EO, ALO, BE | EO, ALO |
 | Delta Lake change feed (local table) | EO, ALO, BE | rejected |
@@ -71,7 +70,6 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Kafka | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Kafka (Debezium) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Delta Lake change feed | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 | Delta Lake change feed (local table) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
@@ -95,8 +93,7 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Kafka | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| PostgreSQL CDC | — | — | — | — | — | — | — | — | — | — | — | — |
-| PostgreSQL CDC (no initial copy) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| PostgreSQL CDC | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Delta Lake change feed | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -231,6 +228,21 @@ keyed materialized view folds the feed, through the same kills. One more round f
 reading the table until a survivor reads it, then resumes it: the frozen node must exit fenced.
 Once the writer stops, every node's committed read of the view must equal the same aggregate over
 the table's final snapshot, and more than one node must have read the table.
+
+A PostgreSQL CDC source in `changelog` mode, or in `upsert` mode with the initial copy, also
+runs on one node at a time. A checkpoint inside the copy stands between chunks, and the next
+owner continues the copy from it. A `changelog` copy resumes only when no at-least-once sink that
+applies changes by key reads the source; in a cluster none can until mutable sinks run there.
+`postgres_changelog_source::three_node_postgres_changelog_kill9_soak` (candidate) seeds a table
+of wide rows, so the copy outlasts the start, kills the node copying it and requires a survivor
+to continue, then runs the same kills and a paused-owner round while a writer inserts, updates
+and deletes rows and a keyed materialized view folds the changelog. Once the writer stops, every
+node's committed read of the view must equal the aggregate of the table, and the run must create
+one slot. `postgres_upsert_copy_source::three_node_postgres_upsert_copy_interval_kill9_soak`
+(candidate) copies an upsert quotes table keyed by `(at, key)`, in event-time order, as an
+interval join's input against Kafka trades that each match one quote, kills the node copying it,
+then runs the same kills; every node's committed read of a view over every joined quote must
+hold each trade's one quote once.
 
 ## Materialized view reads
 

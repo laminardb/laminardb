@@ -1,7 +1,9 @@
+use laminar_connectors::connector::ReplayRequirement;
+
 use super::{
     admit_sink, open_prepared_sinks, Arc, CheckpointStorageScope, ConnectorTaskFenceRegistration,
-    DbError, DeliveryGuarantee, HashMap, LaminarDB, PipelineSinkSetup, PreparedSink, RuntimeMode,
-    SinkAdmissionContext, SinkContract, TrackedSourceRegistration,
+    DbError, DeliveryGuarantee, HashMap, LaminarDB, PipelineSink, PipelineSinkSetup, PreparedSink,
+    RuntimeMode, SinkAdmissionContext, SinkContract, TrackedSourceRegistration,
 };
 
 impl LaminarDB {
@@ -336,4 +338,67 @@ async fn admit_and_bind_sink(
             ))
         })?;
     Ok(admitted)
+}
+
+/// Set each source's [`ReplayRequirement`]: only a source upstream of an at-least-once sink that
+/// applies changes by key must repeat its output. When a stream's inputs are unknown, every
+/// source keeps the requirement.
+pub(super) fn set_replay_requirements(
+    sources: &mut [TrackedSourceRegistration],
+    sinks: &[PipelineSink],
+    sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+) {
+    let Some(upstream) = keyed_sink_upstream(
+        sinks
+            .iter()
+            .map(|(name, .., contract, _)| (name.as_str(), *contract)),
+        sink_regs,
+        stream_regs,
+    ) else {
+        return;
+    };
+    for source in sources {
+        if !upstream.contains(&source.name) {
+            source.set_replay_requirement(ReplayRequirement::FromCheckpoint);
+        }
+    }
+}
+
+/// Every stream and source upstream of an at-least-once sink that applies changes by key, or
+/// `None` when a stream on the way reads nothing its SQL names, which means it did not parse. A
+/// sink without a connector delivers to the application, which may apply changes by key.
+pub(super) fn keyed_sink_upstream<'a>(
+    sinks: impl IntoIterator<Item = (&'a str, SinkContract)>,
+    sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+) -> Option<rustc_hash::FxHashSet<String>> {
+    let keyed = sinks
+        .into_iter()
+        .filter(|(_, contract)| {
+            !contract.is_checkpoint_committable() && contract.applies_changes_by_key()
+        })
+        .filter_map(|(name, _)| sink_regs.get(name));
+    let application = sink_regs
+        .values()
+        .filter(|sink| sink.connector_type.is_none());
+    let mut pending: Vec<String> = keyed
+        .chain(application)
+        .flat_map(|sink| std::iter::once(&sink.input).chain(&sink.query_inputs))
+        .cloned()
+        .collect();
+    let mut upstream = rustc_hash::FxHashSet::default();
+    while let Some(name) = pending.pop() {
+        if !upstream.insert(name.clone()) {
+            continue;
+        }
+        if let Some(stream) = stream_regs.get(&name) {
+            let inputs = stream.input_names();
+            if inputs.is_empty() {
+                return None;
+            }
+            pending.extend(inputs);
+        }
+    }
+    Some(upstream)
 }

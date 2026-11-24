@@ -46,27 +46,22 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
 use deltalake::{DeltaTable, TableProperty};
 
+use super::bucket_view::{bucket_sql, converged_reads, runtime, view_sql, Buckets};
 use super::kill_rejoin::{
-    boot, cluster_nodes, kill_round, record_consumers, rejoin, steady_phase, SoakSettings,
-    CHECKPOINTS_COMPLETED, EVENTS_INGESTED,
+    boot, cluster_nodes, growing_node, kill_round, per_node, record_consumers, rejoin,
+    steady_phase, SoakSettings, CHECKPOINTS_COMPLETED, EVENTS_INGESTED,
 };
-use super::view_reads::{connect, ReadFailure};
 use super::{
     delta_append_sink_config, delta_soak_table_uri, env_u64, scoped_soak_storage_url, soak_run_id,
     wait_for, wait_for_converged_durable_checkpoint, wait_until, DeltaSoakStorage,
     DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, NODES,
 };
 
-const VIEW: &str = "cdf_buckets";
 const CHANGES: &str = "cdf_bucket_changes";
-const BUCKETS: i64 = 16;
-/// Each key of a bucket: `(bucket, n, total, peak)`.
-type Buckets = Vec<[i64; 4]>;
 const COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 const COMMIT_ATTEMPTS: u32 = 20;
 /// Updates and deletes touch the ids of this many most recent inserts.
 const RECENT_INSERTS: i64 = 8;
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes reading a Delta change feed on S3"]
@@ -112,7 +107,7 @@ fn run(delivery: JoinDelivery) {
         &log_dir,
         &settings,
         &checkpoint_url,
-        &view_sql(),
+        &view_sql("cdf_input"),
         &workload(&table, output.as_ref()),
     );
     let mut writer = Writer::spawn(table.clone(), seed_rows, settings.rps);
@@ -170,31 +165,6 @@ fn run(delivery: JoinDelivery) {
         expected.len(),
         settings.kills
     );
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("soak runtime")
-}
-
-/// The aggregate the view, the output stream and the oracle compute over the table.
-fn bucket_sql(table: &str) -> String {
-    format!(
-        "SELECT id % {BUCKETS} AS bucket, COUNT(*) AS n, SUM(amount) AS total, MAX(amount) AS peak \
-         FROM {table} GROUP BY id % {BUCKETS}"
-    )
-}
-
-fn view_sql() -> String {
-    format!(
-        r#"sql = """
-CREATE MATERIALIZED VIEW {VIEW} AS {};
-"""
-"#,
-        bucket_sql("cdf_input")
-    )
 }
 
 /// The change-feed source, plus for the exactly-once leg the aggregate's changes into `output`.
@@ -492,38 +462,6 @@ async fn commit(
     .map_err(|error| format!("Delta commit {round}: {error}"))
 }
 
-fn ingested(nodes: &[Node]) -> Vec<f64> {
-    nodes
-        .iter()
-        .map(|node| node.metric(EVENTS_INGESTED).unwrap_or(0.0))
-        .collect()
-}
-
-/// The node reading the table: the one whose ingested-event count grows over a window in which
-/// the writer commits.
-fn table_reader(nodes: &mut [Node], live: &mut dyn FnMut(), settings: &SoakSettings) -> usize {
-    let mut reader = None;
-    wait_for(
-        "one node to read the change feed",
-        settings.recovery_ceiling,
-        || {
-            live();
-            let before = ingested(nodes);
-            std::thread::sleep(COMMIT_INTERVAL * 4);
-            let grew: Vec<usize> = ingested(nodes)
-                .iter()
-                .zip(&before)
-                .enumerate()
-                .filter(|(_, (after, before))| after > before)
-                .map(|(id, _)| id)
-                .collect();
-            reader = (grew.len() == 1).then(|| grew[0]);
-            reader.is_some()
-        },
-    );
-    reader.expect("the reader wait returned a node")
-}
-
 /// Freeze the node reading the table past its process lease, require a survivor to read it from
 /// the committed cut, then resume the frozen node: it must exit fenced. Returns the checkpoint
 /// the cluster commits after the node rejoined.
@@ -533,8 +471,15 @@ fn paused_reader_round(
     settings: &SoakSettings,
     latest: DurableCheckpointStatus,
 ) -> DurableCheckpointStatus {
-    let reader = table_reader(nodes, live, settings);
-    let before = ingested(nodes);
+    let reader = growing_node(
+        nodes,
+        live,
+        settings,
+        EVENTS_INGESTED,
+        COMMIT_INTERVAL * 4,
+        "one node to read the change feed",
+    );
+    let before = per_node(nodes, EVENTS_INGESTED);
     let paused = nodes[reader].pause();
     eprintln!("soak: SIGSTOP delivered to node {reader}, which reads the change feed");
     let survived = wait_for_converged_durable_checkpoint(
@@ -566,99 +511,4 @@ fn paused_reader_round(
         CHECKPOINTS_COMPLETED,
         survived,
     )
-}
-
-/// Wait until the first node's committed read of the view equals `expected`, then require every
-/// node to read the same rows at that epoch or later. Returns the epoch.
-fn converged_reads(
-    nodes: &mut [Node],
-    expected: &Buckets,
-    settings: &SoakSettings,
-    latest: DurableCheckpointStatus,
-) -> u64 {
-    wait_for_converged_durable_checkpoint(
-        nodes,
-        Instant::now() + settings.recovery_ceiling,
-        "durable progress after the writer stopped",
-        Some(latest),
-    );
-    let runtime = runtime();
-    let mut last = None;
-    let converged = wait_until(settings.recovery_ceiling + Duration::from_secs(60), || {
-        match runtime.block_on(committed_read(nodes[0].id, 0)) {
-            Ok(read) => last = Some(read),
-            Err(ReadFailure::Retryable(_)) => {}
-            Err(ReadFailure::Fatal(reason)) => panic!("node0 committed view read: {reason}"),
-        }
-        last.as_ref().is_some_and(|(_, rows)| rows == expected)
-    });
-    let epoch = match (converged, last) {
-        (true, Some((epoch, _))) => epoch,
-        (_, last) => panic!(
-            "no committed view read equals the final snapshot {expected:?}; last read {last:?}"
-        ),
-    };
-    for node in nodes.iter() {
-        match runtime.block_on(committed_read(node.id, epoch)) {
-            Ok((read_epoch, rows)) => {
-                assert!(
-                    read_epoch >= epoch,
-                    "node{} read epoch {read_epoch}",
-                    node.id
-                );
-                assert_eq!(&rows, expected, "node{} view at {read_epoch}", node.id);
-            }
-            Err(ReadFailure::Retryable(reason) | ReadFailure::Fatal(reason)) => {
-                panic!("node{} committed view read failed: {reason}", node.id)
-            }
-        }
-    }
-    epoch
-}
-
-/// One committed read of the view on node `node` at epoch `floor` or later.
-async fn committed_read(node: usize, floor: u64) -> Result<(u64, Buckets), ReadFailure> {
-    let read = async {
-        let client = connect(node, "committed").await?;
-        client
-            .batch_execute(&format!("SET laminar.min_epoch = {floor}"))
-            .await?;
-        let rows = client
-            .simple_query(&format!(
-                "SELECT bucket, n, total, peak FROM {VIEW} ORDER BY bucket"
-            ))
-            .await?;
-        let epoch = client.simple_query("SHOW laminar.read_epoch").await?;
-        Ok::<_, ReadFailure>((rows, epoch))
-    };
-    let (rows, epoch) = tokio::time::timeout(READ_TIMEOUT, read)
-        .await
-        .map_err(|_| ReadFailure::Retryable("read timeout".to_owned()))??;
-    let fatal = |reason: &str| ReadFailure::Fatal(reason.to_owned());
-    let epoch = rows_of(&epoch)
-        .next()
-        .and_then(|row| row.get(0)?.parse::<u64>().ok())
-        .ok_or_else(|| fatal("SHOW laminar.read_epoch returned no epoch"))?;
-    let buckets = rows_of(&rows)
-        .map(|row| {
-            let mut values = [0; 4];
-            for (index, value) in values.iter_mut().enumerate() {
-                *value = row
-                    .get(index)
-                    .and_then(|text| text.parse().ok())
-                    .ok_or_else(|| fatal("a view column is not a BIGINT"))?;
-            }
-            Ok(values)
-        })
-        .collect::<Result<_, ReadFailure>>()?;
-    Ok((epoch, buckets))
-}
-
-fn rows_of(
-    messages: &[tokio_postgres::SimpleQueryMessage],
-) -> impl Iterator<Item = &tokio_postgres::SimpleQueryRow> {
-    messages.iter().filter_map(|message| match message {
-        tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
-        _ => None,
-    })
 }

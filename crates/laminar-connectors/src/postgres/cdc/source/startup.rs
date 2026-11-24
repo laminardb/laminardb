@@ -3,7 +3,7 @@
 
 use arrow_schema::SchemaRef;
 
-use crate::connector::ProcessLeaseCheck;
+use crate::connector::{ProcessLeaseCheck, ReplayRequirement};
 
 use super::super::config::{PostgresCdcConfig, SnapshotMode};
 use super::super::postgres_io::{
@@ -16,7 +16,8 @@ use super::super::schema_resolution::{bind_layout, validate_relation};
 use super::super::typed_rows::RowLayout;
 use super::checkpoint::{validate_live_binding, Cursor, CursorPhase, SnapshotPosition};
 use super::claim::{
-    busy, report_orphans, require_live, settle, warn_orphaning, ResumeAction, SlotClaim,
+    busy, report_orphans, require_live, require_resumable_copy, settle, warn_orphaning,
+    ResumeAction, SlotClaim,
 };
 use super::reader::{run_wal_reader, OwnedWalPayload, WalPayloadRx, WalTerminalError};
 use super::snapshot::{copy_problem, CopyPlan};
@@ -72,6 +73,7 @@ pub(super) struct StartInputs<'a> {
     pub(super) committed_relation: Option<&'a RelationInfo>,
     pub(super) incarnation: &'a str,
     pub(super) process_lease: Option<&'a ProcessLeaseCheck>,
+    pub(super) replay_requirement: ReplayRequirement,
 }
 
 pub(super) struct ReaderRuntime {
@@ -104,6 +106,14 @@ pub(super) async fn prepare(
 ) -> Result<PreparedStart, ConnectorError> {
     require_live(inputs.process_lease)?;
     let config = inputs.config;
+    if let Some(cursor) = &cursor {
+        require_resumable_copy(
+            &cursor.phase,
+            config.output_mode,
+            inputs.replay_requirement,
+            &cursor.claim,
+        )?;
+    }
     let claim = cursor.as_ref().map_or_else(
         || SlotClaim::generate(&config.slot_name),
         |cursor| cursor.claim.clone(),

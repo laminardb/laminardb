@@ -1,3 +1,4 @@
+use super::sink_preparation::set_replay_requirements;
 #[cfg(feature = "cluster")]
 use super::{
     checked_pipeline_deadline, latch_cluster_terminal_data_plane,
@@ -549,8 +550,7 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
-        let stream_output_schemas = &resolved_stream_outputs.schemas;
-        self.install_stream_schemas(stream_output_schemas);
+        self.install_stream_schemas(&resolved_stream_outputs.schemas);
 
         #[cfg(feature = "cluster")]
         let (restored_graph, topology_metadata) = match topology {
@@ -614,7 +614,7 @@ impl LaminarDB {
             .prepare_pipeline_sinks(
                 &sources,
                 &sink_regs,
-                stream_output_schemas,
+                &resolved_stream_outputs.schemas,
                 &resolved_stream_outputs.changelog_carrying,
                 &mutation_routes.direct,
                 runtime_mode,
@@ -623,6 +623,7 @@ impl LaminarDB {
                 prom_registry.as_ref(),
             )
             .await?;
+        set_replay_requirements(&mut sources, &sink_setup.sinks, &sink_regs, &stream_regs);
         #[cfg(feature = "cluster")]
         let recovery = if let Some(metadata) = topology_metadata.as_ref() {
             self.install_topology_runtime_state(graph, metadata).await?

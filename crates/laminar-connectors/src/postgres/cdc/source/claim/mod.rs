@@ -8,7 +8,7 @@
 
 mod creation;
 
-use crate::connector::{ProcessLeaseCheck, SourceBatch};
+use crate::connector::{ProcessLeaseCheck, ReplayRequirement, SourceBatch};
 
 use super::super::config::{OutputMode, PostgresCdcConfig};
 use super::super::postgres_io::slots::{self, PrefixSlot, SlotFacts, SlotHolder};
@@ -123,26 +123,42 @@ pub(super) enum ResumeAction {
     FailClosed(String),
 }
 
+/// Refuse a resume inside a changelog copy when a replay must repeat the failed attempt's
+/// output. The resumed copy reads its next chunks at a newer snapshot, so a row the failed
+/// attempt copied after this cursor, and that was deleted before the copy reached it again, is
+/// never retracted. An upsert copy resumes anyway: it never suppresses a tombstone.
+///
+/// # Errors
+/// Returns a configuration error with the reset instructions for such a resume.
+pub(super) fn require_resumable_copy(
+    phase: &CursorPhase,
+    output: OutputMode,
+    replay: ReplayRequirement,
+    claim: &SlotClaim,
+) -> Result<(), ConnectorError> {
+    match (phase, output, replay) {
+        (CursorPhase::Snapshot(_), OutputMode::Changelog, ReplayRequirement::RepeatOutput) => {
+            let name = claim.slot();
+            Err(ConnectorError::ConfigurationError(format!(
+                "the checkpoint was captured inside the initial snapshot of slot '{name}', which \
+                 a changelog source resumes only when no at-least-once sink that applies changes \
+                 by key reads it: {}",
+                reset_instructions(name)
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The restart matrix: the action a committed cursor `phase` takes on its claimed slot.
 pub(super) fn resume_action(
     phase: &CursorPhase,
     slot: Option<&SlotFacts>,
-    output: OutputMode,
     claim: &SlotClaim,
     incarnation: &str,
 ) -> ResumeAction {
     let name = claim.slot();
     match (phase, slot) {
-        // A sink may already hold rows the failed attempt copied after this cursor. Upsert
-        // targets converge because tombstones are never suppressed during the copy; a changelog
-        // consumer would keep a row deleted before it was copied again.
-        (CursorPhase::Snapshot(_), _) if output == OutputMode::Changelog => {
-            ResumeAction::FailClosed(format!(
-                "the checkpoint was captured inside the initial snapshot of slot '{name}', \
-                 which a changelog source cannot resume: {}",
-                reset_instructions(name)
-            ))
-        }
         (CursorPhase::Claimed, None) => ResumeAction::Create,
         (CursorPhase::Snapshot(_) | CursorPhase::Streaming { .. }, None) => {
             ResumeAction::FailClosed(format!(
@@ -265,7 +281,6 @@ pub(super) async fn settle(
         Ok::<_, ConnectorError>(resume_action(
             phase,
             inspected.slot.as_ref(),
-            config.output_mode,
             claim,
             incarnation,
         ))
@@ -390,6 +405,7 @@ impl PostgresCdcSource {
         Ok(ChunkedSnapshot::new(
             Arc::clone(plan),
             self.claim()?.application_name(&self.incarnation),
+            self.process_lease.clone(),
             Some(floor),
         ))
     }

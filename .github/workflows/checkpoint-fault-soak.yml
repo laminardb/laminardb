@@ -380,6 +380,40 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs redpanda postgres
             candidate: "true"
+          - label: Cluster ALO PostgreSQL changelog source (gossip)
+            test: postgres_changelog_source::three_node_postgres_changelog_kill9_soak
+            features: cluster,aws,kafka,postgres-cdc,postgres-sink
+            delivery: alo
+            topology: cluster-postgres-changelog
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # One node at a time copies a seeded table, then streams its slot; the copying node
+            # is killed and a survivor continues the copy, and every node's committed read of the
+            # view over the changelog must equal the table's aggregate.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs postgres
+            candidate: "true"
+          - label: Cluster ALO PostgreSQL upsert copy into an interval join (gossip)
+            test: postgres_upsert_copy_source::three_node_postgres_upsert_copy_interval_kill9_soak
+            features: cluster,aws,kafka,postgres-cdc,postgres-sink
+            delivery: alo
+            topology: cluster-postgres-upsert-copy
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # An upsert source copies a seeded quotes table as an interval join's right side; the
+            # copying node is killed, and every Kafka trade must reach the output joined to its
+            # one quote.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs redpanda postgres
+            candidate: "true"
           - label: Cluster ALO PostgreSQL sink (gossip)
             test: multi_writer_sinks::three_node_postgres_sink_kill9_soak
             features: cluster,aws,kafka,postgres-sink

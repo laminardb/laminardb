@@ -1596,11 +1596,11 @@ async fn snapshot_longer_than_the_checkpoint_timeout_completes() {
     db.shutdown().await.expect("shutdown");
 }
 
-/// A changelog target fed before a restart inside the copy may keep a row the failed attempt
-/// copied and that changed before the range was copied again, so a changelog source fails closed
-/// with reset guidance instead of resuming the copy.
+/// A keyed changelog sink fed before a restart inside the copy may keep a row the failed attempt
+/// copied and that was deleted before the range was copied again, so a changelog source read by
+/// one fails closed with reset guidance instead of resuming the copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restart_inside_the_snapshot_fails_closed() {
+async fn restart_inside_the_snapshot_fails_closed_under_a_keyed_sink() {
     let Some(client) = postgres().await else {
         return;
     };
@@ -1638,6 +1638,162 @@ async fn restart_inside_the_snapshot_fails_closed() {
         "{error}"
     );
     let _ = db.shutdown().await;
+}
+
+const NARROW_ROWS: i64 = 200_000;
+
+/// `label -> (SUM(qty), COUNT(*))` of the `totals` view.
+async fn view_totals(db: &LaminarDB) -> Totals {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{DataType, Int64Type};
+
+    let laminar_db::ExecuteResult::Query(mut query) = db
+        .execute("SELECT label, total, n FROM totals")
+        .await
+        .expect("query the view")
+    else {
+        panic!("expected a query result");
+    };
+    let batches = tokio::time::timeout(
+        CONVERGE,
+        query.subscribe_raw().expect("subscribe").read_all(),
+    )
+    .await
+    .expect("the view read in time")
+    .expect("read the view");
+    let mut totals = Totals::new();
+    for batch in &batches {
+        let column = |index: usize, kind: &DataType| {
+            arrow::compute::cast(batch.column(index), kind).expect("view column type")
+        };
+        let (labels, sums, counts) = (
+            column(0, &DataType::Utf8),
+            column(1, &DataType::Int64),
+            column(2, &DataType::Int64),
+        );
+        let (labels, sums, counts) = (
+            labels.as_string::<i32>(),
+            sums.as_primitive::<Int64Type>(),
+            counts.as_primitive::<Int64Type>(),
+        );
+        for row in 0..batch.num_rows() {
+            totals.insert(
+                labels.value(row).to_string(),
+                (sums.value(row), counts.value(row)),
+            );
+        }
+    }
+    totals
+}
+
+/// A database checkpointing every 100 ms whose sources return at most 64 rows per poll, so a
+/// chunk of the copy is emitted in many pieces and barriers arrive between them.
+async fn open_with_small_polls(storage: &Path) -> std::sync::Arc<LaminarDB> {
+    LaminarDB::builder()
+        .storage_dir(storage)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: Some(100),
+            ..Default::default()
+        })
+        .buffer_size(64)
+        .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .config_var("E2E_PG_PASSWORD", PASSWORD)
+        .build()
+        .await
+        .expect("open database")
+}
+
+/// A changelog source that no at-least-once keyed sink reads resumes its copy from a cut inside
+/// it. Chunks of thousands of narrow rows are emitted in many pieces, so only the rule that a
+/// cut stands between chunks keeps a resumed chunk from counting its rows twice. Rows in the
+/// uncopied range change, move and disappear while the pipeline is down, and the view, restored
+/// from the cut, must end equal to the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changelog_copy_read_only_by_a_view_resumes_inside_the_snapshot_exactly() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    let t = &capture.table;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {t} SELECT g, CASE WHEN g % 3 = 0 THEN 'OPEN' ELSE 'CLOSED' END, \
+             g % 1000 FROM generate_series(1, {NARROW_ROWS}) g"
+        ))
+        .await
+        .unwrap();
+    let statements = vec![
+        capture.source(
+            "orders",
+            CHANGELOG_COLUMNS,
+            ", 'output.mode' = 'changelog', 'max.buffered.bytes' = '4194304'",
+        ),
+        "CREATE MATERIALIZED VIEW totals AS SELECT label, SUM(qty) AS total, COUNT(*) AS n \
+         FROM orders GROUP BY label"
+            .to_string(),
+    ];
+    let storage = tempfile::tempdir().unwrap();
+    let db = open_with_small_polls(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let copied = |totals: &Totals| totals.values().map(|(_, n)| n).sum::<i64>();
+    let partial = eventually(
+        CONVERGE,
+        || view_totals(&db),
+        |totals| copied(totals) > NARROW_ROWS / 10,
+    )
+    .await;
+    db.shutdown().await.expect("shutdown");
+    assert!(
+        copied(&partial) > NARROW_ROWS / 10 && copied(&partial) < NARROW_ROWS,
+        "the restart lands inside the copy ({} rows copied)",
+        copied(&partial)
+    );
+    let slots = slots_under(&client, &capture.slot).await;
+    assert_eq!(slots.len(), 1, "{slots:?}");
+
+    let half = NARROW_ROWS / 2;
+    client
+        .batch_execute(&format!(
+            "DELETE FROM {t} WHERE id > {half} AND id % 97 = 0; \
+             UPDATE {t} SET qty = qty + 1, label = 'OPEN' WHERE id % 101 = 0; \
+             UPDATE {t} SET id = id + {NARROW_ROWS} WHERE id > {half} AND id % 103 = 0; \
+             DELETE FROM {t} WHERE id <= 100;"
+        ))
+        .await
+        .unwrap();
+    let db = reopen(storage.path(), &statements).await;
+    let registry = Arc::new(prometheus::Registry::new());
+    db.set_prometheus_registry(Arc::clone(&registry)).unwrap();
+    db.start()
+        .await
+        .expect("a changelog copy read only by a view resumes");
+    let expected = totals(
+        &client,
+        &format!("SELECT label, SUM(qty)::bigint, COUNT(*) FROM {t} GROUP BY label"),
+    )
+    .await;
+    let observed = eventually(CONVERGE, || view_totals(&db), |got| got == &expected).await;
+    assert_eq!(observed, expected, "the view after the resumed copy");
+    // A restart after the copy ended streams without copying a row.
+    let copied_after_restart: f64 = registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "postgres_cdc_snapshot_rows_total")
+        .flat_map(|family| family.get_metric())
+        .map(|metric| metric.get_counter().value())
+        .sum();
+    assert!(
+        copied_after_restart > 0.0,
+        "the restart resumed inside the copy"
+    );
+    assert_eq!(
+        slots_under(&client, &capture.slot).await,
+        slots,
+        "the copy resumes on its slot"
+    );
+    assert_eq!(db.last_fault(), None);
+    db.shutdown().await.expect("shutdown");
 }
 
 /// A few writes spread over ids `1..=rows`: updates, deletes, inserts, and a primary-key change.

@@ -55,6 +55,7 @@ impl SourceActorSpawner<'_> {
             primary_key_indices,
             schema_admitted: _,
             admitted_non_append_mode,
+            replay_requirement: _,
             task_fence,
         } = registration;
         let terminal_tasks = task_fence.tracker();

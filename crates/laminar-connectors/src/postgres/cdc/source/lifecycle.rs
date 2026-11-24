@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
-    SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart, SourceTopology,
+    ConnectorTaskTracker, SourceBatch, SourceCheckpointUnavailablePolicy, SourceConnector,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
+    SourceRowPositionCapability, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
-use super::super::config::{OutputMode, PostgresCdcConfig, SnapshotMode};
+use super::super::config::{OutputMode, PostgresCdcConfig};
 use super::super::schema_resolution::{committed_relation, declared_primary_key, declared_schema};
 use super::super::typed_rows::RowBuilder;
 use super::checkpoint::{parse_cursor, validate_live_binding, write_cursor, CursorPhase};
@@ -292,6 +293,7 @@ impl SourceConnector for PostgresCdcSource {
             }
         }
         let process_lease = request.process_lease().cloned();
+        let replay_requirement = request.replay_requirement();
         let (config, position, _) = request.into_parts();
         let parsed = parsed_config(&self.config, &config)?;
         let declared = declared_schema(&config, None)?;
@@ -324,6 +326,7 @@ impl SourceConnector for PostgresCdcSource {
                 committed_relation: committed.as_ref(),
                 incarnation: &incarnation,
                 process_lease: process_lease.as_ref(),
+                replay_requirement,
             },
             cursor,
         )
@@ -364,6 +367,7 @@ impl SourceConnector for PostgresCdcSource {
                 let snapshot = ChunkedSnapshot::resume(
                     plan,
                     claim.application_name(&self.incarnation),
+                    self.process_lease.clone(),
                     position,
                 )?;
                 self.consistent_point = Some(consistent_point);
@@ -437,6 +441,17 @@ impl SourceConnector for PostgresCdcSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         self.cursor()
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        if matches!(&self.phase, Phase::Snapshot(snapshot) if snapshot.is_emitting_chunk()) {
+            return Ok(None);
+        }
+        Ok(Some(self.cursor()))
+    }
+
+    fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
+        SourceCheckpointUnavailablePolicy::PollToReplayBoundary
     }
 
     async fn notify_epoch_committed(
@@ -531,15 +546,10 @@ impl SourceConnector for PostgresCdcSource {
             input_mode,
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic);
-        // Any one node may stream the slot: the cursor holds the claim and position, and a node
-        // ends another session of the claim only while its process lease is live. The copy and
-        // changelog mode are not qualified for cluster sources.
-        Ok(match (parsed.output_mode, parsed.snapshot_mode) {
-            (OutputMode::Upsert, SnapshotMode::Never) => {
-                contract.with_cluster_singleton_placement()
-            }
-            _ => contract,
-        })
+        // Any one node may stream the slot and continue the copy: the cursor holds the claim, the
+        // position and the copy's progress, and a node ends another session of the claim only
+        // while its process lease is live.
+        Ok(contract.with_cluster_singleton_placement())
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {

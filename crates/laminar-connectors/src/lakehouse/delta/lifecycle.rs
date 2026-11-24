@@ -61,6 +61,11 @@ impl SinkConnector for DeltaLakeSink {
             DeltaWriteMode::Overwrite => SinkInputMode::AppendOnly,
         };
         let contract = SinkContract::new(consistency, topology, input_mode);
+        let contract = if cfg.write_mode == DeltaWriteMode::Append {
+            contract.with_appended_changes()
+        } else {
+            contract
+        };
         let cluster_exact_target = StorageProvider::is_direct_s3_uri(&cfg.table_path);
         Ok(
             if consistency == SinkConsistency::CheckpointCommittable && cluster_exact_target {
