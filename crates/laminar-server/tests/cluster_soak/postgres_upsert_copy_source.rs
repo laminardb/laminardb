@@ -1,16 +1,17 @@
 //! Three-node at-least-once soak for a PostgreSQL CDC source in upsert mode with the initial
 //! copy, which one node at a time reads, as an interval join's left side. The quotes table is
 //! keyed by `(at, key)`, so the copy reads it in event-time order, and before any node starts it
-//! holds one wide row per key and second of a historical stretch: the copy outlasts the start. Kafka
-//! already holds one trade for every fourth second, each matching exactly one quote, its key's at
-//! the start of the trade's second. A stream keeps a trade only when the join found that quote,
-//! and a keyed materialized view folds the quote values of those trades by trade id bucket.
+//! holds one wide row per key and second of a historical stretch: the copy outlasts the start.
+//! Kafka already holds one trade for every fourth second, each matching exactly one quote, its
+//! key's at the start of the trade's second. A keyed materialized view folds every joined quote
+//! value by trade id bucket.
 //!
 //! The first round kills the node copying the table, and a survivor must continue the copy. Then
 //! the observed leader and each follower are killed inside a checkpoint and rejoin
 //! (`kill_rejoin`). Operator state and source positions commit in one cut, so every node's
-//! committed read of the view must equal the buckets of every produced trade, each once: a lost,
-//! repeated or wrongly copied quote changes a bucket. The quotes must never claim a second slot.
+//! committed read of the view must equal the buckets of every produced trade joined to its one
+//! quote, each once: a lost, repeated, extra or wrongly copied quote changes a bucket. The quotes
+//! must never claim a second slot.
 //!
 //! ```text
 //! cargo test --profile soak -p laminar-server --no-default-features \
@@ -102,7 +103,7 @@ fn three_node_postgres_upsert_copy_interval_kill9_soak() {
         &log_dir,
         &settings,
         &checkpoint_url,
-        &view_sql("correctly_quoted"),
+        &view_sql("quoted"),
         &workload(&brokers, &topic, &capture, &postgres.source_properties()),
     );
     let mut live = || {};
@@ -198,10 +199,6 @@ name = "key"
 type = "BIGINT"
 nullable = false
 [[source.schema]]
-name = "expected"
-type = "BIGINT"
-nullable = false
-[[source.schema]]
 name = "at"
 type = "TIMESTAMP"
 nullable = false
@@ -212,15 +209,10 @@ max_out_of_orderness = "1s"
 [[pipeline]]
 name = "quoted"
 sql = """
-SELECT t.id AS id, t.expected AS expected, q.value AS value
+SELECT t.id AS id, q.value AS amount
 FROM quotes q JOIN trades t
   ON q.key = t.key AND t.at BETWEEN q.at AND q.at + INTERVAL '1' SECOND
 """
-
-# A trade joined to no quote or another one is dropped here, so its bucket falls short.
-[[pipeline]]
-name = "correctly_quoted"
-sql = "SELECT id, value AS amount FROM quoted WHERE value = expected"
 "#
     )
 }
@@ -250,10 +242,10 @@ fn create_and_seed(postgres: &Postgres, capture: &Capture, seconds: i64) {
     });
 }
 
-/// Trade `id` at half past second `id * TRADE_EVERY_SECONDS` on key `id % KEYS`, expecting that
-/// key's quote of that second, then one trade per partition on a key with no quotes, ten seconds
-/// past the quotes, so every partition's watermark passes the last matched trade. Returns the
-/// records and the number of matched trades, ids `0..`.
+/// Trade `id` at half past second `id * TRADE_EVERY_SECONDS` on key `id % KEYS`, which joins
+/// that key's quote of that second, then one trade per partition on a key with no quotes, ten
+/// seconds past the quotes, so every partition's watermark passes the last matched trade. Returns
+/// the records and the number of matched trades, ids `0..`.
 fn trades(seconds: i64) -> (Vec<(i32, String, String)>, i64) {
     let matched = seconds / TRADE_EVERY_SECONDS;
     let partitions = i64::from(TRADE_PARTITIONS);
@@ -264,8 +256,7 @@ fn trades(seconds: i64) -> (Vec<(i32, String, String)>, i64) {
         .map(|(id, key, second)| {
             let partition = i32::try_from(id % partitions).expect("partitions fit i32");
             let payload = format!(
-                r#"{{"id":{id},"key":{key},"expected":{},"at":{}}}"#,
-                second * 1000 + key,
+                r#"{{"id":{id},"key":{key},"at":{}}}"#,
                 FIRST_SECOND_MS + second * 1000 + 500
             );
             (partition, id.to_string(), payload)

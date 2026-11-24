@@ -613,8 +613,8 @@ committed after it was copied: no gap and no overlap.
   most 5 s for its lock, each statement in it runs for at most 20 s, and an attempt that takes
   longer than 30 s is abandoned and retried on a new session. One poll can still take up to
   60 s against a slow server, so keep the checkpoint timeout above that while a copy runs (the
-  default is 120 s): a poll that exceeds it fails the source, and in `changelog` mode that
-  failure needs the reset below.
+  default is 120 s): a poll that exceeds it fails the source, and the restart resumes the copy
+  as described below.
 - A chunk is emitted once the stream has passed the position it was read at, in batches of the
   pipeline's poll size, so a chunk of wide rows still fits a sink's input limit. Changes its
   snapshot missed are merged into it first. A change is matched to a chunk by transaction
@@ -630,10 +630,12 @@ committed after it was copied: no gap and no overlap.
 - A change to the table's columns, types, replica identity or primary key during the copy stops
   the source before the next chunk is read. A table rewrite is not visible consistently to a
   snapshot taken across it.
-- A restart inside the copy resumes it in `upsert` mode. Deletes are always forwarded during the
-  copy, so rows the target received before the restart are corrected. In `changelog` mode the
-  restart fails closed and names the reset: a changelog consumer would keep rows it received
-  before the restart that changed before they were copied again.
+- A restart inside the copy resumes it from the last checkpoint. In `upsert` mode deletes are
+  always forwarded during the copy, so rows the target received before the restart are
+  corrected. In `changelog` mode it resumes unless a sink that applies changes by key reads the
+  source at at-least-once (see [Delivery, recovery and
+  resources](#delivery-recovery-and-resources)); then the restart fails closed and names the
+  reset.
 - The copy needs a primary server, because it reads WAL insert positions. Primary-key columns
   must use deterministic collations, the column's own collation in the index, and the default
   operator class: keys are compared on the server in the index's order, and equal keys must be

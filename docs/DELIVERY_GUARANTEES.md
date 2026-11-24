@@ -241,8 +241,8 @@ node's committed read of the view must equal the aggregate of the table, and the
 one slot. `postgres_upsert_copy_source::three_node_postgres_upsert_copy_interval_kill9_soak`
 (candidate) copies an upsert quotes table keyed by `(at, key)`, in event-time order, as an
 interval join's input against Kafka trades that each match one quote, kills the node copying it,
-then runs the same kills; every node's committed read of a view over the correctly joined trades
-must hold each trade once.
+then runs the same kills; every node's committed read of a view over every joined quote must
+hold each trade's one quote once.
 
 ## Materialized view reads
 
