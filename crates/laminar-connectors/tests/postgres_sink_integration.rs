@@ -540,6 +540,61 @@ async fn changelog_upsert_and_delete(operation_type: DataType) {
     sink.close().await.expect("close");
 }
 
+// ── At-least-once replay into a changelog target ───────────────────
+
+/// A failed attempt wrote a row's insert; the replay after it flushes the insert and its delete
+/// together. Netting the pair to nothing would leave the row behind; the delete must still apply.
+#[tokio::test]
+async fn test_changelog_replay_deletes_a_row_a_failed_attempt_wrote() {
+    let (_container, host, port) = start_pg().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("__weight", DataType::Int64, false),
+    ]));
+    let batch = |weights: &[i64]| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![7; weights.len()])),
+                Arc::new(StringArray::from(vec!["seven"; weights.len()])),
+                Arc::new(Float64Array::from(vec![7.0; weights.len()])),
+                Arc::new(Int64Array::from(weights.to_vec())),
+            ],
+        )
+        .expect("weighted batch")
+    };
+    let mut config = sink_config(&host, port, WriteMode::Upsert);
+    config.changelog_mode = true;
+
+    let mut failed_attempt = PostgresSink::new(Arc::clone(&schema), config.clone(), None);
+    failed_attempt
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open");
+    failed_attempt.write_batch(&batch(&[1])).await.expect("write");
+    failed_attempt.flush().await.expect("flush the insert");
+    failed_attempt.close().await.expect("close");
+
+    let mut replay = PostgresSink::new(Arc::clone(&schema), config, None);
+    replay
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open");
+    replay.write_batch(&batch(&[1, -1])).await.expect("write");
+    replay.flush().await.expect("flush the replay");
+    replay.close().await.expect("close");
+
+    let rows: i64 = connect(&host, port)
+        .await
+        .query_one("SELECT COUNT(*) FROM public.test_events", &[])
+        .await
+        .expect("count rows")
+        .get(0);
+    assert_eq!(rows, 0, "the replay left the row its delete retracts");
+}
+
 // ── A target shared by key across cluster nodes ────────────────────
 
 /// A changelog target that several cluster nodes write by key refuses a unique constraint beyond

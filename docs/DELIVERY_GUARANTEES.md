@@ -152,6 +152,21 @@ and before each release, but do not yet fail the `Checkpoint fault and soak` wor
 | MongoDB insert | Collection, documents counted per id | `three_node_mongodb_sink_kill9_soak` |
 | NATS JetStream | File-backed stream with three replicas, drained by a durable consumer | `three_node_nats_sink_kill9_soak` |
 
+The PostgreSQL and MongoDB upsert sinks apply rows by key, so a cluster admits them only when each
+key is produced on one node at a time: the input is partitioned by columns that are all in the
+sink's key, sits on one vnode, or is projected from one source that runs on one node at a time.
+Other inputs are rejected before I/O. A node that hands vnodes over flushes before the handoff
+cut commits and writes nothing after it. A PostgreSQL writer sends `COMMIT` only after every
+statement returned and while its lease is live, so a stale writer cannot overwrite a key its
+successor took over. MongoDB writes are not transactional: a write sent just before a process's
+lease expired can land after its successor's and leave the key's older value until its next
+change. `keyed_sinks::three_node_postgres_keyed_sinks_kill9_soak` (candidate) replicates a
+PostgreSQL CDC `changelog` source into a table keyed by `id`, and writes a keyed aggregate over
+it to a PostgreSQL table and a MongoDB collection keyed by its group. It runs the kill and
+rejoin rounds and a paused-owner round while a writer inserts, updates and deletes rows; once the
+writer stops, the replica must equal the table, and the aggregate table and collection must
+equal the aggregate over the table.
+
 ## Evidence for cluster at-least-once sources
 
 Kafka and the split Generator read one channel per vnode owner. A RabbitMQ queue has no channels to
@@ -233,8 +248,8 @@ the table's final snapshot, and more than one node must have read the table.
 
 A PostgreSQL CDC source in `changelog` mode, or in `upsert` mode with the initial copy, also
 runs on one node at a time. A checkpoint inside the copy stands between chunks, and the next
-owner continues the copy from it. A `changelog` copy resumes only when no at-least-once sink that
-applies changes by key reads the source; in a cluster none can until mutable sinks run there.
+owner continues the copy from it. A `changelog` copy resumes after a crash only when no
+at-least-once sink that applies changes by key reads the source, and after a handoff always.
 `postgres_changelog_source::three_node_postgres_changelog_kill9_soak` (candidate) seeds a table
 of wide rows, so the copy outlasts the start, kills the node copying it and requires a survivor
 to continue, then runs the same kills and a paused-owner round while a writer inserts, updates

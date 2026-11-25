@@ -17,11 +17,16 @@ use crate::error::ConnectorError;
 ///
 /// Two input encodings are detected automatically:
 ///
-/// - **Z-set** (the `__weight` column is present): identical full rows are
-///   consolidated by summing their weights, net-zero rows are dropped, then the
-///   survivors are grouped by `merge_key`. A key with a net-positive (live) row
-///   becomes a `U` carrying that value; a key with only net-negative rows
-///   becomes a `D`. The `__weight` column is stripped from the output.
+/// - **Z-set** (the `__weight` column is present): rows are grouped by
+///   `merge_key`, and a key's identical full rows are consolidated by summing
+///   their weights. A key with a net-positive (live) row becomes a `U` carrying
+///   that value; a key with only net-negative rows becomes a `D`. A key whose
+///   rows all cancel takes the sign of its last row in arrival order: `U` after
+///   a final insertion, `D` after a final retraction. Applied to the state before
+///   the batch that is a no-op, but an at-least-once replay can meet a target
+///   that already holds part of the batch from a failed attempt, such as a row
+///   the batch inserts and then deletes; the `D` removes it. The `__weight`
+///   column is stripped from the output.
 /// - **CDC** (no `__weight`): the last-arriving row per `merge_key` wins (row
 ///   order is arrival order). Its op is normalized to `D` for deletes
 ///   (`_op ∈ {D, U-}`) and `U` for everything else. A batch with neither column
@@ -104,7 +109,6 @@ fn collapse_zset(
     merge_key: &[String],
     weight_idx: usize,
 ) -> Result<RecordBatch, ConnectorError> {
-    let num_rows = batch.num_rows();
     let weights = batch
         .column(weight_idx)
         .as_any()
@@ -116,78 +120,57 @@ fn collapse_zset(
     let user_indices: Vec<usize> = (0..batch.num_columns())
         .filter(|&i| !is_metadata_column(schema.field(i).name()))
         .collect();
-
-    // 1. Consolidate identical full rows, summing weights; keep net-nonzero.
-    //    `survivors` holds (representative row index, net weight).
     let full_rows = rows_over(batch, &user_indices)?;
-    let mut order: Vec<usize> = (0..num_rows).collect();
-    order.sort_unstable_by(|&a, &b| full_rows.row(a).cmp(&full_rows.row(b)));
-
-    let mut survivors: Vec<(usize, i64)> = Vec::new();
-    let mut i = 0;
-    while i < order.len() {
-        let rep = order[i];
-        let rep_row = full_rows.row(rep);
-        let mut sum = 0i64;
-        let mut j = i;
-        while j < order.len() && full_rows.row(order[j]) == rep_row {
-            sum += weights.value(order[j]);
-            j += 1;
-        }
-        if sum != 0 {
-            survivors.push((rep, sum));
-        }
-        i = j;
-    }
-
-    if survivors.is_empty() {
-        return build_output(batch, &user_indices, &[], &[]);
-    }
-
-    // 2. Group survivors by merge key; one output row per key.
     let key_rows = rows_over(batch, &index_of_all(batch, merge_key))?;
-    survivors
-        .sort_unstable_by(|&(a, _), &(b, _)| key_rows.row(a).cmp(&key_rows.row(b)).then(a.cmp(&b)));
 
-    let mut selected: Vec<usize> = Vec::new();
-    let mut ops: Vec<&str> = Vec::new();
-    let mut g = 0;
-    while g < survivors.len() {
-        let key = key_rows.row(survivors[g].0);
-        let mut live: Option<usize> = None;
-        let mut live_count = 0usize;
-        let mut first_negative: Option<usize> = None;
-        let mut h = g;
-        while h < survivors.len() && key_rows.row(survivors[h].0) == key {
-            let (idx, weight) = survivors[h];
-            if weight > 0 {
-                live_count += 1;
-                if live.is_none() {
-                    live = Some(idx);
-                }
-            } else if first_negative.is_none() {
-                first_negative = Some(idx);
-            }
-            h += 1;
-        }
-        if live_count > 1 {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "changelog collapse: merge.key.columns {merge_key:?} is not unique — {live_count} \
-                 distinct live rows share one key in a single epoch; declare a merge key that is \
-                 unique over the materialized-view output"
-            )));
-        }
-        if let Some(idx) = live {
-            selected.push(idx);
-            ops.push("U");
-        } else if let Some(idx) = first_negative {
-            selected.push(idx);
-            ops.push("D");
-        }
-        g = h;
+    // Rows grouped by key, in arrival order within each key.
+    let mut order: Vec<usize> = (0..batch.num_rows()).collect();
+    order.sort_unstable_by(|&a, &b| key_rows.row(a).cmp(&key_rows.row(b)).then(a.cmp(&b)));
+    let mut selected = Vec::new();
+    let mut ops = Vec::new();
+    for key_group in order.chunk_by(|&a, &b| key_rows.row(a) == key_rows.row(b)) {
+        let (row, op) = collapse_key(key_group, &full_rows, weights, merge_key)?;
+        selected.push(row);
+        ops.push(op);
     }
-
     build_output(batch, &user_indices, &selected, &ops)
+}
+
+/// The one change that `key_group`, one key's rows in arrival order, leaves.
+fn collapse_key(
+    key_group: &[usize],
+    full_rows: &Rows,
+    weights: &Int64Array,
+    merge_key: &[String],
+) -> Result<(usize, &'static str), ConnectorError> {
+    let mut by_row = key_group.to_vec();
+    by_row.sort_by(|&a, &b| full_rows.row(a).cmp(&full_rows.row(b)));
+    let mut live = None;
+    let mut live_count = 0usize;
+    let mut retracted = None;
+    for same_row in by_row.chunk_by(|&a, &b| full_rows.row(a) == full_rows.row(b)) {
+        let net: i64 = same_row.iter().map(|&row| weights.value(row)).sum();
+        if net > 0 {
+            live_count += 1;
+            live.get_or_insert(same_row[0]);
+        } else if net < 0 {
+            retracted.get_or_insert(same_row[0]);
+        }
+    }
+    if live_count > 1 {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "changelog collapse: merge.key.columns {merge_key:?} is not unique — {live_count} \
+             distinct live rows share one key in a single epoch; declare a merge key that is \
+             unique over the materialized-view output"
+        )));
+    }
+    let last = key_group[key_group.len() - 1];
+    Ok(match (live, retracted) {
+        (Some(row), _) => (row, "U"),
+        (None, Some(row)) => (row, "D"),
+        (None, None) if weights.value(last) > 0 => (last, "U"),
+        (None, None) => (last, "D"),
+    })
 }
 
 /// CDC collapse: last-arriving row per merge key wins; op normalized to U/D.
@@ -390,16 +373,28 @@ mod tests {
     }
 
     #[test]
-    fn zset_insert_then_delete_within_epoch_is_noop() {
-        // +1 then -1 on the same full row nets zero → dropped entirely.
+    fn zset_insert_then_delete_within_epoch_deletes_the_key() {
+        // +1 then -1 on the same full row nets zero, but a replay can meet the row a failed
+        // attempt already wrote: the final retraction deletes it.
         let out = collapse_changelog(
             &zset_batch(&[("east", 10, 1), ("east", 10, -1)]),
             &keys(&["region"]),
         )
         .unwrap();
-        assert_eq!(out.num_rows(), 0);
+        assert_eq!(col_str(&out, "region"), vec!["east"]);
+        assert_eq!(col_str(&out, "_op"), vec!["D"]);
         assert!(out.schema().index_of(WEIGHT_COLUMN).is_err());
-        assert!(out.schema().index_of("_op").is_ok());
+    }
+
+    #[test]
+    fn zset_delete_then_reinsert_within_epoch_keeps_the_row() {
+        let out = collapse_changelog(
+            &zset_batch(&[("east", 10, -1), ("east", 10, 1)]),
+            &keys(&["region"]),
+        )
+        .unwrap();
+        assert_eq!(col_str(&out, "_op"), vec!["U"]);
+        assert_eq!(col_i64(&out, "total"), vec![10]);
     }
 
     #[test]

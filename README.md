@@ -363,7 +363,8 @@ key in a sink. A changelog (`output.mode = 'changelog'`) retracts the old row an
 one, so filters and `SUM`/`COUNT`/`AVG` totals stay exact as rows change or disappear. It runs
 embedded, on a single-node server, or in a cluster on one node at a time, with at-least-once
 delivery; in a cluster a changelog feeds aggregates and materialized views spread across the
-nodes.
+nodes, and PostgreSQL or MongoDB upsert sinks keyed by what each node owns
+([keyed sinks in a cluster](crates/laminar-connectors/README.md#keyed-sinks-in-a-cluster)).
 [Try it locally](crates/laminar-connectors/README.md#try-postgresql-cdc-locally) or read the
 [guide](crates/laminar-connectors/README.md#postgresql-cdc).
 

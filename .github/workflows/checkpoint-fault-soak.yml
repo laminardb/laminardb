@@ -397,6 +397,24 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs postgres
             candidate: "true"
+          - label: Cluster ALO keyed PostgreSQL and MongoDB sinks (gossip)
+            test: keyed_sinks::three_node_postgres_keyed_sinks_kill9_soak
+            features: cluster,aws,kafka,postgres-cdc,postgres-sink,mongodb-cdc
+            delivery: alo
+            topology: cluster-keyed-sinks
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # A PostgreSQL changelog source is replicated into a table keyed by id, and a keyed
+            # aggregate over it into a table and a MongoDB collection keyed by bucket. Each node
+            # writes the keys it owns through kills, rejoins and a paused owner, and every output
+            # must equal the source table.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs postgres mongodb
+            candidate: "true"
           - label: Cluster ALO PostgreSQL upsert copy into an interval join (gossip)
             test: postgres_upsert_copy_source::three_node_postgres_upsert_copy_interval_kill9_soak
             features: cluster,aws,kafka,postgres-cdc,postgres-sink

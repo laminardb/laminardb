@@ -669,10 +669,13 @@ committed after it was copied: no gap and no overlap.
 - In `changelog` mode a restart inside the copy resumes only when no at-least-once sink that
   applies changes by key reads the source, directly or through streams: a PostgreSQL upsert sink,
   a Kafka `envelope = 'upsert'` sink, a MongoDB or Delta upsert sink, or a sink without a
-  connector, which hands rows to the application. The resumed copy reads its next chunks at a
-  newer snapshot, so such a sink could keep a row the failed attempt copied and that was deleted
-  before the copy reached it again; with one, the restart fails closed and asks for the reset. Aggregates, views and exactly-once sinks restart from the checkpoint, so
-  they hold each row once. A Delta `append` sink at at-least-once can keep a change the failed
+  connector, which hands rows to the application. A stream on the way whose SQL cannot be parsed
+  counts as such a path, because its inputs are unknown. The resumed copy reads its next chunks
+  at a newer snapshot, so such a sink could keep a row the failed attempt copied and that was
+  deleted before the copy reached it again; with one, the restart fails closed and asks for the
+  reset. A move to another cluster node at a committed handoff always resumes: the previous owner
+  wrote nothing after the handoff cut. Aggregates, views and exactly-once sinks restart from the
+  checkpoint, so they hold each row once. A Delta `append` sink at at-least-once can keep a change the failed
   attempt wrote without its retraction, as any at-least-once replay into it can.
 - The PostgreSQL sink paces itself by how fast the target applied its recent statements. It
   flushes before the next batch would make a flush take more than half of `statement.timeout.ms`
@@ -728,9 +731,10 @@ committed after it was copied: no gap and no overlap.
 - In a cluster an upsert source may only be a temporal join's right side, with the watermark on
   `change.time.column` (so without the copy), or an interval join's input when its `PRIMARY KEY`
   holds every join column and the watermarked event-time column.
-- Until mutable sinks run in a cluster, a changelog source's consumers there are aggregates,
-  materialized views, and Delta `append` sinks on object storage, which keep `__weight`; so a
-  restart inside its copy always resumes.
+- In a cluster a changelog source's consumers are aggregates, materialized views, Delta `append`
+  sinks on object storage, which keep `__weight`, and PostgreSQL or MongoDB upsert sinks on input
+  [placed by their key](#keyed-sinks-in-a-cluster). Under such an upsert sink a crash inside the
+  copy fails closed, as on one node; a handoff to another node resumes it.
 - A source without the copy that a topology change adds to a running cluster starts from a claim
   recorded when the change was sealed; its first owner creates the slot. Adding a source that
   copies to a running cluster is rejected.
@@ -742,7 +746,8 @@ A primary-key change, or a unique value moving from one row to another, reaches 
 delete and an insert in the same epoch. The PostgreSQL sink applies each epoch in one transaction
 with `SET CONSTRAINTS ALL DEFERRED`, so other unique constraints on the target must be
 `DEFERRABLE`. Changelog upsert sinks reject non-deferrable unique or exclusion constraints and
-plain unique indexes at startup.
+plain unique indexes at startup, and in a cluster reject every unique or exclusion constraint
+other than the primary key ([keyed sinks in a cluster](#keyed-sinks-in-a-cluster)).
 
 ### Recovery and native client APIs
 
@@ -993,9 +998,10 @@ batch; lookups are separate.
 - A checkpoint waits for the commit or snapshot file the node is reading, and in a cluster every
   node's checkpoint waits with it; keep the cluster checkpoint timeout above the time to read
   the largest one.
-- Until mutable sinks run in a cluster, the feed's consumers there are aggregates, materialized
-  views, and Delta `append` sinks on object storage, which keep `__weight`. Upsert sinks stay
-  rejected in a cluster.
+- In a cluster the feed's consumers are aggregates, materialized views, Delta `append` sinks on
+  object storage, which keep `__weight`, and PostgreSQL or MongoDB upsert sinks on input
+  [placed by their key](#keyed-sinks-in-a-cluster). The Delta upsert sink stays rejected in a
+  cluster.
 - With `delivery = exactly_once`, the feed's changes go to Delta `append` on direct S3/S3A, the
   cluster exactly-once sink that takes a changelog (the Iceberg append sink takes none). The node
   reading the feed and the nodes writing its aggregates commit in the same checkpoint, so the sink
@@ -1082,8 +1088,8 @@ backpressures rather than dropping rows.
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | RabbitMQ | `rabbitmq` | Publisher-confirmed, mandatory publishes to one exchange; durable at-least-once for persistent messages on durable queues | Implemented |
 | IBM MQ | `ibmmq` | `MQPUT` under syncpoint with `MQCMIT` per unit of work; durable at-least-once for persistent messages | Implemented |
-| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
-| MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert, history `cdc_replay`, durable at-least-once | Implemented |
+| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once; upsert in a cluster on [input placed by its key](#keyed-sinks-in-a-cluster) | Implemented |
+| MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert, history `cdc_replay`, durable at-least-once; upsert in a cluster on [input placed by its key](#keyed-sinks-in-a-cluster) | Implemented |
 | Delta Lake | `delta-lake` | Coordinated append (cluster EO certified only for direct S3/S3A); at-least-once append, MERGE upsert on non-null keys, and whole-table overwrite | Implemented |
 | Iceberg | `iceberg` | Rolling append writer; direct ALO, coordinated local EO, and REST + direct S3/S3A cluster EO; MOR/COW fail closed | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
@@ -1193,6 +1199,47 @@ requirements:
   loudly if two live rows share a key, rather than dropping data.
 - **Partition or Z-order the table by the merge key** for copy-on-write MERGE
   performance (each commit then rewrites only the touched files).
+
+### Keyed sinks in a cluster
+
+Every cluster node writes the sink rows its own pipeline produces. A sink that applies rows by key
+(PostgreSQL `write.mode = 'upsert'`, with or without `changelog.mode`, and MongoDB
+`write.mode = 'upsert'`) runs at-least-once in a cluster only when each key is produced on one
+node at a time, so one writer applies each key's changes in order. The input must be one of:
+
+- partitioned by columns that are all in the sink's key: a keyed aggregate written to a sink keyed
+  by its group (`GROUP BY id` into `primary.key = 'id'`), or an interval join keyed by a join key;
+- on one vnode: a global aggregate;
+- projections and filters over one source that runs on one node at a time, such as a PostgreSQL
+  CDC source in `changelog` mode replicated into a table keyed by its primary key.
+
+Anything else is rejected at `CREATE SINK` and at startup: rows for one key could come from two
+nodes, and a key's retraction on one node with its new value on another would net to a delete.
+`GROUP BY a, b` into a sink keyed by `a` is rejected for that reason; key the sink by every group
+column, or aggregate by the sink key first. A sink reading a source directly is rejected in a
+cluster, as before.
+
+When vnodes move between nodes, the previous owner flushes what it wrote before the handoff cut
+commits and writes nothing after it, and the new owner writes the moved keys only once it owns
+them. After a failure, every node restarts from the committed checkpoint and repeats its output
+since, so each key converges on its latest value.
+
+- **PostgreSQL**: each flush is one transaction, and a process sends its `COMMIT` only after every
+  statement returned and only while its lease is live. A stale writer therefore cannot overwrite
+  the keys its successor took over: its uncommitted rows hold their row locks until PostgreSQL
+  ends the transaction. In a cluster the sink's sessions
+  end a transaction left idle longer than `statement.timeout.ms`
+  (`idle_in_transaction_session_timeout`), so a frozen process releases those locks. A
+  `changelog.mode` target may have no unique or exclusion constraint other than the primary key:
+  one node defers such a constraint to the end of its flush, but two nodes apply the keys they own
+  in separate transactions, so a value moving between their keys could collide.
+- **MongoDB** applies each write as it arrives, without a transaction. A write sent just before a
+  process's lease expired can reach the server after its successor's write of the same key, and
+  the key keeps the older value until its next change.
+- Kafka `envelope = 'upsert'` at at-least-once and Delta `write.mode = 'upsert'` stay rejected in a
+  cluster. librdkafka keeps retrying records a stale process queued, for up to
+  `delivery.timeout.ms`, and only a transactional producer fences another. Concurrent Delta MERGEs
+  from several nodes conflict.
 
 ## Key Modules
 

@@ -14,8 +14,8 @@ use mongodb::Client;
 use super::{block_on, setting, Destination, Observed, Oracle};
 
 /// Passed to the nodes as a reference, because a connection URI can carry credentials.
-const URI: &str = "LAMINAR_SOAK_MONGODB_URI";
-const DATABASE: &str = "laminar_soak";
+pub(crate) const URI: &str = "LAMINAR_SOAK_MONGODB_URI";
+pub(crate) const DATABASE: &str = "laminar_soak";
 
 pub(crate) struct MongoDb {
     uri: String,

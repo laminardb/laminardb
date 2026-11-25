@@ -141,6 +141,14 @@ mod mongodb_source;
 ))]
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
+#[cfg(all(
+    feature = "kafka",
+    feature = "postgres-cdc",
+    feature = "postgres-sink",
+    feature = "mongodb-cdc"
+))]
+#[path = "cluster_soak/keyed_sinks.rs"]
+mod keyed_sinks;
 #[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]
 #[path = "cluster_soak/postgres_changelog_source.rs"]
 mod postgres_changelog_source;

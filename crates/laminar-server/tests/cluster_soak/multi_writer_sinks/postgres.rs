@@ -71,6 +71,32 @@ password = "$${{{PASSWORD}}}"
         });
     }
 
+    /// The properties of a PostgreSQL sink that applies a changelog to `table` by `key`.
+    #[cfg(all(feature = "postgres-cdc", feature = "mongodb-cdc"))]
+    pub(crate) fn changelog_sink_properties(&self, table: &str, key: &str) -> String {
+        format!(
+            "{}\"table.name\" = \"{table}\"\n\"write.mode\" = \"upsert\"\n\"primary.key\" = \"{key}\"\n\
+             \"changelog.mode\" = \"true\"\n",
+            self.sink_connection()
+        )
+    }
+
+    fn sink_connection(&self) -> String {
+        format!(
+            r#"hostname = "{host}"
+port = "{port}"
+database = "{database}"
+username = "{username}"
+password = "$${{{PASSWORD}}}"
+"ssl.mode" = "disable"
+"#,
+            host = self.host,
+            port = self.port,
+            database = self.database,
+            username = self.username,
+        )
+    }
+
     fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password={}",
@@ -102,19 +128,8 @@ impl Destination for Postgres {
 
     fn sink_properties(&self, table: &str) -> String {
         format!(
-            r#"hostname = "{host}"
-port = "{port}"
-database = "{database}"
-username = "{username}"
-password = "$${{{PASSWORD}}}"
-"ssl.mode" = "disable"
-"table.name" = "{table}"
-"write.mode" = "append"
-"#,
-            host = self.host,
-            port = self.port,
-            database = self.database,
-            username = self.username,
+            "{}\"table.name\" = \"{table}\"\n\"write.mode\" = \"append\"\n",
+            self.sink_connection()
         )
     }
 

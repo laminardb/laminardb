@@ -4,6 +4,22 @@
 
 ### Added
 
+- In cluster mode the PostgreSQL upsert sink (`write.mode = 'upsert'`, with or without
+  `changelog.mode`) and the MongoDB upsert sink run at-least-once, each node writing the keys it
+  owns, when each key is produced on one node at a time: the input is partitioned by columns that
+  are all in the sink's key (a keyed aggregate into a sink keyed by its group), sits on one vnode
+  (a global aggregate), or is projected from one source that runs on one node at a time (a
+  PostgreSQL CDC `changelog` source replicated into a table keyed by its primary key). Other inputs
+  are rejected at `CREATE SINK`, at startup and in topology planning. In a cluster a PostgreSQL
+  `changelog.mode` target may have no unique or exclusion constraint other than the primary key,
+  and the sink's sessions end a transaction left idle longer than `statement.timeout.ms`. A
+  MongoDB write sent just before a process's lease expired can still land after its successor's
+  and leave the older value until the key's next change. Kafka `envelope = 'upsert'` at
+  at-least-once and Delta upsert stay rejected in a cluster. A source started on another node
+  after a committed handoff no longer repeats its output, so a rescale during a PostgreSQL
+  `changelog` copy resumes the copy. Connector API: `SinkTopology::KeyPartitioned`,
+  `SinkConnector::destination_key` and `SinkConnector::share_destination_by_key`.
+
 - In cluster mode a PostgreSQL CDC source runs at-least-once on one node at a time in both output
   modes, with or without the initial copy. A `changelog` source feeds aggregates, materialized
   views and Delta `append` sinks; an `upsert` source with the copy feeds an interval join, as one
@@ -11,9 +27,10 @@
   next owner continues the copy from the committed checkpoint. A restart inside a `changelog`
   copy now resumes it in every mode unless an at-least-once sink that applies changes by key
   reads the source, directly or through streams (PostgreSQL, Kafka `envelope = 'upsert'`,
-  MongoDB or Delta upsert sinks, or a sink without a connector): the resumed copy reads its next
-  chunks at a newer snapshot, so such a sink could keep a row deleted while the copy was down,
-  and there the restart still fails closed with the reset. Adding a source that copies to a running cluster and exactly-once
+  MongoDB or Delta upsert sinks, or a sink without a connector), or a stream on the way whose
+  SQL cannot be parsed, since its inputs are unknown: the resumed copy reads its next chunks at a
+  newer snapshot, so such a sink could keep a row deleted while the copy was down, and there the
+  restart still fails closed with the reset. Adding a source that copies to a running cluster and exactly-once
   stay rejected. `SourceStart` carries a `ReplayRequirement` (`with_replay_requirement`,
   `replay_requirement`) that the engine derives from the sinks reading each source, and
   `SinkContract::with_appended_changes` marks a sink that logs each change, such as Delta
@@ -142,6 +159,13 @@
   `is_cluster_exact_delivery_certified()`.
 
 ### Fixed
+
+- Sinks that collapse a weighted changelog by key (PostgreSQL `changelog.mode`, MongoDB and Delta
+  upsert, Kafka `envelope = 'upsert'`) no longer drop a key whose changes cancel within one flush,
+  such as a row inserted and then deleted. They now apply its last change: a delete after a final
+  retraction, the row after a final insertion. Before, an at-least-once replay that flushed both
+  could leave behind the row a failed attempt had already written. A Kafka upsert sink can now
+  write a tombstone for a key it never published.
 
 - A PostgreSQL CDC checkpoint no longer falls inside a chunk of the initial copy that is partly
   emitted. Before, such a cut held rows the cursor did not cover, and the resumed copy read the
