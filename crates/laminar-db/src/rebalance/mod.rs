@@ -4167,7 +4167,10 @@ async fn pre_rotation_checkpoint(
 ) -> Result<CommittedCheckpointRef, String> {
     let deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
     let ckpt = db
-        .checkpoint_until(deadline)
+        .checkpoint_until(
+            deadline,
+            crate::db::ManualCheckpointCaller::AssignmentHandoff,
+        )
         .await
         .map_err(|e| e.to_string())?;
     if !ckpt.success {

@@ -160,13 +160,7 @@ impl StreamingCoordinator {
             );
             return None;
         }
-        if manual
-            && self.manual_handoff_required
-            && flags & laminar_core::checkpoint::flags::HANDOFF == 0
-        {
-            let reason = "assignment handoff ended before its replay-quiescent checkpoint";
-            callback.record_checkpoint_admission_failure(reason);
-            self.fail_waiting_manual(reason);
+        if manual && self.refuse_cut_without_handoff(callback, flags) {
             return None;
         }
         Some(CheckpointAdmission {

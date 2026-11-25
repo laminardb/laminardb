@@ -164,6 +164,17 @@
 
 ### Fixed
 
+- In cluster mode, a graceful vnode rotation accepts as its handoff only a checkpoint that carries
+  the handoff, which fences each giving node's intake before its state is captured. Before, if the
+  drain ended just as the rotation's checkpoint was admitted, an ordinary checkpoint could commit
+  in its place and the rotation could proceed while nodes giving up vnodes still accepted input
+  for them. The rotation now fails and aborts the drain instead.
+
+- In cluster mode, a node that owns vnodes and rejoins while a coordinated recovery holds it no
+  longer fails startup with "cluster assignment N is not certified for source intake". The
+  recovery withdraws the node's assignment fence; startup now keeps intake closed and waits for the
+  round to release it, as it already did when the fence was withdrawn later in startup.
+
 - Sinks that collapse a weighted changelog by key (PostgreSQL `changelog.mode`, MongoDB and Delta
   upsert, Kafka `envelope = 'upsert'`) no longer drop a key whose changes cancel within one flush,
   such as a row inserted and then deleted. They now apply its last change: a delete after a final

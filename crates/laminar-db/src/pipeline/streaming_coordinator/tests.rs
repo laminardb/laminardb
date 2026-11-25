@@ -214,6 +214,7 @@ fn manual_request(reply: crate::db::ForceCheckpointReply) -> ForceCheckpointRequ
         reply,
         reservation_claim: None,
         deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+        caller: crate::db::ManualCheckpointCaller::Public,
     }
 }
 
@@ -239,6 +240,7 @@ fn manual_request_until(
             reply,
             reservation_claim: Some(reservation_claim),
             deadline,
+            caller: crate::db::ManualCheckpointCaller::Public,
         },
         reservation_wait,
     )
@@ -3272,6 +3274,7 @@ async fn acknowledged_handoff_replay_survives_public_expiry_until_terminal_succe
             reply: original_reply,
             reservation_claim: None,
             deadline: original_deadline,
+            caller: crate::db::ManualCheckpointCaller::Public,
         }],
     });
     let completion = CheckpointCompletion::validated(
@@ -3342,6 +3345,7 @@ async fn handoff_replay_does_not_preclaim_new_waiter_during_delayed_reservation(
         reply: replay_reply,
         reservation_claim: None,
         deadline: tokio::time::Instant::now(),
+        caller: crate::db::ManualCheckpointCaller::Public,
     });
     coordinator.manual_handoff_required = true;
 
@@ -3844,6 +3848,43 @@ async fn periodic_admission_defers_handoff_to_manual_owner_arriving_during_audit
     assert_eq!(callback.barrier_captures.as_slice(), &[(attempt, 0)]);
     #[cfg(feature = "cluster")]
     assert!(callback.intake_gate.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn assignment_handoff_request_is_answered_only_by_a_handoff_cut() {
+    let mut coordinator = admission_coordinator(Vec::new());
+    coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
+    let attempt = CheckpointAttempt::canonical(18_003);
+    let mut callback = MockCallback::new();
+    callback.attempt_to_reserve = attempt;
+    let handoff_request = |reply| {
+        let (mut request, reservation) = unreserved_manual_request(reply);
+        request.caller = crate::db::ManualCheckpointCaller::AssignmentHandoff;
+        (request, reservation)
+    };
+
+    // The drain ended before admission, so admission finds no drain and offers no HANDOFF.
+    let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
+    let (request, _reservation) = handoff_request(reply_tx);
+    coordinator.manual_waiting.push(request);
+    coordinator.maybe_checkpoint(&mut callback).await;
+    let error = reply_rx.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("before its HANDOFF checkpoint"), "{error}");
+    assert!(callback.checkpoint_admission_failures.is_empty());
+    assert_eq!(callback.reserve_calls, 0);
+    assert!(callback.prepared_attempts.is_empty());
+
+    callback.assignment_flags = laminar_core::checkpoint::flags::HANDOFF;
+    let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
+    let (request, _reservation) = handoff_request(reply_tx);
+    coordinator.manual_waiting.push(request);
+    coordinator.maybe_checkpoint(&mut callback).await;
+    let result = reply_rx.await.unwrap().unwrap();
+    assert_eq!(
+        CheckpointAttempt::new(result.epoch, result.checkpoint_id),
+        attempt
+    );
+    assert_eq!(callback.reserve_calls, 1);
 }
 
 #[cfg(feature = "cluster")]

@@ -976,6 +976,28 @@ async fn assignment_closure_wins_while_startup_waits_to_open_intake() {
 }
 
 #[tokio::test]
+async fn startup_waits_for_a_recovery_that_withdrew_its_assignment() {
+    let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
+    controller.publish_checkpoint_assignment_fence(None);
+    let error = db
+        .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not certified for source intake"), "{error}");
+
+    db.fence_coordinated_recovery_lifecycle();
+    assert_eq!(
+        db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ClusterStartupDisposition::RecoveryFenced
+    );
+    assert!(db.cluster_intake_fenced());
+}
+
+#[tokio::test]
 async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
     let (restored, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
         startup_db().await;
