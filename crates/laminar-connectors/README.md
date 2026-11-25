@@ -717,9 +717,10 @@ committed after it was copied: no gap and no overlap.
 
 - Both output modes, with or without the initial copy, run at-least-once on one node at a time:
   the node that owns the source's home vnode. When it fails, a survivor resumes from the
-  committed slot position, inside the copy too; when the source moves at a rescale or a rejoin,
-  the node giving it up reads to the end of the chunk it is emitting, stops at the handoff
-  checkpoint, and the node taking it resumes there. A changelog must reach each group in log
+  committed slot position, inside the copy too, unless a `changelog` copy feeds an at-least-once
+  sink that applies changes by key (then it fails closed; see below). When the source moves at a
+  rescale or a rejoin, the node giving it up reads to the end of the chunk it is emitting, stops
+  at the handoff checkpoint, and the node taking it resumes there. A changelog must reach each group in log
   order, so one node reads it; the aggregates and views over it spread across every node by
   their keys.
 - The slot allows one session at a time. A node ends a session of its own claim left by another
@@ -1222,7 +1223,7 @@ cluster, as before.
 When vnodes move between nodes, the previous owner flushes what it wrote before the handoff cut
 commits and writes nothing after it, and the new owner writes the moved keys only once it owns
 them. After a failure, every node restarts from the committed checkpoint and repeats its output
-since, so each key converges on its latest value.
+since, so each key converges on its latest value, except for the MongoDB case below.
 
 - **PostgreSQL**: each flush is one transaction, and a process sends its `COMMIT` only after every
   statement returned and only while its lease is live. A stale writer therefore cannot overwrite
@@ -1235,7 +1236,9 @@ since, so each key converges on its latest value.
   in separate transactions, so a value moving between their keys could collide.
 - **MongoDB** applies each write as it arrives, without a transaction. A write sent just before a
   process's lease expired can reach the server after its successor's write of the same key, and
-  the key keeps the older value until its next change.
+  the key keeps the older value until its next change. MongoDB stores timestamps in
+  milliseconds, so in a cluster an upsert key may not be a microsecond or nanosecond timestamp:
+  two keys that differ below a millisecond would share one document.
 - Kafka `envelope = 'upsert'` at at-least-once and Delta `write.mode = 'upsert'` stay rejected in a
   cluster. librdkafka keeps retrying records a stale process queued, for up to
   `delivery.timeout.ms`, and only a transactional producer fences another. Concurrent Delta MERGEs

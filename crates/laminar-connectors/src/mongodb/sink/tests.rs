@@ -910,3 +910,29 @@ fn cdc_replay_maps_an_explicit_source_namespace_to_the_target() {
     config.set("write.mode", "insert");
     assert!(MongoDbSinkConfig::from_config(&config).is_err());
 }
+
+#[tokio::test]
+async fn a_collection_shared_by_key_refuses_a_key_finer_than_milliseconds() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "at",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let mut config = test_config();
+    config.write_mode = WriteMode::Upsert {
+        key_fields: vec!["at".to_string()],
+    };
+    let mut sink = MongoDbSink::new(schema, config, None);
+    sink.share_destination_by_key();
+    let error = sink
+        .open(&ConnectorConfig::new("mongodb"))
+        .await
+        .expect_err("a microsecond key was admitted on a shared collection");
+    assert!(
+        error.to_string().contains("stores in milliseconds"),
+        "{error}"
+    );
+}

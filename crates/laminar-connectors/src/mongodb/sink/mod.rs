@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use tracing::{debug, info};
 
@@ -102,6 +102,8 @@ pub struct MongoDbSink {
 
     client: Option<mongodb::Client>,
     collection: Option<mongodb::Collection<mongodb::bson::Document>>,
+    /// Writers on other cluster nodes upsert other keys of the collection at the same time.
+    shared_by_key: bool,
 }
 
 impl MongoDbSink {
@@ -127,6 +129,7 @@ impl MongoDbSink {
             task_tracker,
             client: None,
             collection: None,
+            shared_by_key: false,
         }
     }
 
@@ -191,6 +194,35 @@ impl MongoDbSink {
     fn driver_timeout(&self) -> Duration {
         let headroom = (self.write_timeout / 5).min(MAX_DRIVER_TIMEOUT_HEADROOM);
         self.write_timeout.checked_sub(headroom).unwrap()
+    }
+
+    /// A collection written by several cluster nodes needs each document's key to come from one
+    /// node. MongoDB stores a timestamp in milliseconds, so two key values that differ below a
+    /// millisecond would share one document while the engine places them on different nodes.
+    fn require_exact_upsert_keys(
+        schema: &SchemaRef,
+        config: &MongoDbSinkConfig,
+    ) -> Result<(), ConnectorError> {
+        let WriteMode::Upsert { key_fields } = &config.write_mode else {
+            return Ok(());
+        };
+        for key in key_fields {
+            let Ok(field) = schema.field_with_name(key) else {
+                continue;
+            };
+            if matches!(
+                field.data_type(),
+                DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
+            ) {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "MongoDB upsert key field '{key}' is a {:?} timestamp, which MongoDB stores \
+                     in milliseconds: rows that differ below a millisecond would share a \
+                     document that several cluster nodes write; cast the key to milliseconds",
+                    field.data_type()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_schema(

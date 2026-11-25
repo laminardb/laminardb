@@ -55,6 +55,10 @@ impl SinkConnector for MongoDbSink {
         })
     }
 
+    fn share_destination_by_key(&mut self) {
+        self.shared_by_key = true;
+    }
+
     async fn resolve_schema(
         &mut self,
         config: &ConnectorConfig,
@@ -76,6 +80,9 @@ impl SinkConnector for MongoDbSink {
             Self::validate_schema(&self.schema, &self.config)?;
         } else {
             self.apply_connector_config(config)?;
+        }
+        if self.shared_by_key {
+            Self::require_exact_upsert_keys(&self.schema, &self.config)?;
         }
         let mut current =
             super::schema_resolution::resolve(config, &self.config, self.schema.clone()).await?;

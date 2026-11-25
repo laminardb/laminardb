@@ -14,7 +14,9 @@
   PostgreSQL `changelog.mode` target may have no unique or exclusion constraint other than the
   primary key, and the sink's sessions end a transaction left idle for half of
   `statement.timeout.ms`. A MongoDB write sent just before a process's lease expired can still
-  land after its successor's and leave the older value until the key's next change. Kafka
+  land after its successor's and leave the older value until the key's next change, and in a
+  cluster a MongoDB upsert key may not be a microsecond or nanosecond timestamp, which MongoDB
+  stores in milliseconds. Kafka
   `envelope = 'upsert'` at at-least-once and Delta upsert stay rejected in a cluster. A source
   started on another node after a committed handoff no longer repeats its output, so a rescale
   during a PostgreSQL `changelog` copy resumes the copy. Connector API:
