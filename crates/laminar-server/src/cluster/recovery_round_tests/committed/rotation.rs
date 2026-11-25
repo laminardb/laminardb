@@ -137,3 +137,109 @@ pub(super) async fn wait_owned_by(processes: &mut [Process; 2], owner: u64) -> R
     .await
     .with_context(|| format!("the drain did not move every vnode to {owner}; last: {last:?}"))?
 }
+
+/// A window still open at the handoff cut moves in the cut's state, and only its new owner closes
+/// it: the draining database's intake stays fenced from the cut's capture until it adopts the
+/// verdict. Every window row is written once, by one database.
+pub(super) async fn qualify_windows(processes: &mut [Process; 2]) -> Result<()> {
+    start_pair(processes).await?;
+    let keys = connectors::keys()?;
+    deliver(processes, 2, 4).await?;
+    let first = leader(processes).await?;
+    checkpoint(&mut processes[first], &[7, 8]).await?;
+    wait_windows(processes, 2).await?;
+    // Each account's third record opens a window that is still open at the handoff cut: no later
+    // record has passed its end.
+    deliver(processes, 3, 6).await?;
+    for process in &mut *processes {
+        process.done(&Command::Drain(8)).await?;
+    }
+    wait_owned_by(processes, 7).await?;
+    deliver(processes, 4, 8).await?;
+    let after = leader(processes).await?;
+    checkpoint(&mut processes[after], &[7]).await?;
+    wait_windows(processes, 6).await?;
+    let mut written = Vec::new();
+    for process in &mut *processes {
+        match process.request(&Command::ReadWindows).await? {
+            Response::Rows(rows) => written.push(rows),
+            response => return Err(anyhow!("expected window rows: {response:?}")),
+        }
+    }
+    let twice: Vec<_> = written[0]
+        .iter()
+        .filter(|row| written[1].iter().any(|other| other[..2] == row[..2]))
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "both databases wrote these windows (account, start, total): {twice:?}; node 7 {:?}, node 8 {:?}",
+        written[0],
+        written[1]
+    );
+    // Account `keys[1]` lives on node 8's vnode, so node 7 closes its third window only from the
+    // moved state.
+    assert!(
+        written[0].contains(&vec![keys[1], 1_003_000, 30]),
+        "node 7 did not close the moved window: {:?}",
+        written[0]
+    );
+    let mut all: Vec<_> = written.concat();
+    all.sort_unstable();
+    let mut expected: Vec<Vec<i64>> = (1..=3_i64)
+        .flat_map(|record| {
+            (0..2_i64).map(move |partition| {
+                vec![
+                    keys[usize::try_from(1 - partition).unwrap()],
+                    1_000_000 + record * 1_000,
+                    record * 10 + partition,
+                ]
+            })
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(all, expected);
+    Ok(())
+}
+
+/// Let each database's probe source read `prefix` records per owned partition, and wait until
+/// the two have delivered `total` records between them.
+async fn deliver(processes: &mut [Process; 2], prefix: u64, total: u64) -> Result<()> {
+    for process in &mut *processes {
+        process.done(&Command::Prefix(prefix)).await?;
+    }
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let mut delivered = 0;
+            for process in processes.iter_mut() {
+                delivered += process.observe().await?.delivered;
+            }
+            if delivered >= total {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("the probe did not deliver {total} records"))?
+}
+
+/// Wait until the two databases' sinks hold at least `rows` window rows between them.
+async fn wait_windows(processes: &mut [Process; 2], rows: usize) -> Result<()> {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let mut written = 0;
+            for process in processes.iter_mut() {
+                match process.request(&Command::ReadWindows).await? {
+                    Response::Rows(windows) => written += windows.len(),
+                    response => return Err(anyhow!("expected window rows: {response:?}")),
+                }
+            }
+            if written >= rows {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("the sinks did not write {rows} window rows"))?
+}

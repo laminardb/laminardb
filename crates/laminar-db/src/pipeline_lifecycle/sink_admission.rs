@@ -18,6 +18,7 @@ pub(super) fn admit_sink(
         delivery,
         runtime,
         carries_changelog,
+        input_placement,
         mutation_key,
         checkpointing_enabled,
         checkpoint_storage_scope,
@@ -29,7 +30,13 @@ pub(super) fn admit_sink(
         ))
     })?;
 
-    admit_sink_contract(contract, delivery, runtime, carries_changelog).map_err(|reason| {
+    let destination_key = sink.destination_key(config).map_err(|error| {
+        DbError::Config(format!(
+            "sink '{name}' has an invalid configuration: {error}"
+        ))
+    })?;
+    let key_writers = input_placement.key_writers(destination_key.as_deref());
+    admit_sink_contract(contract, delivery, runtime, carries_changelog, key_writers).map_err(|reason| {
         let detail = format!(
             "sink '{name}' is not admissible in {runtime:?} mode with {delivery} delivery: \
              {reason} (contract: {contract:?})"

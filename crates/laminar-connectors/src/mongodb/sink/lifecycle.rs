@@ -29,13 +29,28 @@ impl SinkConnector for MongoDbSink {
         let (topology, input_mode) = match cfg.write_mode {
             WriteMode::Insert => (SinkTopology::MultiWriter, SinkInputMode::AppendOnly),
             WriteMode::CdcReplay => (SinkTopology::Singleton, SinkInputMode::AppendOnly),
-            WriteMode::Upsert { .. } => (SinkTopology::Singleton, SinkInputMode::FullChangelog),
+            WriteMode::Upsert { .. } => (SinkTopology::KeyPartitioned, SinkInputMode::FullChangelog),
         };
         Ok(SinkContract::new(
             SinkConsistency::DurableAtLeastOnce,
             topology,
             input_mode,
         ))
+    }
+
+    fn destination_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            Self::decode_connector_config(config)?.0
+        };
+        Ok(match cfg.write_mode {
+            WriteMode::Upsert { key_fields } => Some(key_fields),
+            WriteMode::Insert | WriteMode::CdcReplay => None,
+        })
     }
 
     async fn resolve_schema(

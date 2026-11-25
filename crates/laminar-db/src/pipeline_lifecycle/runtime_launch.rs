@@ -614,8 +614,7 @@ impl LaminarDB {
             .prepare_pipeline_sinks(
                 &sources,
                 &sink_regs,
-                &resolved_stream_outputs.schemas,
-                &resolved_stream_outputs.changelog_carrying,
+                &resolved_stream_outputs,
                 &mutation_routes.direct,
                 runtime_mode,
                 checkpointing_enabled,

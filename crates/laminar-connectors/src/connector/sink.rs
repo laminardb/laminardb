@@ -121,6 +121,22 @@ pub trait SinkConnector: Send {
         Ok(None)
     }
 
+    /// Columns that identify the destination row each input row replaces or deletes.
+    ///
+    /// `None` (the default) means rows are appended, not applied by key. A configuration whose
+    /// contract is [`SinkTopology::KeyPartitioned`](super::SinkTopology::KeyPartitioned) must
+    /// return its key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration itself is invalid.
+    fn destination_key(
+        &self,
+        _config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Resolve a writer contract from already-bound query output before activation.
     /// Destinations with authoritative schemas override this read-only hook.
     async fn resolve_schema(

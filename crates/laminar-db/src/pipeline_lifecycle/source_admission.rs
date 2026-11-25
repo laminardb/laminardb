@@ -1,7 +1,7 @@
 use super::{
     admit_append_only_source, Arc, CheckpointStorageScope, ConnectorConfig,
-    ConnectorTaskFenceRegistration, DbError, DeliveryGuarantee, FxHashMap, HashMap,
-    RecoveredInputChannelProgress, RuntimeMode, SinkConnector, SinkConsistency, SinkContract,
+    ConnectorTaskFenceRegistration, DbError, DeliveryGuarantee, FxHashMap, HashMap, InputPlacement,
+    KeyWriters, RecoveredInputChannelProgress, RuntimeMode, SinkConnector, SinkConsistency, SinkContract,
     SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceLocality,
     SourceRowPositionCapability, SourceTopology, SourceWatermarkState, CLUSTER_BEST_EFFORT,
     EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
@@ -358,12 +358,15 @@ pub(crate) fn validate_source_recovery_assignment(
     }
 }
 
-/// Validate sink durability, placement, and changelog semantics before I/O.
+/// Validate sink durability, placement, and changelog semantics before I/O. `key_writers` says
+/// how many nodes can produce rows for one destination key; only a key-partitioned sink in a
+/// cluster reads it.
 pub(crate) fn admit_sink_contract(
     contract: SinkContract,
     delivery: DeliveryGuarantee,
     runtime: RuntimeMode,
     carries_changelog: bool,
+    key_writers: KeyWriters,
 ) -> Result<(), &'static str> {
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
         return Err(CLUSTER_BEST_EFFORT);
@@ -398,6 +401,15 @@ pub(crate) fn admit_sink_contract(
     if runtime == RuntimeMode::Cluster {
         match contract.topology {
             SinkTopology::MultiWriter => {}
+            SinkTopology::KeyPartitioned if key_writers == KeyWriters::One => {}
+            SinkTopology::KeyPartitioned => {
+                return Err(
+                    "rows for one destination key can come from several cluster nodes, whose \
+                     writes would land in no defined order; key the sink by every column its \
+                     input is partitioned by (aggregate by the sink key first), or read one \
+                     placed source through projections",
+                );
+            }
             SinkTopology::NodeLocalEgress => {
                 return Err(
                     "cluster node-local egress has no defined rebalance/state-loss contract",
@@ -430,6 +442,8 @@ pub(super) struct SinkAdmissionContext<'a> {
     pub(super) delivery: DeliveryGuarantee,
     pub(super) runtime: RuntimeMode,
     pub(super) carries_changelog: bool,
+    /// Where the input's rows are produced across cluster nodes.
+    pub(super) input_placement: &'a InputPlacement,
     /// Primary key of a direct keyed-mutation source input.
     pub(super) mutation_key: Option<&'a [String]>,
     pub(super) checkpointing_enabled: bool,

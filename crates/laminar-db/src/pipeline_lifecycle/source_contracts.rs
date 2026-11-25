@@ -255,6 +255,19 @@ impl LaminarDB {
         Ok(temporal_source_roles)
     }
 
+    /// Whether `source_name` is a registered source placed on one node at a time. A contract that
+    /// cannot be resolved counts as not placed.
+    pub(crate) fn is_placed_singleton_source(
+        &self,
+        source_name: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> bool {
+        matches!(
+            self.resolve_registered_source_contract(source_name, source_regs),
+            Ok(Some((contract, _))) if contract.supports_cluster_singleton_placement()
+        )
+    }
+
     pub(crate) fn resolve_registered_source_contract(
         &self,
         source_name: &str,

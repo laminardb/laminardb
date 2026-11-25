@@ -8,6 +8,7 @@ use arrow::datatypes::{DataType, Schema};
 
 use crate::db::{exact_table_reference, LaminarDB};
 use crate::error::DbError;
+use crate::pipeline_lifecycle::KeyWriters;
 
 use super::stream::{
     contains_builtin_join_without_cluster_lifecycle, logical_aggregate_stage_count,
@@ -34,6 +35,28 @@ pub(super) enum ChangelogInputKind {
 const MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH: usize = 3;
 
 impl LaminarDB {
+    /// How many nodes can produce rows for one destination key of a key-partitioned sink reading
+    /// `input` in a cluster. Other sinks and other modes do not read it.
+    pub(super) async fn cluster_sink_key_writers(
+        &self,
+        contract: laminar_connectors::connector::SinkContract,
+        destination_key: Option<&[String]>,
+        input: &str,
+    ) -> Result<KeyWriters, DbError> {
+        if self.runtime_mode() != crate::db::RuntimeMode::Cluster
+            || contract.topology != laminar_connectors::connector::SinkTopology::KeyPartitioned
+        {
+            return Ok(KeyWriters::Several);
+        }
+        let resolved = self.resolve_catalog_stream_outputs(None).await?;
+        let sources = self.connector_manager.lock().sources().clone();
+        Ok(resolved
+            .input_placement(input, &|source| {
+                self.is_placed_singleton_source(source, &sources)
+            })
+            .key_writers(destination_key))
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn has_cluster_query_ownership_scope(&self) -> bool {
         if let Some(available) = self.topology_planning_ownership_scope {

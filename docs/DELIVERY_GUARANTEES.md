@@ -56,7 +56,9 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake upsert | ALO, BE | rejected |
 | Iceberg append (REST + S3) | EO, ALO, BE | EO, ALO |
 | PostgreSQL | ALO, BE | ALO |
+| PostgreSQL upsert | ALO, BE | ALO |
 | MongoDB | ALO, BE | ALO |
+| MongoDB upsert | ALO, BE | ALO |
 | Files | ALO, BE | rejected |
 | RabbitMQ | ALO, BE | ALO |
 | IBM MQ | ALO, BE | ALO |
@@ -65,51 +67,51 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 
 ### Embedded / single-node: strongest guarantee per pair
 
-| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | MongoDB | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Kafka | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Kafka (Debezium) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Delta Lake change feed | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Delta Lake change feed (local table) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Files (object store, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| NATS JetStream | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| WebSocket | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| OpenTelemetry | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| FIX TagValue | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| Generator | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Generator (splits) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | PostgreSQL upsert | MongoDB | MongoDB upsert | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Kafka | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Kafka (Debezium) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed (local table) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Files (object store, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| NATS JetStream | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| WebSocket | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| OpenTelemetry | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| FIX TagValue | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| Generator | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Generator (splits) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 
 ### Cluster: strongest guarantee per pair
 
-| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | MongoDB | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Kafka | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| PostgreSQL CDC | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — |
-| Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
-| Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
-| Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Files | — | — | — | — | — | — | — | — | — | — | — | — |
-| Files (object store, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| IBM MQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — |
-| WebSocket | — | — | — | — | — | — | — | — | — | — | — | — |
-| OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — |
-| FIX TagValue | — | — | — | — | — | — | — | — | — | — | — | — |
-| Generator | — | — | — | — | — | — | — | — | — | — | — | — |
-| Generator (splits) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | PostgreSQL upsert | MongoDB | MongoDB upsert | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Kafka | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| PostgreSQL CDC | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Files | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Files (object store, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| IBM MQ | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| WebSocket | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| FIX TagValue | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Generator | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Generator (splits) | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 
 <!-- delivery-matrix:end -->
 

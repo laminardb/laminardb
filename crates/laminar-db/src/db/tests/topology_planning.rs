@@ -261,10 +261,10 @@ impl SinkConnector for PlanningSink {
         Arc::new(arrow_schema::Schema::empty())
     }
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-        let topology = if config.get("placement") == Some("singleton") {
-            SinkTopology::Singleton
-        } else {
-            SinkTopology::MultiWriter
+        let topology = match config.get("placement") {
+            Some("singleton") => SinkTopology::Singleton,
+            Some("key") => SinkTopology::KeyPartitioned,
+            _ => SinkTopology::MultiWriter,
         };
         let consistency = if config.get("durability") == Some("ephemeral") {
             SinkConsistency::Ephemeral
@@ -277,6 +277,11 @@ impl SinkConnector for PlanningSink {
             SinkInputMode::FullChangelog
         };
         Ok(SinkContract::new(consistency, topology, input))
+    }
+    fn destination_key(&self, config: &ConnectorConfig) -> Result<Option<Vec<String>>, ConnectorError> {
+        Ok(config
+            .get("key")
+            .map(|key| key.split(',').map(str::to_owned).collect()))
     }
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         if let Some(runtime) = self.1.as_mut() {
@@ -1392,6 +1397,50 @@ async fn topology_validation_reuses_cluster_source_sink_and_changelog_admission(
     ] {
         let result = fixture.validate(std::slice::from_ref(&sql)).await;
         assert!(result.is_err(), "unsafe candidate was accepted: {sql}");
+        fixture.assert_no_effects();
+    }
+}
+
+/// A sink that applies rows by key runs on every node only when each of its keys is produced on
+/// one node at a time.
+#[tokio::test]
+async fn topology_validation_admits_a_keyed_sink_only_on_input_placed_by_its_key() {
+    let fixture = Fixture::new().await;
+    for admitted in [
+        // `totals` is placed by `id`.
+        vec!["CREATE SINK by_id FROM totals INTO \"planning-sink\" ('placement' = 'key', 'key' = 'id')".to_owned()],
+        vec!["CREATE SINK by_id_total FROM totals INTO \"planning-sink\" ('placement' = 'key', 'key' = 'total,id')".to_owned()],
+        vec![
+            "CREATE STREAM grand_total AS SELECT SUM(value) AS total FROM trades".to_owned(),
+            "CREATE SINK by_total FROM grand_total INTO \"planning-sink\" ('placement' = 'key', 'key' = 'total')".to_owned(),
+        ],
+        // One node at a time reads a placed source, and a projection keeps its rows there.
+        vec![
+            source_ddl("queue", "'placement' = 'placed', 'topic' = 'queue'"),
+            "CREATE STREAM queue_rows AS SELECT id, value FROM queue WHERE value > 0".to_owned(),
+            "CREATE SINK by_id FROM queue_rows INTO \"planning-sink\" ('placement' = 'key', 'key' = 'id')".to_owned(),
+        ],
+    ] {
+        fixture.validate(&admitted).await.unwrap_or_else(|error| {
+            panic!("a keyed sink on input placed by its key was refused: {admitted:?}: {error}")
+        });
+    }
+    for rejected in [
+        vec!["CREATE SINK by_total FROM totals INTO \"planning-sink\" ('placement' = 'key', 'key' = 'total')".to_owned()],
+        vec![
+            "CREATE STREAM per_value AS SELECT id, value, COUNT(*) AS n FROM trades GROUP BY id, value EMIT CHANGES".to_owned(),
+            "CREATE SINK by_id FROM per_value INTO \"planning-sink\" ('placement' = 'key', 'key' = 'id')".to_owned(),
+        ],
+        vec![
+            "CREATE STREAM raw AS SELECT id, value FROM trades".to_owned(),
+            "CREATE SINK by_id FROM raw INTO \"planning-sink\" ('placement' = 'key', 'key' = 'id')".to_owned(),
+        ],
+    ] {
+        let error = fixture.validate(&rejected).await.expect_err("a keyed sink with several writers per key was admitted");
+        assert!(
+            error.to_string().contains("rows for one destination key can come from several cluster nodes"),
+            "{rejected:?}: {error}"
+        );
         fixture.assert_no_effects();
     }
 }

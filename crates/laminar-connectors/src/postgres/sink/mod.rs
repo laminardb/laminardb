@@ -761,20 +761,30 @@ impl SinkConnector for PostgresSink {
         } else {
             SinkInputMode::AppendOnly
         };
-        // Append-only writes commute across independent runtime writers. Mutable writes do not:
-        // without key-affine placement and a fenced handoff, an older upsert/delete from one node
-        // can land after a newer value from another node. Keep those modes singleton until the
-        // runtime can prove that stronger topology protocol.
+        // Append-only writes commute across independent runtime writers. Writes by key do not, so
+        // each key needs one writer at a time.
         let topology = if cfg.write_mode == WriteMode::Append {
             SinkTopology::MultiWriter
         } else {
-            SinkTopology::Singleton
+            SinkTopology::KeyPartitioned
         };
         Ok(SinkContract::new(
             SinkConsistency::DurableAtLeastOnce,
             topology,
             input_mode,
         ))
+    }
+
+    fn destination_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            Self::decode_connector_config(config)?.0
+        };
+        Ok((cfg.write_mode == WriteMode::Upsert).then_some(cfg.primary_key_columns))
     }
 
     fn keyed_mutation_key(

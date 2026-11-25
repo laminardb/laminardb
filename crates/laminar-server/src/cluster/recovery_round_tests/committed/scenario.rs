@@ -448,6 +448,7 @@ enum Scenario {
     FailedOwner,
     Migration,
     Drain,
+    WindowDrain,
     Process(u64),
     Generator(generator::Sequence, generator::Handover),
 }
@@ -466,6 +467,12 @@ pub(super) async fn run_migration() -> Result<()> {
 
 pub(super) async fn run_drain() -> Result<()> {
     run_pair(Runtime::Aggregate, Scenario::Drain)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn run_window_drain() -> Result<()> {
+    run_pair(Runtime::Windows, Scenario::WindowDrain)
         .await
         .map(|_| ())
 }
@@ -531,6 +538,9 @@ async fn run_pair(runtime: Runtime, scenario: Scenario) -> Result<process::Trans
                 .await
                 .map(|()| (Vec::new(), Vec::new())),
             Scenario::Drain => rotation::qualify(&mut processes)
+                .await
+                .map(|()| (Vec::new(), Vec::new())),
+            Scenario::WindowDrain => rotation::qualify_windows(&mut processes)
                 .await
                 .map(|()| (Vec::new(), Vec::new())),
             Scenario::Process(failed) => process::qualify(&mut processes, failed).await,

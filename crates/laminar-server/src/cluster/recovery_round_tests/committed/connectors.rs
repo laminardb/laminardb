@@ -16,8 +16,10 @@ pub(super) struct ReplayProbe {
     pub prefix: AtomicU64,
     pub hold: AtomicBool,
     pub polls: AtomicU64,
+    pub delivered: AtomicU64,
     pub starts: parking_lot::Mutex<Vec<Resume>>,
     pub output: parking_lot::Mutex<BTreeMap<i64, i64>>,
+    pub windows: parking_lot::Mutex<Vec<Vec<i64>>>,
     pub callbacks: parking_lot::Mutex<Vec<process::Callback>>,
     pub activity: parking_lot::Mutex<Vec<process::ActivityRow>>,
 }
@@ -255,6 +257,7 @@ impl SourceConnector for ReplaySource {
                 UInt32Array::from(vec![0]),
             )?;
             self.checkpoint.set_offset(key, next.to_string());
+            self.probe.delivered.fetch_add(1, Ordering::AcqRel);
             return Ok(Some(
                 SourceBatch::positioned(batch, position)?.with_checkpoint(self.checkpoint.clone()),
             ));
@@ -369,6 +372,67 @@ impl SinkConnector for ObservedSink {
     }
 }
 
+/// Records every window row it is given, so a test can tell which database wrote each window.
+struct WindowSink {
+    probe: Arc<ReplayProbe>,
+}
+
+#[async_trait::async_trait]
+impl SinkConnector for WindowSink {
+    fn suggested_write_timeout(&self) -> Duration {
+        DEADLINE
+    }
+    fn contract(&self, _: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+        Ok(SinkContract::new(
+            SinkConsistency::DurableAtLeastOnce,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        ))
+    }
+    async fn open(&mut self, _: &ConnectorConfig) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("account", DataType::Int64, true),
+            Field::new(
+                "w",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("total", DataType::Int64, true),
+        ]))
+    }
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        let missing = |name: &str| ConnectorError::SchemaMismatch(format!("missing window column {name}"));
+        let accounts = batch
+            .column_by_name("account")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| missing("account"))?;
+        let starts = batch
+            .column_by_name("w")
+            .and_then(|array| array.as_any().downcast_ref::<TimestampMicrosecondArray>())
+            .ok_or_else(|| missing("w"))?;
+        let totals = batch
+            .column_by_name("total")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| missing("total"))?;
+        let mut windows = self.probe.windows.lock();
+        for row in 0..batch.num_rows() {
+            windows.push(vec![accounts.value(row), starts.value(row), totals.value(row)]);
+        }
+        if windows.len() > 64 {
+            return Err(ConnectorError::ConfigurationError(
+                "window probe exceeded its row bound".into(),
+            ));
+        }
+        Ok(WriteResult::new(batch.num_rows(), 0))
+    }
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
 pub(super) fn register(
     probe: Arc<ReplayProbe>,
     path: PathBuf,
@@ -376,7 +440,7 @@ pub(super) fn register(
 ) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {
     move |registry| {
         match runtime {
-            Runtime::Aggregate => {}
+            Runtime::Aggregate | Runtime::Windows => {}
             Runtime::Sequence(generator::Sequence::Splits) => return Ok(()),
             Runtime::Sequence(
                 sequence @ (generator::Sequence::Singleton | generator::Sequence::Changelog),
@@ -411,6 +475,26 @@ pub(super) fn register(
                 }))
             }),
         )?;
+        if runtime == Runtime::Windows {
+            return registry.register_sink(
+                "recovery-window-probe",
+                ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(true),
+                    name: "recovery-window-probe".into(),
+                    display_name: "Recovery window probe".into(),
+                    version: "1".into(),
+                    is_source: false,
+                    is_sink: true,
+                    config_keys: Vec::new(),
+                },
+                Arc::new(move |_, _| {
+                    Ok(Box::new(WindowSink {
+                        probe: Arc::clone(&probe),
+                    }))
+                }),
+            );
+        }
         registry.register_sink(
             "recovery-output-probe",
             ConnectorInfo {
