@@ -281,8 +281,13 @@ fn test_sink_contract_upsert() {
     };
     let sink = MongoDbSink::new(test_schema(), config, None);
     let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
-    assert_eq!(contract.topology, SinkTopology::Singleton);
+    assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert_eq!(
+        sink.destination_key(&ConnectorConfig::new("mongodb"))
+            .unwrap(),
+        Some(vec!["id".to_string()])
+    );
 }
 
 #[test]
@@ -904,4 +909,30 @@ fn cdc_replay_maps_an_explicit_source_namespace_to_the_target() {
     config.set("replay.source.namespace", "app.users");
     config.set("write.mode", "insert");
     assert!(MongoDbSinkConfig::from_config(&config).is_err());
+}
+
+#[tokio::test]
+async fn a_collection_shared_by_key_refuses_a_key_finer_than_milliseconds() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "at",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let mut config = test_config();
+    config.write_mode = WriteMode::Upsert {
+        key_fields: vec!["at".to_string()],
+    };
+    let mut sink = MongoDbSink::new(schema, config, None);
+    sink.share_destination_by_key();
+    let error = sink
+        .open(&ConnectorConfig::new("mongodb"))
+        .await
+        .expect_err("a microsecond key was admitted on a shared collection");
+    assert!(
+        error.to_string().contains("stores in milliseconds"),
+        "{error}"
+    );
 }

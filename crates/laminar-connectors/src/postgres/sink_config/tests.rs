@@ -237,10 +237,13 @@ fn statement_timeout_is_a_bounded_integer_startup_setting() {
     let mut cfg = PostgresSinkConfig::new("localhost", "db", "events");
     cfg.statement_timeout = Duration::from_millis(30_000);
     cfg.validate().unwrap();
+    assert_eq!(cfg.session_startup_options(), "-c statement_timeout=30000");
+    cfg.shared_by_key = true;
     assert_eq!(
-        cfg.statement_timeout_startup_option(),
-        "-c statement_timeout=30000"
+        cfg.session_startup_options(),
+        "-c statement_timeout=30000 -c idle_in_transaction_session_timeout=15000"
     );
+    cfg.shared_by_key = false;
 
     cfg.statement_timeout =
         Duration::from_millis(u64::try_from(MAX_POSTGRES_STATEMENT_TIMEOUT_MS).unwrap());

@@ -354,6 +354,10 @@ pub enum SinkTopology {
     Singleton,
     /// Independent runtime writers can safely target the destination.
     MultiWriter,
+    /// Writers may run on every node while each destination key, named by
+    /// [`SinkConnector::destination_key`](super::SinkConnector::destination_key), is written by
+    /// one node at a time: writes for one key from two nodes would land in no defined order.
+    KeyPartitioned,
     /// Each runtime node owns a distinct local egress endpoint or audience.
     NodeLocalEgress,
 }

@@ -52,7 +52,7 @@ use super::{
 
 /// Grows on a node while it copies the table.
 const SNAPSHOT_ROWS: &str = "laminardb_postgres_cdc_snapshot_rows_total";
-const SOURCE: &str = "changes";
+pub(super) const SOURCE: &str = "changes";
 const COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 /// Updates and deletes above the seed touch the ids of this many most recent inserts.
 const RECENT_INSERTS: i64 = 8;
@@ -157,7 +157,7 @@ fn three_node_postgres_changelog_kill9_soak() {
     );
 }
 
-fn workload(capture: &Capture, source: &str) -> String {
+pub(super) fn workload(capture: &Capture, source: &str) -> String {
     let Capture {
         table,
         publication,
@@ -197,7 +197,7 @@ nullable = false
 
 /// Create the table and its publication, and seed `rows` ids with 1 KiB notes, before any node
 /// starts. Updates and deletes carry the whole old row only under `REPLICA IDENTITY FULL`.
-fn create_and_seed(postgres: &Postgres, capture: &Capture, rows: i64) {
+pub(super) fn create_and_seed(postgres: &Postgres, capture: &Capture, rows: i64) {
     let Capture {
         table, publication, ..
     } = capture;
@@ -262,7 +262,7 @@ pub(super) fn copier_kill_round(
 /// Every [`COMMIT_INTERVAL`], one transaction that inserts new ids above the seed, updates every
 /// seventh recent id and deletes some even ones, and updates a few seeded ids and deletes one,
 /// wherever the copy stands. Returns the transactions committed.
-fn spawn_writer(postgres: &Postgres, table: &str, seed_rows: i64, rps: u64) -> Worker {
+pub(super) fn spawn_writer(postgres: &Postgres, table: &str, seed_rows: i64, rps: u64) -> Worker {
     let (postgres, table) = (postgres.clone(), table.to_owned());
     let per_insert = i64::try_from(rps).expect("rps fits i64") / 2;
     Worker::spawn("changelog writer", move |stop| async move {
@@ -297,7 +297,7 @@ fn spawn_writer(postgres: &Postgres, table: &str, seed_rows: i64, rps: u64) -> W
 }
 
 /// The view's rows over the table. PostgreSQL sums `bigint` as `numeric`.
-async fn table_buckets(postgres: &Postgres, table: &str) -> Buckets {
+pub(super) async fn table_buckets(postgres: &Postgres, table: &str) -> Buckets {
     postgres
         .client()
         .await

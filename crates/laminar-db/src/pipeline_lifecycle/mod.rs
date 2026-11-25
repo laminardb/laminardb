@@ -306,6 +306,8 @@ use watermarks::{
 };
 mod reference_sources;
 use reference_sources::{create_reference_table_sources, hydrate_reference_table_sources};
+mod key_writers;
+pub(crate) use key_writers::{runs_on_one_node, InputPlacement};
 mod sink_admission;
 #[cfg(test)]
 use sink_admission::close_opened_sinks;

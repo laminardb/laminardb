@@ -1,4 +1,4 @@
-use laminar_connectors::connector::ReplayRequirement;
+use laminar_connectors::connector::{ReplayRequirement, SinkTopology};
 
 use super::{
     admit_sink, open_prepared_sinks, Arc, CheckpointStorageScope, ConnectorTaskFenceRegistration,
@@ -11,8 +11,7 @@ impl LaminarDB {
         &self,
         sources: &[TrackedSourceRegistration],
         sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
-        stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
-        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        resolved: &super::ResolvedStreamOutputs,
         direct_mutation_sources: &rustc_hash::FxHashSet<String>,
         runtime_mode: RuntimeMode,
         checkpointing_enabled: bool,
@@ -34,7 +33,7 @@ impl LaminarDB {
                 .then(|| self.catalog.get_source(&reg.input))
                 .flatten();
             let config =
-                pipeline_sink_config(self, reg, stream_output_schemas, direct_source.as_ref())?;
+                pipeline_sink_config(self, reg, &resolved.schemas, direct_source.as_ref())?;
             let mut sink = self
                 .connector_registry
                 .create_sink(&config, prom_registry)
@@ -54,7 +53,7 @@ impl LaminarDB {
             // Key-only deletes need a sink that represents deletes faithfully, though the batches
             // carry `_op` rather than a weighted changelog.
             let carries_changelog =
-                direct_source.is_some() || changelog_carrying.contains(&reg.input);
+                direct_source.is_some() || resolved.changelog_carrying.contains(&reg.input);
             let checkpoint_storage_scope = sink_checkpoint_storage_scope(self);
             let (contract, configured_timeout) = admit_and_bind_sink(
                 self,
@@ -66,6 +65,8 @@ impl LaminarDB {
                     delivery: self.config.delivery_guarantee,
                     runtime: runtime_mode,
                     carries_changelog,
+                    input_placement: &resolved
+                        .input_placement(&reg.input, &|input| is_placed_singleton(sources, input)),
                     mutation_key: direct_source
                         .as_ref()
                         .map(|entry| entry.primary_key.as_slice()),
@@ -83,7 +84,7 @@ impl LaminarDB {
                 filter_expr: reg.filter_expr.clone(),
                 input: reg.input.clone(),
                 contract,
-                expects_changelog: changelog_carrying.contains(&reg.input),
+                expects_changelog: resolved.changelog_carrying.contains(&reg.input),
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error: contract.is_checkpoint_committable()
@@ -312,9 +313,12 @@ async fn admit_and_bind_sink(
     sink: &mut dyn laminar_connectors::connector::SinkConnector,
     context: SinkAdmissionContext<'_>,
 ) -> Result<(SinkContract, Option<u64>), DbError> {
-    let name = context.name;
+    let (name, runtime) = (context.name, context.runtime);
     let admitted = admit_sink(sink, context)?;
     let (contract, _) = admitted;
+    if runtime == RuntimeMode::Cluster && contract.topology == SinkTopology::KeyPartitioned {
+        sink.share_destination_by_key();
+    }
     if !contract.is_checkpoint_committable() {
         return Ok(admitted);
     }
@@ -338,6 +342,13 @@ async fn admit_and_bind_sink(
             ))
         })?;
     Ok(admitted)
+}
+
+/// Whether `name` is a source placed on one node at a time.
+fn is_placed_singleton(sources: &[TrackedSourceRegistration], name: &str) -> bool {
+    sources
+        .iter()
+        .any(|source| source.name == name && super::runs_on_one_node(source.contract()))
 }
 
 /// Set each source's [`ReplayRequirement`]: only a source upstream of an at-least-once sink that

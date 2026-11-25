@@ -51,7 +51,9 @@ pub(super) async fn resolve(
         let mut keys = parsed.primary_key_columns.clone();
         keys.sort();
         if parsed.changelog_mode {
-            defer_constraints = changelog_constraint_policy(&**client, relation_oid, &keys).await?;
+            defer_constraints =
+                changelog_constraint_policy(&**client, relation_oid, &keys, parsed.shared_by_key)
+                    .await?;
         }
         let valid: bool = client.query_one(
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid=$1::bigint::oid AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum WHERE k.ord<=i.indnkeyatts)=$2::text[])",
@@ -83,11 +85,14 @@ pub(super) async fn resolve(
 /// A flush applies only the final row of each key, so a value that moves between rows within one
 /// source transaction (a delete releasing it, or two rows swapping it) can transiently collide.
 /// Deferrable constraints are checked at commit, after the whole flush; non-deferrable ones are
-/// checked row by row and are rejected. Returns whether any constraint must be deferred.
+/// checked row by row and are rejected. A target shared by key rejects both: two cluster nodes
+/// apply the keys they own in separate transactions, so a value that moves between them can
+/// collide even when deferred. Returns whether any constraint must be deferred.
 async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
     client: &C,
     relation_oid: i64,
     sorted_keys: &[String],
+    shared_by_key: bool,
 ) -> Result<bool, ConnectorError> {
     let rows = client
         .query(
@@ -117,18 +122,30 @@ async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
                 "PostgreSQL unique and exclusion constraints cannot be validated".into(),
             )
         })?;
-    let mut defer = false;
     let mut immediate = Vec::new();
+    let mut deferred = Vec::new();
     for row in rows {
         let columns: Option<Vec<String>> = row.try_get(2).map_err(metadata_error)?;
         if columns.as_deref() == Some(sorted_keys) {
             continue;
         }
+        let name = row.try_get::<_, String>(0).map_err(metadata_error)?;
         if row.try_get::<_, bool>(1).map_err(metadata_error)? {
-            defer = true;
+            deferred.push(name);
         } else {
-            immediate.push(row.try_get::<_, String>(0).map_err(metadata_error)?);
+            immediate.push(name);
         }
+    }
+    if shared_by_key && (!immediate.is_empty() || !deferred.is_empty()) {
+        immediate.extend(deferred);
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "PostgreSQL changelog target written by several cluster nodes has unique or \
+             exclusion constraints beyond the upsert key: {}. Each node applies the keys it owns \
+             in its own transaction, so a value that moves between keys owned by two nodes can \
+             collide even when the constraint is deferred; drop the constraint or run the \
+             pipeline on one node",
+            immediate.join(", ")
+        )));
     }
     if !immediate.is_empty() {
         return Err(ConnectorError::SchemaMismatch(format!(
@@ -141,7 +158,7 @@ async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
             immediate.join(", ")
         )));
     }
-    Ok(defer)
+    Ok(!deferred.is_empty())
 }
 
 /// Whether the activated target needs its deferrable constraints checked at commit.

@@ -361,6 +361,11 @@ pub(crate) async fn resolve_stream_output_schemas(
             schemas,
             changelog_carrying,
             exchange_plan,
+            projections: shapes
+                .iter()
+                .filter(|(_, shape)| shape.projection_filter)
+                .map(|(name, _)| name.clone())
+                .collect(),
         })
     }
     .await;
@@ -377,6 +382,8 @@ pub(crate) struct ResolvedStreamOutputs {
     pub(crate) schemas: HashMap<String, arrow_schema::SchemaRef>,
     pub(crate) changelog_carrying: rustc_hash::FxHashSet<String>,
     pub(crate) exchange_plan: crate::exchange_plan::ExchangePlan,
+    /// Streams that only project and filter one input.
+    pub(crate) projections: rustc_hash::FxHashSet<String>,
 }
 
 pub(super) struct StreamOutputShape {

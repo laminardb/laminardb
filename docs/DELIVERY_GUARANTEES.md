@@ -18,7 +18,11 @@ Generated from the admission code by `delivery_matrix_doc_matches_admission`
 (`crates/laminar-db/src/pipeline_lifecycle/delivery_matrix_tests.rs`) for one representative
 configuration per row; options that change a connector's contract are listed as separate rows.
 Rows and pairs show the guarantees the connector contracts admit. SQL shape, topology and
-connector-specific limits elsewhere in this documentation can still reject a pipeline.
+connector-specific limits elsewhere in this documentation can still reject a pipeline. In a
+cluster, the `PostgreSQL upsert` and `MongoDB upsert` cells assume input placed by the sink's key
+(see [cluster at-least-once sinks](#evidence-for-cluster-at-least-once-sinks)): Kafka written to
+an upsert sink through a projection is rejected there, and through an aggregate keyed by the sink
+key is admitted.
 
 <!-- delivery-matrix:begin -->
 
@@ -56,7 +60,9 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 | Delta Lake upsert | ALO, BE | rejected |
 | Iceberg append (REST + S3) | EO, ALO, BE | EO, ALO |
 | PostgreSQL | ALO, BE | ALO |
+| PostgreSQL upsert | ALO, BE | ALO |
 | MongoDB | ALO, BE | ALO |
+| MongoDB upsert | ALO, BE | ALO |
 | Files | ALO, BE | rejected |
 | RabbitMQ | ALO, BE | ALO |
 | IBM MQ | ALO, BE | ALO |
@@ -65,51 +71,51 @@ connector-specific limits elsewhere in this documentation can still reject a pip
 
 ### Embedded / single-node: strongest guarantee per pair
 
-| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | MongoDB | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Kafka | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Kafka (Debezium) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Delta Lake change feed | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Delta Lake change feed (local table) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Files (object store, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| NATS JetStream | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| WebSocket | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| OpenTelemetry | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
-| FIX TagValue | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | — |
-| Generator | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
-| Generator (splits) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | PostgreSQL upsert | MongoDB | MongoDB upsert | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Kafka | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Kafka (Debezium) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| PostgreSQL CDC | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| MongoDB change stream | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Delta Lake change feed (local table) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Iceberg (snapshot read) | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| Iceberg (append read) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Iceberg (append read, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Files | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Files (object store, splits) | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| RabbitMQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| IBM MQ | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| NATS JetStream | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| WebSocket | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| OpenTelemetry | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE | BE |
+| FIX TagValue | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | — |
+| Generator | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
+| Generator (splits) | EO | EO | EO | ALO | EO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | ALO | BE |
 
 ### Cluster: strongest guarantee per pair
 
-| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | MongoDB | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Kafka | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| PostgreSQL CDC | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — |
-| Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — |
-| Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — |
-| Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Files | — | — | — | — | — | — | — | — | — | — | — | — |
-| Files (object store, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| IBM MQ | ALO | ALO | ALO | — | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — |
-| WebSocket | — | — | — | — | — | — | — | — | — | — | — | — |
-| OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — |
-| FIX TagValue | — | — | — | — | — | — | — | — | — | — | — | — |
-| Generator | — | — | — | — | — | — | — | — | — | — | — | — |
-| Generator (splits) | ALO | EO | ALO | — | EO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Source \ Sink | Kafka | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | PostgreSQL upsert | MongoDB | MongoDB upsert | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Kafka | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Kafka (Debezium) | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| PostgreSQL CDC | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| MongoDB change stream | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Iceberg (append read, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Files | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Files (object store, splits) | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| RabbitMQ | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| IBM MQ | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| NATS JetStream | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| WebSocket | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| FIX TagValue | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Generator | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| Generator (splits) | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 
 <!-- delivery-matrix:end -->
 
@@ -149,6 +155,21 @@ and before each release, but do not yet fail the `Checkpoint fault and soak` wor
 | PostgreSQL append | Keyless table, rows counted per id | `three_node_postgres_sink_kill9_soak` |
 | MongoDB insert | Collection, documents counted per id | `three_node_mongodb_sink_kill9_soak` |
 | NATS JetStream | File-backed stream with three replicas, drained by a durable consumer | `three_node_nats_sink_kill9_soak` |
+
+The PostgreSQL and MongoDB upsert sinks apply rows by key, so a cluster admits them only when each
+key is produced on one node at a time: the input is partitioned by columns that are all in the
+sink's key, sits on one vnode, or is projected from one source that runs on one node at a time.
+Other inputs are rejected before I/O. A node that hands vnodes over flushes before the handoff
+cut commits and writes nothing after it. A PostgreSQL writer sends `COMMIT` only after every
+statement returned and while its lease is live, so a stale writer cannot overwrite a key its
+successor took over. MongoDB writes are not transactional: a write sent just before a process's
+lease expired can land after its successor's and leave the key's older value until its next
+change. `keyed_sinks::three_node_postgres_keyed_sinks_kill9_soak` (candidate) replicates a
+PostgreSQL CDC `changelog` source into a table keyed by `id`, and writes a keyed aggregate over
+it to a PostgreSQL table and a MongoDB collection keyed by its group. It runs the kill and
+rejoin rounds and a paused-owner round while a writer inserts, updates and deletes rows; once the
+writer stops, the replica must equal the table, and the aggregate table and collection must
+equal the aggregate over the table.
 
 ## Evidence for cluster at-least-once sources
 
@@ -231,8 +252,8 @@ the table's final snapshot, and more than one node must have read the table.
 
 A PostgreSQL CDC source in `changelog` mode, or in `upsert` mode with the initial copy, also
 runs on one node at a time. A checkpoint inside the copy stands between chunks, and the next
-owner continues the copy from it. A `changelog` copy resumes only when no at-least-once sink that
-applies changes by key reads the source; in a cluster none can until mutable sinks run there.
+owner continues the copy from it. A `changelog` copy resumes after a crash only when no
+at-least-once sink that applies changes by key reads the source, and after a handoff always.
 `postgres_changelog_source::three_node_postgres_changelog_kill9_soak` (candidate) seeds a table
 of wide rows, so the copy outlasts the start, kills the node copying it and requires a survivor
 to continue, then runs the same kills and a paused-owner round while a writer inserts, updates

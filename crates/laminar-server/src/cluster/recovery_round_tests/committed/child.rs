@@ -76,7 +76,7 @@ impl DatabasePeer {
                     )
                     .await?;
             }
-            Runtime::Aggregate | Runtime::Sequence(_) => {
+            Runtime::Aggregate | Runtime::Windows | Runtime::Sequence(_) => {
                 return Err(anyhow!("this fixture cannot install process code"))
             }
         }
@@ -162,6 +162,7 @@ impl DatabasePeer {
         Ok(Observation {
             fenced: self.db()?.cluster_intake_fenced(),
             polls: self.probe.polls.load(Ordering::Acquire),
+            delivered: self.probe.delivered.load(Ordering::Acquire),
             starts,
             output,
             assignment: controller.checkpoint_assignment_fence(registry.assignment_version()),
@@ -385,6 +386,17 @@ impl DatabasePeer {
             Command::Catalog => {
                 match self.runtime {
                     Runtime::Aggregate => {}
+                    Runtime::Windows => {
+                        let ddl = [
+                            "CREATE SOURCE recovery_input (account BIGINT, amount BIGINT, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts) FROM \"recovery-cut-probe\" ('fixture' = 'bounded-replay-v1')".into(),
+                            // Each record opens its own window, which closes once the frontier of
+                            // every database passes its end.
+                            "CREATE STREAM recovery_windows AS SELECT account, tumble(ts, INTERVAL '1' MILLISECOND) AS w, SUM(amount) AS total FROM recovery_input GROUP BY account, tumble(ts, INTERVAL '1' MILLISECOND) EMIT ON WINDOW CLOSE".into(),
+                            "CREATE SINK recovery_window_probe FROM recovery_windows INTO \"recovery-window-probe\" ('fixture' = 'bounded-replay-v1')".into(),
+                        ];
+                        self.db()?.execute_cluster_bootstrap_batch(&ddl).await?;
+                        return Ok(Response::Done);
+                    }
                     Runtime::Sequence(sequence) => {
                         self.db()?
                             .execute_cluster_bootstrap_batch(&sequence.catalog())
@@ -445,7 +457,7 @@ impl DatabasePeer {
             }
             Command::Prefix(prefix) => {
                 let bound = match self.runtime {
-                    Runtime::Aggregate => 4,
+                    Runtime::Aggregate | Runtime::Windows => 4,
                     Runtime::Native => 7,
                     #[cfg(feature = "process-remote")]
                     Runtime::RemoteRust => 7,
@@ -465,6 +477,7 @@ impl DatabasePeer {
             Command::Drain(node) => self.change_membership(node, Some(NodeState::Draining))?,
             Command::ClearProcessObservation => self.clear_process_observation(),
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
+            Command::ReadWindows => return Ok(Response::Rows(self.probe.windows.lock().clone())),
             Command::Checkpoint => return self.checkpoint().await,
             Command::ReadView(sql, epoch) => return self.read_view(&sql, epoch).await,
             Command::Subscribe(view, columns) => self.subscribe(view, columns).await?,

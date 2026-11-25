@@ -397,6 +397,24 @@ jobs:
             visibility_slo_mode: certify
             services: seaweedfs postgres
             candidate: "true"
+          - label: Cluster ALO keyed PostgreSQL and MongoDB sinks (gossip)
+            test: keyed_sinks::three_node_postgres_keyed_sinks_kill9_soak
+            features: cluster,aws,kafka,postgres-cdc,postgres-sink,mongodb-cdc
+            delivery: alo
+            topology: cluster-keyed-sinks
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # A PostgreSQL changelog source is replicated into a table keyed by id, and a keyed
+            # aggregate over it into a table and a MongoDB collection keyed by bucket. Each node
+            # writes the keys it owns through kills, rejoins and a paused owner, and every output
+            # must equal the source table.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: seaweedfs postgres mongodb
+            candidate: "true"
           - label: Cluster ALO PostgreSQL upsert copy into an interval join (gossip)
             test: postgres_upsert_copy_source::three_node_postgres_upsert_copy_interval_kill9_soak
             features: cluster,aws,kafka,postgres-cdc,postgres-sink
@@ -750,7 +768,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --profile soak -p laminar-server --bin laminardb --no-default-features --features cluster,aws,process-remote cluster::recovery_round_tests::committed:: -- --ignored --nocapture --test-threads=1 --color never 2>&1 | tee process-node-loss.log
-          grep -Eq '^test result: ok\. 9 passed; 0 failed;' process-node-loss.log
+          grep -Eq '^test result: ok\. 12 passed; 0 failed;' process-node-loss.log
           cargo test --profile soak -p laminar-db --lib --no-default-features --features cluster,process-remote process_function::operator::execution::tests::shuffle::committed::peers::independent_owners_restore_the_committed_cut_after_host_loss_and_rescale -- --exact --ignored --nocapture --color never 2>&1 | tee process-owner-transfer.log
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' process-owner-transfer.log
         env:

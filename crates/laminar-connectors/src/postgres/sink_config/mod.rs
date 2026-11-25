@@ -88,6 +88,10 @@ pub struct PostgresSinkConfig {
 
     /// Per-query statement timeout (default: 30s).
     pub statement_timeout: Duration,
+
+    /// Set by the engine, not by a property: writers on other cluster nodes apply other keys of
+    /// the target at the same time.
+    pub shared_by_key: bool,
 }
 
 impl Default for PostgresSinkConfig {
@@ -109,6 +113,7 @@ impl Default for PostgresSinkConfig {
             auto_create_table: false,
             changelog_mode: false,
             statement_timeout: Duration::from_secs(30),
+            shared_by_key: false,
         }
     }
 }
@@ -310,13 +315,21 @@ impl PostgresSinkConfig {
         Ok(())
     }
 
-    /// `PostgreSQL` startup option applied to every connection created by the pool.
+    /// `PostgreSQL` startup options applied to every connection the pool creates. A target shared
+    /// by key also ends a transaction whose client stays silent for half a statement timeout: a
+    /// writer frozen with a transaction open would otherwise hold its row locks against the
+    /// successor that took over its keys until that successor's own statements time out.
     #[must_use]
-    pub(super) fn statement_timeout_startup_option(&self) -> String {
-        format!(
-            "-c statement_timeout={}",
-            self.statement_timeout.as_millis()
-        )
+    pub(super) fn session_startup_options(&self) -> String {
+        let timeout = self.statement_timeout.as_millis();
+        if self.shared_by_key {
+            format!(
+                "-c statement_timeout={timeout} -c idle_in_transaction_session_timeout={}",
+                timeout / 2
+            )
+        } else {
+            format!("-c statement_timeout={timeout}")
+        }
     }
 
     /// Returns the safely quoted fully qualified table name (`"schema"."table"`).

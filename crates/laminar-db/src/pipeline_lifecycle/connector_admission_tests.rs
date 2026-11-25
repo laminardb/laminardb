@@ -3,9 +3,9 @@ use super::{
     admit_sink, admit_sink_contract, admit_source_contract, admit_temporal_source_contract,
     close_opened_sinks, has_only_temporal_right_consumers, open_prepared_sinks,
     resolve_stream_output_schemas, validate_source_recovery_assignment,
-    ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
-    TemporalSourceRole, TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
-    KEYED_SOURCE_PRIMARY_KEY,
+    ConnectorTaskFenceRegistration, DbError, InputPlacement, PreparedSink, RuntimeMode,
+    SinkAdmissionContext, TemporalSourceRole, TrackedSourceRegistration, CLUSTER_BEST_EFFORT,
+    EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
 };
 use crate::db::DbState;
 use crate::pipeline::streaming_coordinator::MUTATION_SOURCE_NOT_ADMITTED;
@@ -2768,6 +2768,7 @@ fn sink_contract_admission_matrix_is_fail_closed() {
     let topologies = [
         SinkTopology::Singleton,
         SinkTopology::MultiWriter,
+        SinkTopology::KeyPartitioned,
         SinkTopology::NodeLocalEgress,
     ];
     let input_modes = [
@@ -2792,7 +2793,10 @@ fn sink_contract_admission_matrix_is_fail_closed() {
                             let durable = delivery != DeliveryGuarantee::AtLeastOnce
                                 || consistency != SinkConsistency::Ephemeral;
                             let placed = runtime != RuntimeMode::Cluster
-                                || topology == SinkTopology::MultiWriter;
+                                || matches!(
+                                    topology,
+                                    SinkTopology::MultiWriter | SinkTopology::KeyPartitioned
+                                );
                             let input_compatible =
                                 !carries_changelog || input_mode.accepts_full_changelog();
                             let protocol_compatible = if delivery == DeliveryGuarantee::ExactlyOnce
@@ -3148,6 +3152,7 @@ fn sink_admission_failure_retains_captured_generation_fence() {
                 delivery: DeliveryGuarantee::ExactlyOnce,
                 runtime: RuntimeMode::Local,
                 carries_changelog: false,
+                input_placement: &InputPlacement::AnyNode,
                 mutation_key: None,
                 checkpointing_enabled: true,
                 checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
@@ -3539,6 +3544,7 @@ fn coordinated_commit_is_rejected_under_at_least_once_before_open() {
             delivery: DeliveryGuarantee::AtLeastOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            input_placement: &InputPlacement::AnyNode,
             mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::Volatile,
@@ -3627,6 +3633,7 @@ fn complete_exact_protocol_is_admitted_without_opening() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            input_placement: &InputPlacement::AnyNode,
             mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
@@ -3669,6 +3676,7 @@ fn rest_s3_iceberg_is_cluster_exact_admitted_before_io() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Cluster,
             carries_changelog: false,
+            input_placement: &InputPlacement::AnyNode,
             mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
@@ -3727,6 +3735,7 @@ fn uncertified_or_unsupported_iceberg_targets_fail_before_io() {
                 delivery: DeliveryGuarantee::ExactlyOnce,
                 runtime: RuntimeMode::Cluster,
                 carries_changelog: false,
+                input_placement: &InputPlacement::AnyNode,
                 mutation_key: None,
                 checkpointing_enabled: true,
                 checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
@@ -3761,6 +3770,7 @@ fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            input_placement: &InputPlacement::AnyNode,
             mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
@@ -3816,6 +3826,7 @@ fn exact_state_scope_is_runtime_aware_and_checked_before_open() {
                 delivery: DeliveryGuarantee::ExactlyOnce,
                 runtime,
                 carries_changelog: false,
+                input_placement: &InputPlacement::AnyNode,
                 mutation_key: None,
                 checkpointing_enabled: true,
                 checkpoint_storage_scope: scope,
@@ -3854,6 +3865,7 @@ fn exact_rejection_precedes_open_for_non_committable_contract() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            input_placement: &InputPlacement::AnyNode,
             mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
@@ -4033,6 +4045,7 @@ async fn direct_mutation_sinks_must_apply_keyed_deletes_by_the_source_key() {
                         delivery: DeliveryGuarantee::AtLeastOnce,
                         runtime: RuntimeMode::Local,
                         carries_changelog: true,
+                        input_placement: &InputPlacement::AnyNode,
                         mutation_key: Some(&key),
                         checkpointing_enabled: true,
                         checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,

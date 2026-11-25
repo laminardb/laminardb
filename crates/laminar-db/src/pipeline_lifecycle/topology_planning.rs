@@ -183,7 +183,7 @@ impl LaminarDB {
             schemas.insert(name, Arc::clone(&source.schema));
         }
         connector_sha256.extend(
-            self.plan_topology_sinks(&sinks, &schemas, &resolved, &source_input_modes)
+            self.plan_topology_sinks(&sinks, &schemas, &resolved, &sources)
                 .await?,
         );
         if let Some((input, _)) = &restore {
@@ -216,7 +216,7 @@ impl LaminarDB {
         sinks: &std::collections::HashMap<String, crate::connector_manager::SinkRegistration>,
         schemas: &BTreeMap<String, arrow_schema::SchemaRef>,
         resolved: &super::output_schema::ResolvedStreamOutputs,
-        planned_sources: &BTreeMap<String, SourceInputMode>,
+        sources: &std::collections::HashMap<String, crate::connector_manager::SourceRegistration>,
     ) -> Result<BTreeMap<String, String>, DbError> {
         let mut connector_sha256 = BTreeMap::new();
         let mut sink_names: Vec<_> = sinks.keys().collect();
@@ -234,7 +234,7 @@ impl LaminarDB {
                     "sink '{name}' has no durable connector; catalog-only output is not an external migration sink"
                 )).into());
             }
-            if planned_sources.contains_key(&registration.input) {
+            if sources.contains_key(&registration.input) {
                 return Err(super::direct_mutation_routes::cluster_source_sink_error(
                     name,
                     &registration.input,
@@ -258,6 +258,9 @@ impl LaminarDB {
                     delivery: self.config.delivery_guarantee,
                     runtime: RuntimeMode::Cluster,
                     carries_changelog: resolved.changelog_carrying.contains(&registration.input),
+                    input_placement: &resolved.input_placement(&registration.input, &|input| {
+                        self.is_placed_singleton_source(input, sources)
+                    }),
                     mutation_key: None,
                     checkpointing_enabled: self.config.checkpoint.is_some(),
                     checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,

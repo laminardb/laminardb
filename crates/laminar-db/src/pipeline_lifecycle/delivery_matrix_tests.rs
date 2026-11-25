@@ -12,7 +12,7 @@ use laminar_connectors::registry::ConnectorRegistry;
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 
 use super::{
-    admit_sink, admit_source_recovery_contract, RuntimeMode, SinkAdmissionContext,
+    admit_sink, admit_source_recovery_contract, InputPlacement, RuntimeMode, SinkAdmissionContext,
     CLUSTER_BEST_EFFORT,
 };
 use crate::pipeline_callback::encode_arrow_schema;
@@ -285,12 +285,37 @@ const SINKS: &[Variant] = &[
         exact_properties: &[],
     },
     Variant {
+        label: "PostgreSQL upsert",
+        connector: "postgres-sink",
+        properties: &[
+            ("hostname", "localhost"),
+            ("database", "app"),
+            ("username", "writer"),
+            ("table.name", "out"),
+            ("write.mode", "upsert"),
+            ("primary.key", "id"),
+        ],
+        exact_properties: &[],
+    },
+    Variant {
         label: "MongoDB",
         connector: "mongodb-sink",
         properties: &[
             ("connection.uri", "mongodb://localhost:27017"),
             ("database", "app"),
             ("collection", "out"),
+        ],
+        exact_properties: &[],
+    },
+    Variant {
+        label: "MongoDB upsert",
+        connector: "mongodb-sink",
+        properties: &[
+            ("connection.uri", "mongodb://localhost:27017"),
+            ("database", "app"),
+            ("collection", "out"),
+            ("write.mode", "upsert"),
+            ("write.mode.key_fields", "id"),
         ],
         exact_properties: &[],
     },
@@ -434,6 +459,9 @@ fn admitted_sink(registry: &ConnectorRegistry, variant: &Variant) -> Admitted {
                     delivery,
                     runtime,
                     carries_changelog: false,
+                    // A key-partitioned sink also needs input placed by its key, which is query
+                    // shape, not delivery: model an input whose keys each have one writer.
+                    input_placement: &InputPlacement::OneNode,
                     mutation_key: None,
                     checkpointing_enabled: true,
                     checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,

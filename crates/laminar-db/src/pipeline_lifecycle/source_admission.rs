@@ -1,6 +1,6 @@
 use super::{
     admit_append_only_source, Arc, CheckpointStorageScope, ConnectorConfig,
-    ConnectorTaskFenceRegistration, DbError, DeliveryGuarantee, FxHashMap, HashMap,
+    ConnectorTaskFenceRegistration, DbError, DeliveryGuarantee, FxHashMap, HashMap, InputPlacement,
     RecoveredInputChannelProgress, RuntimeMode, SinkConnector, SinkConsistency, SinkContract,
     SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceLocality,
     SourceRowPositionCapability, SourceTopology, SourceWatermarkState, CLUSTER_BEST_EFFORT,
@@ -397,7 +397,8 @@ pub(crate) fn admit_sink_contract(
 
     if runtime == RuntimeMode::Cluster {
         match contract.topology {
-            SinkTopology::MultiWriter => {}
+            // `admit_sink` requires the input to produce each key on one node at a time.
+            SinkTopology::MultiWriter | SinkTopology::KeyPartitioned => {}
             SinkTopology::NodeLocalEgress => {
                 return Err(
                     "cluster node-local egress has no defined rebalance/state-loss contract",
@@ -430,6 +431,8 @@ pub(super) struct SinkAdmissionContext<'a> {
     pub(super) delivery: DeliveryGuarantee,
     pub(super) runtime: RuntimeMode,
     pub(super) carries_changelog: bool,
+    /// Where the input's rows are produced across cluster nodes.
+    pub(super) input_placement: &'a InputPlacement,
     /// Primary key of a direct keyed-mutation source input.
     pub(super) mutation_key: Option<&'a [String]>,
     pub(super) checkpointing_enabled: bool,

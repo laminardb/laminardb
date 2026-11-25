@@ -16,10 +16,10 @@ use tokio::sync::Notify;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, ConnectorTaskTracker, SourceBatch, SourceBatchCursor,
-    SourceCheckpointUnavailablePolicy, SourceConnector, SourceContract, SourceDrainOutcome,
-    SourceDrainRequest, SourceDrainSettlement, SourcePosition, SourceRecency, SourceStart,
-    SourceTopology,
+    ConnectorCancellationPolicy, ConnectorTaskTracker, ReplayRequirement, SourceBatch,
+    SourceBatchCursor, SourceCheckpointUnavailablePolicy, SourceConnector, SourceContract,
+    SourceDrainOutcome, SourceDrainRequest, SourceDrainSettlement, SourcePosition, SourceRecency,
+    SourceStart,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::{AssignmentDrainId, CheckpointAttempt};
@@ -60,8 +60,11 @@ struct Drain {
 }
 
 enum Pending {
-    /// Start the connector at this position.
-    Open(SourcePosition),
+    /// Start the connector at this position, owing `replay`.
+    Open {
+        position: SourcePosition,
+        replay: ReplayRequirement,
+    },
     /// Release what the handoff cut holds, then close: the next owner reads after the cut.
     Close {
         handoff: CheckpointAttempt,
@@ -149,10 +152,15 @@ impl SingletonPlacement {
                 return;
             }
             (false, true, Some((attempt, committed))) => {
-                Some(Pending::Open(SourcePosition::Resume {
-                    attempt,
-                    checkpoint: (*committed).clone(),
-                }))
+                // The previous owner's intake was fenced from the handoff cut's capture, and it
+                // flushed its output before the cut committed: the start owes no repeated output.
+                Some(Pending::Open {
+                    position: SourcePosition::Resume {
+                        attempt,
+                        checkpoint: (*committed).clone(),
+                    },
+                    replay: ReplayRequirement::FromCheckpoint,
+                })
             }
             (false, true, None) if self.released => {
                 self.fault = Some(
@@ -167,7 +175,10 @@ impl SingletonPlacement {
                     self.fault = Some("singleton source assigned before it started".into());
                     return;
                 };
-                Some(Pending::Open(request.clone().into_parts().1))
+                Some(Pending::Open {
+                    replay: request.replay_requirement(),
+                    position: request.clone().into_parts().1,
+                })
             }
             (true, true, _) | (false, false, _) => None,
         };
@@ -193,12 +204,13 @@ impl SingletonPlacement {
 
     async fn perform(&mut self, pending: &Pending) -> Result<(), ConnectorError> {
         match pending {
-            Pending::Open(position) => {
+            Pending::Open { position, replay } => {
                 let start = self
                     .request
                     .clone()
                     .ok_or_else(|| invalid("singleton source assigned before it started"))?
-                    .with_position(start_position(position))?;
+                    .with_position(start_position(position))?
+                    .with_replay_requirement(*replay);
                 self.inner.start(start).await?;
                 self.open = true;
                 tracing::info!(
@@ -236,15 +248,21 @@ impl SingletonPlacement {
     /// position, since nothing has been read from it yet.
     fn cursor(&self) -> SourceCheckpoint {
         match &self.pending {
-            Some(Pending::Open(SourcePosition::Initial) | Pending::Close { .. }) => {
-                SourceCheckpoint::new()
-            }
-            Some(Pending::Open(
-                SourcePosition::Initialized { checkpoint }
-                | SourcePosition::Resume { checkpoint, .. },
-            )) => checkpoint.clone(),
+            Some(Pending::Open {
+                position:
+                    SourcePosition::Initialized { checkpoint }
+                    | SourcePosition::Resume { checkpoint, .. },
+                ..
+            }) => checkpoint.clone(),
             None if self.open => self.inner.checkpoint(),
-            None => SourceCheckpoint::new(),
+            Some(
+                Pending::Open {
+                    position: SourcePosition::Initial,
+                    ..
+                }
+                | Pending::Close { .. },
+            )
+            | None => SourceCheckpoint::new(),
         }
     }
 
@@ -263,7 +281,7 @@ impl SingletonPlacement {
     /// Bind this node's share of the channel and the assignment it follows to a cursor.
     fn bind(&self, mut checkpoint: SourceCheckpoint) -> SourceCheckpoint {
         let owns = match &self.pending {
-            Some(Pending::Open(_)) => true,
+            Some(Pending::Open { .. }) => true,
             Some(Pending::Close { .. }) => false,
             None => self.open,
         };
@@ -296,9 +314,7 @@ pub(crate) fn place(
     config: &ConnectorConfig,
 ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
     let contract = connector.contract(config)?;
-    if contract.topology == SourceTopology::Singleton
-        && super::source_admission::cluster_assignment_scoped(contract)
-    {
+    if super::runs_on_one_node(contract) {
         // The catalog name is the channel identity; refuse one the cursor format reserves.
         SourceCheckpoint::new().set_input_channels(vec![name.as_bytes().to_vec()])?;
         return Ok(Box::new(SingletonPlacement::new(
@@ -633,10 +649,13 @@ mod tests {
         ack_refusals: usize,
     }
 
-    fn position(position: &SourcePosition) -> String {
-        match position {
-            SourcePosition::Initial => "initial".into(),
-            SourcePosition::Initialized { .. } => "initialized".into(),
+    /// The start a test source records: its position, and whether it owes no repeated output.
+    fn started(request: SourceStart) -> Event {
+        let replay = request.replay_requirement();
+        let (_, start, _) = request.into_parts();
+        let mut event = match start {
+            SourcePosition::Initial => "initial".to_owned(),
+            SourcePosition::Initialized { .. } => "initialized".to_owned(),
             SourcePosition::Resume {
                 attempt,
                 checkpoint,
@@ -645,7 +664,11 @@ mod tests {
                 attempt.epoch,
                 checkpoint.get_offset("delivered").unwrap_or("-")
             ),
+        };
+        if replay == ReplayRequirement::FromCheckpoint {
+            event.push_str(", owing no repeat");
         }
+        Event::Start(event)
     }
 
     #[async_trait]
@@ -655,14 +678,14 @@ mod tests {
                 request.process_lease().is_some(),
                 "the wrapper hands the connector its process lease"
             );
-            let (_, start, _) = request.into_parts();
+            let event = started(request);
             if self.refusals > 0 {
                 self.refusals -= 1;
                 return Err(ConnectorError::ConnectionFailed(
                     "broker unreachable".into(),
                 ));
             }
-            self.events.lock().push(Event::Start(position(&start)));
+            self.events.lock().push(event);
             self.open = true;
             Ok(())
         }
@@ -753,8 +776,7 @@ mod tests {
     #[async_trait]
     impl SourceConnector for UnitOfWork {
         async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-            let (_, start, _) = request.into_parts();
-            self.events.lock().push(Event::Start(position(&start)));
+            self.events.lock().push(started(request));
             Ok(())
         }
 
@@ -1114,7 +1136,11 @@ mod tests {
             ],
             "the donor releases the handoff cut before it closes"
         );
-        assert_eq!(b.events(), [Event::Start("resume 5 at 2".into())]);
+        assert_eq!(
+            b.events(),
+            [Event::Start("resume 5 at 2, owing no repeat".into())],
+            "the previous owner wrote nothing after the handoff cut"
+        );
         assert_eq!(cursor.assignment_version().map(NonZeroU64::get), Some(2));
         assert_eq!(a.source.checkpoint().input_channels(), Some(&[][..]));
     }
@@ -1330,7 +1356,10 @@ mod tests {
             ],
             "the donor commits the sealed handoff unit before it closes"
         );
-        assert_eq!(b.events(), [Event::Start("resume 2 at 4".into())]);
+        assert_eq!(
+            b.events(),
+            [Event::Start("resume 2 at 4, owing no repeat".into())]
+        );
     }
 
     /// Every owner reports the catalog name as the one channel, so positioned rows carry it as

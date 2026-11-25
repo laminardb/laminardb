@@ -125,7 +125,7 @@ fn build_pool(config: &PostgresSinkConfig) -> Result<Pool, ConnectorError> {
     pool_config.dbname = Some(config.database.clone());
     pool_config.user = Some(config.username.clone());
     pool_config.password = Some(config.password.clone());
-    pool_config.options = Some(config.statement_timeout_startup_option());
+    pool_config.options = Some(config.session_startup_options());
     pool_config.connect_timeout = Some(config.connect_timeout);
     pool_config.ssl_mode = Some(match config.ssl_mode {
         crate::postgres::SslMode::Disable => deadpool_postgres::SslMode::Disable,
@@ -232,6 +232,17 @@ impl PostgresSink {
         Ok(Self::new(schema, sink_config, registry))
     }
 
+    /// The configuration `config` describes, or this sink's own when `config` carries no properties
+    /// (direct programmatic construction).
+    #[cfg(feature = "postgres-sink")]
+    fn config_for(&self, config: &ConnectorConfig) -> Result<PostgresSinkConfig, ConnectorError> {
+        if config.properties().is_empty() {
+            Ok(self.config.clone())
+        } else {
+            Ok(Self::decode_connector_config(config)?.0)
+        }
+    }
+
     fn decode_connector_config(
         config: &ConnectorConfig,
     ) -> Result<(PostgresSinkConfig, SchemaRef), ConnectorError> {
@@ -251,7 +262,8 @@ impl PostgresSink {
     }
 
     fn apply_connector_config(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        let (sink_config, schema) = Self::decode_connector_config(config)?;
+        let (mut sink_config, schema) = Self::decode_connector_config(config)?;
+        sink_config.shared_by_key = self.config.shared_by_key;
         let user_schema = build_user_schema(&schema);
         self.config = sink_config;
         self.schema = schema;
@@ -745,11 +757,7 @@ impl PostgresSink {
 #[async_trait]
 impl SinkConnector for PostgresSink {
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-        let cfg = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            Self::decode_connector_config(config)?.0
-        };
+        let cfg = self.config_for(config)?;
         cfg.validate()?;
         if config.properties().is_empty() {
             validate_sink_schema(&self.schema, &cfg)?;
@@ -761,14 +769,12 @@ impl SinkConnector for PostgresSink {
         } else {
             SinkInputMode::AppendOnly
         };
-        // Append-only writes commute across independent runtime writers. Mutable writes do not:
-        // without key-affine placement and a fenced handoff, an older upsert/delete from one node
-        // can land after a newer value from another node. Keep those modes singleton until the
-        // runtime can prove that stronger topology protocol.
+        // Append-only writes commute across independent runtime writers. Writes by key do not, so
+        // each key needs one writer at a time.
         let topology = if cfg.write_mode == WriteMode::Append {
             SinkTopology::MultiWriter
         } else {
-            SinkTopology::Singleton
+            SinkTopology::KeyPartitioned
         };
         Ok(SinkContract::new(
             SinkConsistency::DurableAtLeastOnce,
@@ -777,15 +783,23 @@ impl SinkConnector for PostgresSink {
         ))
     }
 
+    fn destination_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        let cfg = self.config_for(config)?;
+        Ok((cfg.write_mode == WriteMode::Upsert).then_some(cfg.primary_key_columns))
+    }
+
+    fn share_destination_by_key(&mut self) {
+        self.config.shared_by_key = true;
+    }
+
     fn keyed_mutation_key(
         &self,
         config: &ConnectorConfig,
     ) -> Result<Option<Vec<String>>, ConnectorError> {
-        let cfg = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            Self::decode_connector_config(config)?.0
-        };
+        let cfg = self.config_for(config)?;
         // Changelog mode collapses each flush to one terminal `_op` per key, upserts `U` rows
         // and deletes `D` rows by primary key only.
         Ok((cfg.changelog_mode && cfg.write_mode == WriteMode::Upsert)

@@ -35,6 +35,8 @@ struct PeerConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Runtime {
     Aggregate,
+    /// The probe input closed into event-time windows written to a recording sink.
+    Windows,
     Native,
     #[cfg(feature = "process-remote")]
     RemoteRust,
@@ -54,6 +56,8 @@ enum Command {
     Drain(u64),
     ClearProcessObservation,
     Observe,
+    /// Every window row this database's sink wrote: account, window start, total.
+    ReadWindows,
     Checkpoint,
     /// A committed read of one view: the newest cut, or exactly this epoch.
     ReadView(String, Option<u64>),
@@ -80,6 +84,8 @@ struct Resume {
 struct Observation {
     fenced: bool,
     polls: u64,
+    /// Records the probe source has delivered on this database.
+    delivered: u64,
     starts: Vec<Resume>,
     output: BTreeMap<i64, i64>,
     assignment: Option<CheckpointAssignmentFence>,
@@ -158,6 +164,12 @@ async fn two_databases_migrate_and_seed_views_from_the_cut() {
 #[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
 async fn a_draining_database_hands_its_views_over_live() {
     scenario::run_drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_writes_no_window_its_acquirer_closes() {
+    scenario::run_window_drain().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
