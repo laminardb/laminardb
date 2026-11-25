@@ -284,7 +284,8 @@ fn test_sink_contract_upsert() {
     assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
     assert_eq!(
-        sink.destination_key(&ConnectorConfig::new("mongodb")).unwrap(),
+        sink.destination_key(&ConnectorConfig::new("mongodb"))
+            .unwrap(),
         Some(vec!["id".to_string()])
     );
 }

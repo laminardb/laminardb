@@ -29,17 +29,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::TryStreamExt as _;
-use mongodb::bson::{doc, Bson, Document};
+use mongodb::bson::Bson;
 
 use super::bucket_view::{bucket_sql, converged_reads, view_sql, Buckets};
 use super::kill_rejoin::{
     boot, cluster_nodes, kill_round, per_node, record_consumers, steady_phase, SoakSettings,
     CHECKPOINTS_COMPLETED,
 };
-use super::multi_writer_sinks::block_on;
-use super::multi_writer_sinks::mongo::{DATABASE as MONGO_DATABASE, URI as MONGO_URI};
+use super::multi_writer_sinks::mongo::MongoDb;
 use super::multi_writer_sinks::postgres::Postgres;
+use super::multi_writer_sinks::{block_on, Destination};
 use super::postgres_changelog_source::{
     create_and_seed, spawn_writer, table_buckets, workload, SOURCE,
 };
@@ -72,8 +71,7 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
     executable.describe();
     let settings = SoakSettings::from_environment(JoinDelivery::AtLeastOnce);
     let postgres = Postgres::from_environment();
-    let mongo_uri = std::env::var(MONGO_URI)
-        .unwrap_or_else(|_| panic!("the keyed sink soak requires {MONGO_URI}"));
+    let mongo = MongoDb::from_environment();
     let run_id = soak_run_id();
     let checkpoint_url =
         scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
@@ -97,11 +95,11 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
         output: Some(&dropped_outputs),
     };
     let _documents = DropCollection {
-        uri: &mongo_uri,
+        mongo: &mongo,
         collection: &outputs.buckets,
     };
     create_and_seed(&postgres, &capture, seed_rows);
-    create_outputs(&postgres, &mongo_uri, &outputs);
+    create_outputs(&postgres, &mongo, &outputs);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let log_dir: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
@@ -117,7 +115,7 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
         &format!(
             "{}{}",
             workload(&capture, &postgres.source_properties()),
-            keyed_sinks(&postgres, &outputs)
+            keyed_sinks(&postgres, &mongo, &outputs)
         ),
     );
     let mut writer = spawn_writer(&postgres, &capture.table, seed_rows, settings.rps);
@@ -158,7 +156,7 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
     let epoch = converged_reads(&mut nodes, &expected, &settings, latest);
     let mut last = None;
     let applied = wait_until(SINK_SETTLE, || {
-        let observed = block_on(observe(&postgres, &mongo_uri, &capture, &outputs));
+        let observed = block_on(observe(&postgres, &mongo, &capture, &outputs));
         let applied = observed.replica_differences == (0, 0)
             && observed.buckets == expected
             && observed.documents == expected;
@@ -184,20 +182,23 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
     );
 }
 
-/// Under a sink that applies changes by key, a crash inside the copy fails closed by design, so the
-/// kills start from a committed cut past it. The source streams the slot only after the copy, and
-/// the third cut committed after a node streams was captured after the second committed, which
-/// was after the stream began. Returns that cut.
+/// The first committed cut captured after the copy ended. The source streams the slot only after
+/// the copy, and the third cut committed after a node streams was captured after the second
+/// committed, which was after the stream began.
 fn past_the_copy(
     nodes: &mut [Node],
     live: &mut dyn FnMut(),
     settings: &SoakSettings,
     mut latest: DurableCheckpointStatus,
 ) -> DurableCheckpointStatus {
-    wait_for("the copy to end and the slot to stream", COPY_DEADLINE, || {
-        live();
-        per_node(nodes, STREAMED_TRANSACTIONS).iter().sum::<f64>() > 0.0
-    });
+    wait_for(
+        "the copy to end and the slot to stream",
+        COPY_DEADLINE,
+        || {
+            live();
+            per_node(nodes, STREAMED_TRANSACTIONS).iter().sum::<f64>() > 0.0
+        },
+    );
     for _ in 0..3 {
         latest = wait_for_converged_durable_checkpoint(
             nodes,
@@ -210,7 +211,7 @@ fn past_the_copy(
 }
 
 /// The projection and aggregate the sinks read, and the three sinks.
-fn keyed_sinks(postgres: &Postgres, outputs: &Outputs) -> String {
+fn keyed_sinks(postgres: &Postgres, mongo: &MongoDb, outputs: &Outputs) -> String {
     let Outputs { replica, buckets } = outputs;
     format!(
         r#"
@@ -240,30 +241,20 @@ name = "bucket_documents"
 pipeline = "bucket_changes"
 connector = "mongodb-sink"
 [sink.properties]
-"connection.uri" = "$${{{MONGO_URI}}}"
-database = "{MONGO_DATABASE}"
-collection = "{buckets}"
-"write.mode" = "upsert"
-"write.mode.key_fields" = "bucket"
-"#,
+{document_properties}"#,
         buckets_sql = bucket_sql(SOURCE),
         replica_properties = postgres.changelog_sink_properties(replica, "id"),
         bucket_properties = postgres.changelog_sink_properties(buckets, "bucket"),
+        document_properties = mongo.upsert_sink_properties(buckets, "bucket"),
     )
 }
 
 /// Every node opens the sinks concurrently, so the test creates the tables and the collection
 /// rather than racing three nodes' automatic creation.
-fn create_outputs(postgres: &Postgres, mongo_uri: &str, outputs: &Outputs) {
+fn create_outputs(postgres: &Postgres, mongo: &MongoDb, outputs: &Outputs) {
     let Outputs { replica, buckets } = outputs;
+    mongo.create(buckets);
     block_on(async {
-        mongodb::Client::with_uri_str(mongo_uri)
-            .await
-            .expect("connect to MongoDB")
-            .database(MONGO_DATABASE)
-            .create_collection(buckets)
-            .await
-            .expect("create the bucket collection");
         postgres
             .client()
             .await
@@ -288,7 +279,7 @@ struct Observed {
 
 async fn observe(
     postgres: &Postgres,
-    mongo_uri: &str,
+    mongo: &MongoDb,
     capture: &Capture,
     outputs: &Outputs,
 ) -> Observed {
@@ -320,54 +311,29 @@ async fn observe(
     Observed {
         replica_differences,
         buckets,
-        documents: documents(mongo_uri, &outputs.buckets).await,
-    }
-}
-
-/// The bucket collection's documents as `(bucket, n, total, peak)`, in bucket order.
-async fn documents(uri: &str, collection: &str) -> Buckets {
-    let client = mongodb::Client::with_uri_str(uri)
-        .await
-        .expect("connect to MongoDB");
-    let documents: Vec<Document> = client
-        .database(MONGO_DATABASE)
-        .collection::<Document>(collection)
-        .find(doc! {})
-        .sort(doc! { "bucket": 1 })
-        .await
-        .expect("read the bucket collection")
-        .try_collect()
-        .await
-        .expect("read the bucket documents");
-    documents
-        .iter()
-        .map(|document| {
-            ["bucket", "n", "total", "peak"].map(|field| match document.get(field) {
-                Some(Bson::Int64(value)) => *value,
-                Some(Bson::Int32(value)) => i64::from(*value),
-                other => panic!("bucket document field {field} is {other:?}"),
+        documents: mongo
+            .documents(&outputs.buckets, "bucket")
+            .await
+            .iter()
+            .map(|document| {
+                ["bucket", "n", "total", "peak"].map(|field| match document.get(field) {
+                    Some(Bson::Int64(value)) => *value,
+                    Some(Bson::Int32(value)) => i64::from(*value),
+                    other => panic!("bucket document field {field} is {other:?}"),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    }
 }
 
 /// Drops the bucket collection when the soak ends, even while a failed soak unwinds.
 struct DropCollection<'a> {
-    uri: &'a str,
+    mongo: &'a MongoDb,
     collection: &'a str,
 }
 
 impl Drop for DropCollection<'_> {
     fn drop(&mut self) {
-        let (uri, collection) = (self.uri.to_owned(), self.collection.to_owned());
-        block_on(async move {
-            if let Ok(client) = mongodb::Client::with_uri_str(&uri).await {
-                let _ = client
-                    .database(MONGO_DATABASE)
-                    .collection::<Document>(&collection)
-                    .drop()
-                    .await;
-            }
-        });
+        self.mongo.delete(self.collection);
     }
 }

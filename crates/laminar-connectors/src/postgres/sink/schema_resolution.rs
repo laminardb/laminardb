@@ -122,7 +122,6 @@ async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
                 "PostgreSQL unique and exclusion constraints cannot be validated".into(),
             )
         })?;
-    let mut defer = false;
     let mut immediate = Vec::new();
     let mut deferred = Vec::new();
     for row in rows {
@@ -132,7 +131,6 @@ async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
         }
         let name = row.try_get::<_, String>(0).map_err(metadata_error)?;
         if row.try_get::<_, bool>(1).map_err(metadata_error)? {
-            defer = true;
             deferred.push(name);
         } else {
             immediate.push(name);
@@ -160,7 +158,7 @@ async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
             immediate.join(", ")
         )));
     }
-    Ok(defer)
+    Ok(!deferred.is_empty())
 }
 
 /// Whether the activated target needs its deferrable constraints checked at commit.

@@ -1,7 +1,7 @@
 use super::{
     admit_sink_contract, required_recovery_scope, ConnectorCancellationPolicy, DbError,
-    DeliveryGuarantee, PreparedSink, SinkAdmissionContext, SinkConnector, SinkContract,
-    EXACT_SINK_PROTOCOL,
+    DeliveryGuarantee, PreparedSink, RuntimeMode, SinkAdmissionContext, SinkConnector,
+    SinkContract, SinkTopology, EXACT_SINK_PROTOCOL,
 };
 
 /// Resolve and validate a sink before any external I/O. Keeping this boundary separate from the
@@ -30,13 +30,12 @@ pub(super) fn admit_sink(
         ))
     })?;
 
-    let destination_key = sink.destination_key(config).map_err(|error| {
+    let invalid_configuration = |error| {
         DbError::Config(format!(
             "sink '{name}' has an invalid configuration: {error}"
         ))
-    })?;
-    let key_writers = input_placement.key_writers(destination_key.as_deref());
-    admit_sink_contract(contract, delivery, runtime, carries_changelog, key_writers).map_err(|reason| {
+    };
+    admit_sink_contract(contract, delivery, runtime, carries_changelog).map_err(|reason| {
         let detail = format!(
             "sink '{name}' is not admissible in {runtime:?} mode with {delivery} delivery: \
              {reason} (contract: {contract:?})"
@@ -51,12 +50,25 @@ pub(super) fn admit_sink(
         }
     })?;
 
+    if runtime == RuntimeMode::Cluster && contract.topology == SinkTopology::KeyPartitioned {
+        let destination_key = sink
+            .destination_key(config)
+            .map_err(invalid_configuration)?;
+        if !input_placement.writes_each_key_on_one_node(destination_key.as_deref()) {
+            return Err(DbError::Config(format!(
+                "[LDB-5035] sink '{name}' is not admissible in cluster mode: rows for one \
+                 destination key of '{input}' can come from several cluster nodes, whose writes \
+                 would land in no defined order; key the sink by every column its input is \
+                 partitioned by (aggregate by the sink key first), or read one placed source \
+                 through projections"
+            )));
+        }
+    }
+
     if let Some(source_key) = mutation_key {
-        let sink_key = sink.keyed_mutation_key(config).map_err(|error| {
-            DbError::Config(format!(
-                "sink '{name}' has an invalid configuration: {error}"
-            ))
-        })?;
+        let sink_key = sink
+            .keyed_mutation_key(config)
+            .map_err(invalid_configuration)?;
         crate::direct_mutation::validate_sink_key(name, input, source_key, sink_key)
             .map_err(|reason| DbError::Config(format!("[LDB-5035] {reason}")))?;
     }

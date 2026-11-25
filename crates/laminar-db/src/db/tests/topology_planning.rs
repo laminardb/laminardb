@@ -278,7 +278,10 @@ impl SinkConnector for PlanningSink {
         };
         Ok(SinkContract::new(consistency, topology, input))
     }
-    fn destination_key(&self, config: &ConnectorConfig) -> Result<Option<Vec<String>>, ConnectorError> {
+    fn destination_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
         Ok(config
             .get("key")
             .map(|key| key.split(',').map(str::to_owned).collect()))
@@ -1438,7 +1441,7 @@ async fn topology_validation_admits_a_keyed_sink_only_on_input_placed_by_its_key
     ] {
         let error = fixture.validate(&rejected).await.expect_err("a keyed sink with several writers per key was admitted");
         assert!(
-            error.to_string().contains("rows for one destination key can come from several cluster nodes"),
+            error.to_string().contains("can come from several cluster nodes"),
             "{rejected:?}: {error}"
         );
         fixture.assert_no_effects();

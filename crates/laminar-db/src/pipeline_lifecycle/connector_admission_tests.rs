@@ -3,9 +3,9 @@ use super::{
     admit_sink, admit_sink_contract, admit_source_contract, admit_temporal_source_contract,
     close_opened_sinks, has_only_temporal_right_consumers, open_prepared_sinks,
     resolve_stream_output_schemas, validate_source_recovery_assignment,
-    ConnectorTaskFenceRegistration, DbError, InputPlacement, KeyWriters, PreparedSink, RuntimeMode,
-    SinkAdmissionContext, TemporalSourceRole, TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
-    KEYED_SOURCE_PRIMARY_KEY,
+    ConnectorTaskFenceRegistration, DbError, InputPlacement, PreparedSink, RuntimeMode,
+    SinkAdmissionContext, TemporalSourceRole, TrackedSourceRegistration, CLUSTER_BEST_EFFORT,
+    EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
 };
 use crate::db::DbState;
 use crate::pipeline::streaming_coordinator::MUTATION_SOURCE_NOT_ADMITTED;
@@ -2788,19 +2788,15 @@ fn sink_contract_admission_matrix_is_fail_closed() {
             for input_mode in input_modes {
                 for delivery in deliveries {
                     for runtime in runtimes {
-                        for (carries_changelog, key_writers) in [false, true]
-                            .into_iter()
-                            .flat_map(|carries| {
-                                [KeyWriters::One, KeyWriters::Several].map(|writers| (carries, writers))
-                            })
-                        {
+                        for carries_changelog in [false, true] {
                             let contract = SinkContract::new(consistency, topology, input_mode);
                             let durable = delivery != DeliveryGuarantee::AtLeastOnce
                                 || consistency != SinkConsistency::Ephemeral;
                             let placed = runtime != RuntimeMode::Cluster
-                                || topology == SinkTopology::MultiWriter
-                                || (topology == SinkTopology::KeyPartitioned
-                                    && key_writers == KeyWriters::One);
+                                || matches!(
+                                    topology,
+                                    SinkTopology::MultiWriter | SinkTopology::KeyPartitioned
+                                );
                             let input_compatible =
                                 !carries_changelog || input_mode.accepts_full_changelog();
                             let protocol_compatible = if delivery == DeliveryGuarantee::ExactlyOnce
@@ -2822,13 +2818,11 @@ fn sink_contract_admission_matrix_is_fail_closed() {
                                     delivery,
                                     runtime,
                                     carries_changelog,
-                                    key_writers,
                                 )
                                 .is_ok(),
                                 expected,
                                 "contract={contract:?}, delivery={delivery:?}, \
-                                 runtime={runtime:?}, carries_changelog={carries_changelog}, \
-                                 key_writers={key_writers:?}"
+                                 runtime={runtime:?}, carries_changelog={carries_changelog}"
                             );
                         }
                     }

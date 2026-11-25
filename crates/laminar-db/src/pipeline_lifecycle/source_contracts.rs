@@ -257,6 +257,7 @@ impl LaminarDB {
 
     /// Whether `source_name` is a registered source placed on one node at a time. A contract that
     /// cannot be resolved counts as not placed.
+    #[cfg(feature = "cluster")]
     pub(crate) fn is_placed_singleton_source(
         &self,
         source_name: &str,

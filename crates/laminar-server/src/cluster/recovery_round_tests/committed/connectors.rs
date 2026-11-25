@@ -404,7 +404,8 @@ impl SinkConnector for WindowSink {
         ]))
     }
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        let missing = |name: &str| ConnectorError::SchemaMismatch(format!("missing window column {name}"));
+        let missing =
+            |name: &str| ConnectorError::SchemaMismatch(format!("missing window column {name}"));
         let accounts = batch
             .column_by_name("account")
             .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
@@ -419,7 +420,11 @@ impl SinkConnector for WindowSink {
             .ok_or_else(|| missing("total"))?;
         let mut windows = self.probe.windows.lock();
         for row in 0..batch.num_rows() {
-            windows.push(vec![accounts.value(row), starts.value(row), totals.value(row)]);
+            windows.push(vec![
+                accounts.value(row),
+                starts.value(row),
+                totals.value(row),
+            ]);
         }
         if windows.len() > 64 {
             return Err(ConnectorError::ConfigurationError(

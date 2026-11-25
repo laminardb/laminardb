@@ -393,16 +393,11 @@ impl LaminarDB {
                 .streams()
                 .get(&input)
                 .is_some_and(|stream| stream.incremental);
-        let destination_key = sink.destination_key(&config)?;
-        let key_writers = self
-            .cluster_sink_key_writers(contract, destination_key.as_deref(), &input)
-            .await?;
         crate::pipeline_lifecycle::admit_sink_contract(
             contract,
             self.config.delivery_guarantee,
             self.runtime_mode(),
             carries_changelog,
-            key_writers,
         )
         .map_err(|reason| {
             DbError::Config(format!(

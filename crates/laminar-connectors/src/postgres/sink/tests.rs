@@ -769,7 +769,8 @@ fn contract_upsert_requires_keyed_input() {
     assert_eq!(contract.input_mode, SinkInputMode::KeyedUpsert);
     assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
     assert_eq!(
-        sink.destination_key(&ConnectorConfig::new("postgres")).unwrap(),
+        sink.destination_key(&ConnectorConfig::new("postgres"))
+            .unwrap(),
         Some(sink.config.primary_key_columns.clone())
     );
 }

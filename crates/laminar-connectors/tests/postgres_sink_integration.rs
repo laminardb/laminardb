@@ -573,7 +573,10 @@ async fn test_changelog_replay_deletes_a_row_a_failed_attempt_wrote() {
         .open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
-    failed_attempt.write_batch(&batch(&[1])).await.expect("write");
+    failed_attempt
+        .write_batch(&batch(&[1]))
+        .await
+        .expect("write");
     failed_attempt.flush().await.expect("flush the insert");
     failed_attempt.close().await.expect("close");
 

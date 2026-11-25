@@ -6,7 +6,7 @@
 
 use laminar_connectors::connector::{SourceContract, SourceTopology};
 
-use crate::exchange_plan::{Distribution, KeyColumn, PartitionKey, PortExchange};
+use crate::exchange_plan::{Distribution, PortExchange};
 
 use super::ResolvedStreamOutputs;
 
@@ -21,30 +21,18 @@ pub(crate) enum InputPlacement {
     AnyNode,
 }
 
-/// How many nodes can produce rows for one destination key of a sink at a time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeyWriters {
-    One,
-    Several,
-}
-
 impl InputPlacement {
-    /// Rows that share a destination key share every hash column when the destination key
-    /// contains them all, and so share one vnode. A destination key inside the hash key is not
-    /// enough: `GROUP BY a, b` into a sink keyed by `a` produces each `a` on several nodes.
-    pub(crate) fn key_writers(&self, destination_key: Option<&[String]>) -> KeyWriters {
-        let Some(destination_key) = destination_key else {
-            return KeyWriters::Several;
-        };
-        let one = match self {
-            Self::OneNode => true,
-            Self::HashedBy(columns) => columns.iter().all(|column| destination_key.contains(column)),
-            Self::AnyNode => false,
-        };
-        if one {
-            KeyWriters::One
-        } else {
-            KeyWriters::Several
+    /// Whether every row for one value of `destination_key` is produced on one node at a time.
+    /// Rows that share a destination key share every hash column when the key contains them all,
+    /// and so share one vnode. A destination key inside the hash key is not enough: `GROUP BY a,
+    /// b` into a sink keyed by `a` produces each `a` on several nodes.
+    pub(crate) fn writes_each_key_on_one_node(&self, destination_key: Option<&[String]>) -> bool {
+        match (self, destination_key) {
+            (_, None) | (Self::AnyNode, _) => false,
+            (Self::OneNode, Some(_)) => true,
+            (Self::HashedBy(columns), Some(key)) => {
+                columns.iter().all(|column| key.contains(column))
+            }
         }
     }
 }
@@ -52,7 +40,8 @@ impl InputPlacement {
 /// Whether a source with this contract runs on one cluster node at a time: a singleton the engine
 /// places on the owner of its home vnode.
 pub(crate) fn runs_on_one_node(contract: SourceContract) -> bool {
-    contract.topology == SourceTopology::Singleton && contract.supports_cluster_singleton_placement()
+    contract.topology == SourceTopology::Singleton
+        && contract.supports_cluster_singleton_placement()
 }
 
 impl ResolvedStreamOutputs {
@@ -73,14 +62,11 @@ impl ResolvedStreamOutputs {
         };
         match &stream.output.distribution {
             Distribution::Singleton { .. } => InputPlacement::OneNode,
-            Distribution::Hash(PartitionKey(columns)) => columns
-                .iter()
-                .map(|column| match column {
-                    KeyColumn::Column { name, .. } => Some(name.clone()),
-                    KeyColumn::Computed { .. } => None,
+            Distribution::Hash(key) => {
+                key.column_names().map_or(InputPlacement::AnyNode, |names| {
+                    InputPlacement::HashedBy(names.into_iter().map(str::to_owned).collect())
                 })
-                .collect::<Option<Vec<_>>>()
-                .map_or(InputPlacement::AnyNode, InputPlacement::HashedBy),
+            }
             Distribution::Arbitrary => {
                 let mut ports = stream.inputs.iter();
                 let forwards_one_node = self.projections.contains(input)
@@ -112,26 +98,20 @@ mod tests {
     #[test]
     fn a_destination_key_holding_every_hash_column_has_one_writer() {
         let hashed = InputPlacement::HashedBy(key(&["a"]));
-        assert_eq!(hashed.key_writers(Some(&key(&["a"]))), KeyWriters::One);
-        assert_eq!(hashed.key_writers(Some(&key(&["b", "a"]))), KeyWriters::One);
+        assert!(hashed.writes_each_key_on_one_node(Some(&key(&["a"]))));
+        assert!(hashed.writes_each_key_on_one_node(Some(&key(&["b", "a"]))));
     }
 
     #[test]
     fn a_destination_key_inside_the_hash_key_has_several_writers() {
         let hashed = InputPlacement::HashedBy(key(&["a", "b"]));
-        assert_eq!(hashed.key_writers(Some(&key(&["a"]))), KeyWriters::Several);
+        assert!(!hashed.writes_each_key_on_one_node(Some(&key(&["a"]))));
     }
 
     #[test]
     fn placement_without_a_key_proves_nothing() {
-        assert_eq!(InputPlacement::OneNode.key_writers(None), KeyWriters::Several);
-        assert_eq!(
-            InputPlacement::AnyNode.key_writers(Some(&key(&["a"]))),
-            KeyWriters::Several
-        );
-        assert_eq!(
-            InputPlacement::OneNode.key_writers(Some(&key(&["a"]))),
-            KeyWriters::One
-        );
+        assert!(!InputPlacement::OneNode.writes_each_key_on_one_node(None));
+        assert!(!InputPlacement::AnyNode.writes_each_key_on_one_node(Some(&key(&["a"]))));
+        assert!(InputPlacement::OneNode.writes_each_key_on_one_node(Some(&key(&["a"]))));
     }
 }

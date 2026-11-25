@@ -642,7 +642,7 @@ impl LaminarDB {
         schema: &Schema,
         aggregate: bool,
     ) -> Result<crate::mv_store::ViewKey, DbError> {
-        use crate::exchange_plan::{Distribution, KeyColumn};
+        use crate::exchange_plan::Distribution;
         use crate::mv_store::ViewKey;
 
         let name = candidate.name.clone();
@@ -668,13 +668,13 @@ impl LaminarDB {
             Distribution::Hash(key) => key,
         };
         let columns = key
-            .0
-            .iter()
-            .map(|column| match column {
-                KeyColumn::Column { name: column, .. } => schema.index_of(column).ok(),
-                KeyColumn::Computed { .. } => None,
+            .column_names()
+            .and_then(|names| {
+                names
+                    .into_iter()
+                    .map(|column| schema.index_of(column).ok())
+                    .collect::<Option<Vec<_>>>()
             })
-            .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
                 DbError::MaterializedView(format!(
                     "materialized view '{name}' output key {key} is not a set of its columns"

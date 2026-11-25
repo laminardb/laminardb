@@ -123,6 +123,14 @@ mod iceberg_leg;
 #[cfg(all(feature = "kafka", feature = "iceberg", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/iceberg_source.rs"]
 mod iceberg_source;
+#[cfg(all(
+    feature = "kafka",
+    feature = "postgres-cdc",
+    feature = "postgres-sink",
+    feature = "mongodb-cdc"
+))]
+#[path = "cluster_soak/keyed_sinks.rs"]
+mod keyed_sinks;
 #[cfg(all(feature = "kafka", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/mongodb_document_source.rs"]
 mod mongodb_document_source;
@@ -141,14 +149,6 @@ mod mongodb_source;
 ))]
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
-#[cfg(all(
-    feature = "kafka",
-    feature = "postgres-cdc",
-    feature = "postgres-sink",
-    feature = "mongodb-cdc"
-))]
-#[path = "cluster_soak/keyed_sinks.rs"]
-mod keyed_sinks;
 #[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]
 #[path = "cluster_soak/postgres_changelog_source.rs"]
 mod postgres_changelog_source;

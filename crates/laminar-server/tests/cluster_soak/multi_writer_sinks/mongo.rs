@@ -14,8 +14,8 @@ use mongodb::Client;
 use super::{block_on, setting, Destination, Observed, Oracle};
 
 /// Passed to the nodes as a reference, because a connection URI can carry credentials.
-pub(crate) const URI: &str = "LAMINAR_SOAK_MONGODB_URI";
-pub(crate) const DATABASE: &str = "laminar_soak";
+const URI: &str = "LAMINAR_SOAK_MONGODB_URI";
+const DATABASE: &str = "laminar_soak";
 
 pub(crate) struct MongoDb {
     uri: String,
@@ -26,6 +26,36 @@ impl MongoDb {
         Self {
             uri: setting(URI, None),
         }
+    }
+
+    /// The properties of a MongoDB sink that upserts into `collection` by `key`.
+    #[cfg(all(feature = "postgres-cdc", feature = "postgres-sink"))]
+    pub(crate) fn upsert_sink_properties(&self, collection: &str, key: &str) -> String {
+        format!(
+            r#""connection.uri" = "$${{{URI}}}"
+database = "{DATABASE}"
+collection = "{collection}"
+"write.mode" = "upsert"
+"write.mode.key_fields" = "{key}"
+"#
+        )
+    }
+
+    /// The documents of `collection`, in `field` order.
+    #[cfg(all(feature = "postgres-cdc", feature = "postgres-sink"))]
+    pub(crate) async fn documents(&self, collection: &str, field: &str) -> Vec<Document> {
+        Client::with_uri_str(&self.uri)
+            .await
+            .expect("connect to MongoDB")
+            .database(DATABASE)
+            .collection::<Document>(collection)
+            .find(doc! {})
+            .sort(doc! { field: 1 })
+            .await
+            .expect("read the collection")
+            .try_collect()
+            .await
+            .expect("read the documents")
     }
 }
 

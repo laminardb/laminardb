@@ -29,7 +29,9 @@ impl SinkConnector for MongoDbSink {
         let (topology, input_mode) = match cfg.write_mode {
             WriteMode::Insert => (SinkTopology::MultiWriter, SinkInputMode::AppendOnly),
             WriteMode::CdcReplay => (SinkTopology::Singleton, SinkInputMode::AppendOnly),
-            WriteMode::Upsert { .. } => (SinkTopology::KeyPartitioned, SinkInputMode::FullChangelog),
+            WriteMode::Upsert { .. } => {
+                (SinkTopology::KeyPartitioned, SinkInputMode::FullChangelog)
+            }
         };
         Ok(SinkContract::new(
             SinkConsistency::DurableAtLeastOnce,

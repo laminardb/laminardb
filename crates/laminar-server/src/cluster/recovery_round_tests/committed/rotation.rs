@@ -162,10 +162,7 @@ pub(super) async fn qualify_windows(processes: &mut [Process; 2]) -> Result<()> 
     wait_windows(processes, 6).await?;
     let mut written = Vec::new();
     for process in &mut *processes {
-        match process.request(&Command::ReadWindows).await? {
-            Response::Rows(rows) => written.push(rows),
-            response => return Err(anyhow!("expected window rows: {response:?}")),
-        }
+        written.push(read_windows(process).await?);
     }
     let twice: Vec<_> = written[0]
         .iter()
@@ -230,10 +227,7 @@ async fn wait_windows(processes: &mut [Process; 2], rows: usize) -> Result<()> {
         loop {
             let mut written = 0;
             for process in processes.iter_mut() {
-                match process.request(&Command::ReadWindows).await? {
-                    Response::Rows(windows) => written += windows.len(),
-                    response => return Err(anyhow!("expected window rows: {response:?}")),
-                }
+                written += read_windows(process).await?.len();
             }
             if written >= rows {
                 return Ok(());
@@ -243,4 +237,12 @@ async fn wait_windows(processes: &mut [Process; 2], rows: usize) -> Result<()> {
     })
     .await
     .with_context(|| format!("the sinks did not write {rows} window rows"))?
+}
+
+/// Every window row one database's sink wrote.
+async fn read_windows(process: &mut Process) -> Result<Vec<Vec<i64>>> {
+    match process.request(&Command::ReadWindows).await? {
+        Response::Rows(rows) => Ok(rows),
+        response => Err(anyhow!("expected window rows: {response:?}")),
+    }
 }

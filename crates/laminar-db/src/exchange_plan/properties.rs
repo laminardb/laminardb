@@ -88,6 +88,19 @@ impl fmt::Display for KeyColumn {
     }
 }
 
+impl PartitionKey {
+    /// The key's column names, or `None` when a key column is an expression.
+    pub(crate) fn column_names(&self) -> Option<Vec<&str>> {
+        self.0
+            .iter()
+            .map(|column| match column {
+                KeyColumn::Column { name, .. } => Some(name.as_str()),
+                KeyColumn::Computed { .. } => None,
+            })
+            .collect()
+    }
+}
+
 impl fmt::Display for PartitionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, column) in self.0.iter().enumerate() {

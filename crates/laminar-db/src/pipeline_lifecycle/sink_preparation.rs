@@ -65,9 +65,8 @@ impl LaminarDB {
                     delivery: self.config.delivery_guarantee,
                     runtime: runtime_mode,
                     carries_changelog,
-                    input_placement: &resolved.input_placement(&reg.input, &|input| {
-                        is_placed_singleton(sources, input)
-                    }),
+                    input_placement: &resolved
+                        .input_placement(&reg.input, &|input| is_placed_singleton(sources, input)),
                     mutation_key: direct_source
                         .as_ref()
                         .map(|entry| entry.primary_key.as_slice()),
@@ -347,9 +346,9 @@ async fn admit_and_bind_sink(
 
 /// Whether `name` is a source placed on one node at a time.
 fn is_placed_singleton(sources: &[TrackedSourceRegistration], name: &str) -> bool {
-    sources.iter().any(|source| {
-        source.name == name && super::runs_on_one_node(source.contract())
-    })
+    sources
+        .iter()
+        .any(|source| source.name == name && super::runs_on_one_node(source.contract()))
 }
 
 /// Set each source's [`ReplayRequirement`]: only a source upstream of an at-least-once sink that

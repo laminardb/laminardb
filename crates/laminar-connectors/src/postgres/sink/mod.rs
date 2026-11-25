@@ -232,6 +232,17 @@ impl PostgresSink {
         Ok(Self::new(schema, sink_config, registry))
     }
 
+    /// The configuration `config` describes, or this sink's own when `config` carries no properties
+    /// (direct programmatic construction).
+    #[cfg(feature = "postgres-sink")]
+    fn config_for(&self, config: &ConnectorConfig) -> Result<PostgresSinkConfig, ConnectorError> {
+        if config.properties().is_empty() {
+            Ok(self.config.clone())
+        } else {
+            Ok(Self::decode_connector_config(config)?.0)
+        }
+    }
+
     fn decode_connector_config(
         config: &ConnectorConfig,
     ) -> Result<(PostgresSinkConfig, SchemaRef), ConnectorError> {
@@ -746,11 +757,7 @@ impl PostgresSink {
 #[async_trait]
 impl SinkConnector for PostgresSink {
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-        let cfg = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            Self::decode_connector_config(config)?.0
-        };
+        let cfg = self.config_for(config)?;
         cfg.validate()?;
         if config.properties().is_empty() {
             validate_sink_schema(&self.schema, &cfg)?;
@@ -780,11 +787,7 @@ impl SinkConnector for PostgresSink {
         &self,
         config: &ConnectorConfig,
     ) -> Result<Option<Vec<String>>, ConnectorError> {
-        let cfg = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            Self::decode_connector_config(config)?.0
-        };
+        let cfg = self.config_for(config)?;
         Ok((cfg.write_mode == WriteMode::Upsert).then_some(cfg.primary_key_columns))
     }
 
@@ -796,11 +799,7 @@ impl SinkConnector for PostgresSink {
         &self,
         config: &ConnectorConfig,
     ) -> Result<Option<Vec<String>>, ConnectorError> {
-        let cfg = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            Self::decode_connector_config(config)?.0
-        };
+        let cfg = self.config_for(config)?;
         // Changelog mode collapses each flush to one terminal `_op` per key, upserts `U` rows
         // and deletes `D` rows by primary key only.
         Ok((cfg.changelog_mode && cfg.write_mode == WriteMode::Upsert)

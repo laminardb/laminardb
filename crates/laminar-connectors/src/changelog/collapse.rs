@@ -128,27 +128,29 @@ fn collapse_zset(
     order.sort_unstable_by(|&a, &b| key_rows.row(a).cmp(&key_rows.row(b)).then(a.cmp(&b)));
     let mut selected = Vec::new();
     let mut ops = Vec::new();
-    for key_group in order.chunk_by(|&a, &b| key_rows.row(a) == key_rows.row(b)) {
-        let (row, op) = collapse_key(key_group, &full_rows, weights, merge_key)?;
+    for key_group in order.chunk_by_mut(|&a, &b| key_rows.row(a) == key_rows.row(b)) {
+        let last = key_group[key_group.len() - 1];
+        key_group.sort_unstable_by(|&a, &b| full_rows.row(a).cmp(&full_rows.row(b)));
+        let (row, op) = collapse_key(key_group, last, &full_rows, weights, merge_key)?;
         selected.push(row);
         ops.push(op);
     }
     build_output(batch, &user_indices, &selected, &ops)
 }
 
-/// The one change that `key_group`, one key's rows in arrival order, leaves.
+/// The one change that `key_group`, one key's rows ordered by full row, leaves; `last` is the
+/// key's last row in arrival order.
 fn collapse_key(
     key_group: &[usize],
+    last: usize,
     full_rows: &Rows,
     weights: &Int64Array,
     merge_key: &[String],
 ) -> Result<(usize, &'static str), ConnectorError> {
-    let mut by_row = key_group.to_vec();
-    by_row.sort_by(|&a, &b| full_rows.row(a).cmp(&full_rows.row(b)));
     let mut live = None;
     let mut live_count = 0usize;
     let mut retracted = None;
-    for same_row in by_row.chunk_by(|&a, &b| full_rows.row(a) == full_rows.row(b)) {
+    for same_row in key_group.chunk_by(|&a, &b| full_rows.row(a) == full_rows.row(b)) {
         let net: i64 = same_row.iter().map(|&row| weights.value(row)).sum();
         if net > 0 {
             live_count += 1;
@@ -164,7 +166,6 @@ fn collapse_key(
              unique over the materialized-view output"
         )));
     }
-    let last = key_group[key_group.len() - 1];
     Ok(match (live, retracted) {
         (Some(row), _) => (row, "U"),
         (None, Some(row)) => (row, "D"),
