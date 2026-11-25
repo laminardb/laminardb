@@ -1236,9 +1236,12 @@ since, so each key converges on its latest value, except for the MongoDB case be
   in separate transactions, so a value moving between their keys could collide.
 - **MongoDB** applies each write as it arrives, without a transaction. A write sent just before a
   process's lease expired can reach the server after its successor's write of the same key, and
-  the key keeps the older value until its next change. MongoDB stores timestamps in
-  milliseconds, so in a cluster an upsert key may not be a microsecond or nanosecond timestamp:
-  two keys that differ below a millisecond would share one document.
+  the key keeps the older value until its next change. In a cluster the collection must keep one
+  document per key: it needs a unique index on exactly the key fields, with the simple collation
+  and no partial filter, so two upserts of a new key racing at a takeover cannot both insert, and
+  no non-simple default collation. MongoDB stores timestamps in milliseconds, so an upsert key may
+  not be a microsecond or nanosecond timestamp: two keys that differ below a millisecond would
+  share one document.
 - Kafka `envelope = 'upsert'` at at-least-once and Delta `write.mode = 'upsert'` stay rejected in a
   cluster. librdkafka keeps retrying records a stale process queued, for up to
   `delivery.timeout.ms`, and only a transactional producer fences another. Concurrent Delta MERGEs

@@ -1582,3 +1582,65 @@ async fn sink_cdc_replay() {
 
     sink.close().await.unwrap();
 }
+
+/// A collection that several cluster nodes upsert by key must keep one document per key: a
+/// unique index on exactly the key fields, and the simple collation.
+#[tokio::test(flavor = "multi_thread")]
+async fn sink_shared_by_key_requires_one_document_per_key() {
+    async fn open_shared(uri: &str, collection: &str) -> Result<(), String> {
+        let mut config = MongoDbSinkConfig::new(uri, "test_shared_by_key", collection);
+        config.auto_create = true;
+        config.write_mode = WriteMode::Upsert {
+            key_fields: vec!["name".to_string()],
+        };
+        let mut sink = MongoDbSink::new(sink_test_schema(), config, None);
+        sink.share_destination_by_key();
+        let opened = sink
+            .open(&ConnectorConfig::new("mongodb-sink"))
+            .await
+            .map_err(|error| error.to_string());
+        if opened.is_ok() {
+            sink.close().await.unwrap();
+        }
+        opened
+    }
+
+    let (_container, uri) = start_mongo().await;
+    let database = mongodb::Client::with_uri_str(&uri)
+        .await
+        .unwrap()
+        .database("test_shared_by_key");
+    let unique_name = || {
+        IndexModel::builder()
+            .keys(doc! { "name": 1 })
+            .options(IndexOptions::builder().unique(true).build())
+            .build()
+    };
+
+    let error = open_shared(&uri, "plain").await.unwrap_err();
+    assert!(error.contains("no unique index"), "{error}");
+    database
+        .collection::<mongodb::bson::Document>("plain")
+        .create_index(unique_name())
+        .await
+        .unwrap();
+    open_shared(&uri, "plain").await.unwrap();
+
+    database
+        .create_collection("folded")
+        .collation(
+            mongodb::options::Collation::builder()
+                .locale("en")
+                .strength(mongodb::options::CollationStrength::Secondary)
+                .build(),
+        )
+        .await
+        .unwrap();
+    database
+        .collection::<mongodb::bson::Document>("folded")
+        .create_index(unique_name())
+        .await
+        .unwrap();
+    let error = open_shared(&uri, "folded").await.unwrap_err();
+    assert!(error.contains("collation is not simple"), "{error}");
+}

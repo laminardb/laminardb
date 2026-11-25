@@ -201,6 +201,9 @@ impl MongoDbSink {
                     .await?;
             }
         }
+        if self.shared_by_key {
+            self.require_one_document_per_key(&db).await?;
+        }
 
         let coll_opts = CollectionOptions::builder().write_concern(wc).build();
 
@@ -211,6 +214,82 @@ impl MongoDbSink {
         self.collection = Some(collection);
 
         Ok(())
+    }
+
+    /// A collection written by several cluster nodes must keep one document per key. Without a
+    /// unique index on exactly the key fields, two upserts of a new key racing at a takeover can
+    /// both insert. Under a non-simple collation, keys the engine places on different nodes can
+    /// match one document.
+    async fn require_one_document_per_key(
+        &self,
+        db: &mongodb::Database,
+    ) -> Result<(), ConnectorError> {
+        use futures_util::TryStreamExt;
+        use mongodb::bson::{doc, Document};
+
+        let WriteMode::Upsert { key_fields } = &self.config.write_mode else {
+            return Ok(());
+        };
+        let collection = &self.config.collection;
+        let inspect = |error: mongodb::error::Error| {
+            ConnectorError::ConnectionFailed(format!(
+                "inspect MongoDB collection '{collection}' for writers on several nodes: {error}"
+            ))
+        };
+        let refuse = |reason: String| {
+            ConnectorError::SchemaMismatch(format!(
+                "MongoDB collection '{collection}' is written by several cluster nodes but {reason}"
+            ))
+        };
+        let simple = |collation: Option<&mongodb::options::Collation>| {
+            collation.is_none_or(|collation| collation.locale == "simple")
+        };
+        let spec = db
+            .list_collections()
+            .filter(doc! { "name": collection })
+            .await
+            .map_err(inspect)?
+            .try_next()
+            .await
+            .map_err(inspect)?;
+        if !simple(
+            spec.as_ref()
+                .and_then(|spec| spec.options.collation.as_ref()),
+        ) {
+            return Err(refuse(
+                "its default collation is not simple, so distinct keys can match one document"
+                    .into(),
+            ));
+        }
+        let key: std::collections::BTreeSet<&str> = key_fields.iter().map(String::as_str).collect();
+        let indexes: Vec<mongodb::IndexModel> = db
+            .collection::<Document>(collection)
+            .list_indexes()
+            .await
+            .map_err(inspect)?
+            .try_collect()
+            .await
+            .map_err(inspect)?;
+        let one_document_per_key = indexes.iter().any(|index| {
+            let fields: std::collections::BTreeSet<&str> =
+                index.keys.keys().map(String::as_str).collect();
+            let options = index.options.as_ref();
+            let unique = fields == std::collections::BTreeSet::from(["_id"])
+                || options.and_then(|options| options.unique) == Some(true);
+            let partial =
+                options.is_some_and(|options| options.partial_filter_expression.is_some());
+            fields == key
+                && unique
+                && !partial
+                && simple(options.and_then(|options| options.collation.as_ref()))
+        });
+        if one_document_per_key {
+            return Ok(());
+        }
+        Err(refuse(format!(
+            "has no unique index on exactly its key fields {key_fields:?}; create one with the \
+             simple collation and no partial filter"
+        )))
     }
 
     /// Reject an existing view or time-series collection when standard mode was requested.

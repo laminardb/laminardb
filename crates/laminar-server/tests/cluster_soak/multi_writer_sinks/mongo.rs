@@ -41,6 +41,31 @@ collection = "{collection}"
         )
     }
 
+    /// Create a unique index on `field` of `collection`, which an upsert sink shared by key needs.
+    #[cfg(all(feature = "postgres-cdc", feature = "postgres-sink"))]
+    pub(crate) fn create_unique_index(&self, collection: &str, field: &str) {
+        let (uri, collection, field) = (self.uri.clone(), collection.to_owned(), field.to_owned());
+        block_on(async move {
+            Client::with_uri_str(&uri)
+                .await
+                .expect("connect to MongoDB")
+                .database(DATABASE)
+                .collection::<Document>(&collection)
+                .create_index(
+                    mongodb::IndexModel::builder()
+                        .keys(doc! { field: 1 })
+                        .options(
+                            mongodb::options::IndexOptions::builder()
+                                .unique(true)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await
+                .expect("create the unique key index");
+        });
+    }
+
     /// The documents of `collection`, in `field` order.
     #[cfg(all(feature = "postgres-cdc", feature = "postgres-sink"))]
     pub(crate) async fn documents(&self, collection: &str, field: &str) -> Vec<Document> {

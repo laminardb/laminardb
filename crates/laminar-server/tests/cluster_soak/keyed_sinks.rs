@@ -254,6 +254,7 @@ connector = "mongodb-sink"
 fn create_outputs(postgres: &Postgres, mongo: &MongoDb, outputs: &Outputs) {
     let Outputs { replica, buckets } = outputs;
     mongo.create(buckets);
+    mongo.create_unique_index(buckets, "bucket");
     block_on(async {
         postgres
             .client()
