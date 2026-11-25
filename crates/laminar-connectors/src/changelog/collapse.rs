@@ -25,8 +25,12 @@ use crate::error::ConnectorError;
 ///   a final insertion, `D` after a final retraction. Applied to the state before
 ///   the batch that is a no-op, but an at-least-once replay can meet a target
 ///   that already holds part of the batch from a failed attempt, such as a row
-///   the batch inserts and then deletes; the `D` removes it. The `__weight`
-///   column is stripped from the output.
+///   the batch inserts and then deletes; the `D` removes it. This relies on a
+///   key's rows arriving in the order they happened, with a replaced row's
+///   retraction before its replacement: the engine's aggregates and joins emit
+///   them so, the PostgreSQL CDC source does, and so do Delta change feeds that
+///   delta-rs wrote (`update_preimage` before `update_postimage`). The
+///   `__weight` column is stripped from the output.
 /// - **CDC** (no `__weight`): the last-arriving row per `merge_key` wins (row
 ///   order is arrival order). Its op is normalized to `D` for deletes
 ///   (`_op ∈ {D, U-}`) and `U` for everything else. A batch with neither column
@@ -385,6 +389,38 @@ mod tests {
         assert_eq!(col_str(&out, "region"), vec!["east"]);
         assert_eq!(col_str(&out, "_op"), vec!["D"]);
         assert!(out.schema().index_of(WEIGHT_COLUMN).is_err());
+    }
+
+    #[test]
+    fn zset_value_that_returns_within_epoch_keeps_the_row() {
+        // 10 → 20 → 10: every row cancels and the key ends where it started.
+        let out = collapse_changelog(
+            &zset_batch(&[
+                ("east", 10, -1),
+                ("east", 20, 1),
+                ("east", 20, -1),
+                ("east", 10, 1),
+            ]),
+            &keys(&["region"]),
+        )
+        .unwrap();
+        assert_eq!(col_str(&out, "_op"), vec!["U"]);
+        assert_eq!(col_i64(&out, "total"), vec![10]);
+    }
+
+    #[test]
+    fn zset_insert_update_delete_within_epoch_deletes_the_key() {
+        let out = collapse_changelog(
+            &zset_batch(&[
+                ("east", 10, 1),
+                ("east", 10, -1),
+                ("east", 20, 1),
+                ("east", 20, -1),
+            ]),
+            &keys(&["region"]),
+        )
+        .unwrap();
+        assert_eq!(col_str(&out, "_op"), vec!["D"]);
     }
 
     #[test]

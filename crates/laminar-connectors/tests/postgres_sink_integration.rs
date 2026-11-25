@@ -680,7 +680,7 @@ async fn test_changelog_target_shared_by_key_refuses_other_unique_constraints() 
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(bounds, ["1s"]);
+    assert_eq!(bounds, ["500ms"]);
 }
 
 // ── Arrow view types, which SQL string casts produce ────────────────

@@ -316,15 +316,16 @@ impl PostgresSinkConfig {
     }
 
     /// `PostgreSQL` startup options applied to every connection the pool creates. A target shared
-    /// by key also ends a transaction whose client stays silent longer than a statement may run: a
+    /// by key also ends a transaction whose client stays silent for half a statement timeout: a
     /// writer frozen with a transaction open would otherwise hold its row locks against the
-    /// successor that took over its keys.
+    /// successor that took over its keys until that successor's own statements time out.
     #[must_use]
     pub(super) fn session_startup_options(&self) -> String {
         let timeout = self.statement_timeout.as_millis();
         if self.shared_by_key {
             format!(
-                "-c statement_timeout={timeout} -c idle_in_transaction_session_timeout={timeout}"
+                "-c statement_timeout={timeout} -c idle_in_transaction_session_timeout={}",
+                timeout / 2
             )
         } else {
             format!("-c statement_timeout={timeout}")

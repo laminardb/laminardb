@@ -879,7 +879,7 @@ fn a_target_shared_by_key_keeps_its_session_bound_when_reconfigured() {
     assert!(
         sink.config
             .session_startup_options()
-            .contains("idle_in_transaction_session_timeout=30000"),
+            .contains("idle_in_transaction_session_timeout=15000"),
         "the engine's flag is not a property, so reconfiguration keeps it"
     );
 }

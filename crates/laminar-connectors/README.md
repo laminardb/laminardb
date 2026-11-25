@@ -1227,9 +1227,9 @@ since, so each key converges on its latest value.
 - **PostgreSQL**: each flush is one transaction, and a process sends its `COMMIT` only after every
   statement returned and only while its lease is live. A stale writer therefore cannot overwrite
   the keys its successor took over: its uncommitted rows hold their row locks until PostgreSQL
-  ends the transaction. In a cluster the sink's sessions
-  end a transaction left idle longer than `statement.timeout.ms`
-  (`idle_in_transaction_session_timeout`), so a frozen process releases those locks. A
+  ends the transaction. In a cluster the sink's sessions end a transaction left idle for half of
+  `statement.timeout.ms` (`idle_in_transaction_session_timeout`), so a frozen process releases
+  those locks before its successor's statements time out. A
   `changelog.mode` target may have no unique or exclusion constraint other than the primary key:
   one node defers such a constraint to the end of its flush, but two nodes apply the keys they own
   in separate transactions, so a value moving between their keys could collide.

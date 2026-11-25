@@ -241,7 +241,7 @@ fn statement_timeout_is_a_bounded_integer_startup_setting() {
     cfg.shared_by_key = true;
     assert_eq!(
         cfg.session_startup_options(),
-        "-c statement_timeout=30000 -c idle_in_transaction_session_timeout=30000"
+        "-c statement_timeout=30000 -c idle_in_transaction_session_timeout=15000"
     );
     cfg.shared_by_key = false;
 
