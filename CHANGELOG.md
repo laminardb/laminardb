@@ -10,15 +10,16 @@
   are all in the sink's key (a keyed aggregate into a sink keyed by its group), sits on one vnode
   (a global aggregate), or is projected from one source that runs on one node at a time (a
   PostgreSQL CDC `changelog` source replicated into a table keyed by its primary key). Other inputs
-  are rejected at `CREATE SINK`, at startup and in topology planning. In a cluster a PostgreSQL
-  `changelog.mode` target may have no unique or exclusion constraint other than the primary key,
-  and the sink's sessions end a transaction left idle longer than `statement.timeout.ms`. A
-  MongoDB write sent just before a process's lease expired can still land after its successor's
-  and leave the older value until the key's next change. Kafka `envelope = 'upsert'` at
-  at-least-once and Delta upsert stay rejected in a cluster. A source started on another node
-  after a committed handoff no longer repeats its output, so a rescale during a PostgreSQL
-  `changelog` copy resumes the copy. Connector API: `SinkTopology::KeyPartitioned`,
-  `SinkConnector::destination_key` and `SinkConnector::share_destination_by_key`.
+  are rejected before the pipeline starts, when the cluster plans its topology. In a cluster a
+  PostgreSQL `changelog.mode` target may have no unique or exclusion constraint other than the
+  primary key, and the sink's sessions end a transaction left idle longer than
+  `statement.timeout.ms`. A MongoDB write sent just before a process's lease expired can still
+  land after its successor's and leave the older value until the key's next change. Kafka
+  `envelope = 'upsert'` at at-least-once and Delta upsert stay rejected in a cluster. A source
+  started on another node after a committed handoff no longer repeats its output, so a rescale
+  during a PostgreSQL `changelog` copy resumes the copy. Connector API:
+  `SinkTopology::KeyPartitioned`, `SinkConnector::destination_key` and
+  `SinkConnector::share_destination_by_key`.
 
 - In cluster mode a PostgreSQL CDC source runs at-least-once on one node at a time in both output
   modes, with or without the initial copy. A `changelog` source feeds aggregates, materialized

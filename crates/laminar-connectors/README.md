@@ -1213,7 +1213,7 @@ node at a time, so one writer applies each key's changes in order. The input mus
 - projections and filters over one source that runs on one node at a time, such as a PostgreSQL
   CDC source in `changelog` mode replicated into a table keyed by its primary key.
 
-Anything else is rejected at `CREATE SINK` and at startup: rows for one key could come from two
+Anything else is rejected before the pipeline starts: rows for one key could come from two
 nodes, and a key's retraction on one node with its new value on another would net to a delete.
 `GROUP BY a, b` into a sink keyed by `a` is rejected for that reason; key the sink by every group
 column, or aggregate by the sink key first. A sink reading a source directly is rejected in a
