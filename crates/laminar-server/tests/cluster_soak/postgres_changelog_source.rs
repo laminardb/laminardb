@@ -51,7 +51,7 @@ use super::{
 };
 
 /// Grows on a node while it copies the table.
-pub(super) const SNAPSHOT_ROWS: &str = "laminardb_postgres_cdc_snapshot_rows_total";
+const SNAPSHOT_ROWS: &str = "laminardb_postgres_cdc_snapshot_rows_total";
 pub(super) const SOURCE: &str = "changes";
 const COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 /// Updates and deletes above the seed touch the ids of this many most recent inserts.

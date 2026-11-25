@@ -18,7 +18,11 @@ Generated from the admission code by `delivery_matrix_doc_matches_admission`
 (`crates/laminar-db/src/pipeline_lifecycle/delivery_matrix_tests.rs`) for one representative
 configuration per row; options that change a connector's contract are listed as separate rows.
 Rows and pairs show the guarantees the connector contracts admit. SQL shape, topology and
-connector-specific limits elsewhere in this documentation can still reject a pipeline.
+connector-specific limits elsewhere in this documentation can still reject a pipeline. In a
+cluster, the `PostgreSQL upsert` and `MongoDB upsert` cells assume input placed by the sink's key
+(see [cluster at-least-once sinks](#evidence-for-cluster-at-least-once-sinks)): Kafka written to
+an upsert sink through a projection is rejected there, and through an aggregate keyed by the sink
+key is admitted.
 
 <!-- delivery-matrix:begin -->
 

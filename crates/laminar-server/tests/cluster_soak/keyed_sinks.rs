@@ -27,7 +27,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::TryStreamExt as _;
 use mongodb::bson::{doc, Bson, Document};
@@ -41,18 +41,20 @@ use super::multi_writer_sinks::block_on;
 use super::multi_writer_sinks::mongo::{DATABASE as MONGO_DATABASE, URI as MONGO_URI};
 use super::multi_writer_sinks::postgres::Postgres;
 use super::postgres_changelog_source::{
-    create_and_seed, spawn_writer, table_buckets, workload, SNAPSHOT_ROWS, SOURCE,
+    create_and_seed, spawn_writer, table_buckets, workload, SOURCE,
 };
 use super::postgres_source::{paused_owner_round, Capture, CaptureCleanup};
 use super::{
-    env_u64, scoped_soak_storage_url, soak_run_id, wait_for, wait_until, JoinDelivery,
-    ResolvedExecutable, NODES,
+    env_u64, scoped_soak_storage_url, soak_run_id, wait_for, wait_for_converged_durable_checkpoint,
+    wait_until, DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, NODES,
 };
 
 /// How long the sinks may take to apply the last changes after the view converged.
 const SINK_SETTLE: Duration = Duration::from_secs(120);
 /// How long the boot may take to copy the seed.
 const COPY_DEADLINE: Duration = Duration::from_secs(300);
+/// Grows on the node streaming the slot, which starts after the copy.
+const STREAMED_TRANSACTIONS: &str = "laminardb_postgres_cdc_transactions_total";
 
 /// The tables and collection the keyed sinks write.
 struct Outputs {
@@ -122,12 +124,7 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
     let mut live = || writer.assert_running();
     let mut consumers = BTreeSet::new();
     let mut latest = boot(&mut nodes, &mut live, &settings, CHECKPOINTS_COMPLETED);
-    // Under a sink that applies changes by key, a crash inside the copy fails closed by design, so
-    // the kills start once the copy has ended.
-    wait_for("the copy of the seed to end", COPY_DEADLINE, || {
-        live();
-        per_node(&nodes, SNAPSHOT_ROWS).iter().sum::<f64>() >= seed_rows as f64
-    });
+    latest = past_the_copy(&mut nodes, &mut live, &settings, latest);
     let mut killed_followers = BTreeSet::new();
     for round in 0..settings.kills {
         (_, latest) = kill_round(
@@ -185,6 +182,31 @@ fn three_node_postgres_keyed_sinks_kill9_soak() {
         expected.len(),
         settings.kills
     );
+}
+
+/// Under a sink that applies changes by key, a crash inside the copy fails closed by design, so the
+/// kills start from a committed cut past it. The source streams the slot only after the copy, and
+/// the third cut committed after a node streams was captured after the second committed, which
+/// was after the stream began. Returns that cut.
+fn past_the_copy(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    settings: &SoakSettings,
+    mut latest: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
+    wait_for("the copy to end and the slot to stream", COPY_DEADLINE, || {
+        live();
+        per_node(nodes, STREAMED_TRANSACTIONS).iter().sum::<f64>() > 0.0
+    });
+    for _ in 0..3 {
+        latest = wait_for_converged_durable_checkpoint(
+            nodes,
+            Instant::now() + settings.recovery_ceiling,
+            "a committed cut past the copy",
+            Some(latest),
+        );
+    }
+    latest
 }
 
 /// The projection and aggregate the sinks read, and the three sinks.

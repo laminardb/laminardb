@@ -348,7 +348,7 @@ async fn admit_and_bind_sink(
 /// Whether `name` is a source placed on one node at a time.
 fn is_placed_singleton(sources: &[TrackedSourceRegistration], name: &str) -> bool {
     sources.iter().any(|source| {
-        source.name == name && source.contract().supports_cluster_singleton_placement()
+        source.name == name && super::runs_on_one_node(source.contract())
     })
 }
 

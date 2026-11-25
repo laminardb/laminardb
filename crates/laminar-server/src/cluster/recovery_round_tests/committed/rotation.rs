@@ -139,8 +139,9 @@ pub(super) async fn wait_owned_by(processes: &mut [Process; 2], owner: u64) -> R
 }
 
 /// A window still open at the handoff cut moves in the cut's state, and only its new owner closes
-/// it: the draining database's intake stays fenced from the cut's capture until it adopts the
-/// verdict. Every window row is written once, by one database.
+/// it: every window row is written once, by one database. The record that closes the moved window
+/// arrives after both databases adopted the verdict, so this does not reach the draining database
+/// between the cut and its adoption; there its intake stays fenced from the cut's capture.
 pub(super) async fn qualify_windows(processes: &mut [Process; 2]) -> Result<()> {
     start_pair(processes).await?;
     let keys = connectors::keys()?;

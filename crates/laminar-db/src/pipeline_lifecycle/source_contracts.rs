@@ -264,7 +264,7 @@ impl LaminarDB {
     ) -> bool {
         matches!(
             self.resolve_registered_source_contract(source_name, source_regs),
-            Ok(Some((contract, _))) if contract.supports_cluster_singleton_placement()
+            Ok(Some((contract, _))) if super::runs_on_one_node(contract)
         )
     }
 

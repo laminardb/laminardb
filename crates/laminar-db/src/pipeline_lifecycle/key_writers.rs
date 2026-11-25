@@ -4,6 +4,8 @@
 //! defined order, and a key's retraction on one node with its new value on another net to a
 //! delete.
 
+use laminar_connectors::connector::{SourceContract, SourceTopology};
+
 use crate::exchange_plan::{Distribution, KeyColumn, PartitionKey, PortExchange};
 
 use super::ResolvedStreamOutputs;
@@ -45,6 +47,12 @@ impl InputPlacement {
             KeyWriters::Several
         }
     }
+}
+
+/// Whether a source with this contract runs on one cluster node at a time: a singleton the engine
+/// places on the owner of its home vnode.
+pub(crate) fn runs_on_one_node(contract: SourceContract) -> bool {
+    contract.topology == SourceTopology::Singleton && contract.supports_cluster_singleton_placement()
 }
 
 impl ResolvedStreamOutputs {
