@@ -125,7 +125,7 @@ fn build_pool(config: &PostgresSinkConfig) -> Result<Pool, ConnectorError> {
     pool_config.dbname = Some(config.database.clone());
     pool_config.user = Some(config.username.clone());
     pool_config.password = Some(config.password.clone());
-    pool_config.options = Some(config.statement_timeout_startup_option());
+    pool_config.options = Some(config.session_startup_options());
     pool_config.connect_timeout = Some(config.connect_timeout);
     pool_config.ssl_mode = Some(match config.ssl_mode {
         crate::postgres::SslMode::Disable => deadpool_postgres::SslMode::Disable,
@@ -251,7 +251,8 @@ impl PostgresSink {
     }
 
     fn apply_connector_config(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        let (sink_config, schema) = Self::decode_connector_config(config)?;
+        let (mut sink_config, schema) = Self::decode_connector_config(config)?;
+        sink_config.shared_by_key = self.config.shared_by_key;
         let user_schema = build_user_schema(&schema);
         self.config = sink_config;
         self.schema = schema;
@@ -785,6 +786,10 @@ impl SinkConnector for PostgresSink {
             Self::decode_connector_config(config)?.0
         };
         Ok((cfg.write_mode == WriteMode::Upsert).then_some(cfg.primary_key_columns))
+    }
+
+    fn share_destination_by_key(&mut self) {
+        self.config.shared_by_key = true;
     }
 
     fn keyed_mutation_key(

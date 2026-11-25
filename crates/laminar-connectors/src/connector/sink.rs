@@ -137,6 +137,13 @@ pub trait SinkConnector: Send {
         Ok(None)
     }
 
+    /// Called before [`open`](Self::open) when writers on other cluster nodes apply other keys of
+    /// this [`KeyPartitioned`](super::SinkTopology::KeyPartitioned) destination at the same time,
+    /// and a successor may take over this node's keys after it fails. A connector refuses
+    /// destination constraints that span keys, which no one writer can keep, and bounds what a
+    /// stalled writer can hold.
+    fn share_destination_by_key(&mut self) {}
+
     /// Resolve a writer contract from already-bound query output before activation.
     /// Destinations with authoritative schemas override this read-only hook.
     async fn resolve_schema(

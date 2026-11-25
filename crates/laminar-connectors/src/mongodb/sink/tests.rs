@@ -281,8 +281,12 @@ fn test_sink_contract_upsert() {
     };
     let sink = MongoDbSink::new(test_schema(), config, None);
     let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
-    assert_eq!(contract.topology, SinkTopology::Singleton);
+    assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert_eq!(
+        sink.destination_key(&ConnectorConfig::new("mongodb")).unwrap(),
+        Some(vec!["id".to_string()])
+    );
 }
 
 #[test]

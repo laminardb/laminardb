@@ -1,4 +1,4 @@
-use laminar_connectors::connector::ReplayRequirement;
+use laminar_connectors::connector::{ReplayRequirement, SinkTopology};
 
 use super::{
     admit_sink, open_prepared_sinks, Arc, CheckpointStorageScope, ConnectorTaskFenceRegistration,
@@ -314,9 +314,12 @@ async fn admit_and_bind_sink(
     sink: &mut dyn laminar_connectors::connector::SinkConnector,
     context: SinkAdmissionContext<'_>,
 ) -> Result<(SinkContract, Option<u64>), DbError> {
-    let name = context.name;
+    let (name, runtime) = (context.name, context.runtime);
     let admitted = admit_sink(sink, context)?;
     let (contract, _) = admitted;
+    if runtime == RuntimeMode::Cluster && contract.topology == SinkTopology::KeyPartitioned {
+        sink.share_destination_by_key();
+    }
     if !contract.is_checkpoint_committable() {
         return Ok(admitted);
     }

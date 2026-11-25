@@ -767,7 +767,11 @@ fn contract_upsert_requires_keyed_input() {
     let sink = PostgresSink::new(test_schema(), upsert_config(), None);
     let contract = sink.contract(&ConnectorConfig::new("postgres")).unwrap();
     assert_eq!(contract.input_mode, SinkInputMode::KeyedUpsert);
-    assert_eq!(contract.topology, SinkTopology::Singleton);
+    assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
+    assert_eq!(
+        sink.destination_key(&ConnectorConfig::new("postgres")).unwrap(),
+        Some(sink.config.primary_key_columns.clone())
+    );
 }
 
 #[cfg(feature = "postgres-sink")]
@@ -778,7 +782,7 @@ fn contract_changelog_accepts_full_changelog() {
     let sink = PostgresSink::new(changelog_schema(), config, None);
     let contract = sink.contract(&ConnectorConfig::new("postgres")).unwrap();
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
-    assert_eq!(contract.topology, SinkTopology::Singleton);
+    assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
     assert!(contract.accepts_full_changelog());
     assert_eq!(
         sink.suggested_write_timeout(),
@@ -849,4 +853,32 @@ fn test_build_user_schema_no_metadata() {
     let schema = test_schema();
     let user = build_user_schema(&schema);
     assert_eq!(user.fields().len(), 3);
+}
+
+#[test]
+fn a_target_shared_by_key_keeps_its_session_bound_when_reconfigured() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    let mut config = ConnectorConfig::new("postgres-sink");
+    config.set("hostname", "localhost");
+    config.set("database", "analytics");
+    config.set("username", "writer");
+    config.set("table.name", "events");
+    config.set("write.mode", "upsert");
+    config.set("primary.key", "id");
+    config.set(
+        "_arrow_schema",
+        crate::config::encode_arrow_schema_ipc(schema.as_ref()),
+    );
+    let mut sink = PostgresSink::new(Arc::clone(&schema), test_config(), None);
+    sink.share_destination_by_key();
+    sink.apply_connector_config(&config).unwrap();
+    assert!(
+        sink.config
+            .session_startup_options()
+            .contains("idle_in_transaction_session_timeout=30000"),
+        "the engine's flag is not a property, so reconfiguration keeps it"
+    );
 }

@@ -540,6 +540,91 @@ async fn changelog_upsert_and_delete(operation_type: DataType) {
     sink.close().await.expect("close");
 }
 
+// ── A target shared by key across cluster nodes ────────────────────
+
+/// A changelog target that several cluster nodes write by key refuses a unique constraint beyond
+/// its key, even a deferrable one that a single writer defers; and its sessions end a transaction
+/// left idle, so a frozen writer cannot hold row locks against its successor.
+#[tokio::test]
+async fn test_changelog_target_shared_by_key_refuses_other_unique_constraints() {
+    let (_container, host, port) = start_pg().await;
+    let pg = connect(&host, port).await;
+    pg.batch_execute(
+        "CREATE TABLE public.test_events (id BIGINT PRIMARY KEY, name TEXT, value DOUBLE PRECISION, \
+         CONSTRAINT unique_name UNIQUE (name) DEFERRABLE)",
+    )
+    .await
+    .expect("create target");
+    let changelog_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("_op", DataType::Utf8, false),
+    ]));
+    let mut config = sink_config(&host, port, WriteMode::Upsert);
+    config.changelog_mode = true;
+    config.statement_timeout = Duration::from_secs(1);
+
+    let mut one_writer = PostgresSink::new(Arc::clone(&changelog_schema), config.clone(), None);
+    one_writer
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("one writer defers the constraint to commit");
+    one_writer.close().await.expect("close");
+
+    let mut shared = PostgresSink::new(Arc::clone(&changelog_schema), config.clone(), None);
+    shared.share_destination_by_key();
+    let error = shared
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect_err("a constraint spanning keys was admitted on a shared target");
+    let message = error.to_string();
+    assert!(
+        message.contains("written by several cluster nodes") && message.contains("unique_name"),
+        "{message}"
+    );
+
+    // Without the extra constraint, the shared writer's sessions carry the idle bound.
+    pg.batch_execute(
+        "ALTER TABLE public.test_events DROP CONSTRAINT unique_name; \
+         CREATE TABLE public.session_bounds (bound TEXT); \
+         CREATE FUNCTION record_session_bound() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO public.session_bounds \
+         VALUES (current_setting('idle_in_transaction_session_timeout')); RETURN NEW; END $$; \
+         CREATE TRIGGER record_session_bound BEFORE INSERT ON public.test_events \
+         FOR EACH ROW EXECUTE FUNCTION record_session_bound()",
+    )
+    .await
+    .expect("record the writer's session bound");
+    let mut shared = PostgresSink::new(Arc::clone(&changelog_schema), config, None);
+    shared.share_destination_by_key();
+    shared
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open shared writer");
+    let batch = RecordBatch::try_new(
+        changelog_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(StringArray::from(vec!["I"])),
+        ],
+    )
+    .expect("changelog batch");
+    shared.write_batch(&batch).await.expect("write");
+    shared.flush().await.expect("flush");
+    shared.close().await.expect("close");
+    let bounds: Vec<String> = pg
+        .query("SELECT bound FROM public.session_bounds", &[])
+        .await
+        .expect("read session bounds")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(bounds, ["1s"]);
+}
+
 // ── Arrow view types, which SQL string casts produce ────────────────
 
 fn view_batch(
