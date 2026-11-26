@@ -129,14 +129,14 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 |---|---|---|
 | Kafka → Delta Lake append (S3/S3A) | Cluster | `three_node_eo_join_kill9_soak`: repeated `kill -9` of the leader and followers inside checkpoints, and leaders frozen with `SIGSTOP` at the committed-index and sink-commit gates, then resumed after a successor commits; the stale leader must fence itself and exit. Frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Iceberg append (REST + S3) | Cluster | `three_node_eo_join_kill9_soak`: the same join also writes to Iceberg through every `kill -9` and paused-leader round; the table's data files must hold every join pair exactly once, and every snapshot must belong to exactly one checkpoint. `iceberg_cluster_soak`: leader killed at the external commit gate and restarted; one snapshot per checkpoint and an exact data-file oracle. |
-| Generator (splits) → Delta Lake append (S3/S3A) | Cluster | `generator_splits::three_node_generator_splits_delta_eo_kill9_soak` (candidate): `kill -9` of the leader and each follower inside a checkpoint, each restarted and rejoining while the bounded sequence still runs. After every round the Delta table may hold no row twice, and when the sequence ends it must hold each row exactly once; committed view reads on every node must hold an exact prefix of every split. It has no paused-leader or sink-commit-gate faults. Emulated S3 (SeaweedFS). |
+| Generator (splits) → Delta Lake append (S3/S3A) | Cluster | `generator_splits::three_node_generator_splits_delta_eo_kill9_soak`: `kill -9` of the leader and each follower inside a checkpoint, each restarted and rejoining while the bounded sequence still runs. After every round the Delta table may hold no row twice, and when the sequence ends it must hold each row exactly once; committed view reads on every node must hold an exact prefix of every split. It has no paused-leader or sink-commit-gate faults. Emulated S3 (SeaweedFS). |
 | Generator (splits) → Iceberg append (REST + S3) | Cluster | Admitted through the Iceberg sink's certification (the Kafka → Iceberg row); no leg writes a split generator to Iceberg. |
 | Delta Lake change feed → Delta Lake append (S3/S3A) | Cluster | `delta_cdf_source::three_node_delta_cdf_delta_eo_kill9_soak` (candidate): the at-least-once change-feed leg's rounds (`kill -9` of the leader and each follower inside a checkpoint, then the node reading the feed frozen with `SIGSTOP` until a survivor reads it, resumed and fenced) under exactly-once, with a keyed `EMIT CHANGES` aggregate over the feed written to a Delta append table that keeps each change's `__weight`. After every round the table's weights must net to zero or one per row and to one row per bucket; once the writer stops, those rows must equal the aggregate over the input's final snapshot. Emulated S3 (SeaweedFS). |
 | Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |
 | Delta Lake change feed → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/delta_change_feed_exactly_once.rs`: a child process forwards a change feed (inserts of several polls each, updates and deletes) through a stream into a local append table and is killed four times; the table must hold every change of the feed, read independently through delta-rs, exactly once. Object-store tables rest on the Delta sink's own certification. The feed carries retractions, so the Iceberg append sink, which takes no changelog, rejects it even where the matrix pairs the contracts. |
-| Generator (splits) → managed state | Embedded / single-node | `local_exact_source_state_kill9_soak` with `LAMINAR_SOAK_SPLITS=4` (candidate step): `kill -9` inside a checkpoint while the finite source moves and three times after it is exhausted; each recovery must restore the exact aggregate of the finite prefix, from a cursor with one offset per split, without replaying input. `crates/laminar-db/tests/generator_splits.rs` restarts an embedded split generator under exactly-once. |
+| Generator (splits) → managed state | Embedded / single-node | `local_exact_source_state_kill9_soak` with `LAMINAR_SOAK_SPLITS=4`: `kill -9` inside a checkpoint while the finite source moves and three times after it is exhausted; each recovery must restore the exact aggregate of the finite prefix, from a cursor with one offset per split, without replaying input. `crates/laminar-db/tests/generator_splits.rs` restarts an embedded split generator under exactly-once. |
 
 ## Evidence for cluster at-least-once sinks
 
@@ -146,8 +146,8 @@ projection, the leader and each follower are hard-killed while paused inside a c
 the sinks flushed, and every node must write before the first kill, after it rejoins, and through
 the steady phase that follows. An independent reader of the destination must see every
 Kafka-acknowledged id; ids never produced fail the run, and duplicates are counted. Checkpoints go
-to emulated S3 (SeaweedFS). The PostgreSQL, MongoDB and NATS legs are candidates: they run weekly
-and before each release, but do not yet fail the `Checkpoint fault and soak` workflow.
+to emulated S3 (SeaweedFS). The legs run weekly and before each release, and a failure fails the
+`Checkpoint fault and soak` workflow.
 
 | Sink | Destination read by the oracle | Leg |
 |---|---|---|
@@ -181,7 +181,7 @@ table.
 
 Kafka and the split Generator read one channel per vnode owner. A RabbitMQ queue has no channels to
 split, so one node at a time consumes it, the owner of the source's home vnode, and the source
-moves with that vnode. `rabbitmq_source::three_node_rabbitmq_source_kill9_soak` (candidate) feeds
+moves with that vnode. `rabbitmq_source::three_node_rabbitmq_source_kill9_soak` feeds
 a durable classic queue from a confirmed publisher and forwards every row through a stream to a
 RabbitMQ sink. The leader and each follower are hard-killed while paused inside a checkpoint. An
 independent reader of the output queue must see every confirmed id, ids never published fail the
@@ -198,7 +198,7 @@ queue manager, so it is development-host evidence and no workflow runs it.
 
 A MongoDB change stream (`output.mode=history`, `snapshot.mode=never`) runs the same way and
 resumes after the committed resume token. `mongodb_source::three_node_mongodb_source_kill9_soak`
-(candidate) inserts documents acknowledged by the majority into a one-member replica set and
+inserts documents acknowledged by the majority into a one-member replica set and
 forwards each insert's id through a stream to a MongoDB sink, through the same kills. Every
 acknowledged id must reach the output collection, ids never written fail the run, duplicates are
 counted, and more than one node must have read the stream.
@@ -207,7 +207,7 @@ A MongoDB document source (`output.mode=document`, `snapshot.mode=never`) runs t
 an upsert source: in a cluster it may be a temporal join's right side, with the watermark on its
 `change.time.column`, or an interval join's input when its key holds every join column and the
 watermarked event time (a `TIMESTAMP` `_id`).
-`mongodb_document_source::three_node_mongodb_document_temporal_kill9_soak` (candidate) writes
+`mongodb_document_source::three_node_mongodb_document_temporal_kill9_soak` writes
 one rate per key, acknowledged by the majority, and a heartbeat document every 250 ms. It
 produces Kafka trades stamped with the wall time, prices each through a temporal `LEFT JOIN`,
 and keeps only the trades priced with their key's rate in a MongoDB sink, through the same kills.
@@ -222,7 +222,7 @@ owner or recovery fenced its process, and a process checks its own lease just be
 to the slot or ends another node's session. The check is not atomic with the call: a process that
 stalls between the two can still make that one call after its lease expired, before it exits
 fenced.
-`postgres_source::three_node_postgres_temporal_kill9_soak` (candidate) runs the MongoDB document
+`postgres_source::three_node_postgres_temporal_kill9_soak` runs the MongoDB document
 soak's trade workload on a PostgreSQL rates table, into a PostgreSQL sink, through the same kills.
 One more round freezes the node streaming the slot until a survivor takes the slot over, then
 resumes it: the frozen node must exit fenced while the survivor's session keeps the slot, and the
@@ -230,7 +230,7 @@ run must create one slot.
 
 An Iceberg append read with `read.splits = n` hashes each data file into one of `n` channels, and
 each channel keeps its own position in the table's snapshot lineage, so every node reads part of
-the table. `iceberg_source::three_node_iceberg_source_kill9_soak` (candidate) appends snapshots of
+the table. `iceberg_source::three_node_iceberg_source_kill9_soak` appends snapshots of
 ids to a REST-catalog table on S3, seeded before the nodes start, and forwards each id through a
 stream to a MongoDB sink, through the same kills. Every appended id must reach the output
 collection, ids never appended fail the run, duplicates are counted, and more than one node must
@@ -238,7 +238,7 @@ have read the table.
 
 A files source over an object-store directory with `splits = n` hashes each object's key into one
 of `n` channels, and each channel keeps its own processed keys and partly read object, so every
-node reads part of the directory. `files_source::three_node_files_source_kill9_soak` (candidate)
+node reads part of the directory. `files_source::three_node_files_source_kill9_soak`
 puts objects of ids into an S3 prefix, seeded before the nodes start, and forwards each id through
 a stream to a MongoDB sink, through the same kills. Every written id must reach the output
 collection, ids never written fail the run, duplicates are counted, and more than one node must
