@@ -17,12 +17,24 @@
   land after its successor's and leave the older value until the key's next change. In a cluster a
   MongoDB upsert collection needs a unique index on exactly its key fields and the simple
   collation, and its key may not be a microsecond or nanosecond timestamp, which MongoDB stores in
-  milliseconds. Kafka
-  `envelope = 'upsert'` at at-least-once and Delta upsert stay rejected in a cluster. A source
-  started on another node after a committed handoff no longer repeats its output, so a rescale
-  during a PostgreSQL `changelog` copy resumes the copy. Connector API:
-  `SinkTopology::KeyPartitioned`, `SinkConnector::destination_key` and
+  milliseconds. Delta
+  upsert stays rejected in a cluster. A source started on another node after a committed handoff
+  no longer repeats its output, so a rescale during a PostgreSQL `changelog` copy resumes the
+  copy. Connector API: `SinkTopology::KeyPartitioned`, `SinkConnector::destination_key` and
   `SinkConnector::share_destination_by_key`.
+- In cluster mode the Kafka upsert sink (`envelope = 'upsert'`) runs at-least-once on input placed
+  by its key, like the PostgreSQL and MongoDB upsert sinks. Each process writes through its own
+  transactional producer, one transaction per written batch, under the `transactional.id`
+  `laminardb-writer-<sink>-<node>-<boot id>`. Before a recovery hands a failed process's keys to a
+  successor, the leader initializes transactions under that id, so nothing the failed process
+  still sends can land after its successor's record. The brokers must support transactions, and
+  the sink's principal needs `Write` and `Describe` on transactional ids with the prefix
+  `laminardb-writer-`. A frozen process's open transaction holds back `read_committed` consumers
+  until the fence or `transaction.timeout.ms`, and a recovery that removes a process, a cold start
+  of the cluster included, waits for the brokers when they are unreachable. Embedded and single-node Kafka sinks are unchanged. Connector
+  API: `SinkConnector::share_destination_by_key` takes the process's `DestinationWriter`, and a
+  sink connector type registers a fence for departed writers with
+  `ConnectorRegistry::register_sink_writer_fence`.
 
 - In cluster mode a PostgreSQL CDC source runs at-least-once on one node at a time in both output
   modes, with or without the initial copy. A `changelog` source feeds aggregates, materialized

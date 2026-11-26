@@ -791,7 +791,7 @@ impl SinkConnector for PostgresSink {
         Ok((cfg.write_mode == WriteMode::Upsert).then_some(cfg.primary_key_columns))
     }
 
-    fn share_destination_by_key(&mut self) {
+    fn share_destination_by_key(&mut self, _writer: crate::connector::DestinationWriter) {
         self.config.shared_by_key = true;
     }
 

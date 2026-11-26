@@ -1594,7 +1594,7 @@ async fn sink_shared_by_key_requires_one_document_per_key() {
             key_fields: vec!["name".to_string()],
         };
         let mut sink = MongoDbSink::new(sink_test_schema(), config, None);
-        sink.share_destination_by_key();
+        sink.share_destination_by_key(destination_writer(1));
         let opened = sink
             .open(&ConnectorConfig::new("mongodb-sink"))
             .await
@@ -1643,4 +1643,14 @@ async fn sink_shared_by_key_requires_one_document_per_key() {
         .unwrap();
     let error = open_shared(&uri, "folded").await.unwrap_err();
     assert!(error.contains("collation is not simple"), "{error}");
+}
+
+fn destination_writer(node_id: u64) -> laminar_connectors::connector::DestinationWriter {
+    laminar_connectors::connector::DestinationWriter {
+        sink_id: "orders".into(),
+        process: laminar_core::checkpoint::CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        },
+    }
 }

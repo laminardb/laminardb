@@ -789,7 +789,7 @@ tree implements; "rejected" means startup fails before connector I/O with the st
 | Source, Kafka table (key + value = upsert, key + null = delete) | Not implemented | Not implemented |
 | Source, regex subscription or partition/topic additions under a guarantee | Rejected | Rejected |
 | Sink, append, at-least-once | Implemented | Implemented (independent writers) |
-| Sink, upsert (compacted topic), at-least-once | Implemented (singleton writer) | Rejected: no fencing for a former owner's delayed writes |
+| Sink, upsert (compacted topic), at-least-once | Implemented (one writer) | Implemented on [input placed by its key](#keyed-sinks-in-a-cluster): one transactional producer per process, fenced by the leader before a successor writes a failed process's keys |
 | Sink, exactly-once (append and upsert) | Implemented: checkpoint-staged output published by one fenced transactional committer | Rejected until the cluster kill-9 qualification passes; the protocol already handles multiple participants and leader fencing tokens |
 | Sink, upsert under exactly-once | Implemented (any participant may stage; only the fenced committer writes) | Rejected with cluster exactly-once |
 
@@ -1085,7 +1085,7 @@ backpressures rather than dropping rows.
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert from a singleton writer); exactly-once append and upsert in embedded/single-node mode via checkpoint-staged output and one fenced transactional committer | Implemented |
+| Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert; upsert in a cluster on [input placed by its key](#keyed-sinks-in-a-cluster)); exactly-once append and upsert in embedded/single-node mode via checkpoint-staged output and one fenced transactional committer | Implemented |
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | RabbitMQ | `rabbitmq` | Publisher-confirmed, mandatory publishes to one exchange; durable at-least-once for persistent messages on durable queues | Implemented |
 | IBM MQ | `ibmmq` | `MQPUT` under syncpoint with `MQCMIT` per unit of work; durable at-least-once for persistent messages | Implemented |
@@ -1204,9 +1204,10 @@ requirements:
 ### Keyed sinks in a cluster
 
 Every cluster node writes the sink rows its own pipeline produces. A sink that applies rows by key
-(PostgreSQL `write.mode = 'upsert'`, with or without `changelog.mode`, and MongoDB
-`write.mode = 'upsert'`) runs at-least-once in a cluster only when each key is produced on one
-node at a time, so one writer applies each key's changes in order. The input must be one of:
+(PostgreSQL `write.mode = 'upsert'`, with or without `changelog.mode`, MongoDB
+`write.mode = 'upsert'`, and Kafka `envelope = 'upsert'` at at-least-once) runs at-least-once in a
+cluster only when each key is produced on one node at a time, so one writer applies each key's
+changes in order. The input must be one of:
 
 - partitioned by columns that are all in the sink's key: a keyed aggregate written to a sink keyed
   by its group (`GROUP BY id` into `primary.key = 'id'`), or an interval join keyed by a join key;
@@ -1242,10 +1243,23 @@ since, so each key converges on its latest value, except for the MongoDB case be
   no non-simple default collation. MongoDB stores timestamps in milliseconds, so an upsert key may
   not be a microsecond or nanosecond timestamp: two keys that differ below a millisecond would
   share one document.
-- Kafka `envelope = 'upsert'` at at-least-once and Delta `write.mode = 'upsert'` stay rejected in a
-  cluster. librdkafka keeps retrying records a stale process queued, for up to
-  `delivery.timeout.ms`, and only a transactional producer fences another. Concurrent Delta MERGEs
-  from several nodes conflict.
+- **Kafka**: librdkafka keeps retrying what a process queued, for up to its delivery timeout, after
+  the process's lease ended. In a cluster each process therefore writes through its own
+  transactional producer, one transaction per written batch, under the `transactional.id`
+  `laminardb-writer-<sink>-<node>-<boot id>`. Before a recovery hands a failed process's keys to a
+  successor, the leader initializes transactions under that id: the broker aborts the process's
+  open transaction and rejects anything it still sends, so none of it can land after the
+  successor's record. A restarted node is a new boot with a new id, so the fence never reaches a
+  live process.
+  - The brokers must support transactions, and the sink's principal needs `Write` and `Describe`
+    on transactional ids with the prefix `laminardb-writer-`.
+  - Each written batch pays one transaction commit. A frozen process's open transaction holds back
+    `read_committed` consumers on the partitions it wrote until the fence or
+    `transaction.timeout.ms` (default 60000), whichever comes first.
+  - While the brokers are unreachable the leader cannot fence, so a recovery that removes a
+    process, a cold start of the cluster included, waits for them.
+- Delta `write.mode = 'upsert'` stays rejected in a cluster: concurrent MERGEs from several nodes
+  conflict.
 
 ## Key Modules
 

@@ -25,6 +25,15 @@ pub struct SinkRuntimeContext {
     pub participant_id: u64,
 }
 
+/// One cluster process's writer of a destination that several processes write by key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationWriter {
+    /// Stable sink registration name within the pipeline.
+    pub sink_id: String,
+    /// The writing process. A restart of the same node is another writer.
+    pub process: laminar_core::checkpoint::CheckpointParticipant,
+}
+
 /// Summary of a successful `write_batch` call.
 #[derive(Debug, Clone)]
 pub struct WriteResult {
@@ -139,10 +148,10 @@ pub trait SinkConnector: Send {
 
     /// Called before [`open`](Self::open) when writers on other cluster nodes apply other keys of
     /// this [`KeyPartitioned`](super::SinkTopology::KeyPartitioned) destination at the same time,
-    /// and a successor may take over this node's keys after it fails. A connector refuses
-    /// destination constraints that span keys, which no one writer can keep, and bounds what a
-    /// stalled writer can hold.
-    fn share_destination_by_key(&mut self) {}
+    /// and a successor may take over this node's keys after it fails. `writer` names this
+    /// process's writer. A connector refuses destination constraints that span keys, which no one
+    /// writer can keep, and bounds what a stalled writer can hold.
+    fn share_destination_by_key(&mut self, _writer: DestinationWriter) {}
 
     /// Resolve a writer contract from already-bound query output before activation.
     /// Destinations with authoritative schemas override this read-only hook.

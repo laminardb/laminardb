@@ -308,6 +308,29 @@ fn sink_checkpoint_storage_scope(database: &LaminarDB) -> CheckpointStorageScope
     }
 }
 
+/// This process's writer of sink `name`, named by its node and boot incarnation.
+fn destination_writer(
+    database: &LaminarDB,
+    name: &str,
+) -> Result<laminar_connectors::connector::DestinationWriter, DbError> {
+    #[cfg(feature = "cluster")]
+    if let Some(controller) = database.cluster_controller.lock().as_ref() {
+        return Ok(laminar_connectors::connector::DestinationWriter {
+            sink_id: name.to_string(),
+            process: laminar_core::checkpoint::CheckpointParticipant {
+                node_id: controller.instance_id().0,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+        });
+    }
+    #[cfg(not(feature = "cluster"))]
+    let _ = database;
+    Err(DbError::Config(format!(
+        "[LDB-5035] sink '{name}' is written by key from several cluster nodes, which needs this \
+         node's cluster controller"
+    )))
+}
+
 async fn admit_and_bind_sink(
     database: &LaminarDB,
     sink: &mut dyn laminar_connectors::connector::SinkConnector,
@@ -317,7 +340,7 @@ async fn admit_and_bind_sink(
     let admitted = admit_sink(sink, context)?;
     let (contract, _) = admitted;
     if runtime == RuntimeMode::Cluster && contract.topology == SinkTopology::KeyPartitioned {
-        sink.share_destination_by_key();
+        sink.share_destination_by_key(destination_writer(database, name)?);
     }
     if !contract.is_checkpoint_committable() {
         return Ok(admitted);

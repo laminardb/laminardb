@@ -631,7 +631,7 @@ async fn test_changelog_target_shared_by_key_refuses_other_unique_constraints() 
     one_writer.close().await.expect("close");
 
     let mut shared = PostgresSink::new(Arc::clone(&changelog_schema), config.clone(), None);
-    shared.share_destination_by_key();
+    shared.share_destination_by_key(destination_writer(1));
     let error = shared
         .open(&ConnectorConfig::new("postgres-sink"))
         .await
@@ -655,7 +655,7 @@ async fn test_changelog_target_shared_by_key_refuses_other_unique_constraints() 
     .await
     .expect("record the writer's session bound");
     let mut shared = PostgresSink::new(Arc::clone(&changelog_schema), config, None);
-    shared.share_destination_by_key();
+    shared.share_destination_by_key(destination_writer(1));
     shared
         .open(&ConnectorConfig::new("postgres-sink"))
         .await
@@ -1016,4 +1016,14 @@ async fn test_changelog_decimal_key_upsert_and_delete() {
         [Some("-0.00005".to_string()), None]
     );
     sink.close().await.expect("close");
+}
+
+fn destination_writer(node_id: u64) -> laminar_connectors::connector::DestinationWriter {
+    laminar_connectors::connector::DestinationWriter {
+        sink_id: "orders".into(),
+        process: laminar_core::checkpoint::CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        },
+    }
 }

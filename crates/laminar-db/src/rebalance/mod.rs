@@ -23,8 +23,8 @@ use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentRecoveryDecision,
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointAssignmentAdoption,
     CheckpointAssignmentFence, CheckpointParticipant, ClusterController, LeaderLeaseStore,
-    LeaderProof, ProcessLeaseFence, RecordAssignmentDrainDecisionResult,
-    RecordAssignmentRecoveryDecisionResult, RotateOutcome, SnapshotError,
+    LeaderProof, RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
+    RotateOutcome, SnapshotError,
 };
 use laminar_core::cluster::discovery::NodeState;
 use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
@@ -39,7 +39,8 @@ use crate::db::{DbState, LaminarDB};
 
 mod recovery_adoption;
 use recovery_adoption::{
-    adopt_materialized_recovery_head, ensure_local_recovery_fault, local_recovery_assignment_scope,
+    adopt_materialized_recovery_head, close_local_assignment_authority,
+    ensure_local_recovery_fault, local_recovery_assignment_scope,
     prepare_recovery_assignment_adoption, prepare_watched_recovery_adoption,
     LocalRecoveryAssignmentScope,
 };
@@ -93,56 +94,6 @@ impl RebalanceConfig {
             placement_isolation_tier: 0,
         }
     }
-}
-
-async fn close_local_assignment_authority(
-    db: &Arc<LaminarDB>,
-    controller: &ClusterController,
-    recovery_target: &CheckpointAssignmentFence,
-    removed_processes: &[CheckpointParticipant],
-    deadline: tokio::time::Instant,
-) -> Result<Vec<ProcessLeaseFence>, String> {
-    db.set_source_gate(true);
-    controller.publish_checkpoint_assignment_fence(None);
-    controller.publish_checkpoint_drain_transition(None);
-    // Cancel first: a compute-cycle read guard may itself be blocked in shuffle admission.
-    db.invalidate_shuffle_assignment_fence();
-    let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
-        .await
-        .map_err(|_| "timed out serializing assignment authority closure".to_string())?;
-    // A watcher that already owned the adoption lock could have republished and reopened after
-    // the first cancellation. Reassert the full closure and retain serialization through process
-    // fencing, fault publication, and the execution drain.
-    db.set_source_gate(true);
-    controller.publish_checkpoint_assignment_fence(None);
-    controller.publish_checkpoint_drain_transition(None);
-    db.invalidate_shuffle_assignment_fence();
-    let fence_results = futures::future::join_all(
-        removed_processes
-            .iter()
-            .copied()
-            .map(|participant| controller.fence_process_incarnation(participant, deadline)),
-    )
-    .await;
-    let mut process_fences = Vec::with_capacity(fence_results.len());
-    for result in fence_results {
-        process_fences.push(result?);
-    }
-    // RECOVERY: Prepare cancels graph work, so publish its fault before waiting for that work to
-    // release the execution fence. Process fencing above prevents a live predecessor from causing
-    // a spurious fault, and the serialized local authority is already closed.
-    if recovery_target.participant_incarnation(controller.instance_id().0)
-        == Some(controller.recovery_incarnation())
-    {
-        ensure_local_recovery_fault(db, controller).await?;
-    }
-    let _transition = tokio::time::timeout_at(
-        deadline,
-        Arc::clone(&db.rotation_execution_fence).write_owned(),
-    )
-    .await
-    .map_err(|_| "timed out draining assignment execution after closure".to_string())?;
-    Ok(process_fences)
 }
 
 /// Fail closed for a transient durable snapshot read without forcing a new assignment version.

@@ -166,6 +166,14 @@ pub fn register_kafka_sink(
                 registry.map(Arc::as_ref),
             )))
         }),
+    )?;
+    registry.register_sink_writer_fence(
+        "kafka",
+        Arc::new(|config, sink_id, departed, deadline| {
+            Box::pin(sink::fence_departed_writers(
+                config, sink_id, departed, deadline,
+            ))
+        }),
     )
 }
 

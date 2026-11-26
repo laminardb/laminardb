@@ -9,13 +9,13 @@ use async_trait::async_trait;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
-use rdkafka::ClientConfig;
 use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskOwner, ConnectorTaskTracker, CoordinatedCommitter, DeliveryGuarantee,
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    DestinationWriter, SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+    WriteResult,
 };
 use crate::error::ConnectorError;
 use crate::serde::RecordSerializer;
@@ -31,10 +31,13 @@ use super::sink_metrics::KafkaSinkMetrics;
 mod commit_marker;
 mod exact_commit;
 mod failure;
+mod keyed_writer;
+pub(super) use keyed_writer::fence_departed_writers;
 mod keys;
 mod lifecycle;
 mod serialization;
 mod staged_epoch;
+mod transaction;
 mod upsert;
 
 use exact_commit::KafkaExactCommitter;
@@ -45,7 +48,7 @@ use failure::{
 };
 use keys::{KeyBuffer, KeyEncoder};
 use serialization::select_serializer;
-use staged_epoch::StagedEpoch;
+use staged_epoch::{exactly_once_parts, stage_records, StagedEpoch};
 
 fn required_producer(producer: Option<&FutureProducer>) -> Result<&FutureProducer, ConnectorError> {
     producer.ok_or_else(|| ConnectorError::InvalidState {
@@ -106,6 +109,8 @@ pub struct KafkaSink {
     staged: Option<StagedEpoch>,
     /// Exactly-once only: the designated committer for this sink's namespace.
     exact: Option<Arc<KafkaExactCommitter>>,
+    /// Cluster upsert only: this process's writer of a topic that several processes write by key.
+    keyed_writer: Option<DestinationWriter>,
     /// Sole admission authority for detached producer destruction.
     task_owner: ConnectorTaskOwner,
     /// Cloneable terminal observer returned to the connector runtime.
@@ -152,6 +157,7 @@ impl KafkaSink {
             unkeyed_partition: 0,
             staged,
             exact,
+            keyed_writer: None,
             task_owner,
             task_tracker,
         }
@@ -201,6 +207,7 @@ impl KafkaSink {
             unkeyed_partition: 0,
             staged,
             exact,
+            keyed_writer: None,
             task_owner,
             task_tracker,
         }
@@ -216,6 +223,15 @@ impl KafkaSink {
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
+    }
+
+    /// The configuration `config` describes, or the parsed one when it carries no properties.
+    fn config_for(&self, config: &ConnectorConfig) -> Result<KafkaSinkConfig, ConnectorError> {
+        if config.properties().is_empty() {
+            Ok(self.config.clone())
+        } else {
+            KafkaSinkConfig::from_config(config)
+        }
     }
 
     fn serialize_payloads(
@@ -402,22 +418,15 @@ impl SinkConnector for KafkaSink {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-        let cfg = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            KafkaSinkConfig::from_config(config)?
-        };
+        let cfg = self.config_for(config)?;
         let exactly_once = cfg.delivery == DeliveryGuarantee::ExactlyOnce;
         let consistency = if exactly_once {
             SinkConsistency::CheckpointCommittable
         } else {
             SinkConsistency::DurableAtLeastOnce
         };
-        // Exactly-once output is published only by the fenced designated committer, so staged
-        // upserts from any participant compose. Without it, an upsert record carries no fenced
-        // generation and a former owner could overwrite a newer value for the same compacted key.
-        let topology = if cfg.envelope == SinkEnvelope::Upsert && !exactly_once {
-            SinkTopology::Singleton
+        let topology = if cfg.is_key_partitioned() {
+            SinkTopology::KeyPartitioned
         } else {
             SinkTopology::MultiWriter
         };
@@ -427,6 +436,18 @@ impl SinkConnector for KafkaSink {
             SinkInputMode::AppendOnly
         };
         Ok(SinkContract::new(consistency, topology, input_mode))
+    }
+
+    fn destination_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        let cfg = self.config_for(config)?;
+        Ok((cfg.envelope == SinkEnvelope::Upsert).then(|| cfg.key_columns()))
+    }
+
+    fn share_destination_by_key(&mut self, writer: DestinationWriter) {
+        self.keyed_writer = Some(writer);
     }
 
     async fn resolve_schema(
@@ -474,10 +495,16 @@ impl SinkConnector for KafkaSink {
             "Kafka producer effective configuration"
         );
 
-        let rdkafka_config: ClientConfig = self.config.to_rdkafka_config();
-        let producer: FutureProducer = rdkafka_config
-            .create()
-            .map_err(|error| producer_creation_error("main", &error))?;
+        let producer: FutureProducer = match self.keyed_writer.as_ref() {
+            Some(writer) => {
+                keyed_writer::open(&self.config, writer, &self.task_owner.admission()).await?
+            }
+            None => self
+                .config
+                .to_rdkafka_config()
+                .create()
+                .map_err(|error| producer_creation_error("main", &error))?,
+        };
         self.producer = Some(producer);
 
         // Keep DLQ production decoupled from the main producer. Once a producer
@@ -853,7 +880,12 @@ impl SinkConnector for KafkaSink {
         // The runtime deadline must dominate librdkafka's delivery deadline.
         // Main and DLQ deliveries are concurrent, so only bounded queue retry
         // and scheduling headroom are added rather than a per-row multiplier.
-        kafka_write_timeout(self.config.delivery_timeout)
+        // A keyed writer's transaction timeout also bounds its commit.
+        match self.keyed_writer {
+            Some(_) => kafka_write_timeout(self.config.transactional_delivery_timeout())
+                .saturating_add(self.config.transaction_timeout),
+            None => kafka_write_timeout(self.config.delivery_timeout),
+        }
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
@@ -890,41 +922,6 @@ impl std::fmt::Debug for KafkaSink {
             .field("topic", &self.config.topic)
             .field("format", &self.config.format)
             .finish_non_exhaustive()
-    }
-}
-
-/// Exactly-once: hold routed records for the checkpoint's transaction instead of producing them.
-fn stage_records<'a>(
-    stage: &mut StagedEpoch,
-    partitions: &[i32],
-    keys: Option<&KeyBuffer>,
-    values: impl ExactSizeIterator<Item = Option<&'a [u8]>>,
-) -> Result<WriteResult, ConnectorError> {
-    let rows = values.len();
-    for (row, value) in values.enumerate() {
-        stage.push(partitions[row], keys.and_then(|keys| keys.key(row)), value)?;
-    }
-    Ok(WriteResult::new(rows, 0))
-}
-
-/// The epoch stage and designated committer of an exactly-once sink; `None` otherwise.
-fn exactly_once_parts(
-    config: &KafkaSinkConfig,
-    task_owner: &ConnectorTaskOwner,
-) -> (Option<StagedEpoch>, Option<Arc<KafkaExactCommitter>>) {
-    match (config.delivery, config.commit_topic.as_ref()) {
-        (DeliveryGuarantee::ExactlyOnce, Some(commit_topic)) => (
-            Some(StagedEpoch::new(
-                config.epoch_max_bytes,
-                config.message_max_bytes().unwrap_or(usize::MAX),
-            )),
-            Some(Arc::new(KafkaExactCommitter::new(
-                config.clone(),
-                commit_topic.clone(),
-                task_owner.admission(),
-            ))),
-        ),
-        _ => (None, None),
     }
 }
 

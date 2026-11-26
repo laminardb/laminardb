@@ -874,7 +874,7 @@ fn a_target_shared_by_key_keeps_its_session_bound_when_reconfigured() {
         crate::config::encode_arrow_schema_ipc(schema.as_ref()),
     );
     let mut sink = PostgresSink::new(Arc::clone(&schema), test_config(), None);
-    sink.share_destination_by_key();
+    sink.share_destination_by_key(crate::testing::destination_writer("orders", 1));
     sink.apply_connector_config(&config).unwrap();
     assert!(
         sink.config

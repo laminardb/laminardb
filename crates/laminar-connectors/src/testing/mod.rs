@@ -15,9 +15,9 @@ use parking_lot::Mutex;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorInfo};
 use crate::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceTopology,
-    WriteResult,
+    DestinationWriter, SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourceTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
@@ -373,3 +373,15 @@ pub fn register_mock_sink(registry: &ConnectorRegistry) -> Result<(), ConnectorE
 
 #[cfg(test)]
 mod tests;
+
+/// The writer of `sink_id` on node `node_id`.
+#[must_use]
+pub fn destination_writer(sink_id: &str, node_id: u64) -> DestinationWriter {
+    DestinationWriter {
+        sink_id: sink_id.into(),
+        process: laminar_core::checkpoint::CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        },
+    }
+}

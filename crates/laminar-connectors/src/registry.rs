@@ -42,6 +42,24 @@ pub type SinkFactory = Arc<
         + Sync,
 >;
 
+/// Fences the writers that departed cluster processes hold on one sink, given its config, its
+/// name and the departed processes, before a successor writes their keys: once it returns,
+/// nothing those processes still send can land after a successor's write. A sink connector type registers one when its client
+/// can deliver a write after the writer's lease ended; it returns without I/O for a configuration
+/// whose writes need no fence. It runs on the cluster leader from the sink's registration,
+/// without building the sink.
+pub type SinkWriterFence = Arc<
+    dyn Fn(
+            ConnectorConfig,
+            String,
+            Vec<laminar_core::checkpoint::CheckpointParticipant>,
+            tokio::time::Instant,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), ConnectorError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Factory for finite reference-table snapshots constrained by the declared schema.
 pub type TableSourceFactory = Arc<
     dyn Fn(&ConnectorConfig, SchemaRef) -> Result<Box<dyn ReferenceTableSource>, ConnectorError>
@@ -97,6 +115,7 @@ type LookupSourceRegistration = (ConnectorInfo, Arc<dyn LookupSourceFactory>);
 pub struct ConnectorRegistry {
     sources: Arc<RwLock<HashMap<String, (ConnectorInfo, SourceFactory)>>>,
     sinks: Arc<RwLock<HashMap<String, (ConnectorInfo, SinkFactory)>>>,
+    sink_writer_fences: Arc<RwLock<HashMap<String, SinkWriterFence>>>,
     table_sources: Arc<RwLock<HashMap<String, (ConnectorInfo, TableSourceFactory)>>>,
     lookup_sources: Arc<RwLock<HashMap<String, LookupSourceRegistration>>>,
     /// A registration holds a read guard through insertion; `freeze` takes the write guard.
@@ -114,6 +133,7 @@ impl ConnectorRegistry {
         Self {
             sources: Arc::new(RwLock::new(HashMap::new())),
             sinks: Arc::new(RwLock::new(HashMap::new())),
+            sink_writer_fences: Arc::new(RwLock::new(HashMap::new())),
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             lookup_sources: Arc::new(RwLock::new(HashMap::new())),
             frozen: Arc::new(RwLock::new(false)),
@@ -283,6 +303,37 @@ impl ConnectorRegistry {
         sinks.insert(name, (info, factory));
         drop(frozen);
         Ok(())
+    }
+
+    /// Register the writer fence of the sink connector type `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::RegistryFrozen` after the registry is frozen, or
+    /// `ConnectorError::FactoryAlreadyRegistered` if `name` already has a writer fence.
+    pub fn register_sink_writer_fence(
+        &self,
+        name: impl Into<String>,
+        fence: SinkWriterFence,
+    ) -> Result<(), ConnectorError> {
+        let name = name.into();
+        let frozen = self.frozen.read();
+        if *frozen {
+            return Err(ConnectorError::RegistryFrozen { kind: "sink", name });
+        }
+        let mut fences = self.sink_writer_fences.write();
+        if fences.contains_key(&name) {
+            return Err(ConnectorError::FactoryAlreadyRegistered { kind: "sink", name });
+        }
+        fences.insert(name, fence);
+        drop(frozen);
+        Ok(())
+    }
+
+    /// The writer fence of the sink connector type `name`, if it registered one.
+    #[must_use]
+    pub fn sink_writer_fence(&self, name: &str) -> Option<SinkWriterFence> {
+        self.sink_writer_fences.read().get(name).cloned()
     }
 
     /// Run a connector's `discover_schema` against the given properties.

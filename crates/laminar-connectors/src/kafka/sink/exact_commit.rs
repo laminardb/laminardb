@@ -14,6 +14,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 
 use super::commit_marker::{read_newest_marker, CommitMarker, MarkerLocation, MarkerRead};
 use super::staged_epoch::{OutputRecord, StagedOutput};
+use super::transaction::{self, run_blocking, transactional_producer, TransactionEnd};
 use crate::connector::{
     ConnectorTaskAdmission, CoordinatedCommitBatch, CoordinatedCommitContext,
     CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitter,
@@ -128,28 +129,20 @@ impl KafkaExactCommitter {
         let commit_topic = self.commit_topic.clone();
         let output_topic = self.config.topic.clone();
         let key = namespace_key.clone();
-        let blocking_deadline = to_std(deadline);
-        let fenced = self
-            .run_blocking(deadline, move || {
-                let marker =
-                    MarkerLocation::resolve(&connection, &commit_topic, key, blocking_deadline)?;
-                let producer: FutureProducer = producer_config.create().map_err(|error| {
-                    ConnectorError::ConfigurationError(format!(
-                        "create Kafka transactional producer: {error}"
-                    ))
-                })?;
-                init_transactions(&producer, blocking_deadline)?;
-                let output_partitions =
-                    topic_partitions(&producer, &output_topic, blocking_deadline)?;
-                let newest = read_newest_marker(
-                    &connection,
-                    &marker,
-                    MarkerRead::Authoritative,
-                    blocking_deadline,
-                )?;
-                Ok((producer, marker, newest, output_partitions))
-            })
-            .await?;
+        let fenced = run_blocking(&self.admission, deadline, move |blocking_deadline| {
+            let marker =
+                MarkerLocation::resolve(&connection, &commit_topic, key, blocking_deadline)?;
+            let producer = transactional_producer(&producer_config, blocking_deadline)?;
+            let output_partitions = topic_partitions(&producer, &output_topic, blocking_deadline)?;
+            let newest = read_newest_marker(
+                &connection,
+                &marker,
+                MarkerRead::Authoritative,
+                blocking_deadline,
+            )?;
+            Ok((producer, marker, newest, output_partitions))
+        })
+        .await?;
         let (producer, marker, newest, output_partitions) = fenced;
         if let Some(newest) = newest.as_ref() {
             if newest.topic != self.config.topic {
@@ -172,37 +165,6 @@ impl KafkaExactCommitter {
             marker,
             cursor: newest.map(|marker| marker.cursor()),
         })
-    }
-
-    /// Run a blocking librdkafka call off the async workers within `deadline`. The call carries
-    /// its own timeout bounded by the same deadline, so an abandoned call still finishes.
-    async fn run_blocking<T: Send + 'static>(
-        &self,
-        deadline: tokio::time::Instant,
-        work: impl FnOnce() -> Result<T, ConnectorError> + Send + 'static,
-    ) -> Result<T, ConnectorError> {
-        let guard = self
-            .admission
-            .track()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "live Kafka sink".into(),
-                actual: "sink generation is closed".into(),
-            })?;
-        let task = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            work()
-        });
-        match tokio::time::timeout_at(deadline, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(ConnectorError::outcome_unknown(
-                format!("Kafka transaction worker failed: {error}"),
-                true,
-            )),
-            Err(_) => Err(ConnectorError::outcome_unknown(
-                "Kafka transaction step exceeded the commit deadline",
-                true,
-            )),
-        }
     }
 
     /// Destroy a producer off the async workers: rdkafka's `Drop` purges and joins threads.
@@ -230,8 +192,7 @@ impl KafkaExactCommitter {
     ) -> Result<Option<CommitMarker>, ConnectorError> {
         let connection = self.config.connection_rdkafka_config();
         let commit_topic = self.commit_topic.clone();
-        let blocking_deadline = to_std(deadline);
-        self.run_blocking(deadline, move || {
+        run_blocking(&self.admission, deadline, move |blocking_deadline| {
             let marker =
                 MarkerLocation::resolve(&connection, &commit_topic, key, blocking_deadline)?;
             read_newest_marker(
@@ -377,19 +338,17 @@ impl CoordinatedCommitter for KafkaExactCommitter {
         let producer = writer.producer.clone();
         let location = writer.marker.clone();
         let topic = self.config.topic.clone();
-        let blocking_deadline = to_std(deadline);
-        let outcome = self
-            .run_blocking(deadline, move || {
-                Ok(publish(
-                    &producer,
-                    &topic,
-                    &records,
-                    &location,
-                    &marker,
-                    blocking_deadline,
-                ))
-            })
-            .await;
+        let outcome = run_blocking(&self.admission, deadline, move |blocking_deadline| {
+            Ok(publish(
+                &producer,
+                &topic,
+                &records,
+                &location,
+                &marker,
+                blocking_deadline,
+            ))
+        })
+        .await;
         match outcome {
             Ok(PublishOutcome::Committed) => {
                 if let Some(writer) = state.writer.as_mut() {
@@ -511,20 +470,7 @@ fn publish(
             &format!("produce commit marker: {error}"),
         );
     }
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return PublishOutcome::Unknown("commit_transaction did not finish".into());
-        }
-        match producer.commit_transaction(left) {
-            Ok(()) => return PublishOutcome::Committed,
-            Err(KafkaError::Transaction(error)) if error.txn_requires_abort() => {
-                return abort(producer, deadline, &format!("commit_transaction: {error}"));
-            }
-            Err(KafkaError::Transaction(error)) if error.is_retriable() && !error.is_fatal() => {}
-            Err(error) => return PublishOutcome::Unknown(format!("commit_transaction: {error}")),
-        }
-    }
+    published(transaction::commit(producer, deadline))
 }
 
 /// Enqueue one record, retrying while librdkafka's queue is full. Delivery failures surface as
@@ -549,32 +495,18 @@ fn enqueue(
 }
 
 fn abort(producer: &FutureProducer, deadline: Instant, reason: &str) -> PublishOutcome {
-    let left = deadline.saturating_duration_since(Instant::now());
-    match producer.abort_transaction(left) {
-        Ok(()) => PublishOutcome::Aborted(ConnectorError::TransactionError(format!(
-            "Kafka exactly-once transaction aborted ({reason}); nothing was published"
-        ))),
-        Err(error) => PublishOutcome::Unknown(format!("{reason}; abort_transaction: {error}")),
-    }
+    published(transaction::abort(producer, deadline, reason))
 }
 
-fn init_transactions(producer: &FutureProducer, deadline: Instant) -> Result<(), ConnectorError> {
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(ConnectorError::TransactionError(
-                "Kafka init_transactions did not finish before the deadline".into(),
-            ));
+fn published(end: TransactionEnd) -> PublishOutcome {
+    match end {
+        TransactionEnd::Committed => PublishOutcome::Committed,
+        TransactionEnd::Aborted(reason) => {
+            PublishOutcome::Aborted(ConnectorError::TransactionError(format!(
+                "Kafka exactly-once transaction aborted ({reason}); nothing was published"
+            )))
         }
-        match producer.init_transactions(left) {
-            Ok(()) => return Ok(()),
-            Err(KafkaError::Transaction(error)) if error.is_retriable() && !error.is_fatal() => {}
-            Err(error) => {
-                return Err(ConnectorError::TransactionError(format!(
-                    "Kafka init_transactions: {error}"
-                )));
-            }
-        }
+        TransactionEnd::Unknown(detail) => PublishOutcome::Unknown(detail),
     }
 }
 
@@ -613,8 +545,4 @@ fn remaining_until(deadline: tokio::time::Instant) -> Result<Duration, Connector
         ));
     }
     Ok(left)
-}
-
-fn to_std(deadline: tokio::time::Instant) -> Instant {
-    deadline.into_std()
 }
