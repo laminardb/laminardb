@@ -315,12 +315,16 @@ async fn a_commit_racing_the_fence_lands_before_the_successor_or_not_at_all() {
 
     let committed = commit.join().unwrap();
     let values = topic.values(1, "read_committed");
-    assert_eq!(
-        values.last(),
-        Some(&Some(json(1, "new"))),
-        "committed={committed}"
-    );
-    assert_eq!(values.len(), if committed { 2 } else { 1 });
+    let landed_first = vec![Some(json(1, "stale")), Some(json(1, "new"))];
+    // A commit whose response was lost can still land, so only a successful one pins the log.
+    if committed {
+        assert_eq!(values, landed_first);
+    } else {
+        assert!(
+            values == [Some(json(1, "new"))] || values == landed_first,
+            "{values:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
