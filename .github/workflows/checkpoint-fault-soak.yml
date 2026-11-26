@@ -90,9 +90,6 @@ jobs:
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
 
       - name: Kill and restart exact single-node split generator recovery
-        # A candidate step: it gathers evidence for the split generator's exactly-once
-        # certification and cannot fail the job until it is promoted.
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -297,7 +294,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs rabbitmq
-            candidate: "true"
           - label: Cluster ALO MongoDB source (gossip)
             test: mongodb_source::three_node_mongodb_source_kill9_soak
             features: cluster,aws,kafka,mongodb-cdc
@@ -313,7 +309,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs mongodb mongodb-rs
-            candidate: "true"
           - label: Cluster ALO MongoDB document temporal source (gossip)
             test: mongodb_document_source::three_node_mongodb_document_temporal_kill9_soak
             features: cluster,aws,kafka,mongodb-cdc
@@ -329,7 +324,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda mongodb mongodb-rs
-            candidate: "true"
           - label: Cluster ALO Iceberg split source (gossip)
             test: iceberg_source::three_node_iceberg_source_kill9_soak
             features: cluster,aws,kafka,iceberg,mongodb-cdc
@@ -346,7 +340,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs mongodb
-            candidate: "true"
           - label: Cluster ALO files split source (gossip)
             test: files_source::three_node_files_source_kill9_soak
             features: cluster,aws,kafka,files,mongodb-cdc
@@ -362,7 +355,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs mongodb
-            candidate: "true"
           - label: Cluster ALO PostgreSQL temporal source (gossip)
             test: postgres_source::three_node_postgres_temporal_kill9_soak
             features: cluster,aws,kafka,postgres-cdc,postgres-sink
@@ -379,7 +371,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda postgres
-            candidate: "true"
           - label: Cluster ALO PostgreSQL changelog source (gossip)
             test: postgres_changelog_source::three_node_postgres_changelog_kill9_soak
             features: cluster,aws,kafka,postgres-cdc,postgres-sink
@@ -446,7 +437,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda postgres
-            candidate: "true"
           - label: Cluster ALO MongoDB sink (gossip)
             test: multi_writer_sinks::three_node_mongodb_sink_kill9_soak
             features: cluster,aws,kafka,mongodb-cdc
@@ -461,7 +451,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda mongodb
-            candidate: "true"
           - label: Cluster ALO NATS JetStream sink (gossip)
             test: multi_writer_sinks::three_node_nats_sink_kill9_soak
             features: cluster,aws,kafka,nats
@@ -476,7 +465,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda nats nats-2 nats-3
-            candidate: "true"
           - label: Cluster ALO split generator (gossip)
             test: generator_splits::three_node_generator_splits_kill9_soak
             features: cluster,aws,kafka
@@ -492,7 +480,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs
-            candidate: "true"
           - label: Cluster ALO Delta change feed source (gossip)
             test: delta_cdf_source::three_node_delta_cdf_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3
@@ -541,7 +528,6 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: observe
             services: seaweedfs
-            candidate: "true"
     steps:
       - uses: actions/checkout@v6
         with:

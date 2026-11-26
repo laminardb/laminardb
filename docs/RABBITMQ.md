@@ -276,8 +276,8 @@ home vnode consumes it, and a stream forwards the rows to a RabbitMQ sink whose 
 independent reader drains. The leader was hard-killed twice and each follower once, every time
 while paused inside a checkpoint. In a local run on 2026-11-16, none of 42,944 confirmed messages
 was missing from the output, 4,000 arrived more than once, and two of the three nodes consumed the
-queue as the source moved. The leg is a candidate: it runs weekly in the same workflow but does not
-yet fail it.
+queue as the source moved. The leg runs weekly in the same workflow and before each release, and a
+failure fails it.
 Those results hold for durable, persistent messages on these queue types. They do not extend to
 other queue types, the stream protocol, or broker versions.
 
