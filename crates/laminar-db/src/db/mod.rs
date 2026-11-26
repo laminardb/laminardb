@@ -1023,6 +1023,20 @@ pub(crate) struct ForceCheckpointRequest {
     /// already-acknowledged request back to the waiting queue, so this is intentionally optional.
     pub(crate) reservation_claim: Option<ForceCheckpointReservationClaim>,
     pub(crate) deadline: tokio::time::Instant,
+    pub(crate) caller: ManualCheckpointCaller,
+}
+
+/// Who asked for a manual checkpoint, which decides where it runs and which cut answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualCheckpointCaller {
+    /// A public caller; a follower forwards the request to the leader.
+    Public,
+    /// A request a follower forwarded; only the leader runs it.
+    Forwarded,
+    /// The leader's graceful rotation. Only its drain's HANDOFF cut answers it: a cut without
+    /// HANDOFF leaves the donors' intake open, so they could still write output for vnodes they
+    /// hand over.
+    AssignmentHandoff,
 }
 
 pub(crate) type ForceCheckpointTx =
@@ -5097,7 +5111,8 @@ impl LaminarDB {
         timeout: std::time::Duration,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         let deadline = self.manual_checkpoint_deadline(timeout)?;
-        self.checkpoint_until(deadline).await
+        self.checkpoint_until(deadline, ManualCheckpointCaller::Public)
+            .await
     }
 
     /// Execute a forwarded manual checkpoint directly, without another network forwarding hop.
@@ -5116,7 +5131,8 @@ impl LaminarDB {
         timeout: std::time::Duration,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         let deadline = self.manual_checkpoint_deadline(timeout)?;
-        self.checkpoint_until_inner(deadline, false).await
+        self.checkpoint_until(deadline, ManualCheckpointCaller::Forwarded)
+            .await
     }
 
     fn manual_checkpoint_deadline(
@@ -5146,17 +5162,8 @@ impl LaminarDB {
     pub(crate) async fn checkpoint_until(
         &self,
         deadline: tokio::time::Instant,
+        caller: ManualCheckpointCaller,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
-        self.checkpoint_until_inner(deadline, true).await
-    }
-
-    async fn checkpoint_until_inner(
-        &self,
-        deadline: tokio::time::Instant,
-        allow_forwarding: bool,
-    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
-        #[cfg(not(feature = "cluster"))]
-        let _ = allow_forwarding;
         self.ensure_catalog_cleanup_unfenced("manual checkpoint")?;
         #[cfg(feature = "cluster")]
         self.ensure_coordinated_recovery_mutation_unfenced("manual checkpoint")?;
@@ -5177,23 +5184,26 @@ impl LaminarDB {
             let leader = self.cluster_leader_http_address().map_err(|reason| {
                 DbError::Checkpoint(format!("cannot route checkpoint: {reason}"))
             })?;
-            match leader {
-                None => {}
-                Some(_) if !allow_forwarding => {
-                    return Err(DbError::Checkpoint(
+            if let Some(leader_rpc) = leader {
+                return match caller {
+                    ManualCheckpointCaller::Public => {
+                        tracing::info!(
+                            "Forwarding checkpoint request to leader node at HTTP address {}",
+                            leader_rpc
+                        );
+                        self.forward_checkpoint_to_leader(&leader_rpc, deadline)
+                            .await
+                    }
+                    ManualCheckpointCaller::Forwarded => Err(DbError::Checkpoint(
                         "forwarded checkpoint reached a node that is no longer the cluster leader"
                             .into(),
-                    ))
-                }
-                Some(leader_rpc) => {
-                    tracing::info!(
-                        "Forwarding checkpoint request to leader node at HTTP address {}",
-                        leader_rpc
-                    );
-                    return self
-                        .forward_checkpoint_to_leader(&leader_rpc, deadline)
-                        .await;
-                }
+                    )),
+                    ManualCheckpointCaller::AssignmentHandoff => Err(DbError::Checkpoint(
+                        "assignment handoff checkpoint requested on a node that is no longer the \
+                         cluster leader"
+                            .into(),
+                    )),
+                };
             }
         }
 
@@ -5210,6 +5220,7 @@ impl LaminarDB {
             reply: reply_tx,
             reservation_claim: Some(reservation_claim),
             deadline,
+            caller,
         };
         tokio::time::timeout_at(deadline, tx.send(request))
             .await

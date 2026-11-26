@@ -167,6 +167,38 @@ impl StreamingCoordinator {
         owned
     }
 
+    /// Refuse waiting manual callers that need a HANDOFF cut when admission offers none, and
+    /// return whether it did.
+    pub(super) fn refuse_cut_without_handoff(
+        &mut self,
+        callback: &mut impl PipelineCallback,
+        flags: u64,
+    ) -> bool {
+        if flags & laminar_core::checkpoint::flags::HANDOFF != 0 {
+            return false;
+        }
+        if self.manual_handoff_required {
+            let reason = "assignment handoff ended before its replay-quiescent checkpoint";
+            callback.record_checkpoint_admission_failure(reason);
+            self.fail_waiting_manual(reason);
+            return true;
+        }
+        // The drain can end between the rotation's request and this admission, which then sees no
+        // drain and admits a cut without HANDOFF. That cut must not answer the rotation; like a
+        // drain that changed during admission, this refuses the request without a pipeline fault.
+        let rotation_waits = self
+            .manual_waiting
+            .iter()
+            .any(|request| request.caller == crate::db::ManualCheckpointCaller::AssignmentHandoff);
+        if rotation_waits {
+            self.fail_waiting_manual(
+                "[LDB-6056] manual checkpoint rejected: the assignment drain ended before its \
+                 HANDOFF checkpoint was admitted",
+            );
+        }
+        rotation_waits
+    }
+
     pub(super) fn retry_manual_handoff(&mut self, attempt: CheckpointAttempt) {
         let Some(active) = self.manual_active.take() else {
             return;

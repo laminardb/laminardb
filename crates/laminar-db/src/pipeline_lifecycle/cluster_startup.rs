@@ -63,6 +63,25 @@ impl LaminarDB {
         Ok(true)
     }
 
+    /// A coordinated recovery that holds this process withdraws its assignment fence. For an owner
+    /// of vnodes the round, not startup, then reinstalls the assignment and opens intake. A worker
+    /// that owns none never opens intake, so it would only wait out the startup recovery timeout.
+    #[cfg(feature = "cluster")]
+    fn uncertified_assignment_disposition(
+        &self,
+        controller: &laminar_core::cluster::control::ClusterController,
+        assignment: &laminar_core::state::VnodeAssignmentSnapshot,
+    ) -> Result<ClusterStartupDisposition, DbError> {
+        let local_id = controller.instance_id();
+        if self.coordinated_recovery_in_progress() && assignment.owners().contains(&local_id) {
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
+        }
+        Err(DbError::Checkpoint(format!(
+            "cluster assignment {} is not certified for source intake",
+            assignment.version()
+        )))
+    }
+
     /// Finish clustered startup after the exact assignment fence is available.
     ///
     /// Fresh nodes open intake only when no durable recovery round exists. A process that restored
@@ -71,9 +90,9 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns a checkpoint error when the local assignment has not been certified. Intake remains
-    /// closed when recovery authority is unavailable so the monitor can retry without admitting
-    /// records.
+    /// Returns a checkpoint error when the local assignment has not been certified, unless a
+    /// coordinated recovery holds this process and it owns vnodes. Intake remains closed when
+    /// recovery authority is unavailable so the monitor can retry without admitting records.
     #[cfg(feature = "cluster")]
     pub async fn finish_cluster_startup(
         &self,
@@ -99,14 +118,12 @@ impl LaminarDB {
         let assignment = registry.versioned_snapshot();
         let assignment_version = assignment.version();
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
-        let assignment_fence = controller
+        let Some(assignment_fence) = controller
             .checkpoint_assignment_fence(assignment_version)
             .filter(|fence| fence.matches_owner_map(&owners))
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "cluster assignment {assignment_version} is not certified for source intake"
-                ))
-            })?;
+        else {
+            return self.uncertified_assignment_disposition(&controller, &assignment);
+        };
         let local_id = controller.instance_id().0;
         let local_incarnation = assignment_fence.participant_incarnation(local_id);
         let idle = match local_incarnation {
