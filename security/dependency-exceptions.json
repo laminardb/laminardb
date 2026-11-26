@@ -13,7 +13,7 @@
       "advisory": "RUSTSEC-2024-0436",
       "crate": "paste",
       "version": "1.0.15",
-      "reason": "Accepted unmaintained compile-time dependency through DataFusion, Parquet and tokenizers."
+      "reason": "Accepted unmaintained compile-time dependency through tokenizers (laminar-db's local feature), which requires it directly in every release."
     },
     {
       "advisory": "RUSTSEC-2026-0173",
