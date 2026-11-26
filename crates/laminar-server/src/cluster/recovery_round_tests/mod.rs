@@ -373,23 +373,29 @@ fn shared_store(namespace: &str) -> Result<Arc<dyn object_store::ObjectStore>> {
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err(anyhow!("qualification endpoint must use loopback HTTP"));
     }
-    let store = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(std::env::var("LAMINAR_PROCESS_TEST_S3_BUCKET")?)
-        .with_region("us-east-1")
-        .with_access_key_id(
-            std::env::var("LAMINAR_PROCESS_TEST_S3_ACCESS_KEY")
-                .unwrap_or_else(|_| "minioadmin".into()),
-        )
-        .with_secret_access_key(
-            std::env::var("LAMINAR_PROCESS_TEST_S3_SECRET_KEY")
-                .unwrap_or_else(|_| "minioadmin".into()),
-        )
-        .with_allow_http(true)
-        .build()?;
-    Ok(Arc::new(object_store::prefix::PrefixStore::new(
-        store, namespace,
-    )))
+    let bucket = std::env::var("LAMINAR_PROCESS_TEST_S3_BUCKET")?;
+    let credential = |name: &str| std::env::var(name).unwrap_or_else(|_| "minioadmin".into());
+    let options = std::collections::HashMap::from([
+        ("aws_endpoint".to_owned(), endpoint),
+        ("aws_region".to_owned(), "us-east-1".to_owned()),
+        (
+            "aws_access_key_id".to_owned(),
+            credential("LAMINAR_PROCESS_TEST_S3_ACCESS_KEY"),
+        ),
+        (
+            "aws_secret_access_key".to_owned(),
+            credential("LAMINAR_PROCESS_TEST_S3_SECRET_KEY"),
+        ),
+        ("aws_allow_http".to_owned(), "true".to_owned()),
+    ]);
+    // The server's control-store client: databases restart their pipelines on this store.
+    Ok(
+        laminar_core::checkpoint::object_store_builder::build_object_store_on(
+            &format!("s3://{bucket}/{namespace}"),
+            &options,
+            &tokio::runtime::Handle::current(),
+        )?,
+    )
 }
 
 async fn wait_phase(

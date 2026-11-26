@@ -258,3 +258,134 @@ fn qualified_azure_authority_cannot_be_overridden_by_options() {
     assert!(!error.contains("different-account"));
     assert!(!error.contains("events@account"));
 }
+
+/// A loopback S3 endpoint that answers every HEAD and holds the second response until released.
+#[cfg(feature = "aws")]
+#[derive(Default)]
+struct HeldResponseEndpoint {
+    url: String,
+    requests: std::sync::atomic::AtomicUsize,
+    held_request_arrived: tokio::sync::Notify,
+    release_held_response: tokio::sync::Notify,
+}
+
+#[cfg(feature = "aws")]
+impl HeldResponseEndpoint {
+    const HEAD_RESPONSE: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"frame\"\r\nLast-Modified: Thu, 26 Nov 2026 00:00:00 GMT\r\n\r\n";
+
+    async fn start() -> Arc<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Arc::new(Self {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            ..Self::default()
+        });
+        let server = Arc::clone(&endpoint);
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(Arc::clone(&server).serve(socket));
+            }
+        });
+        endpoint
+    }
+
+    async fn serve(self: Arc<Self>, mut socket: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            while let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                buffer.drain(..end + 4);
+                if self
+                    .requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 1
+                {
+                    self.held_request_arrived.notify_one();
+                    self.release_held_response.notified().await;
+                }
+                if socket.write_all(Self::HEAD_RESPONSE).await.is_err() {
+                    return;
+                }
+            }
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
+}
+
+/// A pipeline's compute runtime reads the shared store and ends with the pipeline. A request
+/// another runtime sends on a connection that runtime opened must still complete.
+#[cfg(feature = "aws")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_on_an_io_runtime_outlives_the_runtime_that_opened_its_connection() {
+    use object_store::ObjectStoreExt as _;
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let endpoint = HeldResponseEndpoint::start().await;
+    let options = HashMap::from([
+        ("aws_endpoint".to_string(), endpoint.url.clone()),
+        ("aws_region".to_string(), "us-east-1".to_string()),
+        ("aws_access_key_id".to_string(), "test".to_string()),
+        ("aws_secret_access_key".to_string(), "test".to_string()),
+        ("aws_allow_http".to_string(), "true".to_string()),
+    ]);
+    let store = build_object_store_on(
+        "s3://checkpoints/node",
+        &options,
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let frame = object_store::path::Path::from("frame");
+
+    // The compute runtime sends the first request and keeps running until stopped.
+    let (opened, opened_on_compute) = tokio::sync::oneshot::channel();
+    let (stop, stop_compute) = tokio::sync::oneshot::channel::<()>();
+    let compute = std::thread::spawn({
+        let (store, frame) = (Arc::clone(&store), frame.clone());
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                opened.send(store.head(&frame).await.map(|_| ())).unwrap();
+                let _ = stop_compute.await;
+            });
+        }
+    });
+    tokio::time::timeout(DEADLINE, opened_on_compute)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // This runtime reuses that connection; the compute runtime ends while the response is held.
+    let held = tokio::spawn({
+        let store = Arc::clone(&store);
+        async move { store.head(&frame).await }
+    });
+    tokio::time::timeout(DEADLINE, endpoint.held_request_arrived.notified())
+        .await
+        .unwrap();
+    stop.send(()).unwrap();
+    tokio::task::spawn_blocking(move || compute.join())
+        .await
+        .unwrap()
+        .unwrap();
+    endpoint.release_held_response.notify_one();
+    tokio::time::timeout(DEADLINE, held)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    // No retry hid a failed request.
+    assert_eq!(
+        endpoint.requests.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}

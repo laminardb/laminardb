@@ -83,7 +83,8 @@ impl CheckpointStorageScope {
 ///
 /// The URL path is applied as a key prefix on the returned store. R2 and
 /// `MinIO` use the S3 scheme with the endpoint option supported by
-/// `object_store`.
+/// `object_store`. A store that tasks on several runtimes share needs
+/// [`build_object_store_on`].
 ///
 /// # Errors
 ///
@@ -93,6 +94,36 @@ impl CheckpointStorageScope {
 pub fn build_object_store(
     url: &str,
     options: &HashMap<String, String>,
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    build_store(url, options, None)
+}
+
+/// Build an [`ObjectStore`] as [`build_object_store`] does, with every HTTP request and
+/// response body of a remote store driven on `io_runtime`.
+///
+/// A pooled connection is driven by the runtime that opened it. Once that runtime shuts down,
+/// a request another runtime sent on the connection fails, and `object_store` does not retry
+/// it. A store shared by tasks on several runtimes, such as a cluster control store that each
+/// pipeline's compute runtime also reads, needs its connections on one runtime that outlives
+/// the others. Response bodies are read ahead without backpressure, so callers must consume
+/// them as they arrive.
+///
+/// # Errors
+///
+/// Returns [`ObjectStoreBuilderError`] as [`build_object_store`] does.
+#[allow(clippy::implicit_hasher)]
+pub fn build_object_store_on(
+    url: &str,
+    options: &HashMap<String, String>,
+    io_runtime: &tokio::runtime::Handle,
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    build_store(url, options, Some(io_runtime))
+}
+
+fn build_store(
+    url: &str,
+    options: &HashMap<String, String>,
+    io_runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     let mut location = StorageLocation::parse(url)
         .map_err(|error| ObjectStoreBuilderError::InvalidUrl(error.to_string()))?;
@@ -144,7 +175,7 @@ pub fn build_object_store(
         "building checkpoint object-store client"
     );
 
-    // `parse_url_opts` applies options in iteration order. Keep explicit settings after the
+    // Options apply in iteration order. Keep explicit settings after the
     // environment so aliases that resolve to the same provider key have deterministic precedence.
     let resolved = environment
         .into_iter()
@@ -156,13 +187,9 @@ pub fn build_object_store(
         .chain(adapted.derived_options)
         .collect::<Vec<_>>();
     #[cfg(feature = "gcs")]
-    let result = if let Some(credentials) = workload_identity {
-        build_gcs_workload_identity_store(&parsed, resolved, credentials)
-    } else {
-        object_store::parse_url_opts(&parsed, resolved)
-    };
+    let result = build_remote_store(&parsed, resolved, workload_identity, io_runtime);
     #[cfg(not(feature = "gcs"))]
-    let result = object_store::parse_url_opts(&parsed, resolved);
+    let result = build_remote_store(&parsed, resolved, io_runtime);
     let (store, prefix) = result.map_err(|_| {
         ObjectStoreBuilderError::Build(format!(
             "failed to construct the {} client; verify the configured option values and downstream credential chain",
@@ -179,17 +206,76 @@ pub fn build_object_store(
     }
 }
 
-#[cfg(feature = "gcs")]
-fn build_gcs_workload_identity_store(
+/// Build a remote client as `object_store::parse_url_opts` does: options apply in order and
+/// keys the provider does not know are skipped (explicit keys were validated; ambient ones may
+/// belong to another client). With `io_runtime`, the client's requests run there.
+#[cfg(any(feature = "aws", feature = "gcs", feature = "azure"))]
+fn build_remote_store(
     url: &url::Url,
     options: Vec<(String, String)>,
-    credentials: object_store::gcp::GcpCredentialProvider,
+    #[cfg(feature = "gcs")] workload_identity: Option<object_store::gcp::GcpCredentialProvider>,
+    io_runtime: Option<&tokio::runtime::Handle>,
 ) -> object_store::Result<(Box<dyn ObjectStore>, object_store::path::Path)> {
-    let builder = object_store::gcp::GoogleCloudStorageBuilder::new().with_url(url.to_string());
-    let store = configure_gcs_workload_identity(builder, options, credentials).build()?;
-    let (_, prefix) = object_store::ObjectStoreScheme::parse(url)?;
+    use object_store::ObjectStoreScheme;
+
+    // Each provider's builder has its own `with_config` and `with_http_connector`.
+    macro_rules! built {
+        ($builder:expr) => {{
+            let mut builder = $builder;
+            if let Some(runtime) = io_runtime {
+                builder = builder.with_http_connector(
+                    object_store::client::SpawnedReqwestConnector::new(runtime.clone()),
+                );
+            }
+            Box::new(builder.build()?) as Box<dyn ObjectStore>
+        }};
+    }
+    macro_rules! configured {
+        ($builder:expr) => {{
+            let mut builder = $builder.with_url(url.as_str());
+            for (key, value) in options {
+                if let Ok(key) = key.to_ascii_lowercase().parse() {
+                    builder = builder.with_config(key, value);
+                }
+            }
+            built!(builder)
+        }};
+    }
+
+    let (scheme, prefix) = ObjectStoreScheme::parse(url)?;
     let prefix = object_store::path::Path::parse(prefix)?;
-    Ok((Box::new(store), prefix))
+    let store = match scheme {
+        #[cfg(feature = "aws")]
+        ObjectStoreScheme::AmazonS3 => configured!(object_store::aws::AmazonS3Builder::new()),
+        #[cfg(feature = "gcs")]
+        ObjectStoreScheme::GoogleCloudStorage => {
+            if let Some(credentials) = workload_identity {
+                built!(configure_gcs_workload_identity(
+                    object_store::gcp::GoogleCloudStorageBuilder::new().with_url(url.as_str()),
+                    options,
+                    credentials,
+                ))
+            } else {
+                configured!(object_store::gcp::GoogleCloudStorageBuilder::new())
+            }
+        }
+        #[cfg(feature = "azure")]
+        ObjectStoreScheme::MicrosoftAzure => {
+            configured!(object_store::azure::MicrosoftAzureBuilder::new())
+        }
+        _ => return object_store::parse_url_opts(url, options),
+    };
+    Ok((store, prefix))
+}
+
+/// Without a remote provider compiled in, the build fails.
+#[cfg(not(any(feature = "aws", feature = "gcs", feature = "azure")))]
+fn build_remote_store(
+    url: &url::Url,
+    options: Vec<(String, String)>,
+    _io_runtime: Option<&tokio::runtime::Handle>,
+) -> object_store::Result<(Box<dyn ObjectStore>, object_store::path::Path)> {
+    object_store::parse_url_opts(url, options)
 }
 
 /// Open the crash-durable local object store used by checkpoint data and metadata.

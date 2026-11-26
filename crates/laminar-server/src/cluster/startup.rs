@@ -207,7 +207,7 @@ async fn acquire_cluster_identity(
             "cluster mode requires ClusterShared checkpoint storage".into(),
         ));
     }
-    let control_store = build_control_store(config)?;
+    let control_store = build_control_store(config, &tokio::runtime::Handle::current())?;
     let lease_cfg = laminar_core::cluster::control::LeaderLeaseConfig::default();
     let lease_ttl_ms = i64::try_from(lease_cfg.ttl.as_millis()).map_err(|_| {
         ClusterStartupError::EngineConstruction(

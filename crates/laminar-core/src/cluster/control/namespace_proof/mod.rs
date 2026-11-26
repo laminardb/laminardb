@@ -289,6 +289,10 @@ async fn wait_for_namespace_proof_visibility(
 /// Prove that the local process can read every startup participant's retained checkpoint
 /// sentinel through its candidate object-store handle.
 ///
+/// Each pipeline's compute runtime reads `checkpoint_store` and ends with the pipeline, so build a
+/// remote store with [`build_object_store_on`](crate::checkpoint::object_store_builder::build_object_store_on)
+/// and a runtime that outlives them.
+///
 /// # Errors
 ///
 /// Returns an error for an invalid roster, a visibility failure, or a proof timeout.

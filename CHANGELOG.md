@@ -176,6 +176,13 @@
 
 ### Fixed
 
+- In cluster mode, a read or write of the shared checkpoint store no longer fails with "error
+  sending request" right after a node restarts its pipeline, as it does in a recovery round or a
+  topology migration. Each pipeline's compute runtime reads the store, and connections it opened
+  stopped working when it ended, so a request sent on one failed without a retry. The cluster's
+  store now runs all of its HTTP requests on the server runtime
+  (`object_store_builder::build_object_store_on`).
+
 - In cluster mode, a graceful vnode rotation accepts as its handoff only a checkpoint that carries
   the handoff, which fences each giving node's intake before its state is captured. Before, if the
   drain ended just as the rotation's checkpoint was admitted, an ordinary checkpoint could commit
