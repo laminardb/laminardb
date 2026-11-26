@@ -3,6 +3,7 @@ use crate::error::SerdeError;
 use crate::serde::Format;
 use arrow_array::{Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use rdkafka::ClientConfig;
 
 struct MismatchedSerializer;
 
@@ -374,18 +375,99 @@ fn partial_or_ambiguous_batch_requires_generation_retirement() {
     assert!(matches!(error, ConnectorError::ConfigurationError(_)));
 }
 
-#[test]
-fn upsert_contract_requires_singleton_writer() {
+fn upsert_config() -> KafkaSinkConfig {
     let mut config = test_config();
     config.envelope = SinkEnvelope::Upsert;
     config.key_column = Some("id".into());
-    let sink = KafkaSink::new(test_schema(), config, None);
+    config
+}
 
-    let contract = sink.contract(&ConnectorConfig::new("kafka")).unwrap();
+#[test]
+fn at_least_once_upsert_is_written_by_key() {
+    let sink = KafkaSink::new(test_schema(), upsert_config(), None);
+    let config = ConnectorConfig::new("kafka");
+
+    let contract = sink.contract(&config).unwrap();
 
     assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
-    assert_eq!(contract.topology, SinkTopology::Singleton);
+    assert_eq!(contract.topology, SinkTopology::KeyPartitioned);
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert_eq!(
+        sink.destination_key(&config).unwrap(),
+        Some(vec!["id".to_string()])
+    );
+    let append = KafkaSink::new(test_schema(), test_config(), None);
+    assert_eq!(append.destination_key(&config).unwrap(), None);
+}
+
+#[test]
+fn a_keyed_writer_deadline_covers_delivery_and_commit() {
+    let mut config = upsert_config();
+    config.delivery_timeout = Duration::from_secs(30);
+    let unshared = KafkaSink::new(test_schema(), config.clone(), None);
+    let mut keyed = KafkaSink::new(test_schema(), config, None);
+    keyed.share_destination_by_key(crate::testing::destination_writer("totals", 1));
+
+    assert_eq!(unshared.suggested_write_timeout(), Duration::from_secs(36));
+    // The 60 s transaction timeout bounds the commit after delivery.
+    assert_eq!(keyed.suggested_write_timeout(), Duration::from_secs(96));
+}
+
+#[tokio::test]
+async fn the_writer_fence_skips_topics_not_written_by_key_without_io() {
+    let registry = crate::registry::ConnectorRegistry::new();
+    crate::kafka::register_kafka_sink(&registry).unwrap();
+    let fence = registry.sink_writer_fence("kafka").unwrap();
+    let exactly_once = [
+        ("envelope", "upsert"),
+        ("delivery.guarantee", "exactly_once"),
+        ("commit.topic", "commits"),
+    ];
+    let append = [
+        ("envelope", "append"),
+        ("delivery.guarantee", "at_least_once"),
+    ];
+    for options in [&exactly_once[..], &append[..]] {
+        let mut config = ConnectorConfig::new("kafka");
+        for (key, value) in [
+            ("bootstrap.servers", "127.0.0.1:1"),
+            ("topic", "totals"),
+            ("format", "json"),
+            ("key.column", "id"),
+            ("partition.count", "4"),
+        ]
+        .iter()
+        .chain(options)
+        {
+            config.set(*key, *value);
+        }
+        let departed = vec![crate::testing::destination_writer("totals", 2).process];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let fenced = fence(config, "totals".into(), departed, deadline);
+
+        tokio::time::timeout(Duration::from_secs(1), fenced)
+            .await
+            .expect("no broker I/O")
+            .unwrap();
+    }
+}
+
+#[test]
+fn each_process_incarnation_writes_under_its_own_transactional_id() {
+    let writer = crate::testing::destination_writer("totals", 7);
+    let mut restarted = writer.clone();
+    restarted.process.boot_incarnation = uuid::Uuid::from_u128(99);
+
+    let id = keyed_writer::transactional_id(&writer);
+
+    assert_eq!(
+        id,
+        format!(
+            "laminardb-writer-totals-0000000000000007-{}",
+            writer.process.boot_incarnation
+        )
+    );
+    assert_ne!(id, keyed_writer::transactional_id(&restarted));
 }
 
 #[test]

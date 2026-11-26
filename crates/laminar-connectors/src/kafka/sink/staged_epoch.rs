@@ -6,9 +6,15 @@
 //! partition count records were routed with, the record count, then per record its partition and
 //! length-prefixed key and value (`-1` for NULL).
 
-use crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES;
+use std::sync::Arc;
+
+use super::exact_commit::KafkaExactCommitter;
+use super::keys::KeyBuffer;
+use crate::connector::{
+    ConnectorTaskOwner, DeliveryGuarantee, WriteResult, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+};
 use crate::error::ConnectorError;
-use crate::kafka::sink_config::MAX_EPOCH_BYTES;
+use crate::kafka::sink_config::{KafkaSinkConfig, MAX_EPOCH_BYTES};
 
 const MAGIC: &[u8; 4] = b"LDBK";
 const FORMAT_VERSION: u8 = 1;
@@ -283,6 +289,41 @@ impl<'a> Reader<'a> {
                 Ok(Some(self.take(len)?.to_vec()))
             }
         }
+    }
+}
+
+/// Exactly-once: hold routed records for the checkpoint's transaction instead of producing them.
+pub(super) fn stage_records<'a>(
+    stage: &mut StagedEpoch,
+    partitions: &[i32],
+    keys: Option<&KeyBuffer>,
+    values: impl ExactSizeIterator<Item = Option<&'a [u8]>>,
+) -> Result<WriteResult, ConnectorError> {
+    let rows = values.len();
+    for (row, value) in values.enumerate() {
+        stage.push(partitions[row], keys.and_then(|keys| keys.key(row)), value)?;
+    }
+    Ok(WriteResult::new(rows, 0))
+}
+
+/// The epoch stage and designated committer of an exactly-once sink; `None` otherwise.
+pub(super) fn exactly_once_parts(
+    config: &KafkaSinkConfig,
+    task_owner: &ConnectorTaskOwner,
+) -> (Option<StagedEpoch>, Option<Arc<KafkaExactCommitter>>) {
+    match (config.delivery, config.commit_topic.as_ref()) {
+        (DeliveryGuarantee::ExactlyOnce, Some(commit_topic)) => (
+            Some(StagedEpoch::new(
+                config.epoch_max_bytes,
+                config.message_max_bytes().unwrap_or(usize::MAX),
+            )),
+            Some(Arc::new(KafkaExactCommitter::new(
+                config.clone(),
+                commit_topic.clone(),
+                task_owner.admission(),
+            ))),
+        ),
+        _ => (None, None),
     }
 }
 

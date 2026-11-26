@@ -55,7 +55,7 @@ impl SinkConnector for MongoDbSink {
         })
     }
 
-    fn share_destination_by_key(&mut self) {
+    fn share_destination_by_key(&mut self, _writer: crate::connector::DestinationWriter) {
         self.shared_by_key = true;
     }
 

@@ -233,6 +233,19 @@ const SINKS: &[Variant] = &[
         exact_properties: &[("commit.topic", "laminar-commits")],
     },
     Variant {
+        label: "Kafka upsert",
+        connector: "kafka",
+        properties: &[
+            ("bootstrap.servers", "localhost:9092"),
+            ("topic", "out"),
+            ("format", "json"),
+            ("envelope", "upsert"),
+            ("key.column", "id"),
+            ("partition.count", "4"),
+        ],
+        exact_properties: &[("commit.topic", "laminar-commits")],
+    },
+    Variant {
         label: "Delta Lake append (S3/S3A)",
         connector: "delta-lake",
         properties: &[("table.path", "s3://lake/out"), ("write.mode", "append")],

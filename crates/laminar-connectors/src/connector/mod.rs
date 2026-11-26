@@ -24,7 +24,7 @@ pub use coordinated_commit::{
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 pub use recency::{RecencyTarget, SourceRecency};
-pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
+pub use sink::{DestinationWriter, SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
     ProcessLeaseCheck, ReplayRequirement, SourceCheckpointUnavailablePolicy, SourceConnector,
     SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourceDrainSettlement,

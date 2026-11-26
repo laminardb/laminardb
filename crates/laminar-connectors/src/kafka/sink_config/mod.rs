@@ -575,7 +575,7 @@ impl KafkaSinkConfig {
     #[must_use]
     pub fn transactional_rdkafka_config(&self, transactional_id: &str) -> ClientConfig {
         let mut config = self.to_rdkafka_config();
-        let message_timeout = self.delivery_timeout.min(self.transaction_timeout);
+        let message_timeout = self.transactional_delivery_timeout();
         config
             .set("transactional.id", transactional_id)
             .set(
@@ -587,6 +587,20 @@ impl KafkaSinkConfig {
                 message_timeout.as_millis().to_string(),
             );
         config
+    }
+
+    /// A transactional producer's delivery deadline: the configured one, capped by the
+    /// transaction timeout as librdkafka requires.
+    #[must_use]
+    pub fn transactional_delivery_timeout(&self) -> Duration {
+        self.delivery_timeout.min(self.transaction_timeout)
+    }
+
+    /// Whether several cluster processes may write this topic, each the keys it owns: an
+    /// at-least-once upsert. Exactly-once output has one fenced committer instead.
+    #[must_use]
+    pub fn is_key_partitioned(&self) -> bool {
+        self.envelope == SinkEnvelope::Upsert && self.delivery != DeliveryGuarantee::ExactlyOnce
     }
 
     /// Configured key column names, in key order.

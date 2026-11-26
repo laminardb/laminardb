@@ -5,12 +5,12 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use arrow_array::StringArray;
-use rdkafka::producer::{DeliveryFuture, FutureRecord};
+use rdkafka::producer::{DeliveryFuture, FutureRecord, Producer};
 
 use super::failure::{
     record_failure, unresolved_delivery_error, KafkaFailure, QUEUE_RETRY_TIMEOUT,
 };
-use super::{required_producer, stage_records, KafkaSink, KeyBuffer};
+use super::{keyed_writer, required_producer, stage_records, KafkaSink, KeyBuffer};
 use crate::changelog::collapse_changelog;
 use crate::connector::WriteResult;
 use crate::error::ConnectorError;
@@ -103,6 +103,11 @@ impl KafkaSink {
             return stage_records(stage, &partitions, Some(&keys), values);
         }
         let producer = required_producer(self.producer.as_ref())?;
+        if self.keyed_writer.is_some() {
+            producer.begin_transaction().map_err(|error| {
+                ConnectorError::WriteError(format!("Kafka begin_transaction: {error}"))
+            })?;
+        }
 
         let mut delivery_futures = Vec::with_capacity(rows);
         let mut enqueue_failure: Option<(KafkaFailure, usize)> = None;
@@ -136,8 +141,19 @@ impl KafkaSink {
             }
         }
 
-        self.settle_upsert_deliveries(delivery_futures, enqueue_failure, &payloads)
-            .await
+        let delivered = self
+            .settle_upsert_deliveries(delivery_futures, enqueue_failure, &payloads)
+            .await;
+        if self.keyed_writer.is_none() {
+            return delivered;
+        }
+        keyed_writer::finish(
+            producer,
+            delivered,
+            &self.config,
+            &self.task_owner.admission(),
+        )
+        .await
     }
 
     /// Await every accepted upsert delivery; a record that was not persisted, or whose outcome is

@@ -926,7 +926,7 @@ async fn a_collection_shared_by_key_refuses_a_key_finer_than_milliseconds() {
         key_fields: vec!["at".to_string()],
     };
     let mut sink = MongoDbSink::new(schema, config, None);
-    sink.share_destination_by_key();
+    sink.share_destination_by_key(crate::testing::destination_writer("orders", 1));
     let error = sink
         .open(&ConnectorConfig::new("mongodb"))
         .await
