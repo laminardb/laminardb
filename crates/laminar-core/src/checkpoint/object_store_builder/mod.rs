@@ -130,6 +130,13 @@ fn build_store(
     if location.provider == StorageProvider::Local {
         return build_local_file_system(url);
     }
+    if let (Some(_), Some(feature)) = (io_runtime, uncompiled_provider_feature(location.provider)) {
+        // `object_store` may still build this client for another crate, but not on `io_runtime`.
+        return Err(ObjectStoreBuilderError::Build(format!(
+            "running {} requests on a given runtime needs laminar-core's `{feature}` feature",
+            location.provider.name()
+        )));
+    }
     let mut environment = provider_environment(location.provider);
     if let Some(endpoint) = configured_endpoint(location.provider, options, &environment) {
         location = location
@@ -150,8 +157,12 @@ fn build_store(
     let auth_source = checkpoint_auth_source(location.provider, options);
     #[cfg(feature = "gcs")]
     let workload_identity = if location.provider == StorageProvider::Gcs {
-        gcs_workload_identity_provider(options, &|name| std::env::var(name).ok())
-            .map_err(|error| ObjectStoreBuilderError::Build(error.to_string()))?
+        gcs_workload_identity_provider(
+            options,
+            &|name| std::env::var(name).ok(),
+            io_runtime.cloned(),
+        )
+        .map_err(|error| ObjectStoreBuilderError::Build(error.to_string()))?
     } else {
         None
     };
@@ -266,6 +277,16 @@ fn build_remote_store(
         _ => return object_store::parse_url_opts(url, options),
     };
     Ok((store, prefix))
+}
+
+/// The laminar-core feature `provider` needs when this build lacks it.
+const fn uncompiled_provider_feature(provider: StorageProvider) -> Option<&'static str> {
+    match provider {
+        StorageProvider::AwsS3 if !cfg!(feature = "aws") => Some("aws"),
+        StorageProvider::Gcs if !cfg!(feature = "gcs") => Some("gcs"),
+        StorageProvider::AzureAdls if !cfg!(feature = "azure") => Some("azure"),
+        _ => None,
+    }
 }
 
 /// Without a remote provider compiled in, the build fails.

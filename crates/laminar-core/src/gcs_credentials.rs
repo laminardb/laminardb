@@ -75,6 +75,8 @@ pub enum GcsCredentialError {
 /// Service-account key/path configuration remains owned by `object_store`.
 /// The returned provider lazily initializes Google's SDK on first I/O so a
 /// synchronously constructed object store is not tied to a temporary runtime.
+/// The SDK's token refresh task runs on `token_refresh_runtime` when one is given, and otherwise
+/// on the runtime that first asks for a token; once that runtime ends, a token wait panics.
 ///
 /// # Errors
 ///
@@ -83,6 +85,7 @@ pub enum GcsCredentialError {
 pub fn gcs_workload_identity_provider<F, S>(
     explicit: &HashMap<String, String, S>,
     env_lookup: &F,
+    token_refresh_runtime: Option<tokio::runtime::Handle>,
 ) -> Result<Option<GcpCredentialProvider>, GcsCredentialError>
 where
     F: Fn(&str) -> Option<String>,
@@ -92,7 +95,7 @@ where
         return Ok(None);
     }
     if let Some(path) = non_empty_option(explicit, APPLICATION_CREDENTIAL_KEYS) {
-        return load_workload_identity_provider(path);
+        return load_workload_identity_provider(path, token_refresh_runtime);
     }
     if has_non_empty_environment(env_lookup, AMBIENT_SERVICE_ACCOUNT_KEYS) {
         return Ok(None);
@@ -102,7 +105,7 @@ where
     else {
         return Ok(None);
     };
-    load_workload_identity_provider(&path)
+    load_workload_identity_provider(&path, token_refresh_runtime)
 }
 
 /// Apply GCS options while keeping credential material owned by the injected
@@ -177,6 +180,7 @@ where
 
 fn load_workload_identity_provider(
     path: &str,
+    token_refresh_runtime: Option<tokio::runtime::Handle>,
 ) -> Result<Option<GcpCredentialProvider>, GcsCredentialError> {
     let file = std::fs::File::open(path)
         .map_err(|_| GcsCredentialError::UnreadableApplicationCredentials)?;
@@ -197,6 +201,7 @@ fn load_workload_identity_provider(
             Ok(Some(Arc::new(WorkloadIdentityCredentialProvider {
                 document: Mutex::new(Some(document)),
                 credentials: tokio::sync::OnceCell::new(),
+                token_refresh_runtime,
             })))
         }
         _ => Err(GcsCredentialError::UnsupportedApplicationCredentialType),
@@ -232,6 +237,7 @@ fn required_string<'a>(
 struct WorkloadIdentityCredentialProvider {
     document: Mutex<Option<Value>>,
     credentials: tokio::sync::OnceCell<AccessTokenCredentials>,
+    token_refresh_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl fmt::Debug for WorkloadIdentityCredentialProvider {
@@ -251,6 +257,11 @@ impl CredentialProvider for WorkloadIdentityCredentialProvider {
                 let document = self.document.lock().take().ok_or_else(|| {
                     object_store_error(GcsCredentialError::InvalidExternalAccountConfiguration)
                 })?;
+                // Building the credentials spawns the SDK's token refresh task.
+                let _refresh_runtime = self
+                    .token_refresh_runtime
+                    .as_ref()
+                    .map(tokio::runtime::Handle::enter);
                 google_cloud_auth::credentials::external_account::Builder::new(document)
                     .with_scopes([GCS_READ_WRITE_SCOPE])
                     .build_access_token_credentials()
@@ -308,9 +319,11 @@ mod tests {
             &external_account_document("subject-token"),
         );
         let options = HashMap::from([("google_application_credentials".into(), path)]);
-        let provider = gcs_workload_identity_provider(&options, &|name| {
-            (name == "GOOGLE_SERVICE_ACCOUNT_KEY").then(|| "not-selected".into())
-        })
+        let provider = gcs_workload_identity_provider(
+            &options,
+            &|name| (name == "GOOGLE_SERVICE_ACCOUNT_KEY").then(|| "not-selected".into()),
+            None,
+        )
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -323,9 +336,11 @@ mod tests {
     fn explicit_service_account_retains_downstream_provider() {
         let options =
             HashMap::from([("google_service_account_key".into(), "not-inspected".into())]);
-        let selected = gcs_workload_identity_provider(&options, &|name| {
-            (name == "GOOGLE_APPLICATION_CREDENTIALS").then(|| "ambient.json".into())
-        })
+        let selected = gcs_workload_identity_provider(
+            &options,
+            &|name| (name == "GOOGLE_APPLICATION_CREDENTIALS").then(|| "ambient.json".into()),
+            None,
+        )
         .unwrap();
         assert!(selected.is_none());
     }
@@ -339,7 +354,7 @@ mod tests {
             &serde_json::json!({ "type": "authorized_user" }),
         );
         let options = HashMap::from([("application_credentials".into(), path)]);
-        assert!(gcs_workload_identity_provider(&options, &|_| None)
+        assert!(gcs_workload_identity_provider(&options, &|_| None, None)
             .unwrap()
             .is_none());
     }
@@ -358,7 +373,7 @@ mod tests {
             }),
         );
         let options = HashMap::from([("google_application_credentials".into(), path)]);
-        let error = gcs_workload_identity_provider(&options, &|_| None)
+        let error = gcs_workload_identity_provider(&options, &|_| None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("audience"), "{error}");
@@ -375,7 +390,7 @@ mod tests {
             path.to_string_lossy().into_owned(),
         )]);
 
-        let error = gcs_workload_identity_provider(&options, &|_| None).unwrap_err();
+        let error = gcs_workload_identity_provider(&options, &|_| None, None).unwrap_err();
         assert!(matches!(
             error,
             GcsCredentialError::ApplicationCredentialsTooLarge
@@ -391,7 +406,7 @@ mod tests {
             &external_account_document("subject-token"),
         );
         let options = HashMap::from([("google_application_credentials".into(), path)]);
-        let provider = gcs_workload_identity_provider(&options, &|_| None)
+        let provider = gcs_workload_identity_provider(&options, &|_| None, None)
             .unwrap()
             .unwrap();
         let builder = configure_gcs_workload_identity(
@@ -436,7 +451,7 @@ mod tests {
             }),
         );
         let options = HashMap::from([("google_application_credentials".into(), credential_path)]);
-        let provider = gcs_workload_identity_provider(&options, &|_| None)
+        let provider = gcs_workload_identity_provider(&options, &|_| None, None)
             .unwrap()
             .unwrap();
 
@@ -449,5 +464,89 @@ mod tests {
         assert_eq!(first.bearer, "test-access-token");
         assert_eq!(second.bearer, first.bearer);
         server.await.unwrap();
+    }
+
+    /// The first token request comes from a pipeline runtime that then ends. The refresh task
+    /// must keep running on the store's runtime, or waiting for the next token panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_refresh_outlives_the_runtime_that_first_asked_for_a_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+        let issued = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let issued = Arc::clone(&issued);
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0_u8; 8 * 1024];
+                    let _ = stream.read(&mut request).await.unwrap();
+                    // The first token expires at once; its replacement arrives a little later.
+                    let token = issued.fetch_add(1, Ordering::SeqCst);
+                    let expires_in = if token == 0 {
+                        1
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        3600
+                    };
+                    let body = format!(
+                        r#"{{"access_token":"token-{token}","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":{expires_in}}}"#
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            })
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let subject_token_path = directory.path().join("subject-token");
+        std::fs::write(&subject_token_path, "test-subject-token").unwrap();
+        let credential_path = write_credentials(
+            &directory,
+            "external.json",
+            &serde_json::json!({
+                "type": "external_account",
+                "audience": "test-audience",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": token_url,
+                "credential_source": { "file": subject_token_path }
+            }),
+        );
+        let options = HashMap::from([("google_application_credentials".into(), credential_path)]);
+        let provider = gcs_workload_identity_provider(
+            &options,
+            &|_| None,
+            Some(tokio::runtime::Handle::current()),
+        )
+        .unwrap()
+        .unwrap();
+
+        let first = std::thread::spawn({
+            let provider = Arc::clone(&provider);
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(provider.get_credential())
+            }
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let refreshed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), provider.get_credential())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.bearer, "token-0");
+        assert_ne!(refreshed.bearer, first.bearer);
+        server.abort();
     }
 }
