@@ -1,10 +1,13 @@
 //! Three-node at-least-once soaks for sinks that every node writes to: RabbitMQ, IBM MQ,
-//! PostgreSQL append, MongoDB insert, and NATS JetStream. A Kafka source feeds a projection, every
-//! node writes its share of the rows to one destination, and the observed leader and each follower
-//! are hard-killed while paused inside a checkpoint, after the sinks flushed. An independent oracle
-//! reads the destination: every Kafka-acknowledged id must arrive, no other id may, and duplicates
-//! are reported. Every node must write before the first kill and again after it rejoins, so a run
-//! in which a single node does all the writing fails.
+//! PostgreSQL append, MongoDB insert, and NATS JetStream, and an exactly-once soak for Kafka. A
+//! Kafka source feeds a projection, every node writes its share of the rows to one destination, and
+//! the observed leader and each follower are hard-killed while paused inside a checkpoint, after the
+//! sinks flushed. An independent oracle reads the destination: every Kafka-acknowledged id must
+//! arrive, no other id may, and duplicates are reported. Every node must write before the first
+//! kill and again after it rejoins, so a run in which a single node does all the writing fails.
+//! Exactly-once then freezes the leader with `SIGSTOP`, once before the committed index and once
+//! before the sink's external commit, resumes it after a successor commits, and allows no
+//! duplicate.
 //!
 //! ```text
 //! cargo test --profile soak -p laminar-server --no-default-features \
@@ -22,6 +25,10 @@
 //! cargo test --profile soak -p laminar-server --no-default-features \
 //!   --features cluster,aws,kafka,nats --test cluster_soak \
 //!   multi_writer_sinks::three_node_nats_sink_kill9_soak -- --ignored --exact --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features \
+//!   --features cluster,aws,kafka --test cluster_soak \
+//!   multi_writer_sinks::three_node_kafka_exactly_once_sink_kill9_soak -- --ignored --exact \
+//!   --nocapture
 //! ```
 //!
 //! All read the shared `LAMINAR_SOAK_CHECKPOINT_URL`, `LAMINAR_SOAK_S3_*`,
@@ -49,6 +56,7 @@
 
 #[cfg(feature = "ibmmq")]
 pub(crate) mod ibmmq;
+mod kafka;
 #[cfg(feature = "mongodb-cdc")]
 pub(crate) mod mongo;
 #[cfg(feature = "nats")]
@@ -65,7 +73,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::kill_rejoin::{boot, cluster_nodes, kill_round, steady_phase, SoakSettings};
+use super::kill_rejoin::{
+    boot, cluster_nodes, kill_round, pause_round, steady_phase, SoakSettings,
+};
+use super::paused_leader::PauseGate;
 use super::{
     cluster_kafka_partition_count, kafka_create_topic, scoped_soak_storage_url, soak_run_id,
     wait_for_converged_durable_checkpoint, wait_until, JoinDelivery, ResolvedExecutable, NODES,
@@ -109,6 +120,12 @@ fn three_node_nats_sink_kill9_soak() {
     run_three_node_sink_kill9_soak(&nats::Nats::from_environment());
 }
 
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka and S3, exactly-once"]
+fn three_node_kafka_exactly_once_sink_kill9_soak() {
+    run_three_node_sink_kill9_soak(&kafka::KafkaExactlyOnce::from_environment());
+}
+
 /// The environment value of `name`, or `default`; without a default the setting is required.
 fn setting(name: &str, default: Option<&str>) -> String {
     match (std::env::var(name), default) {
@@ -122,6 +139,12 @@ fn setting(name: &str, default: Option<&str>) -> String {
 pub(crate) trait Destination {
     /// The `connector` of the sink.
     fn connector(&self) -> &'static str;
+
+    /// The pipeline's guarantee. Exactly-once runs paused-leader rounds after the kill rounds
+    /// and allows no duplicate.
+    fn delivery(&self) -> JoinDelivery {
+        JoinDelivery::AtLeastOnce
+    }
 
     /// A per-node counter that grows only when that node's sink writes.
     fn written_metric(&self) -> &'static str;
@@ -157,7 +180,6 @@ struct Observed(Arc<Mutex<BTreeMap<u64, u32>>>);
 
 impl Observed {
     /// Count one delivery from a queue or stream.
-    #[cfg(any(feature = "rabbitmq", feature = "ibmmq", feature = "nats"))]
     fn add(&self, payload: &[u8]) {
         let value: serde_json::Value =
             serde_json::from_slice(payload).expect("sink output is a JSON object");
@@ -404,7 +426,8 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
     );
     executable.describe();
-    let settings = SoakSettings::from_environment(JoinDelivery::AtLeastOnce);
+    let delivery = destination.delivery();
+    let settings = SoakSettings::from_environment(delivery);
     let partitions = cluster_kafka_partition_count();
     let brokers = setting("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS", None);
     let run_id = soak_run_id();
@@ -440,6 +463,7 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
         "",
         &workload,
     );
+    let exactly_once = delivery == JoinDelivery::ExactlyOnce;
     let mut producer = InputProducer::spawn(brokers, topic, partitions, settings.rps);
     let metric = destination.written_metric();
 
@@ -460,6 +484,19 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
             metric,
             latest,
         );
+    }
+    // Pausing signals the process, which only Unix does, at gates only debug builds compile.
+    if exactly_once && cfg!(unix) && cfg!(debug_assertions) {
+        for gate in [PauseGate::CommittedIndex, PauseGate::SinkCommit(SINK)] {
+            latest = pause_round(
+                &mut nodes,
+                &mut || producer.assert_running(),
+                gate,
+                &settings,
+                metric,
+                latest,
+            );
+        }
     }
     steady_phase(
         &mut nodes,
@@ -491,6 +528,16 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
         &unexpected[..unexpected.len().min(8)]
     );
     let duplicates: u64 = observed.values().map(|count| u64::from(count - 1)).sum();
+    assert!(
+        !exactly_once || duplicates == 0,
+        "exactly-once output holds {duplicates} duplicate rows, first {:?}",
+        observed
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(id, _)| *id)
+            .take(8)
+            .collect::<Vec<_>>()
+    );
     eprintln!(
         "soak: {} sink across {NODES} nodes: produced={produced} lost=0 duplicates={duplicates} \
          kills={} (followers {killed_followers:?})",

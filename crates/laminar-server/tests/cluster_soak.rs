@@ -137,16 +137,7 @@ mod mongodb_document_source;
 #[cfg(all(feature = "kafka", feature = "mongodb-cdc"))]
 #[path = "cluster_soak/mongodb_source.rs"]
 mod mongodb_source;
-#[cfg(all(
-    feature = "kafka",
-    any(
-        feature = "rabbitmq",
-        feature = "ibmmq",
-        feature = "postgres-sink",
-        feature = "mongodb-cdc",
-        feature = "nats"
-    )
-))]
+#[cfg(feature = "kafka")]
 #[path = "cluster_soak/multi_writer_sinks/mod.rs"]
 mod multi_writer_sinks;
 #[cfg(all(feature = "kafka", feature = "postgres-cdc", feature = "postgres-sink"))]

@@ -273,6 +273,12 @@ impl CheckpointCoordinator {
                 deadline,
             )
             .await?;
+        self.validate_external_sink_publication(
+            &manifests
+                .iter()
+                .map(|(manifest, _)| manifest)
+                .collect::<Vec<_>>(),
+        )?;
         Ok(PreparedCheckpoint { manifests })
     }
 

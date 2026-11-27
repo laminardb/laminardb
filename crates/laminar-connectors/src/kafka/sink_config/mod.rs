@@ -596,10 +596,10 @@ impl KafkaSinkConfig {
         self.delivery_timeout.min(self.transaction_timeout)
     }
 
-    /// Whether several cluster processes may write this topic, each the keys it owns: an
+    /// Whether each cluster process writes the keys it owns through a producer of its own: an
     /// at-least-once upsert. Exactly-once output has one fenced committer instead.
     #[must_use]
-    pub fn is_key_partitioned(&self) -> bool {
+    pub fn has_process_writers(&self) -> bool {
         self.envelope == SinkEnvelope::Upsert && self.delivery != DeliveryGuarantee::ExactlyOnce
     }
 

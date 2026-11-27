@@ -339,7 +339,11 @@ async fn admit_and_bind_sink(
     let (name, runtime) = (context.name, context.runtime);
     let admitted = admit_sink(sink, context)?;
     let (contract, _) = admitted;
-    if runtime == RuntimeMode::Cluster && contract.topology == SinkTopology::KeyPartitioned {
+    // A checkpoint-committable sink has one designated committer, never a writer per process.
+    if runtime == RuntimeMode::Cluster
+        && contract.topology == SinkTopology::KeyPartitioned
+        && !contract.is_checkpoint_committable()
+    {
         sink.share_destination_by_key(destination_writer(database, name)?);
     }
     if !contract.is_checkpoint_committable() {

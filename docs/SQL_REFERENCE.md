@@ -592,7 +592,8 @@ With exactly-once delivery (`delivery_guarantee: ExactlyOnce` embedded, `deliver
 "exactly_once"` in the server) each Kafka sink also needs `'commit.topic'`, a topic with
 `cleanup.policy=compact`. Output then becomes visible to `isolation.level=read_committed` readers
 once per committed checkpoint, after a crash at any point included; `read_uncommitted` readers can
-also see aborted attempts. Cluster deployments keep Kafka output at-least-once. A Kafka source
+also see aborted attempts. In a cluster exactly-once Kafka output also needs `'partition.count'`,
+and the leader publishes every node's output for a checkpoint in one transaction. A Kafka source
 keyed by message key (key + value = upsert, key + NULL = delete) is not available; use the
 Debezium envelope for keyed changes.
 
@@ -603,7 +604,7 @@ feature) read queues and write exchanges or queues with at-least-once delivery. 
 commit-coupled: a message is acknowledged (RabbitMQ) or committed (`MQCMIT`) only after the
 checkpoint containing it is durable, so they need checkpointing and at-least-once delivery, and
 cluster mode rejects them. In cluster mode the sinks run on every node as independent
-at-least-once writers, like Kafka output. `FORMAT RAW` with a `value BYTEA` column keeps payload
+at-least-once writers, like at-least-once Kafka output. `FORMAT RAW` with a `value BYTEA` column keeps payload
 bytes exactly; `metadata.columns` appends typed broker metadata after the declared columns.
 
 ```sql

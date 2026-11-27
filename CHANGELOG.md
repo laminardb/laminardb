@@ -4,6 +4,15 @@
 
 ### Added
 
+- In cluster mode the Kafka sink runs exactly-once (`delivery = exactly_once` with a
+  `commit.topic`) when `partition.count` is set, so every node routes a key over the same
+  partitions. Every node stages the rows it routed in its checkpoint; after the checkpoint commits,
+  the leader publishes every node's rows with the commit marker in one transaction, decoding one
+  node's rows at a time. An upsert topic takes input placed by its key, as at-least-once does, and
+  opens no writer per process. Any node can lead, so every node's principal needs `Write` and
+  `Describe` on the committer's transactional id (prefix `laminardb-ldb-c3-`). The compressed rows
+  of all nodes may total at most 64 MiB per checkpoint. Embedded and single-node sinks now also
+  publish one participant at a time.
 - In cluster mode the PostgreSQL upsert sink (`write.mode = 'upsert'`, with or without
   `changelog.mode`) and the MongoDB upsert sink run at-least-once, each node writing the keys it
   owns, when each key is produced on one node at a time: the input is partitioned by columns that
@@ -176,6 +185,13 @@
 
 ### Fixed
 
+- A checkpoint whose exactly-once sink descriptors could never be published (above the 64 MiB a
+  sink's participants may stage together, or missing a participant's descriptor) now fails before
+  its Commit is recorded. It used to commit and then fail every publication and every recovery of
+  that cut; now the pipeline recovers from the previous checkpoint, and checkpointing more often or
+  lowering the sink's epoch bound clears it. Settling the aborted attempt no longer reads or bounds
+  the descriptors of a sink with no abort cleaner, which keeps nothing outside the checkpoint.
+  Delta and Iceberg descriptors stay far below the bound; Kafka's carry the rows.
 - In cluster mode, a read or write of the shared checkpoint store no longer fails with "error
   sending request" right after a node restarts its pipeline, as it does in a recovery round or a
   topology migration. Each pipeline's compute runtime reads the store, and connections it opened

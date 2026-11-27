@@ -148,7 +148,8 @@ pub trait SinkConnector: Send {
 
     /// Called before [`open`](Self::open) when writers on other cluster nodes apply other keys of
     /// this [`KeyPartitioned`](super::SinkTopology::KeyPartitioned) destination at the same time,
-    /// and a successor may take over this node's keys after it fails. `writer` names this
+    /// and a successor may take over this node's keys after it fails. Never called for a
+    /// checkpoint-committable sink, whose designated committer is its only writer. `writer` names this
     /// process's writer. A connector refuses destination constraints that span keys, which no one
     /// writer can keep, and bounds what a stalled writer can hold.
     fn share_destination_by_key(&mut self, _writer: DestinationWriter) {}

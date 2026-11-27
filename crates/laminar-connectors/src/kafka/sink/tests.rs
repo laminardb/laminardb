@@ -401,6 +401,38 @@ fn at_least_once_upsert_is_written_by_key() {
 }
 
 #[test]
+fn exactly_once_output_is_cluster_certified_only_over_a_pinned_partition_count() {
+    let config = ConnectorConfig::new("kafka");
+    let mut append = test_config();
+    append.delivery = DeliveryGuarantee::ExactlyOnce;
+    append.commit_topic = Some("commits".into());
+
+    let unpinned = KafkaSink::new(test_schema(), append.clone(), None)
+        .contract(&config)
+        .unwrap();
+    assert_eq!(unpinned.consistency, SinkConsistency::CheckpointCommittable);
+    assert!(!unpinned.is_cluster_exact_delivery_certified());
+
+    append.partition_count = Some(4);
+    let pinned = KafkaSink::new(test_schema(), append, None)
+        .contract(&config)
+        .unwrap();
+    assert_eq!(pinned.topology, SinkTopology::MultiWriter);
+    assert!(pinned.is_cluster_exact_delivery_certified());
+
+    let mut upsert = upsert_config();
+    upsert.delivery = DeliveryGuarantee::ExactlyOnce;
+    upsert.commit_topic = Some("commits".into());
+    upsert.partition_count = Some(4);
+    let keyed = KafkaSink::new(test_schema(), upsert, None)
+        .contract(&config)
+        .unwrap();
+    assert_eq!(keyed.topology, SinkTopology::KeyPartitioned);
+    assert_eq!(keyed.input_mode, SinkInputMode::FullChangelog);
+    assert!(keyed.is_cluster_exact_delivery_certified());
+}
+
+#[test]
 fn a_keyed_writer_deadline_covers_delivery_and_commit() {
     let mut config = upsert_config();
     config.delivery_timeout = Duration::from_secs(30);

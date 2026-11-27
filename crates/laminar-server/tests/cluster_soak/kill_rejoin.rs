@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::paused_leader::{PauseGate, RoundFault};
 use super::{
     assert_running_nodes, cluster_key_group_count, cluster_node_config,
     configured_cluster_checkpoint_timeout, custom_s3_endpoint_configured, env_u64,
@@ -171,7 +172,9 @@ pub(super) fn cluster_nodes(
                 http_port: BASE_PORT + id as u16,
                 fault_trigger_path: None,
                 checkpoint_gate_path: Some(dir.join(format!("checkpoint-node-{id}.arm"))),
-                sink_commit_gate_path: None,
+                // Only armed by a paused-leader round; setting it alone changes nothing.
+                sink_commit_gate_path: (settings.delivery == JoinDelivery::ExactlyOnce)
+                    .then(|| dir.join(format!("sink-commit-node-{id}.arm"))),
             }
         })
         .collect()
@@ -270,7 +273,61 @@ pub(super) fn kill_round(
         let victim = select_follower_victim(leader, killed_followers, rotation);
         (victim, "follower")
     };
-    nodes[victim].arm_checkpoint_kill(role);
+    if role == "follower" {
+        killed_followers.insert(victim);
+    }
+    let rejoined = fault_round(
+        nodes,
+        live,
+        victim,
+        RoundFault::Kill9(role),
+        settings,
+        metric,
+        latest,
+    );
+    eprintln!(
+        "soak round {round}: node {victim} rejoined; checkpoint {} committed",
+        rejoined.checkpoint_id
+    );
+    (victim, rejoined)
+}
+
+/// Freeze the observed leader with `SIGSTOP` inside `gate`, require the survivors to commit, then
+/// resume it, require it to fence itself and exit, and restart it. Returns the checkpoint
+/// committed after it rejoined.
+pub(super) fn pause_round(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    gate: PauseGate,
+    settings: &SoakSettings,
+    metric: &str,
+    latest: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
+    let leader = stable_leader(nodes, live);
+    fault_round(
+        nodes,
+        live,
+        leader,
+        RoundFault::PauseLeader(gate),
+        settings,
+        metric,
+        latest,
+    )
+}
+
+/// Take `victim` out with `fault` once it is held inside the armed gate, require the survivors to
+/// commit, resume a paused victim until it fences itself and exits, then restart it as [`rejoin`]
+/// does.
+fn fault_round(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    victim: usize,
+    fault: RoundFault,
+    settings: &SoakSettings,
+    metric: &str,
+    latest: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
+    fault.arm(&nodes[victim]);
     // A spontaneous recovery round exposes no checkpoint to arm until it completes.
     wait_for(
         "the selected node to pause inside its armed checkpoint phase",
@@ -278,28 +335,46 @@ pub(super) fn kill_round(
         || {
             assert_running_nodes(nodes);
             live();
-            nodes[victim].checkpoint_kill_ready(role)
+            fault.held(&nodes[victim])
         },
     );
     let failover_deadline = Instant::now() + settings.recovery_ceiling;
-    nodes[victim].kill9();
-    nodes[victim].disarm_checkpoint_kill();
-    if role == "follower" {
-        killed_followers.insert(victim);
-    }
-    eprintln!("soak round {round}: kill -9 delivered to {role} node {victim} inside a checkpoint");
+    let paused = fault.deliver(&mut nodes[victim]);
+    eprintln!("soak: {fault:?} delivered to node {victim} inside a checkpoint");
+    let floor = match paused {
+        // A frozen leader may have committed past `latest` before it stopped. Resumed once the
+        // survivors pass only `latest`, it could still hold its lease and lead again.
+        Some(_) => wait_for_converged_durable_checkpoint(
+            nodes,
+            failover_deadline,
+            "the durable checkpoint the paused leader left",
+            None,
+        ),
+        None => latest,
+    };
     let survived = wait_for_converged_durable_checkpoint(
         nodes,
         failover_deadline,
-        "survivor progress after kill",
-        Some(latest),
+        "survivor progress after the fault",
+        Some(floor),
     );
-    let rejoined = rejoin(nodes, live, victim, settings, metric, survived);
-    eprintln!(
-        "soak round {round}: node {victim} rejoined; checkpoint {} committed",
-        rejoined.checkpoint_id
-    );
-    (victim, rejoined)
+    if let Some(paused) = paused {
+        wait_for(
+            "a survivor to lead while the paused leader is stopped",
+            settings.recovery_ceiling,
+            || {
+                assert_running_nodes(nodes);
+                live();
+                nodes
+                    .iter()
+                    .filter(|node| node.id != victim && node.child.is_some())
+                    .any(|node| node.is_leader() == Some(true))
+            },
+        );
+        let status = paused.resume_until_fenced_exit(settings.recovery_ceiling);
+        eprintln!("soak: resumed stale leader node {victim} fenced itself and exited ({status})");
+    }
+    rejoin(nodes, live, victim, settings, metric, survived)
 }
 
 /// Restart the stopped node `victim`, require it to rejoin and advance `metric`, and return the

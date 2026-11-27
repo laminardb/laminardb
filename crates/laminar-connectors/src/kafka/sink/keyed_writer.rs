@@ -49,7 +49,7 @@ pub(crate) async fn fence_departed_writers(
     deadline: tokio::time::Instant,
 ) -> Result<(), ConnectorError> {
     let config = KafkaSinkConfig::from_config(&config)?;
-    if !config.is_key_partitioned() {
+    if !config.has_process_writers() {
         return Ok(());
     }
     let producer_configs = departed

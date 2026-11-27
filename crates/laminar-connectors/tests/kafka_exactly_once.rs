@@ -383,28 +383,7 @@ async fn a_successor_fences_an_open_transaction_and_publishes_once() {
 
     // A predecessor that crashed mid-transaction: same transactional.id, records produced, no
     // commit.
-    let dangling: BaseProducer = ClientConfig::new()
-        .set("bootstrap.servers", &brokers)
-        .set(
-            "transactional.id",
-            format!("laminardb-{}", namespace.external_key()),
-        )
-        .create()
-        .unwrap();
-    dangling.init_transactions(Duration::from_secs(10)).unwrap();
-    dangling.begin_transaction().unwrap();
-    for id in ["dangling-a", "dangling-b"] {
-        dangling
-            .send(
-                BaseRecord::to(&topics.output)
-                    .partition(0)
-                    .key(id)
-                    .payload("x"),
-            )
-            .map_err(|(error, _)| error)
-            .unwrap();
-    }
-    dangling.flush(Duration::from_secs(10)).unwrap();
+    let dangling = open_transaction(&topics, &namespace, &["dangling-a", "dangling-b"]);
 
     let committer = sink.as_coordinated_committer().unwrap();
     committer
@@ -453,6 +432,37 @@ async fn a_commit_whose_response_was_lost_is_reconciled_by_the_marker() {
         .await
         .unwrap();
     assert_eq!(ids(&topics.read("read_committed")), ["30", "31", "32"]);
+}
+
+/// A committer of `namespace` with records `keys` produced in a transaction it leaves open.
+fn open_transaction(
+    topics: &Topics,
+    namespace: &CoordinatedCommitNamespace,
+    keys: &[&str],
+) -> BaseProducer {
+    let producer: BaseProducer = ClientConfig::new()
+        .set("bootstrap.servers", &topics.brokers)
+        .set(
+            "transactional.id",
+            format!("laminardb-{}", namespace.external_key()),
+        )
+        .create()
+        .unwrap();
+    producer.init_transactions(Duration::from_secs(10)).unwrap();
+    producer.begin_transaction().unwrap();
+    for key in keys {
+        producer
+            .send(
+                BaseRecord::to(&topics.output)
+                    .partition(0)
+                    .key(*key)
+                    .payload("x"),
+            )
+            .map_err(|(error, _)| error)
+            .unwrap();
+    }
+    producer.flush(Duration::from_secs(10)).unwrap();
+    producer
 }
 
 /// Drive one commit the way the engine does: read the cursor, then commit.
@@ -662,4 +672,73 @@ async fn upsert_tombstones_are_published_in_the_checkpoint_transaction() {
         None,
         "a delete is a tombstone"
     );
+}
+
+#[tokio::test]
+async fn participants_routed_over_different_partition_counts_publish_nothing() {
+    let brokers = brokers_or_skip!();
+    let topics = Topics::create(&brokers).await;
+    let namespace = namespace("orders");
+    let mut over_three = topics.sink().await;
+    let mut config = topics.config("append");
+    config.set("partition.count", "2");
+    let mut over_two = KafkaSink::new(schema(), KafkaSinkConfig::default(), None);
+    over_two.open(&config).await.unwrap();
+    let left = stage(&mut over_three, 1, &[80]).await;
+    let right = stage(&mut over_two, 1, &[81]).await;
+
+    let committer = over_three.as_coordinated_committer().unwrap();
+    let error = committer
+        .commit_aggregated(
+            batch(&namespace, None, 1, vec![(1, 1, left), (1, 2, right)]),
+            context(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("different partition counts"),
+        "{error}"
+    );
+    assert!(topics.read("read_committed").is_empty());
+    assert_eq!(committer.committed_cursor(&namespace).await.unwrap(), None);
+}
+
+/// Recovery re-drives a cut under the token of the leader that committed it, so the newest marker
+/// keeps that token until a successor commits a cut of its own. A former leader resuming in that
+/// window passes the authority check and fences the successor's open transaction, then finds its
+/// cut published: one extra recovery for the successor, no duplicate.
+#[tokio::test]
+async fn a_resumed_committer_fences_an_open_successor_but_publishes_nothing_again() {
+    let brokers = brokers_or_skip!();
+    let topics = Topics::create(&brokers).await;
+    let namespace = namespace("orders");
+    let mut first = topics.sink().await;
+    let one = stage(&mut first, 1, &[90]).await;
+    let first_commit = batch(&namespace, None, 1, vec![(1, 1, one)]);
+    engine_commit(&first, &namespace, first_commit.clone())
+        .await
+        .unwrap();
+    drop(first);
+
+    let successor = open_transaction(&topics, &namespace, &["91"]);
+
+    let resumed = topics.sink().await;
+    engine_commit(&resumed, &namespace, first_commit)
+        .await
+        .unwrap();
+    assert_eq!(ids(&topics.read("read_committed")), ["90"]);
+    assert!(successor
+        .commit_transaction(Duration::from_secs(10))
+        .is_err());
+
+    let mut recovered = topics.sink().await;
+    let two = stage(&mut recovered, 2, &[91]).await;
+    engine_commit(
+        &recovered,
+        &namespace,
+        batch(&namespace, Some((1, 1)), 2, vec![(2, 1, two)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&topics.read("read_committed")), ["90", "91"]);
 }

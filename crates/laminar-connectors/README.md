@@ -790,8 +790,8 @@ tree implements; "rejected" means startup fails before connector I/O with the st
 | Source, regex subscription or partition/topic additions under a guarantee | Rejected | Rejected |
 | Sink, append, at-least-once | Implemented | Implemented (independent writers) |
 | Sink, upsert (compacted topic), at-least-once | Implemented (one writer) | Implemented on [input placed by its key](#keyed-sinks-in-a-cluster): one transactional producer per process, fenced by the leader before a successor writes a failed process's keys |
-| Sink, exactly-once (append and upsert) | Implemented: checkpoint-staged output published by one fenced transactional committer | Rejected until the cluster kill-9 qualification passes; the protocol already handles multiple participants and leader fencing tokens |
-| Sink, upsert under exactly-once | Implemented (any participant may stage; only the fenced committer writes) | Rejected with cluster exactly-once |
+| Sink, exactly-once (append and upsert) | Implemented: checkpoint-staged output published by one fenced transactional committer | Implemented with `partition.count` set: every node stages its rows and the leader publishes every node's rows for a checkpoint in one fenced transaction ([cluster](#exactly-once-in-a-cluster)) |
+| Sink, upsert under exactly-once | Implemented (any participant may stage; only the fenced committer writes) | Implemented on [input placed by its key](#keyed-sinks-in-a-cluster); no per-process writer |
 
 Remaining known gaps, tracked until fixed: OAUTHBEARER has no token provider (rejected); GSSAPI
 works only where librdkafka reports `sasl_gssapi` (the Windows build uses SSPI; Linux builds do
@@ -925,6 +925,28 @@ the latency profile tunes the publication batching only. The first transactional
 Apache Kafka cluster creates `__transaction_state`, which can outlast one commit deadline; the
 engine retries the commit.
 
+#### Exactly-once in a cluster
+
+The leader is the designated committer. Every node stages the rows it routed in its own
+checkpoint descriptor; after the durable Commit the leader reads every node's descriptor and
+publishes them, one node at a time, in one transaction with the marker.
+
+- `partition.count` is required: every node must route a key over the same partitions, or a
+  committed checkpoint could not be published. Without it cluster exactly-once is rejected.
+- An upsert topic takes input [placed by its key](#keyed-sinks-in-a-cluster), as at-least-once
+  does: the leader publishes each node's rows in participant order, so a key staged on two nodes
+  in one checkpoint would keep whichever node sorts last.
+- Bounds: each node's compressed descriptor is at most 16 MiB and all nodes' together at most
+  64 MiB per checkpoint. The leader checks both before recording Commit; a checkpoint over them
+  fails and the pipeline recovers, so checkpoint more often or lower `epoch.max.bytes`.
+- One transaction per checkpoint carries the whole cluster's output, produced by the leader's
+  one producer within the engine's 30-second publication deadline.
+- Any node can lead, so every node's principal needs `Write` and `Describe` on the committer's
+  transactional id: `laminardb-` followed by `ldb-c3-` and a digest of the commit namespace (a
+  prefix ACL on `laminardb-ldb-c3-` covers every sink).
+- A leader that fails mid-publication leaves its transaction open until the successor fences it,
+  holding back `read_committed` consumers of the output topic for about one recovery.
+
 Fencing: a committer reads the newest marker before `init_transactions` and refuses to fence
 when it carries a newer fencing token, so an obsolete committer cannot abort a successor that has
 already committed. An obsolete committer that fences a successor which has not yet committed can
@@ -936,8 +958,14 @@ Evidence: `tests/kafka_exactly_once.rs` (real broker) covers invisible staging a
 retried commit, a successor publishing a cut its predecessor never published, a successor
 fencing an open predecessor transaction (its records exist but are aborted), a lost commit
 response reconciled by the marker, obsolete-committer fencing and token regression, multiple
-participants with an overlapping recovery batch and empty participants, and upsert tombstones.
-It passes on Redpanda 26.1.13 and Apache Kafka 4.1.1.
+participants with an overlapping recovery batch and empty participants, participants routed over
+different partition counts (nothing becomes visible), a resumed committer re-driving a published
+cut while its successor's transaction is open (the successor's transaction is aborted and the cut
+is not published again), and upsert tombstones. It passes on Redpanda 26.1.13 and Apache Kafka
+4.1.1. In a cluster, `multi_writer_sinks::three_node_kafka_exactly_once_sink_kill9_soak`
+(candidate) kills the leader and each follower inside a checkpoint, then freezes the leader
+before the committed index and before the sink's external commit until a successor commits; a
+`read_committed` oracle must find every produced row exactly once.
 
 Scope: each committed checkpoint's output becomes visible atomically to `read_committed`
 consumers of the output topic, once per logical output record. It does not deduplicate equal
@@ -1000,11 +1028,12 @@ batch; lookups are separate.
   node's checkpoint waits with it; keep the cluster checkpoint timeout above the time to read
   the largest one.
 - In a cluster the feed's consumers are aggregates, materialized views, Delta `append` sinks on
-  object storage, which keep `__weight`, and PostgreSQL or MongoDB upsert sinks on input
+  object storage, which keep `__weight`, and PostgreSQL, MongoDB or Kafka upsert sinks on input
   [placed by their key](#keyed-sinks-in-a-cluster). The Delta upsert sink stays rejected in a
   cluster.
-- With `delivery = exactly_once`, the feed's changes go to Delta `append` on direct S3/S3A, the
-  cluster exactly-once sink that takes a changelog (the Iceberg append sink takes none). The node
+- With `delivery = exactly_once`, the feed's changes go to Delta `append` on direct S3/S3A or to a
+  Kafka upsert topic with `partition.count` on input placed by its key, the cluster exactly-once
+  sinks that take a changelog (the Iceberg and Kafka append sinks take none). The node
   reading the feed and the nodes writing its aggregates commit in the same checkpoint, so the sink
   holds each committed change once.
 - A local `table.path`, a Glue catalog name, `read.mode = 'snapshot'`, and adding the source to a
@@ -1085,7 +1114,7 @@ backpressures rather than dropping rows.
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert; upsert in a cluster on [input placed by its key](#keyed-sinks-in-a-cluster)); exactly-once append and upsert in embedded/single-node mode via checkpoint-staged output and one fenced transactional committer | Implemented |
+| Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert; upsert in a cluster on [input placed by its key](#keyed-sinks-in-a-cluster)); exactly-once append and upsert via checkpoint-staged output and one fenced transactional committer, in a cluster with `partition.count` set | Implemented |
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | RabbitMQ | `rabbitmq` | Publisher-confirmed, mandatory publishes to one exchange; durable at-least-once for persistent messages on durable queues | Implemented |
 | IBM MQ | `ibmmq` | `MQPUT` under syncpoint with `MQCMIT` per unit of work; durable at-least-once for persistent messages | Implemented |

@@ -227,42 +227,6 @@ impl KafkaExactCommitter {
             _ => Ok(()),
         }
     }
-
-    fn decode_outputs(
-        &self,
-        batch: &CoordinatedCommitBatch,
-        after: u64,
-    ) -> Result<(Vec<OutputRecord>, i32), ConnectorError> {
-        let mut records = Vec::new();
-        let mut partition_count = None;
-        for entry in &batch.entries {
-            if entry.attempt.checkpoint_id <= after {
-                continue;
-            }
-            let Some(payload) = entry.payload.as_deref() else {
-                continue;
-            };
-            let output = StagedOutput::decode(payload)?;
-            if output.topic != self.config.topic {
-                return Err(ConnectorError::TransactionError(format!(
-                    "staged Kafka output targets '{}', but the sink writes '{}'",
-                    output.topic, self.config.topic
-                )));
-            }
-            match partition_count {
-                Some(count) if count != output.partition_count => {
-                    return Err(ConnectorError::TransactionError(
-                        "staged Kafka outputs in one commit were routed over different partition \
-                         counts"
-                            .into(),
-                    ));
-                }
-                _ => partition_count = Some(output.partition_count),
-            }
-            records.extend(output.records);
-        }
-        Ok((records, partition_count.unwrap_or(0)))
-    }
 }
 
 #[async_trait]
@@ -323,28 +287,28 @@ impl CoordinatedCommitter for KafkaExactCommitter {
         }
         state.unresolved = Some(pending.clone());
         let after = observed.map_or(0, |cursor| cursor.checkpoint_id);
-        let (records, partition_count) = self.decode_outputs(&batch, after)?;
+        let staged = batch
+            .entries
+            .into_iter()
+            .filter(|entry| entry.attempt.checkpoint_id > after)
+            .filter_map(|entry| entry.payload)
+            .collect::<Vec<_>>();
         let writer = state
             .writer
             .as_ref()
             .ok_or_else(|| ConnectorError::Internal("Kafka fenced writer vanished".into()))?;
-        let marker = CommitMarker::new(
-            target,
-            pending.fingerprint,
-            &self.config.topic,
-            partition_count,
-        )
-        .encode()?;
         let producer = writer.producer.clone();
         let location = writer.marker.clone();
         let topic = self.config.topic.clone();
+        let fingerprint = pending.fingerprint;
         let outcome = run_blocking(&self.admission, deadline, move |blocking_deadline| {
             Ok(publish(
                 &producer,
                 &topic,
-                &records,
+                &staged,
                 &location,
-                &marker,
+                target,
+                fingerprint,
                 blocking_deadline,
             ))
         })
@@ -419,18 +383,93 @@ impl Drop for KafkaExactCommitter {
     }
 }
 
-/// Produce `records` and the marker in one transaction and commit it.
+/// Produce every participant's staged records and the marker for `target` in one transaction and
+/// commit it.
 fn publish(
     producer: &FutureProducer,
     topic: &str,
-    records: &[OutputRecord],
+    staged: &[Vec<u8>],
     marker_location: &MarkerLocation,
-    marker: &[u8],
+    target: CoordinatedCommitCursor,
+    fingerprint: [u8; 32],
     deadline: Instant,
 ) -> PublishOutcome {
     if let Err(error) = producer.begin_transaction() {
         return PublishOutcome::Unknown(format!("begin_transaction: {error}"));
     }
+    match produce_cut(
+        producer,
+        topic,
+        staged,
+        marker_location,
+        target,
+        fingerprint,
+        deadline,
+    ) {
+        Ok(()) => published(transaction::commit(producer, deadline)),
+        Err(ended) => ended,
+    }
+}
+
+/// Enqueue the cut into the open transaction, decoding one participant's descriptor at a time so
+/// the leader holds one participant's epoch rather than the whole cluster's. `Err` is how the
+/// aborted transaction ended.
+fn produce_cut(
+    producer: &FutureProducer,
+    topic: &str,
+    staged: &[Vec<u8>],
+    marker_location: &MarkerLocation,
+    target: CoordinatedCommitCursor,
+    fingerprint: [u8; 32],
+    deadline: Instant,
+) -> Result<(), PublishOutcome> {
+    let abort_with = |reason: &str| abort(producer, deadline, reason);
+    let mut partition_count = None;
+    for descriptor in staged {
+        let output = routed_output(descriptor, topic, &mut partition_count)
+            .map_err(|error| abort_with(&error.to_string()))?;
+        produce_records(producer, topic, &output.records, deadline)?;
+    }
+    let marker = CommitMarker::new(target, fingerprint, topic, partition_count.unwrap_or(0))
+        .encode()
+        .map_err(|error| abort_with(&error.to_string()))?;
+    let marker_record = FutureRecord::to(&marker_location.topic)
+        .partition(marker_location.partition)
+        .key(marker_location.key.as_bytes())
+        .payload(marker.as_slice());
+    enqueue(producer, marker_record, deadline)
+        .map_err(|error| abort_with(&format!("produce commit marker: {error}")))
+}
+
+/// Decode one participant's descriptor, which must target `topic` and be routed over the same
+/// partition count as every other participant's in this commit.
+fn routed_output(
+    descriptor: &[u8],
+    topic: &str,
+    partition_count: &mut Option<i32>,
+) -> Result<StagedOutput, ConnectorError> {
+    let output = StagedOutput::decode(descriptor)?;
+    if output.topic != topic {
+        return Err(ConnectorError::TransactionError(format!(
+            "staged Kafka output targets '{}', but the sink writes '{topic}'",
+            output.topic
+        )));
+    }
+    if *partition_count.get_or_insert(output.partition_count) != output.partition_count {
+        return Err(ConnectorError::TransactionError(
+            "staged Kafka outputs in one commit were routed over different partition counts".into(),
+        ));
+    }
+    Ok(output)
+}
+
+/// Enqueue one participant's records; `Err` is how the aborted transaction ended.
+fn produce_records(
+    producer: &FutureProducer,
+    topic: &str,
+    records: &[OutputRecord],
+    deadline: Instant,
+) -> Result<(), PublishOutcome> {
     for record in records {
         let mut output: FutureRecord<'_, [u8], [u8]> =
             FutureRecord::to(topic).partition(record.partition);
@@ -445,7 +484,7 @@ fn publish(
             if failure.dlq_eligible() {
                 // A record the client rejects can never be published; retrying the committed
                 // cut would fail the same way forever.
-                return match abort(producer, deadline, &failure.detail) {
+                return Err(match abort(producer, deadline, &failure.detail) {
                     PublishOutcome::Aborted(_) => {
                         PublishOutcome::Aborted(ConnectorError::ConfigurationError(format!(
                             "a committed Kafka record for partition {} cannot be published \
@@ -454,23 +493,12 @@ fn publish(
                         )))
                     }
                     other => other,
-                };
+                });
             }
-            return abort(producer, deadline, &format!("produce: {error}"));
+            return Err(abort(producer, deadline, &format!("produce: {error}")));
         }
     }
-    let marker_record = FutureRecord::to(&marker_location.topic)
-        .partition(marker_location.partition)
-        .key(marker_location.key.as_bytes())
-        .payload(marker);
-    if let Err(error) = enqueue(producer, marker_record, deadline) {
-        return abort(
-            producer,
-            deadline,
-            &format!("produce commit marker: {error}"),
-        );
-    }
-    published(transaction::commit(producer, deadline))
+    Ok(())
 }
 
 /// Enqueue one record, retrying while librdkafka's queue is full. Delivery failures surface as
