@@ -54,8 +54,8 @@ key is admitted.
 
 | Sink | Embedded / single-node | Cluster |
 |---|---|---|
-| Kafka | EO, ALO, BE | ALO |
-| Kafka upsert | EO, ALO, BE | ALO |
+| Kafka | EO, ALO, BE | EO, ALO |
+| Kafka upsert | EO, ALO, BE | EO, ALO |
 | Delta Lake append (S3/S3A) | EO, ALO, BE | EO, ALO |
 | Delta Lake append (Azure) | EO, ALO, BE | ALO |
 | Delta Lake upsert | ALO, BE | rejected |
@@ -98,11 +98,11 @@ key is admitted.
 
 | Source \ Sink | Kafka | Kafka upsert | Delta Lake append (S3/S3A) | Delta Lake append (Azure) | Delta Lake upsert | Iceberg append (REST + S3) | PostgreSQL | PostgreSQL upsert | MongoDB | MongoDB upsert | Files | RabbitMQ | IBM MQ | NATS JetStream | WebSocket server |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Kafka | ALO | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Kafka (Debezium) | ALO | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Kafka | EO | EO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Kafka (Debezium) | EO | EO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | PostgreSQL CDC | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | MongoDB change stream | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
-| Delta Lake change feed | ALO | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Delta Lake change feed | EO | EO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 | Delta Lake change feed (local table) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (snapshot read) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | Iceberg (append read) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -116,7 +116,7 @@ key is admitted.
 | OpenTelemetry | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | FIX TagValue | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | Generator | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| Generator (splits) | ALO | ALO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
+| Generator (splits) | EO | EO | EO | ALO | — | EO | ALO | ALO | ALO | ALO | — | ALO | ALO | ALO | — |
 
 <!-- delivery-matrix:end -->
 
@@ -132,6 +132,7 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 | Generator (splits) → Delta Lake append (S3/S3A) | Cluster | `generator_splits::three_node_generator_splits_delta_eo_kill9_soak`: `kill -9` of the leader and each follower inside a checkpoint, each restarted and rejoining while the bounded sequence still runs. After every round the Delta table may hold no row twice, and when the sequence ends it must hold each row exactly once; committed view reads on every node must hold an exact prefix of every split. It has no paused-leader or sink-commit-gate faults. Emulated S3 (SeaweedFS). |
 | Generator (splits) → Iceberg append (REST + S3) | Cluster | Admitted through the Iceberg sink's certification (the Kafka → Iceberg row); no leg writes a split generator to Iceberg. |
 | Delta Lake change feed → Delta Lake append (S3/S3A) | Cluster | `delta_cdf_source::three_node_delta_cdf_delta_eo_kill9_soak` (candidate): the at-least-once change-feed leg's rounds (`kill -9` of the leader and each follower inside a checkpoint, then the node reading the feed frozen with `SIGSTOP` until a survivor reads it, resumed and fenced) under exactly-once, with a keyed `EMIT CHANGES` aggregate over the feed written to a Delta append table that keeps each change's `__weight`. After every round the table's weights must net to zero or one per row and to one row per bucket; once the writer stops, those rows must equal the aggregate over the input's final snapshot. Emulated S3 (SeaweedFS). |
+| Kafka → Kafka | Cluster | `multi_writer_sinks::three_node_kafka_exactly_once_sink_kill9_soak` (candidate): a Kafka source feeds a projection that every node stages for a Kafka sink with `partition.count` and a `commit.topic`. `kill -9` of the leader and each follower inside a checkpoint, each restarted and rejoining, then the leader frozen with `SIGSTOP` before the committed index and before the sink's external commit, resumed after a successor commits; the stale leader must fence itself and exit. A `read_committed` oracle must find every produced row exactly once. `crates/laminar-connectors/tests/kafka_exactly_once.rs` adds several participants in one commit, participants routed over different partition counts, and a resumed committer re-driving a published cut while its successor's transaction is open. Generator (splits), Delta Lake change feed and Kafka (Debezium) into Kafka, and Kafka upsert on input placed by its key, are admitted through the same sink certification. |
 | Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |

@@ -68,6 +68,80 @@ fn external_sink_descriptor_bounds_precede_object_reads() {
 }
 
 #[tokio::test]
+async fn publication_check_refuses_descriptors_no_committer_could_publish() {
+    let store = DescriptorReadProbeStore {
+        active: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    let (handle, _events) =
+        register_cleanup_probe(&mut coordinator, Arc::new(AtomicUsize::new(0)), false);
+    let per_participant = u64::try_from(MAX_COORDINATED_COMMIT_PAYLOAD_BYTES).unwrap();
+    let manifests = (1..=5)
+        .map(|participant| descriptor_manifest(participant, per_participant))
+        .collect::<Vec<_>>();
+    let error = coordinator
+        .validate_external_sink_publication(&manifests.iter().collect::<Vec<_>>())
+        .unwrap_err();
+    assert!(error.to_string().contains("from 5 participants"), "{error}");
+
+    let mut without_descriptor = descriptor_manifest(6, 1);
+    without_descriptor.prepared_sinks.clear();
+    let error = coordinator
+        .validate_external_sink_publication(&[&manifests[0], &without_descriptor])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no prepared descriptor"),
+        "{error}"
+    );
+    handle.close().await.unwrap();
+}
+
+/// An attempt aborted because its descriptors were too large to publish must still settle for a
+/// sink that keeps nothing outside the checkpoint, such as Kafka's staged epochs.
+#[tokio::test]
+async fn an_oversized_abort_settles_without_a_cleaner_or_descriptor_reads() {
+    let peak = Arc::new(AtomicUsize::new(0));
+    let store = DescriptorReadProbeStore {
+        active: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::clone(&peak),
+    };
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator
+        .bind_deployment_id("018f0000-0000-7000-8000-000000000001".into())
+        .unwrap();
+    let (handle, _events) =
+        register_cleanup_probe(&mut coordinator, Arc::new(AtomicUsize::new(0)), false);
+    coordinator.sinks[0].abort_cleaner = None;
+    let per_participant = u64::try_from(MAX_COORDINATED_COMMIT_PAYLOAD_BYTES).unwrap();
+    let manifests = (1..=5)
+        .map(|participant| descriptor_manifest(participant, per_participant))
+        .collect::<Vec<_>>();
+    let open_intents = (1..=5)
+        .map(|participant| (participant, Some(Vec::new())))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    coordinator
+        .cleanup_aborted_external_sinks_until(
+            CheckpointAttempt::canonical(1),
+            &[1, 2, 3, 4, 5],
+            &manifests.iter().collect::<Vec<_>>(),
+            &open_intents,
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(peak.load(Ordering::Acquire), 0);
+    handle.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn external_sink_abort_bounds_precede_object_reads() {
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));

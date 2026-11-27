@@ -66,7 +66,9 @@ keys, conditional publication, content validation on retry, and a durable visibi
 POSIX rename semantics are not emulated over object storage.
 
 Cluster exact-delivery admission remains limited to Kafka, split generator or Delta Lake change
-feed input (Delta only, since its changes carry retractions) with an S3/S3A append-mode Delta sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom
+feed input with an S3/S3A append-mode Delta sink, a REST-catalog Iceberg append sink backed by
+S3/S3A storage (not the change feed, whose changes carry retractions), or a Kafka sink with
+`partition.count` set (change feed input only into an upsert topic). Sink startup probes a custom
 S3 endpoint's atomic conditional create before new table creation; failure closes admission. Azure
 and GCS remain at-least-once in cluster mode.
 

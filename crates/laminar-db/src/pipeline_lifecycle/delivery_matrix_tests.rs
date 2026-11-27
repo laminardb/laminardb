@@ -230,7 +230,11 @@ const SINKS: &[Variant] = &[
             ("topic", "out"),
             ("format", "json"),
         ],
-        exact_properties: &[("commit.topic", "laminar-commits")],
+        // Cluster exactly-once also needs every node to route over one partition count.
+        exact_properties: &[
+            ("commit.topic", "laminar-commits"),
+            ("partition.count", "4"),
+        ],
     },
     Variant {
         label: "Kafka upsert",

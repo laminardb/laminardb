@@ -425,17 +425,22 @@ impl SinkConnector for KafkaSink {
         } else {
             SinkConsistency::DurableAtLeastOnce
         };
-        let topology = if cfg.is_key_partitioned() {
-            SinkTopology::KeyPartitioned
+        // Upsert input must reach the sink placed by its key in every guarantee: the
+        // exactly-once committer publishes each node's epoch in participant order, so one key
+        // staged on two nodes would keep whichever node sorts last.
+        let (topology, input_mode) = if cfg.envelope == SinkEnvelope::Upsert {
+            (SinkTopology::KeyPartitioned, SinkInputMode::FullChangelog)
         } else {
-            SinkTopology::MultiWriter
+            (SinkTopology::MultiWriter, SinkInputMode::AppendOnly)
         };
-        let input_mode = if cfg.envelope == SinkEnvelope::Upsert {
-            SinkInputMode::FullChangelog
+        let contract = SinkContract::new(consistency, topology, input_mode);
+        // Every node must route over one partition count: a commit whose participants disagree
+        // could never be published.
+        Ok(if exactly_once && cfg.partition_count.is_some() {
+            contract.with_cluster_exact_delivery_certification()
         } else {
-            SinkInputMode::AppendOnly
-        };
-        Ok(SinkContract::new(consistency, topology, input_mode))
+            contract
+        })
     }
 
     fn destination_key(

@@ -465,6 +465,23 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: certify
             services: seaweedfs redpanda nats nats-2 nats-3
+          - label: Cluster EO Kafka sink (gossip)
+            test: multi_writer_sinks::three_node_kafka_exactly_once_sink_kill9_soak
+            features: cluster,aws,kafka
+            delivery: eo
+            topology: cluster-kafka-eo
+            discovery: gossip
+            emulator: "1"
+            # Every node stages its share and the leader publishes each checkpoint in one Kafka
+            # transaction; kills, rejoins and a leader paused before its commit, and the
+            # read_committed oracle requires every input id exactly once.
+            checkpoint_ms: "2000"
+            rps: "250"
+            visibility_ms: "120000"
+            slo_mode: observe
+            visibility_slo_mode: observe
+            services: seaweedfs redpanda
+            candidate: "true"
           - label: Cluster ALO split generator (gossip)
             test: generator_splits::three_node_generator_splits_kill9_soak
             features: cluster,aws,kafka
@@ -575,9 +592,9 @@ jobs:
         if: matrix.iceberg == '1'
         run: docker compose -p laminardb-iceberg-soak -f tests/docker/iceberg-compose.yml up -d --wait --wait-timeout 180
 
-      - name: Verify Kafka global source handoff and the keyed writer fence
+      - name: Verify Kafka global source handoff, the keyed writer fence and the exactly-once committer
         if: matrix.discovery == 'static' && matrix.delivery == 'alo'
-        run: cargo test --profile soak -p laminar-connectors --no-default-features --features "kafka,testing" --test kafka_global_drain --test kafka_keyed_writer -- --nocapture
+        run: cargo test --profile soak -p laminar-connectors --no-default-features --features "kafka,testing" --test kafka_global_drain --test kafka_keyed_writer --test kafka_exactly_once -- --nocapture
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           LAMINAR_KAFKA_BROKERS: 127.0.0.1:19092
