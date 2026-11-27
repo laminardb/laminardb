@@ -13,7 +13,7 @@
       "advisory": "RUSTSEC-2024-0436",
       "crate": "paste",
       "version": "1.0.15",
-      "reason": "Accepted unmaintained compile-time dependency through tokenizers 0.21.4 (laminar-db's local feature). Every stable tokenizers release through 0.23.2 requires it directly; the 1.0 release candidates drop it."
+      "reason": "Accepted unmaintained compile-time dependency through tokenizers 0.21.4 (laminar-db's local feature). Every stable tokenizers release through 0.23.2 requires it directly; the 1.0 release candidates reach it through tk-encode up to rc.2 and no longer from rc.3."
     },
     {
       "advisory": "RUSTSEC-2026-0173",
