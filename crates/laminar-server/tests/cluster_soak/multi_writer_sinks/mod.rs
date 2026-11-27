@@ -485,8 +485,8 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
             latest,
         );
     }
-    // Pausing signals the process, which only Unix does.
-    if exactly_once && cfg!(unix) {
+    // Pausing signals the process, which only Unix does, at gates only debug builds compile.
+    if exactly_once && cfg!(unix) && cfg!(debug_assertions) {
         for gate in [PauseGate::CommittedIndex, PauseGate::SinkCommit(SINK)] {
             latest = pause_round(
                 &mut nodes,

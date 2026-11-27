@@ -4,7 +4,7 @@
 //! row a transaction ever committed twice is counted twice.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
@@ -16,6 +16,8 @@ use crate::{kafka_create_compacted_topic, kafka_create_topic, JoinDelivery};
 
 /// Pinned in the sink, so every node routes a row over the same partitions.
 const OUTPUT_PARTITIONS: i32 = 4;
+/// How long the oracle may take to read the output topic to its end once it is stopped.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
 pub(super) struct KafkaExactlyOnce {
     brokers: String,
@@ -100,12 +102,50 @@ fn consume(brokers: &str, topic: &str, observed: &Observed, stop: &AtomicBool) {
         .assign(&assignment)
         .expect("assign the output partitions");
     while !stop.load(Ordering::Acquire) {
-        match consumer.poll(Duration::from_millis(250)) {
-            Some(Ok(message)) => {
-                observed.add(message.payload().expect("an output row has a value"));
-            }
-            Some(Err(error)) => eprintln!("soak: Kafka output oracle poll: {error}"),
-            None => {}
-        }
+        poll_once(&consumer, observed);
     }
+    // Every id may already be seen while a committed duplicate sits later in a partition, so read
+    // each partition to its end before the counts are final.
+    let ends = (0..OUTPUT_PARTITIONS)
+        .map(|partition| {
+            consumer
+                .fetch_watermarks(topic, partition, Duration::from_secs(10))
+                .expect("output partition watermarks")
+        })
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+    while !read_to(&consumer, topic, &ends) {
+        assert!(
+            Instant::now() < deadline,
+            "the output oracle did not reach the end of {topic} within {DRAIN_DEADLINE:?}"
+        );
+        poll_once(&consumer, observed);
+    }
+}
+
+fn poll_once(consumer: &BaseConsumer, observed: &Observed) {
+    match consumer.poll(Duration::from_millis(250)) {
+        Some(Ok(message)) => {
+            observed.add(message.payload().expect("an output row has a value"));
+        }
+        Some(Err(error)) => eprintln!("soak: Kafka output oracle poll: {error}"),
+        None => {}
+    }
+}
+
+/// Whether the consumer's position has reached `ends`, each partition's `(low, high)` watermarks.
+/// The position, unlike the last record's offset, also steps over transaction markers.
+fn read_to(consumer: &BaseConsumer, topic: &str, ends: &[(i64, i64)]) -> bool {
+    let Ok(position) = consumer.position() else {
+        return false;
+    };
+    (0..OUTPUT_PARTITIONS)
+        .zip(ends)
+        .all(|(partition, &(low, high))| {
+            high <= low
+                || matches!(
+                    position.find_partition(topic, partition).map(|entry| entry.offset()),
+                    Some(Offset::Offset(offset)) if offset >= high
+                )
+        })
 }
