@@ -79,12 +79,17 @@ pub(super) fn num_cpus() -> u32 {
 
 /// Build the shared, cluster-wide control-plane object store (assignment snapshot plus
 /// `ObjectStoreClusterKv`) from the cluster-shared checkpoint namespace.
+///
+/// Each pipeline's compute runtime also reads this store and ends with the pipeline, so its
+/// HTTP connections live on `server_runtime`.
 pub(super) fn build_control_store(
     config: &ServerConfig,
+    server_runtime: &tokio::runtime::Handle,
 ) -> Result<Arc<dyn object_store::ObjectStore>, ClusterStartupError> {
-    laminar_core::checkpoint::object_store_builder::build_object_store(
+    laminar_core::checkpoint::object_store_builder::build_object_store_on(
         &config.checkpoint.url,
         &config.checkpoint.storage,
+        server_runtime,
     )
     .map_err(|e| {
         ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))

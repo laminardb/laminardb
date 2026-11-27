@@ -13,7 +13,7 @@ Machine-readable versions, sources, checksums and reasons are in `dependency-exc
 | Advisory | Pinned crate | Accepted residual risk |
 | --- | --- | --- |
 | [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html) | rsa 0.9.10 | No patched release. reqsign cloud authentication uses randomized signing rather than RSA decryption, but this does not establish absence of timing leakage or private-key exposure. |
-| [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | paste 1.0.15 | Unmaintained compile-time dependency through DataFusion/Parquet/tokenizers. |
+| [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | paste 1.0.15 | Unmaintained compile-time dependency through tokenizers (laminar-db's `local` feature), which requires it directly in every release. |
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | proc-macro-error2 2.0.1 | Unmaintained compile-time dependency through validator_derive in Delta Lake. |
 | [RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440.html) | astral-tokio-tar 0.6.2 | Unmaintained since 2026-11-03, no maintained release. Test-only: reached through testcontainers 0.27.2 (0.28.0 still requires it), a laminar-connectors dev-dependency; no shipped build compiles it. |
 | [RUSTSEC-2026-0542](https://rustsec.org/advisories/RUSTSEC-2026-0542.html) | humantime 2.3.0 | Unmaintained with chrono, no maintained release. Reached through deltalake-core, object_store 0.13 and humantime-serde (laminar-server's duration settings). |
@@ -97,4 +97,12 @@ proc-macro-error2, astral-tokio-tar, humantime, chrono and chrono-tz have no mai
 DataFusion 55.2 still requires object_store `^0.13.2` (so quick-xml `^0.39`), so the quick-xml
 patch and XML exceptions remain. The quick-xml backport's only change in this review is its due
 date, so its reviewed digest was recomputed.
+Re-review on 2026-11-26: no advisory was withdrawn or gained a patched release the graph can take.
+reqsign-core 3.3.4, reqsign-azure-storage 3.3.2 and reqsign-google 3.4.0 still require rsa
+`^0.9.2`. Every tokenizers release through 0.23.2 requires paste directly; DataFusion and Parquet no
+longer reach it. Delta Lake 1.1.4 requires validator `^0.19`, whose derive uses proc-macro-error2
+(validator_derive 0.20.1 drops it). testcontainers 0.28.0 still requires astral-tokio-tar `^0.6.1`.
+DataFusion 55.2 still requires object_store `^0.13.2`, and object_store 0.13.2 is the last 0.13
+release (quick-xml `^0.39`), so the quick-xml patch and XML exceptions remain. humantime, chrono
+and chrono-tz have no maintained release.
 Keep these exceptions under review before **2026-12-30**, which is the hard CI deadline.
