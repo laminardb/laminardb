@@ -389,3 +389,16 @@ async fn a_store_on_an_io_runtime_outlives_the_runtime_that_opened_its_connectio
         2
     );
 }
+
+#[cfg(not(feature = "azure"))]
+#[tokio::test]
+async fn a_runtime_bound_store_needs_its_provider_compiled() {
+    let error = build_object_store_on(
+        "az://container/checkpoints",
+        &HashMap::new(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("`azure` feature"), "{error}");
+}

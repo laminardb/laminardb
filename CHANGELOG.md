@@ -181,7 +181,10 @@
   topology migration. Each pipeline's compute runtime reads the store, and connections it opened
   stopped working when it ended, so a request sent on one failed without a retry. The cluster's
   store now runs all of its HTTP requests on the server runtime
-  (`object_store_builder::build_object_store_on`).
+  (`object_store_builder::build_object_store_on`). With GCS workload identity its token refresh
+  runs there too; before, it stopped with the first runtime that asked for a token, and the next
+  wait for a token panicked. A Delta GCS table configured with an I/O runtime refreshes its token
+  on that runtime. `gcs_workload_identity_provider` takes the refresh runtime.
 
 - In cluster mode, a graceful vnode rotation accepts as its handoff only a checkpoint that carries
   the handoff, which fences each giving node's intake before its state is captured. Before, if the

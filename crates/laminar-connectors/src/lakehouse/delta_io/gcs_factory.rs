@@ -51,9 +51,15 @@ impl ObjectStoreFactory for LaminarGcsFactory {
         url: &Url,
         config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
-        let credentials =
-            gcs_workload_identity_provider(&config.raw, &|name| std::env::var(name).ok())
-                .map_err(|error| DeltaTableError::Generic(error.to_string()))?;
+        let credentials = gcs_workload_identity_provider(
+            &config.raw,
+            &|name| std::env::var(name).ok(),
+            config
+                .runtime
+                .as_ref()
+                .map(deltalake::logstore::IORuntime::get_handle),
+        )
+        .map_err(|error| DeltaTableError::Generic(error.to_string()))?;
         let Some(credentials) = credentials else {
             return deltalake::gcp::GcpFactory::default().parse_url_opts(url, config);
         };
