@@ -70,6 +70,15 @@ topic = "{topic}"
         )
     }
 
+    fn sink_into_sql(&self, topic: &str) -> Option<String> {
+        Some(format!(
+            "INTO KAFKA ('bootstrap.servers' = '{brokers}', 'topic' = '{topic}', \
+             'commit.topic' = '{commits}', 'partition.count' = '{OUTPUT_PARTITIONS}')",
+            brokers = self.brokers,
+            commits = commit_topic(topic),
+        ))
+    }
+
     fn create(&self, topic: &str) {
         kafka_create_topic(&self.brokers, topic, OUTPUT_PARTITIONS);
         kafka_create_compacted_topic(&self.brokers, &commit_topic(topic), 1);

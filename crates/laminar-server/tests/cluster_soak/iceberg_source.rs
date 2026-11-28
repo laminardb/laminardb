@@ -138,7 +138,7 @@ fn three_node_iceberg_source_kill9_soak() {
     record_consumers(&nodes, &mut consumers);
 
     let (written, snapshots) = writer.stop();
-    let observed = wait_for_delivery(oracle, written, settings.recovery_ceiling);
+    let observed = wait_for_delivery(oracle, 0..written, settings.recovery_ceiling);
     let unexpected: Vec<u64> = observed.range(written..).map(|(id, _)| *id).collect();
     assert!(
         unexpected.is_empty(),

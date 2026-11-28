@@ -67,8 +67,9 @@ pub(crate) mod postgres;
 pub(crate) mod rabbitmq;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -89,6 +90,8 @@ use super::{
 };
 
 const SINK: &str = "sink_out";
+/// The checkpoint-committable sink the migration exercise adds.
+const ADDED_SINK: &str = "sink_added";
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka, S3, and RabbitMQ"]
@@ -181,6 +184,12 @@ pub(crate) trait Destination {
     /// The `[sink.properties]` entries that target `name`.
     fn sink_properties(&self, name: &str) -> String;
 
+    /// The `INTO` clause of a `CREATE SINK` that targets `name`, for a sink a topology migration
+    /// adds; destinations that run no migration exercise have none.
+    fn sink_into_sql(&self, _name: &str) -> Option<String> {
+        None
+    }
+
     /// Create `name` before any node starts: a missing destination fails every write.
     fn create(&self, name: &str);
 
@@ -255,12 +264,12 @@ impl Oracle {
         }
     }
 
-    /// Ids in `0..produced` not yet observed: their count and the first few.
-    fn missing(&self, produced: u64) -> (u64, Vec<u64>) {
+    /// Ids in `ids` not yet observed: their count and the first few.
+    fn missing(&self, ids: Range<u64>) -> (u64, Vec<u64>) {
         let observed = self.observed.lock();
         let mut count = 0;
         let mut sample = Vec::new();
-        for id in (0..produced).filter(|id| !observed.contains_key(id)) {
+        for id in ids.filter(|id| !observed.contains_key(id)) {
             count += 1;
             if sample.len() < 8 {
                 sample.push(id);
@@ -293,20 +302,28 @@ impl Drop for Oracle {
 /// soak, so the acknowledged ids are always the contiguous prefix `0..produced`.
 struct InputProducer {
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<u64>>,
+    enqueued: Arc<AtomicU64>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl InputProducer {
     fn spawn(brokers: String, topic: String, partitions: i32, rps: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let enqueued = Arc::new(AtomicU64::new(0));
         let handle = {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || produce(&brokers, &topic, partitions, rps, &stop))
+            let (stop, enqueued) = (Arc::clone(&stop), Arc::clone(&enqueued));
+            std::thread::spawn(move || produce(&brokers, &topic, partitions, rps, &stop, &enqueued))
         };
         Self {
             stop,
+            enqueued,
             handle: Some(handle),
         }
+    }
+
+    /// Ids below this were handed to the producer; every later id is sent after this call.
+    fn enqueued(&self) -> u64 {
+        self.enqueued.load(Ordering::Acquire)
     }
 
     fn assert_running(&mut self) {
@@ -319,13 +336,15 @@ impl InputProducer {
         }
     }
 
+    /// Stop producing and wait for every delivery; returns the number of ids produced.
     fn stop(mut self) -> u64 {
         self.stop.store(true, Ordering::Release);
         self.handle
             .take()
             .expect("Kafka producer was already stopped")
             .join()
-            .expect("Kafka producer thread failed")
+            .expect("Kafka producer thread failed");
+        self.enqueued()
     }
 }
 
@@ -338,7 +357,14 @@ impl Drop for InputProducer {
     }
 }
 
-fn produce(brokers: &str, topic: &str, partitions: i32, rps: u64, stop: &AtomicBool) -> u64 {
+fn produce(
+    brokers: &str,
+    topic: &str,
+    partitions: i32,
+    rps: u64,
+    stop: &AtomicBool,
+    enqueued: &AtomicU64,
+) {
     use futures::stream::{FuturesUnordered, StreamExt as _};
     use rdkafka::producer::{FutureProducer, FutureRecord};
 
@@ -388,12 +414,12 @@ fn produce(brokers: &str, topic: &str, partitions: i32, rps: u64, stop: &AtomicB
                 .unwrap_or_else(|(error, _)| panic!("Kafka enqueue failed: {error}"));
             deliveries.push(delivery);
             produced += 1;
+            enqueued.store(produced, Ordering::Release);
         }
         while let Some(delivery) = deliveries.next().await {
             acknowledge(delivery);
         }
-        produced
-    })
+    });
 }
 
 fn workload(
@@ -501,14 +527,31 @@ fn run_three_node_sink_soak(destination: &dyn Destination, exercise: Exercise) {
         metric,
     );
     let mut killed_followers = BTreeSet::new();
+    let mut added_sink = None;
     let kills = match exercise {
         Exercise::TopologyMigration => {
-            latest = migrate_topology(
+            let topic = format!("{name}-added");
+            destination.create(&topic);
+            let mut oracle = destination.spawn_oracle(&topic);
+            let into = destination
+                .sink_into_sql(&topic)
+                .expect("the migration exercise adds a sink of its destination's kind");
+            let cut = migrate_topology(
                 &mut nodes,
-                &mut || producer.assert_running(),
+                &mut || {
+                    producer.assert_running();
+                    oracle.assert_running();
+                },
                 &settings,
-                latest,
+                &into,
             );
+            let first_id = producer.enqueued();
+            latest = checkpoints_after_cut(&mut nodes, &settings, cut);
+            added_sink = Some(AddedSink {
+                topic,
+                oracle,
+                first_id,
+            });
             0
         }
         Exercise::Faults => {
@@ -545,6 +588,9 @@ fn run_three_node_sink_soak(destination: &dyn Destination, exercise: Exercise) {
         &mut || {
             producer.assert_running();
             oracle.assert_running();
+            if let Some(added) = added_sink.as_mut() {
+                added.oracle.assert_running();
+            }
         },
         settings.steady,
         metric,
@@ -557,7 +603,48 @@ fn run_three_node_sink_soak(destination: &dyn Destination, exercise: Exercise) {
     );
 
     let produced = producer.stop();
-    let observed = wait_for_delivery(oracle, produced, settings.recovery_ceiling);
+    let observed = wait_for_delivery(oracle, 0..produced, settings.recovery_ceiling);
+    let duplicates = assert_produced_ids_only(&observed, produced, exactly_once);
+    eprintln!(
+        "soak: {} sink across {NODES} nodes: produced={produced} lost=0 duplicates={duplicates} \
+         kills={kills} (followers {killed_followers:?})",
+        destination.connector(),
+    );
+    if let Some(AddedSink {
+        topic,
+        oracle,
+        first_id,
+    }) = added_sink
+    {
+        // The added sink reads the source from the migration cut, which precedes activation, so
+        // every id enqueued after activation must reach it.
+        let observed = wait_for_delivery(oracle, first_id..produced, settings.recovery_ceiling);
+        let duplicates = assert_produced_ids_only(&observed, produced, exactly_once);
+        eprintln!(
+            "soak: {ADDED_SINK} added by the migration holds ids {first_id}..{produced} \
+             duplicates={duplicates}"
+        );
+        destination.delete(&topic);
+    }
+    drop(nodes);
+    destination.delete(&name);
+}
+
+/// A checkpoint-committable sink the migration exercise adds, and the ids it must hold.
+struct AddedSink {
+    topic: String,
+    oracle: Oracle,
+    /// The first id enqueued once the migration was active; it and every later id must arrive.
+    first_id: u64,
+}
+
+/// Require `observed` to hold only produced ids and, under exactly-once, none twice; returns the
+/// duplicate count.
+fn assert_produced_ids_only(
+    observed: &BTreeMap<u64, u32>,
+    produced: u64,
+    exactly_once: bool,
+) -> u64 {
     let unexpected: Vec<u64> = observed
         .keys()
         .copied()
@@ -580,13 +667,7 @@ fn run_three_node_sink_soak(destination: &dyn Destination, exercise: Exercise) {
             .take(8)
             .collect::<Vec<_>>()
     );
-    eprintln!(
-        "soak: {} sink across {NODES} nodes: produced={produced} lost=0 duplicates={duplicates} \
-         kills={kills} (followers {killed_followers:?})",
-        destination.connector(),
-    );
-    drop(nodes);
-    destination.delete(&name);
+    duplicates
 }
 
 /// Each node's `(committed, locally active)` topology versions.
@@ -608,20 +689,24 @@ fn operation_status(
     serde_json::from_str(&node.http_get(&path)?).ok()
 }
 
-/// Add a stream over the source through the public topology API, wait until every node runs it,
-/// and require two durable checkpoints of the migrated topology.
+/// Add a stream over the source and a sink over it, targeted by the `into` clause, through the
+/// public topology API, and wait until every node runs them. Returns the migration's cut, the
+/// parent topology's last checkpoint.
 fn migrate_topology(
     nodes: &mut [Node],
     live: &mut dyn FnMut(),
     settings: &SoakSettings,
-    latest: DurableCheckpointStatus,
+    into: &str,
 ) -> DurableCheckpointStatus {
     let request = laminar_db::ClusterTopologyRequest {
         operation_id: uuid::Uuid::new_v4()
             .try_into()
             .expect("a nonzero operation id"),
         expected_parent_version: TopologyVersion::BASELINE,
-        statements: vec!["CREATE STREAM sink_migrated AS SELECT id FROM sink_input".into()],
+        statements: vec![
+            "CREATE STREAM sink_migrated AS SELECT id FROM sink_input".into(),
+            format!("CREATE SINK {ADDED_SINK} FROM sink_migrated {into}"),
+        ],
     };
     let target = TopologyVersion::BASELINE
         .successor()
@@ -650,6 +735,7 @@ fn migrate_topology(
                 || operation_status(&nodes[0], request.operation_id).is_some()
         },
     );
+    let mut cut = None;
     wait_for(
         "every node to run the migrated topology",
         settings.recovery_ceiling,
@@ -663,22 +749,38 @@ fn migrate_topology(
                 !matches!(status.phase, TopologyAdmissionPhase::Aborted { .. }),
                 "soak: the topology migration aborted: {status:?}"
             );
+            cut = status.cut.map(|cut| DurableCheckpointStatus {
+                checkpoint_id: cut.inventory.attempt.checkpoint_id,
+                epoch: cut.inventory.attempt.epoch,
+            });
             status.phase == TopologyAdmissionPhase::Active
                 && nodes.iter().all(|node| {
                     topology_versions(node) == Some((target, target)) && node.is_ready()
                 })
         },
     );
+    let cut = cut.expect("an active migration is bound to its cut");
     eprintln!(
-        "soak: topology {} -> {target} active on every node",
-        TopologyVersion::BASELINE.get()
+        "soak: topology {} -> {target} active on every node after cut {}",
+        TopologyVersion::BASELINE.get(),
+        cut.checkpoint_id
     );
+    cut
+}
+
+/// Require two durable checkpoints after the migration's `cut`, the first two of the migrated
+/// topology.
+fn checkpoints_after_cut(
+    nodes: &mut [Node],
+    settings: &SoakSettings,
+    cut: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
     let deadline = Instant::now() + settings.recovery_ceiling;
     let first = wait_for_converged_durable_checkpoint(
         nodes,
         deadline,
         "the first checkpoint of the migrated topology",
-        Some(latest),
+        Some(cut),
     );
     wait_for_converged_durable_checkpoint(
         nodes,
@@ -691,18 +793,18 @@ fn migrate_topology(
 /// Wait until every produced id has reached the destination, then stop the oracle.
 pub(crate) fn wait_for_delivery(
     mut oracle: Oracle,
-    produced: u64,
+    ids: Range<u64>,
     recovery_ceiling: Duration,
 ) -> BTreeMap<u64, u32> {
     // A recovery round can be in flight when the producer stops.
     let caught_up = wait_until(recovery_ceiling + Duration::from_secs(60), || {
         oracle.assert_running();
-        oracle.missing(produced).0 == 0
+        oracle.missing(ids.clone()).0 == 0
     });
     if !caught_up {
-        let (missing, sample) = oracle.missing(produced);
+        let (missing, sample) = oracle.missing(ids.clone());
         panic!(
-            "{missing} of {produced} produced ids never reached the destination, first {sample:?}"
+            "{missing} of the produced ids {ids:?} never reached the destination, first {sample:?}"
         );
     }
     oracle.finish()

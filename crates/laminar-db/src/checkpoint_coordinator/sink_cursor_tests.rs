@@ -124,15 +124,30 @@ struct Migrated {
     objects: Arc<dyn object_store::ObjectStore>,
 }
 
+fn no_rows_staged_for(sink: &str) -> PreparedSinkDescriptor {
+    PreparedSinkDescriptor {
+        sink_name: sink.into(),
+        format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+        payload: None,
+        sha256: checkpoint_descriptor_sha256(None),
+    }
+}
+
+fn checkpoint_store(objects: &Arc<dyn object_store::ObjectStore>) -> ObjectStoreCheckpointStore {
+    ObjectStoreCheckpointStore::new(Arc::clone(objects), "migrated-sink")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
+}
+
 async fn coordinator(
     objects: &Arc<dyn object_store::ObjectStore>,
     decisions: &Arc<CheckpointDecisionStore>,
     pipeline: PipelineIdentity,
 ) -> CheckpointCoordinator {
-    let store = ObjectStoreCheckpointStore::new(Arc::clone(objects), "migrated-sink")
-        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
-    let mut coordinator =
-        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    let mut coordinator = CheckpointCoordinator::new(
+        CheckpointConfig::default(),
+        Box::new(checkpoint_store(objects)),
+    )
+    .unwrap();
     coordinator
         .bind_durable_decision_store(Arc::clone(decisions))
         .await
@@ -185,11 +200,13 @@ async fn migrated() -> Migrated {
 }
 
 impl Migrated {
-    /// The committed checkpoint `checkpoint_id` of `pipeline`, as the target's predecessor.
+    /// The committed checkpoint `checkpoint_id` of `pipeline`, as the target's predecessor, whose
+    /// one participant prepared a descriptor for each of `prepared`.
     async fn committed(
         &self,
         pipeline: PipelineIdentity,
         checkpoint_id: u64,
+        prepared: &[&str],
     ) -> CommittedCheckpointRef {
         let owner = coordinator(&self.objects, &self.decisions, pipeline.clone()).await;
         let mut manifest = CheckpointManifest::new_with_key_group_count(
@@ -199,7 +216,15 @@ impl Migrated {
         );
         manifest.deployment_id = owner.expected_deployment_id().unwrap().to_owned();
         manifest.pipeline_identity = pipeline;
-        let encoded = bytes::Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+        manifest.sink_names = prepared.iter().map(|&sink| sink.to_owned()).collect();
+        manifest.prepared_sinks = prepared
+            .iter()
+            .map(|&sink| no_rows_staged_for(sink))
+            .collect();
+        let encoded = checkpoint_store(&self.objects)
+            .save_checkpoint(&manifest, &[])
+            .await
+            .unwrap();
         let index = owner
             .build_committed_index(
                 CheckpointAttempt::canonical(checkpoint_id),
@@ -225,12 +250,7 @@ impl Migrated {
             KeyGroupCount::try_from(1_u16).unwrap(),
         );
         manifest.bind_participant(1);
-        manifest.prepared_sinks = vec![PreparedSinkDescriptor {
-            sink_name: "sink".into(),
-            format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
-            payload: None,
-            sha256: checkpoint_descriptor_sha256(None),
-        }];
+        manifest.prepared_sinks = vec![no_rows_staged_for("sink")];
         self.target
             .commit_external_sinks_until(
                 CheckpointAttempt::canonical(4),
@@ -246,7 +266,7 @@ impl Migrated {
 #[tokio::test]
 async fn a_migrated_sink_publishes_its_first_cut_after_the_parent_published_the_migration_cut() {
     let migrated = migrated().await;
-    let cut = migrated.committed(identity('a'), 3).await;
+    let cut = migrated.committed(identity('a'), 3, &["sink"]).await;
     migrated.cursors.set(&identity('a'), 3);
 
     migrated.publish(&cut).await.unwrap();
@@ -272,7 +292,7 @@ async fn a_migrated_sink_publishes_its_first_cut_after_the_parent_published_the_
 async fn a_sink_migrated_back_to_an_earlier_identity_publishes_after_its_old_cursor() {
     let migrated = migrated().await;
     migrated.cursors.set(&identity('b'), 1);
-    let cut = migrated.committed(identity('a'), 3).await;
+    let cut = migrated.committed(identity('a'), 3, &["sink"]).await;
     migrated.cursors.set(&identity('a'), 3);
 
     migrated.publish(&cut).await.unwrap();
@@ -285,9 +305,24 @@ async fn a_sink_migrated_back_to_an_earlier_identity_publishes_after_its_old_cur
 }
 
 #[tokio::test]
+async fn a_sink_the_migration_added_publishes_its_first_cut_from_the_zero_cursor() {
+    let migrated = migrated().await;
+    let cut = migrated.committed(identity('a'), 3, &[]).await;
+
+    migrated.publish(&cut).await.unwrap();
+
+    let published = std::mem::take(&mut *migrated.published.lock());
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].namespace.pipeline_identity, identity('b'));
+    assert_eq!(published[0].expected_predecessor.checkpoint_id, 0);
+    assert!(migrated.cursors.get(&identity('a')).is_none());
+    migrated.handle.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_migrated_sink_refuses_a_cut_its_parent_never_published() {
     let migrated = migrated().await;
-    let cut = migrated.committed(identity('a'), 3).await;
+    let cut = migrated.committed(identity('a'), 3, &["sink"]).await;
 
     let unpublished = migrated.publish(&cut).await.unwrap_err().to_string();
     assert!(
@@ -301,14 +336,14 @@ async fn a_migrated_sink_refuses_a_cut_its_parent_never_published() {
         "{trailing}"
     );
 
-    let same_pipeline = migrated.committed(identity('b'), 3).await;
+    let same_pipeline = migrated.committed(identity('b'), 2, &["sink"]).await;
     let missing = migrated
         .publish(&same_pipeline)
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        missing.contains("has no external cursor for committed predecessor 3"),
+        missing.contains("has no external cursor for committed predecessor 2"),
         "a predecessor of the same pipeline must be in the sink's own namespace: {missing}"
     );
     assert!(migrated.published.lock().is_empty());

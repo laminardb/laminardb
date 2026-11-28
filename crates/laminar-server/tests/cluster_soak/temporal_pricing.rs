@@ -121,7 +121,7 @@ pub(super) fn priced_trades(
 ) -> PricedTrades {
     let owners = placed_owners(nodes, "rates");
     let produced = trader.stop();
-    let observed = wait_for_delivery(oracle, produced, settings.recovery_ceiling);
+    let observed = wait_for_delivery(oracle, 0..produced, settings.recovery_ceiling);
     heartbeat.stop();
     let unexpected: Vec<u64> = observed.range(produced..).map(|(id, _)| *id).collect();
     assert!(

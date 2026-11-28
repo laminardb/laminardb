@@ -1,9 +1,9 @@
 use super::{
     channel_progress_frontiers_by_source, checkpoint_manifest_bytes, classify_channel_progress,
     Arc, BTreeMap, Bytes, ChannelProgress, CheckpointAttempt, CheckpointCoordinator,
-    CheckpointManifest, CheckpointScope, CheckpointWatermark, CommittedCheckpointIndex,
-    CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint, DbError, Duration,
-    FuturesUnordered, StreamExt, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    CheckpointManifest, CheckpointScope, CheckpointStore, CheckpointWatermark,
+    CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint,
+    DbError, Duration, FuturesUnordered, StreamExt, COMMITTED_CHECKPOINT_INDEX_VERSION,
 };
 #[cfg(feature = "cluster")]
 use super::{LeaderProof, QuorumPeer};
@@ -93,6 +93,30 @@ impl CommittedFrontiers {
             CheckpointScope::Local => BTreeMap::new(),
         }
     }
+}
+
+/// One participant's manifest of a committed checkpoint, verified against its committed
+/// reference.
+pub(super) async fn load_committed_manifest_until(
+    store: &dyn CheckpointStore,
+    participant: &CommittedParticipantRef,
+    checkpoint_id: u64,
+    deadline: tokio::time::Instant,
+) -> Result<CheckpointManifest, String> {
+    let participant_id = participant.participant_id;
+    tokio::time::timeout_at(
+        deadline,
+        store.load_manifest_verified(
+            participant_id,
+            checkpoint_id,
+            participant.manifest_len,
+            &participant.manifest_sha256,
+        ),
+    )
+    .await
+    .map_err(|_| format!("participant {participant_id} manifest read timed out"))?
+    .map_err(|error| format!("participant {participant_id} manifest read failed: {error}"))?
+    .ok_or_else(|| format!("participant {participant_id} manifest is missing"))
 }
 
 const PARTICIPANT_MANIFEST_POLL_INITIAL: Duration = Duration::from_millis(10);

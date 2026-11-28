@@ -201,40 +201,6 @@ fn validate_handoff_manifest_budget(
     Ok(())
 }
 
-async fn load_handoff_manifest_until(
-    store: &dyn CheckpointStore,
-    participant: &CommittedParticipantRef,
-    checkpoint_id: u64,
-    deadline: tokio::time::Instant,
-) -> Result<CheckpointManifest, DbError> {
-    let participant_id = participant.participant_id;
-    tokio::time::timeout_at(
-        deadline,
-        store.load_manifest_verified(
-            participant_id,
-            checkpoint_id,
-            participant.manifest_len,
-            &participant.manifest_sha256,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        handoff_error(format!(
-            "participant {participant_id} handoff manifest read timed out"
-        ))
-    })?
-    .map_err(|error| {
-        handoff_error(format!(
-            "participant {participant_id} handoff manifest read failed: {error}"
-        ))
-    })?
-    .ok_or_else(|| {
-        handoff_error(format!(
-            "participant {participant_id} handoff manifest is missing"
-        ))
-    })
-}
-
 fn validate_handoff_manifest(
     manifest: &CheckpointManifest,
     donor: &HandoffDonor,
@@ -316,13 +282,14 @@ async fn load_handoff_donor_plan_until(
     max_payload_bytes: usize,
     deadline: tokio::time::Instant,
 ) -> Result<(VerifiedStateFramePlan, usize), DbError> {
-    let manifest = load_handoff_manifest_until(
+    let manifest = super::commit_index::load_committed_manifest_until(
         store.as_ref(),
         &donor.participant,
         cut.committed.checkpoint_id,
         deadline,
     )
-    .await?;
+    .await
+    .map_err(|reason| handoff_error(format!("handoff {reason}")))?;
     validate_handoff_manifest(&manifest, &donor, cut, predecessor)?;
     select_handoff_plan(
         &manifest,

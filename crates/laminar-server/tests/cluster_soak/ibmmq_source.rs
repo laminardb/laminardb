@@ -122,7 +122,7 @@ fn three_node_ibmmq_source_kill9_soak() {
     record_consumers(&nodes, &mut consumers);
 
     let published = publisher.stop();
-    let observed = wait_for_delivery(oracle, published, settings.recovery_ceiling);
+    let observed = wait_for_delivery(oracle, 0..published, settings.recovery_ceiling);
     let unexpected: Vec<u64> = observed.range(published..).map(|(id, _)| *id).collect();
     assert!(
         unexpected.is_empty(),
