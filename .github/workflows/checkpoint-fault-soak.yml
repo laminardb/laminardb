@@ -489,9 +489,10 @@ jobs:
             topology: cluster-kafka-eo-migration
             discovery: gossip
             emulator: "1"
-            # A stream added through the public topology API while every node stages its share
-            # for the exactly-once Kafka sink; the migration goes live on every node and the
-            # read_committed oracle requires every input id exactly once.
+            # A stream and a second exactly-once Kafka sink added through the public topology API
+            # while every node stages its share; the migration goes live on every node, and the
+            # read_committed oracles require every input id exactly once in the kept sink and every
+            # id produced after activation exactly once in the added one.
             checkpoint_ms: "2000"
             rps: "250"
             visibility_ms: "120000"

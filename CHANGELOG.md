@@ -192,7 +192,8 @@
   The request now names the reserved epoch and the migration's cut takes it. A sink's commit
   record is kept per pipeline identity, which the migration changes, so the first checkpoint of
   the migrated pipeline also found no record of the cut and failed on every recovery; it now
-  starts the new record once the parent's record holds the cut.
+  starts the new record once the parent's record holds the cut. A sink the migration adds has no
+  parent record and is not part of the cut, so it starts its record from its first checkpoint.
 - A checkpoint whose exactly-once sink descriptors could never be published (above the 64 MiB a
   sink's participants may stage together, or missing a participant's descriptor) now fails before
   its Commit is recorded. It used to commit and then fail every publication and every recovery of
