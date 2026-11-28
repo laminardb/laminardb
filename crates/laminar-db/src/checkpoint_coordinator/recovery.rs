@@ -318,10 +318,7 @@ impl CheckpointCoordinator {
                 CheckpointAttempt::canonical(committed.checkpoint_id),
                 &manifests,
                 fencing_token,
-                committed
-                    .predecessor
-                    .as_ref()
-                    .map_or(0, |reference| reference.checkpoint_id),
+                committed.predecessor.as_ref(),
                 deadline,
             )
             .await?;

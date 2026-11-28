@@ -137,17 +137,7 @@ impl LeaderAuthorityRecord {
                     || self
                         .active_checkpoint_artifacts
                         .as_ref()
-                        .is_some_and(|active| {
-                            self.topology_operations
-                                .iter()
-                                .filter(|entry| entry.is_preparing())
-                                .all(|entry| {
-                                    entry
-                                        .cut
-                                        .as_ref()
-                                        .is_none_or(|cut| cut.inventory != *active)
-                                })
-                        })
+                        .is_some_and(|active| !self.topology_preparation_admits_artifacts(active))
                     || (self.assignment_handoff_pin.is_some()
                         && !self.pending_topology_handoff_is_exact())
                     || (self

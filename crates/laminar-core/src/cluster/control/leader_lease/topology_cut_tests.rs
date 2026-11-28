@@ -1044,3 +1044,200 @@ async fn cut_admission_winning_unused_abort_append_requires_normal_recovery() {
         Some(bound)
     );
 }
+
+#[tokio::test]
+async fn a_cut_takes_the_unconsumed_sink_epoch_its_operation_was_admitted_beside() {
+    let authority = store(30_000);
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
+    // A leader with checkpoint-committable sinks always holds its next sink epoch.
+    let sink_epoch =
+        begin_checkpoint_artifacts(&authority, &lease.proof(), &plan.assignment, 1).await;
+    assert!(matches!(
+        authority
+            .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
+            .await,
+        Err(TopologyError::Contended)
+    ));
+    let admitted = authority
+        .admit_topology_plan_with_sink_epoch(
+            &lease.proof(),
+            &assignments,
+            &plan,
+            &target,
+            Some(sink_epoch.attempt),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.phase, TopologyAdmissionPhase::Planned);
+    let head = authority.load_record().await.unwrap().unwrap();
+    assert_eq!(head.active_checkpoint_artifacts, Some(sink_epoch.clone()));
+    #[cfg(feature = "cluster")]
+    assert!(
+        authority
+            .validate_topology_checkpoint_barrier(
+                &lease.proof(),
+                sink_epoch.attempt,
+                Some(&plan.assignment),
+                flags::NONE,
+                Phase::Prepare,
+            )
+            .await
+            .is_err(),
+        "only the cut may consume the reserved sink epoch"
+    );
+
+    topology_preparation::prepare_all(&authority, &assignments, &plan, &admitted).await;
+    let processes = topology_preparation::processes(&authority);
+    let other = checkpoint_artifact_inventory(&authority, &plan.assignment, 2).await;
+    assert!(authority
+        .begin_topology_checkpoint_cut(
+            &lease.proof(),
+            &assignments,
+            &processes,
+            plan.operation_id,
+            &admitted.plan,
+            other,
+        )
+        .await
+        .is_err());
+    let bound = authority
+        .begin_topology_checkpoint_cut(
+            &lease.proof(),
+            &assignments,
+            &processes,
+            plan.operation_id,
+            &admitted.plan,
+            sink_epoch.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound.phase, TopologyAdmissionPhase::Quiescing);
+    assert_eq!(bound.cut.unwrap().inventory, sink_epoch);
+    #[cfg(feature = "cluster")]
+    authority
+        .validate_topology_checkpoint_barrier(
+            &lease.proof(),
+            sink_epoch.attempt,
+            Some(&plan.assignment),
+            flags::TOPOLOGY_CUT,
+            Phase::Prepare,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn admission_names_only_the_active_reservation_of_committable_sinks() {
+    let authority = store(30_000);
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
+    let proof = lease.proof();
+    let named = |attempt| {
+        authority.admit_topology_plan_with_sink_epoch(
+            &proof,
+            &assignments,
+            &plan,
+            &target,
+            Some(attempt),
+        )
+    };
+    assert!(
+        matches!(
+            named(CheckpointAttempt::canonical(1)).await,
+            Err(TopologyError::Conflict(_))
+        ),
+        "no sink epoch is reserved"
+    );
+
+    let mut ordinary = checkpoint_artifact_inventory(&authority, &plan.assignment, 1).await;
+    ordinary.sink_artifact_intent_protocol = false;
+    authority
+        .begin_cluster_checkpoint_artifacts(&lease.proof(), ordinary.clone())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            named(ordinary.attempt).await,
+            Err(TopologyError::Conflict(_))
+        ),
+        "an in-flight checkpoint without sink intents is no sink epoch"
+    );
+    authority
+        .record_cluster_outcome(
+            &lease.proof(),
+            ordinary.attempt.epoch,
+            ordinary.attempt.checkpoint_id,
+            plan.assignment.clone(),
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+    authority
+        .finish_cluster_checkpoint_artifact_cleanup(&lease.proof(), &ordinary)
+        .await
+        .unwrap();
+
+    let sink_epoch = begin_checkpoint_artifacts(&authority, &proof, &plan.assignment, 2).await;
+    assert!(
+        matches!(
+            named(CheckpointAttempt::canonical(3)).await,
+            Err(TopologyError::Conflict(_))
+        ),
+        "another attempt than the reserved one"
+    );
+    assert!(authority
+        .topology_operation_status(plan.operation_id)
+        .await
+        .unwrap()
+        .is_none());
+    named(sink_epoch.attempt).await.unwrap();
+}
+
+#[tokio::test]
+async fn aborting_before_the_cut_leaves_the_sink_epoch_to_ordinary_checkpoints() {
+    let authority = store(30_000);
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
+    // A leader with checkpoint-committable sinks always holds its next sink epoch.
+    let sink_epoch =
+        begin_checkpoint_artifacts(&authority, &lease.proof(), &plan.assignment, 1).await;
+    let admitted = authority
+        .admit_topology_plan_with_sink_epoch(
+            &lease.proof(),
+            &assignments,
+            &plan,
+            &target,
+            Some(sink_epoch.attempt),
+        )
+        .await
+        .unwrap();
+    let aborted = authority
+        .abort_topology_plan(&lease.proof(), plan.operation_id, &admitted.plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        aborted.phase,
+        TopologyAdmissionPhase::Aborted {
+            reason: TopologyAbortReason::Requested
+        }
+    );
+    let head = authority.load_record().await.unwrap().unwrap();
+    assert_eq!(head.active_checkpoint_artifacts, Some(sink_epoch.clone()));
+    assert_eq!(
+        authority
+            .begin_cluster_checkpoint_artifacts(&lease.proof(), sink_epoch.clone())
+            .await
+            .unwrap(),
+        sink_epoch
+    );
+    #[cfg(feature = "cluster")]
+    authority
+        .validate_topology_checkpoint_barrier(
+            &lease.proof(),
+            sink_epoch.attempt,
+            Some(&plan.assignment),
+            flags::NONE,
+            Phase::Prepare,
+        )
+        .await
+        .unwrap();
+}

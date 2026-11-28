@@ -1,15 +1,16 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use laminar_connectors::connector::{
     CoordinatedAbortBatch, CoordinatedAbortDescriptor, CoordinatedAbortEntry,
-    CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
-    CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
-    MAX_COORDINATED_COMMIT_BATCH_ENTRIES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+    CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
+    MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use laminar_core::checkpoint::{
     CheckpointAttempt, CheckpointManifest, CheckpointSinkArtifactIntent, CheckpointStore,
-    PipelineIdentity, PreparedSinkArtifactIntent, PreparedSinkDescriptor,
+    CommittedCheckpointRef, PipelineIdentity, PreparedSinkArtifactIntent, PreparedSinkDescriptor,
 };
 
+use super::sink_cursor::ExternalPublication;
 use super::{CheckpointCoordinator, DbError, RegisteredSink};
 
 const MAX_EXTERNAL_SINK_COMMIT_CONCURRENCY: usize = 8;
@@ -274,7 +275,7 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         manifests: &[&CheckpointManifest],
         fencing_token: u64,
-        predecessor_checkpoint_id: u64,
+        predecessor: Option<&CommittedCheckpointRef>,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
         if !self.has_checkpoint_committable_sinks() {
@@ -298,7 +299,7 @@ impl CheckpointCoordinator {
                 attempt,
                 manifests,
                 fencing_token,
-                predecessor_checkpoint_id,
+                predecessor,
                 &identity,
                 &deployment_id,
                 deadline,
@@ -315,7 +316,7 @@ impl CheckpointCoordinator {
                     attempt,
                     manifests,
                     fencing_token,
-                    predecessor_checkpoint_id,
+                    predecessor,
                     &identity,
                     &deployment_id,
                     deadline,
@@ -335,7 +336,7 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         manifests: &[&CheckpointManifest],
         fencing_token: u64,
-        predecessor_checkpoint_id: u64,
+        predecessor: Option<&CommittedCheckpointRef>,
         identity: &PipelineIdentity,
         deployment_id: &str,
         deadline: tokio::time::Instant,
@@ -346,51 +347,19 @@ impl CheckpointCoordinator {
             sink.name.clone(),
         )
         .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        let cursor =
-            tokio::time::timeout_at(deadline, sink.handle.committed_cursor(namespace.clone()))
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "sink '{}' committed-cursor read timed out",
-                        sink.name
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "sink '{}' committed-cursor read failed: {error}",
-                        sink.name
-                    ))
-                })?;
-        if let Some(cursor) = cursor {
-            if cursor.checkpoint_id == attempt.checkpoint_id {
-                if cursor.fencing_token != fencing_token {
-                    return Err(DbError::Checkpoint(format!(
-                        "sink '{}' checkpoint {} was committed under fencing token {}, expected {fencing_token}",
-                        sink.name, attempt.checkpoint_id, cursor.fencing_token
-                    )));
-                }
-                return Ok(());
-            }
-        }
-        let expected_predecessor = if predecessor_checkpoint_id == 0 {
-            CoordinatedCommitCursor {
-                checkpoint_id: 0,
-                fencing_token: 0,
-            }
-        } else {
-            let cursor = cursor.ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "sink '{}' has no external cursor for committed predecessor {predecessor_checkpoint_id}",
-                    sink.name
-                ))
-            })?;
-            if cursor.checkpoint_id != predecessor_checkpoint_id {
-                return Err(DbError::Checkpoint(format!(
-                    "sink '{}' external cursor {} trails committed predecessor {predecessor_checkpoint_id}; recovery must publish the missing cut first",
-                    sink.name, cursor.checkpoint_id
-                )));
-            }
-            cursor
+        let expected_predecessor = match self
+            .external_publication_until(
+                sink,
+                &namespace,
+                attempt,
+                fencing_token,
+                predecessor,
+                deadline,
+            )
+            .await?
+        {
+            ExternalPublication::Published => return Ok(()),
+            ExternalPublication::After(cursor) => cursor,
         };
 
         let entries = self

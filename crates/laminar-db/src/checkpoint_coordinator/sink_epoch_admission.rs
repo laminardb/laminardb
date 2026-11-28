@@ -10,6 +10,18 @@ const CLUSTER_SINK_EPOCH_POLL_INITIAL: Duration = Duration::from_millis(10);
 #[cfg(feature = "cluster")]
 const CLUSTER_SINK_EPOCH_POLL_MAX: Duration = Duration::from_millis(250);
 
+/// Whether a terminal cut can take the sink epoch of checkpoint-committable sinks.
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutSinkEpoch {
+    /// No checkpoint-committable sink on this process stages output in an epoch.
+    NotRequired,
+    /// Reserved, and not yet consumed by any checkpoint.
+    Unconsumed(CheckpointAttempt),
+    /// Still opening, consumed by a checkpoint, or in doubt.
+    Held,
+}
+
 pub(crate) const fn is_terminal_cut(flags: u64, handoff_replay_pending: bool) -> bool {
     flags
         & (laminar_core::checkpoint::flags::HANDOFF | laminar_core::checkpoint::flags::TOPOLOGY_CUT)
@@ -108,19 +120,19 @@ impl CheckpointCoordinator {
         Ok(true)
     }
 
-    /// Whether this process's checkpoint-committable sinks have an open epoch that no admitted
-    /// checkpoint has consumed. A checkpoint consumes the epoch at reservation, and compute waits
-    /// on the sink write gate until the leader commits it and opens the successor, so a source
-    /// drain cut that arrives in between cannot be delivered.
+    /// The open epoch of this process's checkpoint-committable sinks that a terminal cut can still
+    /// take. A checkpoint consumes the epoch at reservation, and compute waits on the sink write
+    /// gate until the leader commits it and opens the successor, so a source drain or topology
+    /// cut that arrives in between cannot be delivered.
     #[cfg(feature = "cluster")]
-    pub(crate) fn sink_epoch_admits_drain(&self) -> bool {
+    pub(crate) fn cut_sink_epoch(&self) -> CutSinkEpoch {
         match self.initial_sink_epoch_required() {
-            Ok(false) => true,
-            Ok(true) => matches!(
-                *self.allocator.sink_epoch_reservation.lock(),
-                Some(SinkEpochReservation::Ready(_))
-            ),
-            Err(_) => false,
+            Ok(false) => CutSinkEpoch::NotRequired,
+            Ok(true) => match *self.allocator.sink_epoch_reservation.lock() {
+                Some(SinkEpochReservation::Ready(attempt)) => CutSinkEpoch::Unconsumed(attempt),
+                _ => CutSinkEpoch::Held,
+            },
+            Err(_) => CutSinkEpoch::Held,
         }
     }
 

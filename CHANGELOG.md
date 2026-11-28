@@ -185,6 +185,14 @@
 
 ### Fixed
 
+- In cluster mode a topology migration now completes on a pipeline with an exactly-once sink
+  (Kafka, Delta Lake or Iceberg). Such a leader always holds the sink epoch of its next
+  checkpoint, and a migration request could not be admitted beside it: the request timed out, or,
+  admitted in the gap after a commit, failed that reservation and was aborted by a recovery round.
+  The request now names the reserved epoch and the migration's cut takes it. A sink's commit
+  record is kept per pipeline identity, which the migration changes, so the first checkpoint of
+  the migrated pipeline also found no record of the cut and failed on every recovery; it now
+  starts the new record once the parent's record holds the cut.
 - A checkpoint whose exactly-once sink descriptors could never be published (above the 64 MiB a
   sink's participants may stage together, or missing a participant's descriptor) now fails before
   its Commit is recorded. It used to commit and then fail every publication and every recovery of

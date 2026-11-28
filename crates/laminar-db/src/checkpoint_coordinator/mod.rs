@@ -32,6 +32,7 @@ mod retention;
 mod retention_state;
 mod sink_artifact_intents;
 mod sink_commit;
+mod sink_cursor;
 pub(crate) mod sink_epoch_admission;
 mod sink_protocol;
 #[cfg(feature = "cluster")]
@@ -76,6 +77,8 @@ pub(crate) use request::{
 pub(crate) use retention::load_index_manifests;
 use retention::GcRequest;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "cluster")]
+pub(crate) use sink_epoch_admission::CutSinkEpoch;
 
 const MAX_RETENTION_IO_CONCURRENCY: usize = 8;
 const REFERENCED_CHUNK_REBASE_THRESHOLD: usize = 64;
@@ -98,6 +101,9 @@ mod artifact_tests;
 
 #[cfg(test)]
 mod external_sink_tests;
+
+#[cfg(test)]
+mod sink_cursor_tests;
 
 #[cfg(test)]
 mod outcome_tests {
