@@ -95,11 +95,6 @@ struct PublishedCheckpointIndex {
     subscription_commit_stats: Option<subscription_output::SubscriptionCommitStats>,
 }
 
-struct InstalledCheckpoint {
-    index: CommittedCheckpointIndex,
-    predecessor_checkpoint_id: u64,
-}
-
 impl CheckpointCoordinator {
     fn validate_attempt_admission(
         &self,
@@ -364,17 +359,13 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         prepared: &PreparedCheckpoint,
         published: PublishedCheckpointIndex,
-    ) -> Result<InstalledCheckpoint, DbError> {
+    ) -> Result<CommittedCheckpointIndex, DbError> {
         let PublishedCheckpointIndex {
             index,
             reference,
             #[cfg(feature = "cluster")]
                 subscription_commit_stats: _,
         } = published;
-        let predecessor_checkpoint_id = index
-            .predecessor
-            .as_ref()
-            .map_or(0, |reference| reference.checkpoint_id);
         self.last_committed_ref = Some(reference.clone());
         self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
             index.clone(),
@@ -394,17 +385,14 @@ impl CheckpointCoordinator {
                 attempt.epoch,
                 "closing a committed checkpoint",
             )?);
-        Ok(InstalledCheckpoint {
-            index,
-            predecessor_checkpoint_id,
-        })
+        Ok(index)
     }
 
     #[cfg(feature = "cluster")]
     async fn publish_committed_checkpoint_until(
         &self,
         attempt: CheckpointAttempt,
-        installed: &InstalledCheckpoint,
+        installed: &CommittedCheckpointIndex,
         assignment_fence: Option<&laminar_core::checkpoint::CheckpointAssignmentFence>,
         leader_proof: Option<&LeaderProof>,
         flags: u64,
@@ -412,8 +400,8 @@ impl CheckpointCoordinator {
         if let Some(controller) = self.cluster_controller.as_ref() {
             controller
                 .publish_committed_checkpoint_progress(
-                    &installed.index.channel_progress,
-                    &installed.index.source_watermarks,
+                    &installed.channel_progress,
+                    &installed.source_watermarks,
                 )
                 .map_err(DbError::Checkpoint)?;
             // The durable Commit is already immutable. Its cluster hint is best-effort and must
@@ -439,7 +427,7 @@ impl CheckpointCoordinator {
         &mut self,
         attempt: CheckpointAttempt,
         prepared: &PreparedCheckpoint,
-        installed: &InstalledCheckpoint,
+        installed: &CommittedCheckpointIndex,
         leader_proof: Option<&LeaderProof>,
         terminal_handoff: bool,
         sink_epoch_publication: SinkEpochPublication,
@@ -456,13 +444,13 @@ impl CheckpointCoordinator {
                 attempt,
                 &participant_manifests,
                 fencing_token,
-                installed.predecessor_checkpoint_id,
+                installed.predecessor.as_ref(),
                 continuation_deadline,
             )
             .await;
         self.continue_committed_sink_epoch_until(
             continuation,
-            &installed.index,
+            installed,
             leader_proof,
             terminal_handoff,
             continuation_deadline,

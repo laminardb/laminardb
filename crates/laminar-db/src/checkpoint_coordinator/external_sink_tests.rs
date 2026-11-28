@@ -697,16 +697,20 @@ async fn drain_admission_requires_an_unconsumed_committable_sink_epoch() {
     let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "no-sinks");
     let coordinator =
         CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
-    assert!(coordinator.sink_epoch_admits_drain());
+    assert_eq!(coordinator.cut_sink_epoch(), CutSinkEpoch::NotRequired);
 
     let (mut coordinator, handle, _begins) =
         coordinator_with_intent_order_sink("drain-admission").await;
-    assert!(
-        !coordinator.sink_epoch_admits_drain(),
+    assert_eq!(
+        coordinator.cut_sink_epoch(),
+        CutSinkEpoch::Held,
         "a committable sink without an open epoch cannot accept the drain flush"
     );
     coordinator.begin_initial_epoch().await.unwrap();
-    assert!(coordinator.sink_epoch_admits_drain());
+    assert!(matches!(
+        coordinator.cut_sink_epoch(),
+        CutSinkEpoch::Unconsumed(_)
+    ));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let attempt = coordinator
@@ -714,8 +718,9 @@ async fn drain_admission_requires_an_unconsumed_committable_sink_epoch() {
         .consume_sink_epoch_until(deadline)
         .await
         .unwrap();
-    assert!(
-        !coordinator.sink_epoch_admits_drain(),
+    assert_eq!(
+        coordinator.cut_sink_epoch(),
+        CutSinkEpoch::Held,
         "a reserved checkpoint has consumed the open epoch"
     );
 
@@ -751,7 +756,7 @@ async fn drain_admission_requires_an_unconsumed_committable_sink_epoch() {
     coordinator.set_assignment_version(1);
     coordinator.set_vnode_set(Vec::new());
     coordinator.set_cluster_controller(controller);
-    assert!(coordinator.sink_epoch_admits_drain());
+    assert_eq!(coordinator.cut_sink_epoch(), CutSinkEpoch::NotRequired);
 
     handle.rollback_epoch(attempt.epoch).await.unwrap();
     handle.close().await.unwrap();
@@ -799,7 +804,7 @@ async fn durable_at_least_once_sink_stays_out_of_coordinated_protocol() {
         .await
         .unwrap();
     coordinator
-        .commit_external_sinks_until(CheckpointAttempt::canonical(1), &[], 0, 0, deadline)
+        .commit_external_sinks_until(CheckpointAttempt::canonical(1), &[], 0, None, deadline)
         .await
         .unwrap();
 
@@ -867,7 +872,7 @@ async fn external_sink_descriptor_reads_use_a_bounded_window() {
             CheckpointAttempt::canonical(1),
             &references,
             1,
-            0,
+            None,
             tokio::time::Instant::now() + Duration::from_secs(10),
         )
         .await
@@ -952,7 +957,7 @@ async fn committed_external_sinks_publish_concurrently() {
             CheckpointAttempt::canonical(1),
             &[&manifest],
             1,
-            0,
+            None,
             deadline,
         )
         .await

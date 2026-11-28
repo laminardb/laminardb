@@ -33,6 +33,70 @@ impl LeaderAuthorityRecord {
         Err(DecisionError::Conflict("checkpoint is not the exact bound topology cut".into()).into())
     }
 
+    /// Whether `active` is a committable sink epoch the leader of `proof` reserved. Such a leader
+    /// always holds its next checkpoint's reservation, so a topology cut takes it instead of
+    /// reserving its own.
+    fn is_sink_epoch_reserved_by(
+        &self,
+        active: &CheckpointArtifactInventory,
+        proof: &LeaderProof,
+    ) -> bool {
+        active.sink_artifact_intent_protocol
+            && self.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
+    }
+
+    /// Admission waits out an in-flight checkpoint and its cleanup. A leader with checkpoint-
+    /// committable sinks names its reserved sink epoch, which no checkpoint has consumed yet; it
+    /// must be unsettled and on the admitted deployment and assignment, which the cut requires.
+    pub(super) fn require_admission_beside_artifacts(
+        &self,
+        proof: &LeaderProof,
+        assignment: &CheckpointAssignmentFence,
+        sink_epoch: Option<CheckpointAttempt>,
+    ) -> Result<(), TopologyError> {
+        if self.artifact_cleanup.is_some() {
+            return Err(TopologyError::Contended);
+        }
+        match (&self.active_checkpoint_artifacts, sink_epoch) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(TopologyError::Contended),
+            (Some(active), Some(attempt))
+                if active.attempt == attempt
+                    && self.is_sink_epoch_reserved_by(active, proof)
+                    && active.assignment_fence.as_ref() == Some(assignment)
+                    && self
+                        .topology_baseline
+                        .as_ref()
+                        .is_some_and(|baseline| baseline.deployment_id == active.deployment_id)
+                    && self.outcome_head.is_none_or(|head| {
+                        attempt.relation_to(CheckpointAttempt::new(head.epoch, head.checkpoint_id))
+                            == CheckpointAttemptRelation::Newer
+                    }) =>
+            {
+                Ok(())
+            }
+            _ => Err(TopologyError::Conflict(
+                "the named sink epoch is not this leader's unsettled reservation on the admitted assignment"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Active artifacts a topology operation in preparation coexists with: its bound cut, or,
+    /// before the cut, the committable sink epoch reserved by its admitting leader.
+    pub(super) fn topology_preparation_admits_artifacts(
+        &self,
+        active: &CheckpointArtifactInventory,
+    ) -> bool {
+        self.topology_operations
+            .iter()
+            .filter(|entry| entry.is_preparing())
+            .any(|entry| match &entry.cut {
+                Some(cut) => cut.inventory == *active,
+                None => self.is_sink_epoch_reserved_by(active, &entry.admitted_by),
+            })
+    }
+
     pub(super) fn record_topology_cut_outcome(
         &mut self,
         outcome: &CheckpointOutcome,
@@ -199,7 +263,8 @@ impl LeaderLeaseStore {
                 {
                     return Err(TopologyError::Conflict("cut inventory does not bind the admitted parent and assignment".into()));
                 }
-                if current.active_checkpoint_artifacts.is_some() || current.artifact_cleanup.is_some()
+                if current.active_checkpoint_artifacts.as_ref().is_some_and(|active| *active != inventory || !current.is_sink_epoch_reserved_by(active, proof))
+                    || current.artifact_cleanup.is_some()
                     || current.assignment_drain_reservation.is_some() || current.assignment_handoff_pin.is_some()
                     || current.recovery_fault_slots.iter().any(|slot| slot.active || slot.disposition == RecoveryFaultDisposition::Terminal)
                 {

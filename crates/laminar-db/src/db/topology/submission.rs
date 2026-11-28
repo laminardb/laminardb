@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_core::cluster::control::{
-    AssignmentSnapshotStore, CatalogManifest, ClusterController, LeaderProof,
+    AssignmentSnapshotStore, CatalogManifest, ClusterController, LeaderLeaseStore, LeaderProof,
     LocalProcessAuthorityIdentity, TopologyAdmissionPlan, TopologyError,
     TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
 };
 use laminar_sql::parser::parse_streaming_sql;
+
+use crate::checkpoint_coordinator::{CheckpointCoordinator, CutSinkEpoch};
 
 use super::{
     DbError, DbState, LaminarDB, TopologyAdmissionStatus, TopologyOperationId, TopologyVersion,
@@ -186,7 +188,35 @@ impl LaminarDB {
         .map_err(|_| TopologyError::Contended)?
     }
 
+    /// The epoch of this process's checkpoint-committable sinks that a terminal cut can take.
+    pub(crate) async fn cut_sink_epoch(&self) -> CutSinkEpoch {
+        self.coordinator.lock().await.as_ref().map_or(
+            CutSinkEpoch::NotRequired,
+            CheckpointCoordinator::cut_sink_epoch,
+        )
+    }
+
+    /// Checkpoint admission consumes the sink epoch under the adoption lock, so an epoch named
+    /// under it stays unconsumed through the authority append and the cut can take it.
+    async fn admit_beside_unconsumed_sink_epoch(
+        &self,
+        authority: &LeaderLeaseStore,
+        proof: &LeaderProof,
+        assignments: &AssignmentSnapshotStore,
+        plan: &TopologyAdmissionPlan,
+        target: &CatalogManifest,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let _adoption = self.assignment_adoption_lock.lock().await;
+        let CutSinkEpoch::Unconsumed(attempt) = self.cut_sink_epoch().await else {
+            return Err(TopologyError::Contended);
+        };
+        authority
+            .admit_topology_plan_with_sink_epoch(proof, assignments, plan, target, Some(attempt))
+            .await
+    }
+
     /// Retry one immutable plan until admitted while this leader holds periodic checkpoints.
+    /// With checkpoint-committable sinks it names their unconsumed epoch, which the cut takes.
     async fn admit_submitted_plan(
         &self,
         controller: &ClusterController,
@@ -207,10 +237,25 @@ impl LaminarDB {
             {
                 return Err(TopologyError::Fenced.into());
             }
-            match authority
-                .admit_topology_plan(proof, assignments, plan, target)
-                .await
-            {
+            let admission = match self.cut_sink_epoch().await {
+                CutSinkEpoch::Held => Err(TopologyError::Contended),
+                CutSinkEpoch::NotRequired => {
+                    authority
+                        .admit_topology_plan(proof, assignments, plan, target)
+                        .await
+                }
+                CutSinkEpoch::Unconsumed(_) => {
+                    self.admit_beside_unconsumed_sink_epoch(
+                        &authority,
+                        proof,
+                        assignments,
+                        plan,
+                        target,
+                    )
+                    .await
+                }
+            };
+            match admission {
                 Ok(admitted) => return Ok(admitted),
                 Err(TopologyError::Contended) => {
                     // Do not rebuild or change the operation UUID after checkpoint/CAS

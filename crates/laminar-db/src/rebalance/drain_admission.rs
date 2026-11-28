@@ -9,7 +9,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use super::read_assignment_vnode_state_readiness;
-use crate::checkpoint_coordinator::CheckpointCoordinator;
+use crate::checkpoint_coordinator::CutSinkEpoch;
 use crate::db::LaminarDB;
 
 const SINK_EPOCH_POLL: Duration = Duration::from_millis(25);
@@ -33,13 +33,9 @@ pub(super) async fn hold_checkpoints_until_sink_epoch_opens<'c>(
 }
 
 async fn sink_epoch_admits_drain(db: &LaminarDB, deadline: Instant) -> bool {
-    tokio::time::timeout_at(deadline, db.coordinator.lock())
+    tokio::time::timeout_at(deadline, db.cut_sink_epoch())
         .await
-        .is_ok_and(|coordinator| {
-            coordinator
-                .as_ref()
-                .is_none_or(CheckpointCoordinator::sink_epoch_admits_drain)
-        })
+        .is_ok_and(|epoch| epoch != CutSinkEpoch::Held)
 }
 
 /// Whether the predecessor can deliver a drain cut now. `false` defers publication; the caller

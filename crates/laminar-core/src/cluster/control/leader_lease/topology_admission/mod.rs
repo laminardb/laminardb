@@ -4,6 +4,7 @@ mod catalog_history;
 mod validation;
 
 use super::*;
+use crate::checkpoint::CheckpointAttempt;
 use crate::cluster::control::topology::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
     TopologyError, TopologyOperationId, TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
@@ -475,9 +476,28 @@ impl LeaderLeaseStore {
         plan: &TopologyAdmissionPlan,
         target: &CatalogManifest,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        self.admit_topology_plan_with_sink_epoch(proof, assignments, plan, target, None)
+            .await
+    }
+
+    /// [`Self::admit_topology_plan`] for a leader with checkpoint-committable sinks, which always
+    /// holds the next sink epoch's reservation. `sink_epoch` names that reservation, which no
+    /// checkpoint may have consumed; the operation's cut later binds it.
+    ///
+    /// # Errors
+    /// As [`Self::admit_topology_plan`], and rejects a `sink_epoch` that is not this leader's
+    /// unsettled reservation on the admitted assignment.
+    pub async fn admit_topology_plan_with_sink_epoch(
+        &self,
+        proof: &LeaderProof,
+        assignments: &AssignmentSnapshotStore,
+        plan: &TopologyAdmissionPlan,
+        target: &CatalogManifest,
+        sink_epoch: Option<CheckpointAttempt>,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
         tokio::time::timeout(
             CONTROL_TIMEOUT,
-            self.admit_topology_plan_inner(proof, assignments, plan, target),
+            self.admit_topology_plan_inner(proof, assignments, plan, target, sink_epoch),
         )
         .await
         .map_err(|_| TopologyError::Contended)?
@@ -489,6 +509,7 @@ impl LeaderLeaseStore {
         assignments: &AssignmentSnapshotStore,
         plan: &TopologyAdmissionPlan,
         target: &CatalogManifest,
+        sink_epoch: Option<CheckpointAttempt>,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
         let (encoded, reference) = encode_plan(plan)?;
         let (target_bytes, target_ref) = target.encode_and_reference()?;
@@ -567,9 +588,7 @@ impl LeaderLeaseStore {
             // A periodic checkpoint or its serialized cleanup can finish without changing the
             // expected parent. Keep its reservation authoritative; the public caller can retry
             // this same immutable plan within its original deadline.
-            if current.active_checkpoint_artifacts.is_some() || current.artifact_cleanup.is_some() {
-                return Err(TopologyError::Contended);
-            }
+            current.require_admission_beside_artifacts(proof, &plan.assignment, sink_epoch)?;
             let assignment = assignments
                 .load()
                 .await

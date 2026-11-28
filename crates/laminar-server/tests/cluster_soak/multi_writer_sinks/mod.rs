@@ -77,9 +77,14 @@ use super::kill_rejoin::{
     boot, cluster_nodes, kill_round, pause_round, steady_phase, SoakSettings,
 };
 use super::paused_leader::PauseGate;
+use laminar_core::cluster::control::{
+    TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyOperationId, TopologyVersion,
+};
+
 use super::{
-    cluster_kafka_partition_count, kafka_create_topic, scoped_soak_storage_url, soak_run_id,
-    wait_for_converged_durable_checkpoint, wait_until, JoinDelivery, ResolvedExecutable, NODES,
+    assert_running_nodes, cluster_kafka_partition_count, kafka_create_topic,
+    scoped_soak_storage_url, soak_run_id, wait_for, wait_for_converged_durable_checkpoint,
+    wait_until, DurableCheckpointStatus, JoinDelivery, Node, ResolvedExecutable, NODES,
     SOAK_PRODUCER_MAX_IN_FLIGHT,
 };
 
@@ -124,6 +129,24 @@ fn three_node_nats_sink_kill9_soak() {
 #[ignore = "spawns 3 real laminardb processes with Kafka and S3, exactly-once"]
 fn three_node_kafka_exactly_once_sink_kill9_soak() {
     run_three_node_sink_kill9_soak(&kafka::KafkaExactlyOnce::from_environment());
+}
+
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka and S3, exactly-once, and migrates the topology"]
+fn three_node_kafka_exactly_once_sink_topology_migration_soak() {
+    run_three_node_sink_soak(
+        &kafka::KafkaExactlyOnce::from_environment(),
+        Exercise::TopologyMigration,
+    );
+}
+
+/// What the soak does to the running cluster before its steady phase.
+#[derive(Clone, Copy)]
+enum Exercise {
+    /// Kill rounds, and paused-leader rounds for exactly-once.
+    Faults,
+    /// One additive topology migration through the public API.
+    TopologyMigration,
 }
 
 /// The environment value of `name`, or `default`; without a default the setting is required.
@@ -421,6 +444,10 @@ connector = "{connector}"
 }
 
 fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
+    run_three_node_sink_soak(destination, Exercise::Faults);
+}
+
+fn run_three_node_sink_soak(destination: &dyn Destination, exercise: Exercise) {
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
@@ -474,30 +501,45 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
         metric,
     );
     let mut killed_followers = BTreeSet::new();
-    for round in 0..settings.kills {
-        (_, latest) = kill_round(
-            &mut nodes,
-            &mut || producer.assert_running(),
-            round,
-            &mut killed_followers,
-            &settings,
-            metric,
-            latest,
-        );
-    }
-    // Pausing signals the process, which only Unix does, at gates only debug builds compile.
-    if exactly_once && cfg!(unix) && cfg!(debug_assertions) {
-        for gate in [PauseGate::CommittedIndex, PauseGate::SinkCommit(SINK)] {
-            latest = pause_round(
+    let kills = match exercise {
+        Exercise::TopologyMigration => {
+            latest = migrate_topology(
                 &mut nodes,
                 &mut || producer.assert_running(),
-                gate,
                 &settings,
-                metric,
                 latest,
             );
+            0
         }
-    }
+        Exercise::Faults => {
+            for round in 0..settings.kills {
+                (_, latest) = kill_round(
+                    &mut nodes,
+                    &mut || producer.assert_running(),
+                    round,
+                    &mut killed_followers,
+                    &settings,
+                    metric,
+                    latest,
+                );
+            }
+            // Pausing signals the process, which only Unix does, at gates only debug builds
+            // compile.
+            if exactly_once && cfg!(unix) && cfg!(debug_assertions) {
+                for gate in [PauseGate::CommittedIndex, PauseGate::SinkCommit(SINK)] {
+                    latest = pause_round(
+                        &mut nodes,
+                        &mut || producer.assert_running(),
+                        gate,
+                        &settings,
+                        metric,
+                        latest,
+                    );
+                }
+            }
+            settings.kills
+        }
+    };
     steady_phase(
         &mut nodes,
         &mut || {
@@ -540,12 +582,110 @@ fn run_three_node_sink_kill9_soak(destination: &dyn Destination) {
     );
     eprintln!(
         "soak: {} sink across {NODES} nodes: produced={produced} lost=0 duplicates={duplicates} \
-         kills={} (followers {killed_followers:?})",
+         kills={kills} (followers {killed_followers:?})",
         destination.connector(),
-        settings.kills
     );
     drop(nodes);
     destination.delete(&name);
+}
+
+/// Each node's `(committed, locally active)` topology versions.
+fn topology_versions(node: &Node) -> Option<(u64, u64)> {
+    let status: serde_json::Value =
+        serde_json::from_str(&node.http_get("/api/v1/cluster/topology")?).ok()?;
+    Some((
+        status["committed_version"].as_u64()?,
+        status["locally_active_version"].as_u64()?,
+    ))
+}
+
+/// One topology operation's durable status, read through `node`'s public API.
+fn operation_status(
+    node: &Node,
+    operation: TopologyOperationId,
+) -> Option<TopologyAdmissionStatus> {
+    let path = format!("/api/v1/cluster/topology/operations/{}", operation.get());
+    serde_json::from_str(&node.http_get(&path)?).ok()
+}
+
+/// Add a stream over the source through the public topology API, wait until every node runs it,
+/// and require two durable checkpoints of the migrated topology.
+fn migrate_topology(
+    nodes: &mut [Node],
+    live: &mut dyn FnMut(),
+    settings: &SoakSettings,
+    latest: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
+    let request = laminar_db::ClusterTopologyRequest {
+        operation_id: uuid::Uuid::new_v4()
+            .try_into()
+            .expect("a nonzero operation id"),
+        expected_parent_version: TopologyVersion::BASELINE,
+        statements: vec!["CREATE STREAM sink_migrated AS SELECT id FROM sink_input".into()],
+    };
+    let target = TopologyVersion::BASELINE
+        .successor()
+        .expect("a successor topology version")
+        .get();
+    let body = serde_json::to_string(&request).expect("encode the topology request");
+    let admission_ceiling = Duration::from_secs(120);
+    let admitted_by = Instant::now() + admission_ceiling;
+    // A request whose response is lost may still have been admitted: read its exact operation id
+    // before retrying the same payload while checkpoints contend for admission.
+    wait_for(
+        "the topology migration to be admitted",
+        admission_ceiling,
+        || {
+            live();
+            assert_running_nodes(nodes);
+            let remaining = admitted_by.saturating_duration_since(Instant::now());
+            nodes[0]
+                .http_request(
+                    "POST",
+                    "/api/v1/cluster/topology/operations",
+                    Some(&body),
+                    remaining.min(Duration::from_secs(45)),
+                )
+                .is_some()
+                || operation_status(&nodes[0], request.operation_id).is_some()
+        },
+    );
+    wait_for(
+        "every node to run the migrated topology",
+        settings.recovery_ceiling,
+        || {
+            live();
+            assert_running_nodes(nodes);
+            let Some(status) = operation_status(&nodes[0], request.operation_id) else {
+                return false;
+            };
+            assert!(
+                !matches!(status.phase, TopologyAdmissionPhase::Aborted { .. }),
+                "soak: the topology migration aborted: {status:?}"
+            );
+            status.phase == TopologyAdmissionPhase::Active
+                && nodes.iter().all(|node| {
+                    topology_versions(node) == Some((target, target)) && node.is_ready()
+                })
+        },
+    );
+    eprintln!(
+        "soak: topology {} -> {target} active on every node",
+        TopologyVersion::BASELINE.get()
+    );
+    let deadline = Instant::now() + settings.recovery_ceiling;
+    let first = wait_for_converged_durable_checkpoint(
+        nodes,
+        deadline,
+        "the first checkpoint of the migrated topology",
+        Some(latest),
+    );
+    wait_for_converged_durable_checkpoint(
+        nodes,
+        deadline,
+        "a second checkpoint of the migrated topology",
+        Some(first),
+    )
 }
 
 /// Wait until every produced id has reached the destination, then stop the oracle.

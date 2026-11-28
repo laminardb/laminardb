@@ -482,6 +482,23 @@ jobs:
             visibility_slo_mode: observe
             services: seaweedfs redpanda
             candidate: "true"
+          - label: Cluster EO Kafka sink topology migration (gossip)
+            test: multi_writer_sinks::three_node_kafka_exactly_once_sink_topology_migration_soak
+            features: cluster,aws,kafka
+            delivery: eo
+            topology: cluster-kafka-eo-migration
+            discovery: gossip
+            emulator: "1"
+            # A stream added through the public topology API while every node stages its share
+            # for the exactly-once Kafka sink; the migration goes live on every node and the
+            # read_committed oracle requires every input id exactly once.
+            checkpoint_ms: "2000"
+            rps: "250"
+            visibility_ms: "120000"
+            slo_mode: observe
+            visibility_slo_mode: observe
+            services: seaweedfs redpanda
+            candidate: "true"
           - label: Cluster ALO split generator (gossip)
             test: generator_splits::three_node_generator_splits_kill9_soak
             features: cluster,aws,kafka
